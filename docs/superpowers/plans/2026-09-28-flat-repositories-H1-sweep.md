@@ -4,11 +4,23 @@
 
 **Goal:** Close the flat-repository branch's open work before its end-to-end tests and docs (H2, H3): F-24's never-downgrade gap with `gc.keep_displaced = 0` (ruling R-H1), the maintainer's corrupt-anchor decision (ruling R-H2), snake_case names for every prose log message this branch added, with a guard that fails a new one (rulings R-H3, R-H6), the overview's H carry-forwards (the admin `retired_reaped`, the anchorless refresh made visible, the log-fields gaps, the 500-suite simulation under budget), and a disposition for every one of the 136 deferred minors of phases A–G, after which the seven deferred files are deleted.
 
-**Architecture:** No new package, no new config key, no schema change. `internal/cache` gains one predicate in snapshot-GC sub-job B (a snapshot still queued for the legacy trust audit is never deleted, Task 1) and one effect in the audit's quarantine transaction (an `anchor_corrupt` quarantine deletes the `url_path` rows that hold the corrupt blob, Task 2). The renames are mechanical (Task 3). The status page and JSON gain additive fields (`suites[].anchorless`, `recent_adoptions[].scheme`, `gc.retired_reaped`) and two HTML cells (Task 4); the admin endpoints share one form parser (Task 5); the reaper gains a per-run line and a liveness gauge (Task 6); GC's goroutines recover panics behind a narrow store seam (Task 7). The rest are bounded fixes in the files the deferred items name, each with the test its item asked for (Tasks 8–16); Task 17 is the definition of done and Task 18 the documentation, spec revision 12, the overview and the deletion of the seven deferred files.
+**Architecture:** No new package, no new config key, no schema change. `internal/cache` gains one predicate in snapshot-GC sub-job B (a snapshot still queued for the legacy trust audit is never deleted, Task 1) and one effect in the audit's quarantine transaction (an `anchor_corrupt` quarantine deletes the `url_path` rows that hold the corrupt blob, and the audit removes the corrupt pool file before the batch commits, Task 2). The renames are mechanical (Task 3). The status page and JSON gain additive fields (`suites[].anchorless`, `recent_adoptions[].scheme`, `gc.retired_reaped`) and two HTML cells (Task 4); the admin endpoints share one form parser (Task 5); the reaper gains a per-run line and a liveness gauge (Task 6); GC's goroutines and its startup pass recover panics behind a narrow store seam (Task 7). The rest are bounded fixes in the files the deferred items name, each with the test its item asked for (Tasks 8–16); Task 17 is the definition of done and Task 18 the documentation, spec revision 12, the overview and the deletion of the seven deferred files.
 
 **Tech Stack:** Go 1.25 (toolchain 1.26), modernc SQLite, `testing/synctest`.
 
 **Spec:** `docs/superpowers/specs/2026-09-27-flat-repositories-design.md` (revision 11; Task 18 records this plan's rulings and design notes as revision 12) — §6.1 (the legacy trust audit; R-H2 and F-24 change it), C4 (Dispatch 3–4 for the anchorless state the status page now shows), C5 (GD-2's Sources wording), C7 (the status page), C9 (the reaper's run line; sub-job B), C11 (events, metrics, constants), §7, §9's H row, §10 (GD-5 joins the follow-ups). Overview: `docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md` — Global Constraints, the "H:" blocks under "Carry-forwards" and "PR #8 parity", the "Open decision" block. Deferred minors: `…-A-deferred.md` through `…-G-deferred.md` (136 IDs; every one has a row in the disposition table below). H2 (`e2e/flat`) and H3 (README, release notes, strict-mode docs, the live-upstream smoke, the final full-diff review) are planned separately; this plan touches neither `e2e/` nor `README.md`.
+
+## Revision 2026-10-25: the two design reviews
+
+The draft (eadfd80) had a design review of its code tasks (one Critical, one Important, eleven Minor) and one of its dispositions, docs and spec (one Important, eleven Minor); the controller's rulings on them are binding. Every finding is adopted; every task this revision changes was replayed on a fresh copy of eadfd80 (red and green steps, mutation rows, the module-wide checks).
+
+- **Code C-1** (R-H2 did not heal an upstream that still serves the same `InRelease`: the miss path's `Finalize` keeps an existing `pool/<hash>`): the audit also removes the corrupt pool file with `DiscardFinalizedBlob`, on main's goroutine before the batch commits, never on the writer; a failed removal is ERROR `legacy_anchor_discard_failed` and the quarantine proceeds; the handler test runs an unchanged and a changed upstream, two GETs each (Task 2; R-H2, design note 2, Global Constraints, Review Focus 1, spec §6.1, `docs/configuration.md`, "For H3"). The controller's planner brief had said R-H2 "never touches the blob file itself"; that was the controller's own elaboration, not the maintainer's words, and the controller amended it: the maintainer chose the row delete so that the next request fetches a fresh copy, which with an unchanged upstream only the removal achieves; the integrity scanner and the adopter already remove corrupt pool files this way; the corruption is a hash mismatch of bytes read, not an I/O fault; and nothing serves during the audit.
+- **Code I-1** (`GC.StartupPass` unrecovered: a crash loop that never serves): it returns a panic as an error, which main logs before it serves (Task 7, design note 11).
+- **Code M-1** (a pass that panics every tick starves the passes after it): the rotation moves past it (Task 7). **M-2** (E-42 took the counters out of every boundary): a second boundary (Task 9). **M-3** (B-63's "next scheduled check" overstates): "backoff ends in …" / "backoff over" (Task 4, design note 6). **M-4** (R-H7's resolution): a sentence (Task 13). **M-5** (simulations near the budget): Task 17 records the three with `-p 1` and the CPU count and flags any above 4.0 s. **M-6** (the guard's messages): they say where to fix (Task 3). **M-7** (`evidence` joined by spaces): a list (Task 6). **M-8** (`source_paths_skipped` at every adoption): INFO (Task 10). **M-9** (persistently deferred snapshots keep their rows): the R-H1 AIDEV-NOTE and the upgrade text name the remedy and PF-12's one exception (Tasks 1, 18). **M-10**: an AIDEV-NOTE pins `parseSuiteForm` after the guard (Task 5). **M-11** (`anchorless` before the first check): the one-check exception is named (Task 4, design note 5, `docs/admin-ui-spec.md`). The three underspecified points are settled: the discard failure (by the ruling), `periodicTick`'s line, metrics and summary staying inside the recovered function (Task 7), `anchor_rows_deleted` on every quarantine line, 0 but for `anchor_corrupt` (`docs/log-fields.md`).
+- **Sweep I-1** (C-39's race shows in the code): C-39 becomes a test-only fix (Task 15): both chaos tests repeat the trigger until the gate has a waiter; red with the suite held across the first trigger GET.
+- **Sweep M-1** (counts) and **M-2** (spec C5 already said what the plan called a correction): corrected (counts, deviations, design note 12, GD-2's row, Task 10). **M-3** (B-10's reason): apt's tag parser trims the same way (the reviewer's apt 3.3.2 probe, not re-run here). **M-4** (GD-4's reason) and **M-5** (B-63 for a dormant or record-paced suite, which shows the count alone): adopted (Task 4). **M-6** (the 11 renamed DEBUG events lost their meaning): six are renamed to carry it, the 11 share one `docs/log-fields.md` row, and every renamed event is documented (Task 3). **M-7** (configuration.md's scheme wording), **M-8** (overview gaps), **M-9** (where a deleted ID's text lives): adopted (Task 18). **M-10** (R-H5 is a controller ruling): the overview and spec say "for the maintainer's confirmation", and the final report asks. **M-11** (nothing checks the new events are documented): Task 18 adds `TestEveryEventIsDocumented` — every snake_case event needs a `docs/log-fields.md` row, `main`'s 87 without one listed — and a DoD row; it found one more gap, phase E's `adoption_repair_declarations_unavailable`, now documented.
+
+Counts: fix 111, done 2, declined 23 (C-39 moved from declined to fix).
 
 ## Global Constraints
 
@@ -16,11 +28,11 @@ Everything in the overview's Global Constraints applies. In particular:
 
 - No schema change: every fix here reads or writes v7's columns (`legacy_trust_audit`, `url_path`, `suite_freshness`, `suite_snapshot`). Never edit an entry of `migrations`.
 - Production SQL never uses SQLite clock functions; persisted stamps come from `wallclock` (the cache's `nowUnix`, the checker's `now`). In-memory timing is monotonic.
-- `internal/cache` never imports `internal/freshness` or `internal/proxy`; `internal/admin` does not import `internal/freshness` (the check backoff reaches it as a function in `admin.Config`, Task 4). The writer goroutine never runs foreign code or pool I/O: R-H2's delete is SQL in the quarantine's own writer transaction and never touches a pool file (GC owns blob removal).
+- `internal/cache` never imports `internal/freshness` or `internal/proxy`; `internal/admin` does not import `internal/freshness` (the check backoff reaches it as a function in `admin.Config`, Task 4). The writer goroutine never runs foreign code or pool I/O: R-H2's row delete is SQL in the quarantine's own writer transaction, and its pool-file removal runs on the audit's goroutine (main's, before anything serves), as the integrity scanner's does, never on the writer.
 - Every phase F rule about suite-row deletes holds (PF-10, PF-12, R-F1): this plan adds no suite-row delete. R-H2 deletes `url_path` rows through `deleteURLPathRowTx`, the one row delete that releases a row's pin once.
 - An I/O fault is never evidence: R-H2 acts only on bytes the audit read and hashed (`anchor_corrupt`); `anchor_oversized` (not read in full) and a read error (deferred) change nothing they did not change before.
 - Tests that call `wallclock.SetOffsetForTest` never use `t.Parallel()`. Simulations run inside `testing/synctest` bubbles, finish in under 4.5 s under `-race` on a quiet machine (ruling PE-8), sample goroutines only after `synctest.Wait()`, and silence loggers (`simtest.DiscardLogger()`, `discardLogger()`, `silentLogger()`), or capture them. Ruling R-H4: every simulation a task touches is measured before and after, and the numbers go in the task.
-- Every goroutine under `internal/freshness` and `internal/gc`, and every new handler or admin goroutine, recovers panics. Task 7 adds the recovers `internal/gc` lacked (F-21); no task starts a new goroutine outside a recover.
+- Every goroutine under `internal/freshness` and `internal/gc`, and every new handler or admin goroutine, recovers panics. Task 7 adds the recovers `internal/gc` lacked (F-21), and the startup pass, which runs on main's goroutine, returns its panic as an error (review I-1); no task starts a new goroutine outside a recover.
 - `go test -race ./...` and `golangci-lint run ./...` are clean; `gofmt -l .` lists only the five known drift files (`cmd/apt-cacher-ultra/ca_print.go`, `internal/cache/cache_test.go`, `internal/cache/gc_urlpath_test.go`, `internal/freshness/hot_prefetch_test.go`, `internal/proxy/connect_stats.go`) at the end of every task. Never run `gofmt -w` on those five; edit them by hand (Tasks 14 and 15 do, for D-9 and D-56).
 - `AIDEV-NOTE`s on every changed invariant; existing `AIDEV-*` comments are updated, never removed. A comment that cites a deferred minor ("deferred minor D-25") keeps its citation when the deferred files are deleted (design note 16).
 - Commit trailer: the implementer's own harness attribution line (phase A ruling); otherwise `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
@@ -30,20 +42,20 @@ Conventions in this plan:
 - Each task's **Interfaces** block lists what it uses from other tasks and existing test files. Never redefine a helper: a second definition in the same package does not compile.
 - Each commit step starts with `gofmt -l <files>`; it must print nothing. Run `gofmt -w` on the non-drift files a step edits before that check; never on the five drift files.
 - A "verify failure" step whose expected result is a compile failure is complete when the compiler names the undefined identifiers listed; such a step runs `go test -gcflags=-e …` so every error is listed.
-- Mutation checks are run one at a time, each reverted before the next; record each failing test line in the commit message. Every red step, green run and mutation row in this plan was replayed on a scratch copy of the tree at 6786529 with the tasks before it applied; each row names the test line that failed there. (The branch's next commit, c8e6fe4, adds only the H2 plan.)
+- Mutation checks are run one at a time, each reverted before the next; record each failing test line in the commit message. Every red step, green run and mutation row in this plan was replayed on a scratch copy of the tree at 6786529 with the tasks before it applied; each row names the test line that failed there. (The branch's next commit, c8e6fe4, adds only the H2 plan. The revision of 2026-10-25 replayed each task it changed on a fresh copy of eadfd80, this plan's draft, whose code is 6786529's.)
 - Edits to existing files are given as exact `old`/`new` blocks (or a whole function that replaces the one of the same name); each `old` block occurs once in the file as it stands after the previous tasks.
 - Event names in code, tests and docs are the snake_case names of Task 3 from Task 3 on; the tasks before it use the prose names as they stand.
-- **Existing tests that change.** Task 2 changes `ApplyLegacyAuditDecisions`' result to `map[int64]LegacyAuditEffect` (`applyOne` and the freshness audit read `.WasCurrent`). Task 3 renames the 43 messages in every test that matches them, and points `TestCheck_HealthySuiteAsksForNoRepairSlot`'s absence check at the new event (it matched a fragment, so it would have passed vacuously). Task 4 regenerates `TestJSONContractPreserved`'s golden (three additive fields) and changes `suites_healthy_no_lag`'s fixture (B-60). Task 5 changes the admin's `http.Error` bodies to one trailing newline (F-6; the tests trim newlines already) and `TestEndpoint_Forget_LogsAcceptedRequestsAndFailures`'s key (F-16). Task 9 makes `TestAdoptionFailureRecordCutByShutdownIsNotAWarning` assert its one DEBUG line (E-43) and changes `TestDoD_ActiveSuitesAdoptOnceDormantSuitesStaySilent`'s tick (E-56). Task 11 changes `TestServeHTTP_StrictWaitRefusals`' first loop and `TestServeHTTP_CoalescedCreatingMissFiresT1Once` (E-59, E-66). Task 13 rewrites `TestSimScheduler_FiveHundredStallingOneHealthy`'s first phase and setup (C-38) without dropping an assertion, checks every five minutes instead of two in `TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds` (R-H7), and tightens the simulations its items name (E-50–E-53, E-55, F-10, F-11; `internal/flipgate`'s `clients` helper, C-7). Task 14 rewrites `TestInsertCandidateSnapshot_Rejects*` (D-9) and adds rows or assertions to the tests its items name. Task 15 gives silent loggers to the tests it lists, moves `TestOpenCache_LogsNothing`'s assertion after the cleanups (D-60) and reads a decoded record in `TestWarnSuiteCaps_ZeroCapAndReadFailure` (E-73). Task 16 renames or re-documents the tests its items name and moves `deferred_e_test.go`'s nine tests verbatim (E-46). Any other existing test that fails means the change is wrong.
+- **Existing tests that change.** Task 2 changes `ApplyLegacyAuditDecisions`' result to `map[int64]LegacyAuditEffect` (`applyOne` and the freshness audit read `.WasCurrent`). Task 3 renames the 43 messages in every test that matches them, and points `TestCheck_HealthySuiteAsksForNoRepairSlot`'s absence check at the new event (it matched a fragment, so it would have passed vacuously). Task 4 regenerates `TestJSONContractPreserved`'s golden (three additive fields) and changes `suites_healthy_no_lag`'s fixture (B-60). Task 5 changes the admin's `http.Error` bodies to one trailing newline (F-6; the tests trim newlines already) and `TestEndpoint_Forget_LogsAcceptedRequestsAndFailures`'s key (F-16). Task 9 makes `TestAdoptionFailureRecordCutByShutdownIsNotAWarning` assert its one DEBUG line (E-43) and changes `TestDoD_ActiveSuitesAdoptOnceDormantSuitesStaySilent`'s tick (E-56). Task 11 changes `TestServeHTTP_StrictWaitRefusals`' first loop and `TestServeHTTP_CoalescedCreatingMissFiresT1Once` (E-59, E-66). Task 13 rewrites `TestSimScheduler_FiveHundredStallingOneHealthy`'s first phase and setup (C-38) without dropping an assertion, checks every five minutes instead of two in `TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds` (R-H7), and tightens the simulations its items name (E-50–E-53, E-55, F-10, F-11; `internal/flipgate`'s `clients` helper, C-7). Task 14 rewrites `TestInsertCandidateSnapshot_Rejects*` (D-9) and adds rows or assertions to the tests its items name. Task 15 gives silent loggers to the tests it lists, moves `TestOpenCache_LogsNothing`'s assertion after the cleanups (D-60) and reads a decoded record in `TestWarnSuiteCaps_ZeroCapAndReadFailure` (E-73). Task 15 also makes `TestPhase2Chaos_AdoptionFlipUnderConcurrency` and `TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency` hold the suite across their first trigger GET and trigger until the gate parks the adoption (C-39). Task 16 renames or re-documents the tests its items name and moves `deferred_e_test.go`'s nine tests verbatim (E-46). Any other existing test that fails means the change is wrong.
 
 ## Rulings and design notes
 
 Controller rulings (binding):
 
 - **R-H1 — F-24, the never-downgrade gap with `gc.keep_displaced = 0`.** Snapshot-GC sub-job B (`RunSnapshotGCBatch`'s displaced class) never selects a snapshot still queued in `legacy_trust_audit`; it is excluded before the `ROW_NUMBER()` ranking, as retired rows are, so it takes no `keep_displaced` slot either. Chosen over PF-12's `signedHistorySnapshotSQL` upsert before the delete, for three reasons. (1) The audit is the authority on legacy trust, and a deferred snapshot is one it has not judged yet: deleting it turns the next audit's verdict into `LegacyAuditDrop`, and the upsert would write a marker for a snapshot the audit may still find to be plain text or corrupt — no marker, by §6.1's design, so that such a suite later adopts unsigned without a false refusal. Kept, the snapshot waits for the verdict: Keep marks the base, a quarantine retires it, and sub-job B or C then deletes it. (2) Never-downgrade's rule stays in one place and unchanged: `refuseUnsignedDowngrade`'s displaced clause already counts such a snapshot as signed history (design review M-8); the fix only stops GC from removing what the rule reads. (3) It is one predicate on a table that is empty after the first start, save for snapshots an I/O fault deferred. Cost: a snapshot whose anchor stays unreadable at every start keeps its rows until its suite is reaped or forgotten (then `markSnapshotHistoryTx` marks its base and sub-job C deletes it) — bounded by the pre-v7 adopted snapshots. Pinned by a probe that fails at HEAD (Task 1).
-- **R-H2 — a corrupt stored anchor (the maintainer's decision, 2026-10-24).** An `anchor_corrupt` quarantine also deletes every `url_path` row whose `blob_hash` is the snapshot's stored `InRelease` hash — under any scheme and host, since a content-addressed pool file is shared and every row that names it serves the same bad bytes — through `deleteURLPathRowTx` (each row's pin released once; the pool file itself is left to GC). **In the quarantine's own transaction**, not right after: `ApplyLegacyAuditDecisions` dequeues the snapshot in that transaction, so a delete in a later one that a crash or a failed write lost would never be retried — the audit would not see the snapshot again — and the rows would serve the bad bytes for good, the state before this ruling. In one transaction the quarantine and the delete commit or roll back together, and §6.1's "each batch commits with its outcomes, so an interrupted audit resumes without repeating effects" holds for the delete too. `anchor_oversized` (not read in full, so not proven bad) and `anchor_missing` are unchanged: a row whose pool file is missing already falls through to the miss path (`serveBlobWithHeaders` reports not served), so it heals at the next request. The decision carries a new field (`LegacyAuditDecision.DropAnchorRows`) and the result reports what was deleted (`LegacyAuditEffect.AnchorRowsDeleted`, logged as `anchor_rows_deleted` on `legacy_snapshot_quarantined`). Task 2; spec §6.1 revision 12; the overview's open decision is closed.
+- **R-H2 — a corrupt stored anchor (the maintainer's decision, 2026-10-24).** An `anchor_corrupt` quarantine also deletes every `url_path` row whose `blob_hash` is the snapshot's stored `InRelease` hash — under any scheme and host, since a content-addressed pool file is shared and every row that names it serves the same bad bytes — through `deleteURLPathRowTx` (each row's pin released once). The audit also removes the corrupt pool file with `Cache.DiscardFinalizedBlob`, the integrity scanner's remedy, on main's goroutine before the batch's `ApplyLegacyAuditDecisions`, never on the writer (PD-5): the miss path's `Finalize` keeps an existing `pool/<hash>`, so refetching an upstream `InRelease` that has not changed — the usual bit rot — would store onto, and serve, the rotted file. A corrupt file becomes a missing one, which the next request heals. Removing it before the commit is crash-safe: a lost commit re-audits the snapshot as `anchor_missing`. A failed removal is logged (ERROR `legacy_anchor_discard_failed`) and the quarantine proceeds; its rows still go, so a changed upstream still heals (review C-1; the revision note says why the controller amended its own wording here). **In the quarantine's own transaction**, not right after: `ApplyLegacyAuditDecisions` dequeues the snapshot in that transaction, so a delete in a later one that a crash or a failed write lost would never be retried — the audit would not see the snapshot again — and the rows would serve the bad bytes for good, the state before this ruling. In one transaction the quarantine and the delete commit or roll back together, and §6.1's "each batch commits with its outcomes, so an interrupted audit resumes without repeating effects" holds for the delete too. `anchor_oversized` (not read in full, so not proven bad) and `anchor_missing` are unchanged: a row whose pool file is missing already falls through to the miss path (`serveBlobWithHeaders` reports not served), so it heals at the next request. The decision carries a new field (`LegacyAuditDecision.DropAnchorRows`) and the result reports what was deleted (`LegacyAuditEffect.AnchorRowsDeleted`, logged as `anchor_rows_deleted` on `legacy_snapshot_quarantined`). Task 2; spec §6.1 revision 12; the overview's open decision is closed.
 - **R-H3 — snake_case event names.** The 19 prose events the overview lists are renamed, each keeping its level and fields (table below; Task 3). Ruling R-H6 extends the rename to the other 24 prose messages this branch added; the 78 on `main` are left (design note 3).
 - **R-H4 — the simulation budget.** Every simulation a task touches is measured under `-race` before and after; the numbers are in each task. `TestSimScheduler_FiveHundredStallingOneHealthy` goes from 7.0 s to 2.9 s (Task 13, C-38).
-- **R-H5 — GD-5, decided for 1.1.0: keep the current behaviour.** An adopted unsigned flat suite whose `Release` stays absent keeps its coherent snapshot: it shows "refused: anchor_absent", logs `adoption_refused_persistently`, and `POST /forget` recovers it, as *Flat repositories* documents. Reasons: it is rare in the field; the kept snapshot keeps serving cached content when an upstream dies outright, where an automatic drop would turn that into 404s; an automatic drop would add a state transition with trust and serving consequences late in the release. Cost if wrong: an operator runs `/forget` on a rare suite after an alert. Task 18 records it in spec §10 (item 12: decided for 1.1.0, keep; revisit if seen in the field) and among the overview's decided entries; GD-5's row is declined.
+- **R-H5 — GD-5, decided for 1.1.0: keep the current behaviour.** An adopted unsigned flat suite whose `Release` stays absent keeps its coherent snapshot: it shows "refused: anchor_absent", logs `adoption_refused_persistently`, and `POST /forget` recovers it, as *Flat repositories* documents. Reasons: it is rare in the field; the kept snapshot keeps serving cached content when an upstream dies outright, where an automatic drop would turn that into 404s; an automatic drop would add a state transition with trust and serving consequences late in the release. Cost if wrong: an operator runs `/forget` on a rare suite after an alert. A controller ruling on a question that concerns the bytes clients are served, so it stands for the maintainer's confirmation (review sweep M-10; the final report asks): Task 18 records it in spec §10 (item 12: decided for 1.1.0, keep; revisit if seen in the field) and among the overview's decided entries; GD-5's row is declined.
 - **R-H6 — every prose log message this branch added is renamed**, not only R-H3's 19: the 24 of the second table below. They are unreleased, so renaming is free now; after 1.1.0 a rename would break operators' log alerts. R-H3's rules hold: each keeps its level and fields; `docs/log-fields.md`, the tests and the AIDEV-NOTEs that quote one change with it; the prose messages `main` already logs stay. Task 3's guard covers them and more: every log message of production code must be snake_case or one of `main`'s 78 prose messages, listed in the test, so a new prose message fails the build (design note 3).
 - **R-H7 — `TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds` falls under PE-8's intent**: `go test -race` stays fast and free of timing flakes, and an 8 s test is the risk a 4-vCPU runner exposes. A synctest bubble cannot shorten it — the rig's clock is already virtual and the test never waits on wall time; its 7.6–8.0 s under `-race` are CPU, 1,440 checks of about 5 ms — so it is coarsened under 4.5 s with every assertion kept: a check every five minutes instead of two, 3.39–3.46 s (Task 13 Step 7).
 
@@ -71,25 +83,25 @@ Controller rulings (binding):
 
 The naming rule: the prose's subject (`freshness`, `adoption`, `suite reaper`, `admin`, `suite`) and its words, lower-case, joined by `_`, without punctuation or a trailing clause (`; the flip barrier runs`), so the old text finds the new name; row 16 shortens its clause to `over_cap`.
 
-Ruling R-H6's 24, by the same rule. Rows 23, 28–31, 34 and 41 shorten a trailing or long clause (`, kept`, `, skipping`, `until its retry …`, `, retried next run`), and rows 32 and 33 drop an article; row 21, the `adoption.require_signature = false` startup notice, whose one-sentence message was its explanation, becomes `adoption_require_signature_disabled` and gets a `docs/log-fields.md` row:
+Ruling R-H6's 24, by the same rule. Rows 28 and 41 shorten a long clause (`… or the next refresh check`, `, retried next run`), rows 32 and 33 drop an article, and rows 23, 29–31 and 34 keep their meaning in other words (review sweep M-6: `…_sniff_failed_kept`, `…_dormant_no_client_created_row`, `…_dormant_no_recent_interest`, `freshness_check_skipped_no_baseline_anchor_hash`, `…_paced_until_retry`); row 21, the `adoption.require_signature = false` startup notice, whose one-sentence message was its explanation, becomes `adoption_require_signature_disabled` and gets a `docs/log-fields.md` row:
 
 | # | Prose message | Event | Level | Emitted at |
 |---|---|---|---|---|
 | 20 | `adoption: read prior snapshot failed` | `adoption_read_prior_snapshot_failed` | WARN | `internal/freshness/adoption.go` |
 | 21 | `adoption.require_signature = false: an empty keyring is allowed at startup; …` | `adoption_require_signature_disabled` | WARN | `cmd/apt-cacher-ultra/main.go` |
 | 22 | `displaced snapshot lookup failed` | `displaced_snapshot_lookup_failed` | WARN | `internal/handler/handler.go` |
-| 23 | `freshness: anchorless index failed its sniff, kept` | `freshness_anchorless_index_sniff_failed` | DEBUG | `internal/freshness/anchorless.go` |
+| 23 | `freshness: anchorless index failed its sniff, kept` | `freshness_anchorless_index_sniff_failed_kept` | DEBUG | `internal/freshness/anchorless.go` |
 | 24 | `freshness: check cancelled` | `freshness_check_cancelled` | DEBUG | `internal/freshness/check.go` (×3), `current_form.go`, `first_adoption.go`, `anchorless.go` |
 | 25 | `freshness: check ended by shutdown` | `freshness_check_ended_by_shutdown` | DEBUG | `internal/freshness/check.go` (`endedByShutdown`) |
 | 26 | `freshness: clamp adoption retry failed` | `freshness_clamp_adoption_retry_failed` | WARN | `internal/freshness/freshness.go` |
 | 27 | `freshness: clear adoption failure failed` | `freshness_clear_adoption_failure_failed` | WARN | `internal/freshness/check.go` |
-| 28 | `freshness: deferred never-adopted suite paced until its retry or the next refresh check` | `freshness_deferred_never_adopted_suite_paced` | DEBUG | `internal/freshness/first_adoption.go` |
-| 29 | `freshness: never-adopted suite without a client-created anchor or flat index row, dormant` | `freshness_never_adopted_suite_dormant_no_client_row` | DEBUG | `internal/freshness/first_adoption.go` |
-| 30 | `freshness: never-adopted suite without recent interest, dormant` | `freshness_never_adopted_suite_dormant_no_interest` | DEBUG | `internal/freshness/first_adoption.go` |
-| 31 | `freshness: no baseline anchor hash, skipping` | `freshness_no_baseline_anchor_hash` | DEBUG | `internal/freshness/check.go` (`baseline`) |
+| 28 | `freshness: deferred never-adopted suite paced until its retry or the next refresh check` | `freshness_deferred_never_adopted_suite_paced_until_retry` | DEBUG | `internal/freshness/first_adoption.go` |
+| 29 | `freshness: never-adopted suite without a client-created anchor or flat index row, dormant` | `freshness_never_adopted_suite_dormant_no_client_created_row` | DEBUG | `internal/freshness/first_adoption.go` |
+| 30 | `freshness: never-adopted suite without recent interest, dormant` | `freshness_never_adopted_suite_dormant_no_recent_interest` | DEBUG | `internal/freshness/first_adoption.go` |
+| 31 | `freshness: no baseline anchor hash, skipping` | `freshness_check_skipped_no_baseline_anchor_hash` | DEBUG | `internal/freshness/check.go` (`baseline`) |
 | 32 | `freshness: persist failure bump after a panic failed` | `freshness_persist_failure_bump_after_panic_failed` | WARN | `internal/freshness/freshness.go` |
 | 33 | `freshness: read suite row after a panic failed` | `freshness_read_suite_row_after_panic_failed` | WARN | `internal/freshness/freshness.go` |
-| 34 | `freshness: refused suite paced until its retry` | `freshness_refused_suite_paced` | DEBUG | `internal/freshness/check.go` |
+| 34 | `freshness: refused suite paced until its retry` | `freshness_refused_suite_paced_until_retry` | DEBUG | `internal/freshness/check.go` |
 | 35 | `freshness: repair deferred, no adoption slot` | `freshness_repair_deferred_no_adoption_slot` | DEBUG | `internal/freshness/freshness.go` |
 | 36 | `legacy trust audit: cached anchor skipped` | `legacy_trust_audit_cached_anchor_skipped` | DEBUG | `internal/freshness/legacy_audit.go` |
 | 37 | `shutdown wait panicked` | `shutdown_wait_panicked` | ERROR | `cmd/apt-cacher-ultra/main.go` |
@@ -103,17 +115,17 @@ Ruling R-H6's 24, by the same rule. Rows 23, 28–31, 34 and 41 shorten a traili
 Design notes (choices the spec leaves open — the boring, bounded option, with the reason):
 
 1. **F-24's predicate** is `AND snapshot_id NOT IN (SELECT snapshot_id FROM legacy_trust_audit)` inside the displaced class's inner `SELECT`, before `ROW_NUMBER()` (ruling R-H1). Sub-job A (orphans: `adopted_at IS NULL`) needs none: the audit queues adopted snapshots only. Sub-job C needs none: a quarantine dequeues the snapshot in the transaction that retires it.
-2. **R-H2's mechanics.** `LegacyAuditDecision` gains `DropAnchorRows bool`, valid only with `LegacyAuditQuarantine` or `LegacyAuditQuarantineSigned` (set with any other outcome it rolls the batch back, as an invalid outcome does). The freshness audit sets it for `anchor_corrupt` alone (`legacyVerdict.dropAnchorRows`). `ApplyLegacyAuditDecisions` returns `map[int64]LegacyAuditEffect{WasCurrent bool; AnchorRowsDeleted int}` for the quarantined snapshots (it returned `map[int64]bool`; two call sites read it). The rows are found by `blob_hash` over `idx_url_path_blob` (one indexed read), the snapshot's hash read inside the transaction (`suite_snapshot.inrelease_hash`; a snapshot without one deletes nothing).
-3. **R-H3's and R-H6's scope, as the code stands.** Renamed: the 43 messages of the two tables. Left: the 78 prose messages `main` already logs, each listed in Task 3's guard (`mainProseMessages`). Found by an AST walk of every log call's message — slog's methods and the repository's forwarding helpers — in the non-test Go files at 6786529 and at 536a1ab, `main`'s base: 118 prose messages at 6786529 (the reaper's three step constants are counted at their one call site), 84 on `main`, 78 of them in both; the six only on `main` this branch already reworded or dropped ("For H3" lists them). The guard (`TestLogMessagesAreSnakeCase`) checks a message that is a string literal or a constant of its package; one that is neither must be a parameter of a forwarding helper listed in `logSinks` — `(*Reaper).warn`, `logPanic`, `reportPanic`, `logGoroutinePanic`, `emitTlsMitmLog`, and `internal/proxy`'s `LogFn` callbacks, whose call sites are checked in turn — or be listed in `fieldMessages` with the constants it takes (the reaper's `h.step`), so a new helper, or a message held in a variable, fails it until listed. Each allowlisted message must still be logged, so the list shrinks with a later rename. The 11 renamed DEBUG lines `docs/log-fields.md` never documented stay undocumented (the guard's `documented` flag). Before ruling R-H6 this note read: not renamed — added by this branch, not listed by the overview (a question for the maintainer): `adoption: read prior snapshot failed`, the `adoption.require_signature = false: …` startup notice, `displaced snapshot lookup failed`, `freshness: anchorless index failed its sniff, kept`, `freshness: check cancelled`, `freshness: check ended by shutdown`, `freshness: clamp adoption retry failed`, `freshness: clear adoption failure failed`, `freshness: deferred never-adopted suite paced until its retry or the next refresh check`, `freshness: never-adopted suite without a client-created anchor or flat index row, dormant`, `freshness: never-adopted suite without recent interest, dormant`, `freshness: no baseline anchor hash, skipping`, `freshness: persist failure bump after a panic failed`, `freshness: read suite row after a panic failed`, `freshness: refused suite paced until its retry`, `freshness: repair deferred, no adoption slot`, `legacy trust audit: cached anchor skipped`, `shutdown wait panicked`, `snapshot adopted_at lookup failed`, `suite cached anchor read failed`, `suite file head read failed`, `suite reaper: suite busy, retried next run`, `suite signed-seen backstop read failed`, `suite touch failed`. Not renamed — on `main` already: 78 messages, among them `freshness check failed`, `freshness: adopted suites stale beyond threshold`, `freshness: read suite row failed`, `InRelease changed at upstream`, `touch failed`, `singleflight coalesced`, `adoption: commit failed`, `schema migrated`, `fetch retry`. (Found by an AST walk of every slog call's message literal in the non-test Go files at 6786529 and at 536a1ab, `main`'s base.)
+2. **R-H2's mechanics.** `LegacyAuditDecision` gains `DropAnchorRows bool`, valid only with `LegacyAuditQuarantine` or `LegacyAuditQuarantineSigned` (set with any other outcome it rolls the batch back, as an invalid outcome does). The freshness audit sets it for `anchor_corrupt` alone (`legacyVerdict.dropAnchorRows`). `ApplyLegacyAuditDecisions` returns `map[int64]LegacyAuditEffect{WasCurrent bool; AnchorRowsDeleted int}` for the quarantined snapshots (it returned `map[int64]bool`; two call sites read it). The rows are found by `blob_hash` over `idx_url_path_blob` (one indexed read), the snapshot's hash read inside the transaction (`suite_snapshot.inrelease_hash`; a snapshot without one deletes nothing). The pool file goes in `RunLegacyTrustAudit`, right after the verdict and before the decision joins its batch, through a seam (`legacyDiscardAnchor`, which tests swap to inject a failure); `internal/cache` itself still does no pool I/O, so the cache test's "pool file kept" stands. Two snapshots of one batch that share the rotted file: the first removes it and the second reads it missing (`anchor_missing`), whose rows the first's delete already took (review C-1).
+3. **R-H3's and R-H6's scope, as the code stands.** Renamed: the 43 messages of the two tables. Left: the 78 prose messages `main` already logs, each listed in Task 3's guard (`mainProseMessages`). Found by an AST walk of every log call's message — slog's methods and the repository's forwarding helpers — in the non-test Go files at 6786529 and at 536a1ab, `main`'s base: 118 prose messages at 6786529 (the reaper's three step constants are counted at their one call site), 84 on `main`, 78 of them in both; the six only on `main` this branch already reworded or dropped ("For H3" lists them). The guard (`TestLogMessagesAreSnakeCase`) checks a message that is a string literal or a constant of its package; one that is neither must be a parameter of a forwarding helper listed in `logSinks` — `(*Reaper).warn`, `logPanic`, `reportPanic`, `logGoroutinePanic`, `emitTlsMitmLog`, and `internal/proxy`'s `LogFn` callbacks, whose call sites are checked in turn — or be listed in `fieldMessages` with the constants it takes (the reaper's `h.step`), so a new helper, or a message held in a variable, fails it until listed. Each allowlisted message must still be logged, so the list shrinks with a later rename. The failure messages say where to fix (review M-6). Every renamed event has a `docs/log-fields.md` row: the 11 DEBUG lines it never documented share one, each with the meaning its prose carried (review sweep M-6), and `TestSweptEventNames` reads a row — a backquoted name in a table row's first cell — not a mention. Task 18 extends the row rule to every snake_case event (`TestEveryEventIsDocumented`, review sweep M-11). The guard's own first catch was this plan's: Task 7's GC helper first named `reportPanic` collided with the freshness forwarder's name in `logSinks`, so it is `logGCPanic`. Before ruling R-H6 this note read: not renamed — added by this branch, not listed by the overview (a question for the maintainer): `adoption: read prior snapshot failed`, the `adoption.require_signature = false: …` startup notice, `displaced snapshot lookup failed`, `freshness: anchorless index failed its sniff, kept`, `freshness: check cancelled`, `freshness: check ended by shutdown`, `freshness: clamp adoption retry failed`, `freshness: clear adoption failure failed`, `freshness: deferred never-adopted suite paced until its retry or the next refresh check`, `freshness: never-adopted suite without a client-created anchor or flat index row, dormant`, `freshness: never-adopted suite without recent interest, dormant`, `freshness: no baseline anchor hash, skipping`, `freshness: persist failure bump after a panic failed`, `freshness: read suite row after a panic failed`, `freshness: refused suite paced until its retry`, `freshness: repair deferred, no adoption slot`, `legacy trust audit: cached anchor skipped`, `shutdown wait panicked`, `snapshot adopted_at lookup failed`, `suite cached anchor read failed`, `suite file head read failed`, `suite reaper: suite busy, retried next run`, `suite signed-seen backstop read failed`, `suite touch failed`. Not renamed — on `main` already: 78 messages, among them `freshness check failed`, `freshness: adopted suites stale beyond threshold`, `freshness: read suite row failed`, `InRelease changed at upstream`, `touch failed`, `singleflight coalesced`, `adoption: commit failed`, `schema migrated`, `fetch retry`. (Found by an AST walk of every slog call's message literal in the non-test Go files at 6786529 and at 536a1ab, `main`'s base.)
 4. **F-16's field.** The two unreleased admin lines (`admin_forget_requested`, `admin_forget_failed`) name the scheme `canonical_scheme`, as every other line about a suite does. `admin_reconcile_requested` is on `main` with `scheme`; it keeps `scheme` and gains `canonical_scheme` beside it (additive: a filter on either finds it). Task 5.
-5. **`suites[].anchorless` (PG-14)** is derived, not stored: adoption enabled, a flat suite, no current snapshot, `last_success_at` set, no adoption record, `inrelease_change_seen_at` NULL. It holds because every other answered check of a never-adopted flat suite leaves a mark the derivation excludes: a first adoption (queued or running) sets `inrelease_change_seen_at` (`checkFirst`), a refusal or failure writes a record (`unsigned_unconfirmed`, `unsigned_disabled`, `anchor_absent`, …), a committed one sets the current snapshot; only an answered anchorless check clears the pending change and the record together (`anchorlessRefresh`). With adoption disabled no anchorless check runs, and the Phase-1 inline check bumps `last_success_at` of a flat suite with an `InRelease` too, so the field is false there. JSON `anchorless` (boolean, additive); the HTML Adoption cell reads `refreshed without a Release`. No schema change, no in-memory state, true across restarts. An AIDEV-NOTE at the derivation names the facts it relies on. Task 4.
-6. **B-63's text** is `checks failing ×k · next scheduled check in <d>` in the Adoption cell, after the record's text and ` · ` when there is one: k is `check_fail_count`, d is `last_check_at + backoff(k) − now`, or `now` once that time has passed, backoff being the scheduler's own `backoffDelay` reached through `admin.Config.CheckBackoff func(failCount int64) time.Duration` (`freshness.CheckBackoff`, wired by `main`; nil: no "next" part). "Scheduled" because a client's T1 check may come sooner (spec C4: cooldown only). A suite waiting for a slot has no persisted state to show (the scheduler's in-memory queue) and is left as it is. HTML only (`json:"-"`): the JSON already carries `check_fail_count` and `last_check_unixtime`. Task 4.
+5. **`suites[].anchorless` (PG-14)** is derived, not stored: adoption enabled, a flat suite, no current snapshot, `last_success_at` set, no adoption record, `inrelease_change_seen_at` NULL. It holds because every other answered check of a never-adopted flat suite leaves a mark the derivation excludes: a first adoption (queued or running) sets `inrelease_change_seen_at` (`checkFirst`), a refusal or failure writes a record (`unsigned_unconfirmed`, `unsigned_disabled`, `anchor_absent`, …), a committed one sets the current snapshot; only an answered anchorless check clears the pending change and the record together (`anchorlessRefresh`). With adoption disabled no anchorless check runs, and the Phase-1 inline check bumps `last_success_at` of a flat suite with an `InRelease` too, so the field is false there. One exception lasts a check: a flat suite whose row an adoption-disabled `InRelease` miss created has `last_success_at` set (`suiteSeed` stamps it), so the field reads true from the moment adoption is enabled until that suite's first check (review M-11; a note, since the window is one check). JSON `anchorless` (boolean, additive); the HTML Adoption cell reads `refreshed without a Release`. No schema change, no in-memory state, true across restarts. An AIDEV-NOTE at the derivation names the facts it relies on. Task 4.
+6. **B-63's text** is `checks failing ×k · backoff ends in <d>` in the Adoption cell, after the record's text and ` · ` when there is one, or `checks failing ×k · backoff over` once that time has passed (reviews M-3 and sweep M-5): k is `check_fail_count`, d is `last_check_at + backoff(k) − now`, backoff being the scheduler's own `backoffDelay` reached through `admin.Config.CheckBackoff func(failCount int64) time.Duration` (`freshness.CheckBackoff`, wired by `main`; nil: the count alone). That is only the scheduler's floor — the earliest it may check: a client's T1 check may come sooner (spec C4: cooldown only), and `suiteDue` also wants staleness, a due retry or a pending change. A suite the scheduler does not queue on that backoff shows the count alone (`unscheduled`): with adoption enabled, a never-adopted suite no client asked for within the 7-day interest window, and an adopted suite its `anchor_absent` or `unsigned_disabled` record paces (rulings PE-2, PE-12; its record's text shows its retry). `unscheduled` mirrors `suiteDue` and freshness's `interestWindow` in `internal/admin`, which does not import `internal/freshness`; an AIDEV-NOTE ties the two. A suite waiting for a slot has no persisted state to show (the scheduler's in-memory queue) and is left as it is. HTML only (`json:"-"`): the JSON already carries `check_fail_count` and `last_check_unixtime`. Task 4.
 7. **F-13's signal.** Each completed run logs `suite_reaper_run_complete` (INFO: `tried`, `reaped`, `markers_swept`, `deferred`, `duration_ms`) and sets the unlabelled gauge `acu_suite_reaper_last_run_unixtime`. A run whose listing failed is not complete (its WARN says why) and sets neither, so an alert on the gauge's age catches a reaper that stopped. `deferred=true` is a run the forward-step guard held back (no reap, no sweep). One line an hour, as `gc_run_complete` is per tick. Task 6.
 8. **F-15's line** is DEBUG `suite_not_forgotten` (`canonical_scheme`, `canonical_host`, `suite_path`, `reason`: `no_suite` — no row, before or under the hold —, `busy` — the hold was refused —, or `changed` — the final compare-and-delete found the row changed), logged by `(*freshness.Reaper).Forget`, which knows; the HTTP answer still tells neither (spec C9). Task 5.
-9. **F-18's fields.** `suite_reaped` gains `last_requested_unixtime` for `reason=idle` (the listed stamp the cutoff judged) and `evidence` for `reason=junk` (the judged rows' paths, space-separated, in the order judged: at most the three anchors and the 14 root index names). Task 6.
+9. **F-18's fields.** `suite_reaped` gains `last_requested_unixtime` for `reason=idle` (the listed stamp the cutoff judged) and `evidence` for `reason=junk` (the judged rows' paths, a list in the order judged — a JSON array, since a path may hold a space (review M-7): at most the three anchors and the 14 root index names). Task 6.
 10. **F-17.** The reaper's forward-step report (`clock_step_detected stamp=wall_clock`) is counted in `acu_clock_steps_detected_total`, whose HELP text becomes "Wall-clock steps detected: a past-event timestamp found in the future (a backward step), or the wall clock run ahead of the monotonic clock between reaper runs (a forward step)." The report is once per detected step, so the count stays bounded. Task 6.
-11. **F-21's recovers.** `(*gc.GC).Run` recovers a panic per periodic tick and goes on to the next tick; the pool scan recovers per job in each worker and in its producer, whose deferred `close(jobs)` still ends the scan. Each logs ERROR `gc_panicked` (`where`: `tick`, `pool_scan_worker`, `pool_scan_producer`; `panic`; `stack` once per `where` per process). A worker never exits on a panic: if every worker died, the producer would block on `jobs` until shutdown and the startup pass would never end. Task 7.
-12. **GD-2.** `ParseSources` keeps `validateMemberPath` for `Directory` and each file path (ruling PG-21: no widening of what a `dists/` `Sources` materialises), and spec C5 is corrected to say so (revision 12: `Packages` Filenames go through `validateFilename`; `Sources` paths keep `validateMemberPath`). What was silent becomes visible: `SourcesParseStats` counts the skipped paths and keeps the first, and `buildSourceHashes` logs WARN `source_paths_skipped` (`canonical_scheme`, `canonical_host`, `suite_path`, `snapshot_id`, `member_path`, `count`, `first`: `source_parsed`'s fields) once per `Sources` file that skipped any. A skipped path is one `validateMemberPath` refused — every file of a stanza whose `Directory` fails, each file whose own path fails; an entry dropped as malformed (a bad hash, a `/` in its filename) is not counted, as before. Task 10.
+11. **F-21's recovers.** `(*gc.GC).Run` recovers a panic per periodic tick and goes on to the next tick, and a tick's panic moves the pass rotation past the pass in progress (`skipPanickedPass`), so a pass that panics every tick cannot starve the passes after it — the blob pass keeps reclaiming disk (review M-1); the line, metrics and last-run summary stay inside the recovered function, so `acu_gc_last_run_unixtime` ages after a panic. `StartupPass` recovers one too and returns it as an error (`gc startup: panicked: …`), which main logs (`gc startup pass failed`) before it serves; a panic there would otherwise recur at every start (review I-1; `recoverPanicInto`, a sibling of `recoverPanic` that sets the error, both deferred directly); the pool scan recovers per job in each worker and in its producer, whose deferred `close(jobs)` still ends the scan. Each logs ERROR `gc_panicked` (`where`: `tick`, `startup`, `pool_scan_worker`, `pool_scan_producer`; `panic`; `stack` once per `where` per process). A worker never exits on a panic: if every worker died, the producer would block on `jobs` until shutdown and the startup pass would never end. Task 7.
+12. **GD-2.** `ParseSources` keeps `validateMemberPath` for `Directory` and each file path (ruling PG-21: no widening of what a `dists/` `Sources` materialises), as spec C5 already says (revision 10, PG-21); revision 12 adds the line (review sweep M-2). What was silent becomes visible: `SourcesParseStats` counts the skipped paths and keeps the first, and `buildSourceHashes` logs INFO `source_paths_skipped` (INFO, not WARN: it repeats at every adoption and the operator cannot act on it, review M-8) (`canonical_scheme`, `canonical_host`, `suite_path`, `snapshot_id`, `member_path`, `count`, `first`: `source_parsed`'s fields) once per `Sources` file that skipped any. A skipped path is one `validateMemberPath` refused — every file of a stanza whose `Directory` fails, each file whose own path fails; an entry dropped as malformed (a bad hash, a `/` in its filename, a filename of `.` or `..`) is not counted, as before. Task 10.
 13. **E-24** is documented, not gated: a never-adopted check that ends unknown leaves no record, so each client check past the cooldown re-runs the probe tree (a `Release` download included); spec C4 keeps T1 on the cooldown alone, and the permanent case (the knob off) is already a paced refusal (PE-12). `docs/configuration.md` says so (Task 18).
 14. **E-31.** One predicate, `signedForm(cache.AnchorForm) bool` (inline or detached), in `baseline` and `Reconcile`; `Reconcile`'s failed snapshot read, which counts the suite unsigned (fail-closed), is logged WARN `reconcile_snapshot_read_failed` (`err`, `snapshot_id`, `canonical_scheme`, `canonical_host`, `suite_path`). Task 8.
 15. **C-38's coarsening** keeps every assertion: the 500 suites answer their first check 503 — an unknown end that takes no virtual time, so the first tick fails all 500 (they were 500 stalling checks, 16 h 40 min of ticks: about two thirds of the run) — and stall from then on, so phases 2 and 3 run as before; the 501 suites are seeded in one transaction (`seedSimSuites`; 1,503 writer calls took 2.2 s). Measured 6.96–7.05 s → 2.92–2.95 s. `simtest.Unavailable()` is the 503 behaviour. Task 13.
@@ -124,22 +136,22 @@ Design notes (choices the spec leaves open — the boring, bounded option, with 
 20. **F-5's answer.** A body `ParseForm` cannot parse is 400 `malformed form body`; only an `*http.MaxBytesError` is 413 `request body too large`. Task 5.
 21. **E-13.** A failed served-anchor read that a shutdown caused (`p.stopErr(ctx) != nil`, or the error is `context.Canceled`) logs DEBUG, not WARN, as the check's local steps do (`endedByShutdown`, FW-3 (d)). Task 10.
 22. **E-61 is declined** (table): `wait` wakes only when the host's count reaches zero because the handler re-runs its lookup once; woken at the first `end`, a request whose snapshot commits with a later adoption on the host would re-run too early and be refused.
-23. **GD-5 is declined by ruling R-H5**: whether an adopted unsigned flat suite whose `Release` stays absent should drop its snapshot and refresh anchorless was decided for 1.1.0 — keep the behaviour *Flat repositories* documents; revisit if seen in the field. Task 18 records it in spec §10 item 12 and among the overview's decided entries.
+23. **GD-5 is declined by ruling R-H5**, a controller ruling for the maintainer's confirmation (review sweep M-10): whether an adopted unsigned flat suite whose `Release` stays absent should drop its snapshot and refresh anchorless was decided for 1.1.0 — keep the behaviour *Flat repositories* documents; revisit if seen in the field. Task 18 records it in spec §10 item 12 and among the overview's decided entries.
 
 Rulings of earlier phases this plan applies: PD-1 (a file changed only by a mechanical rename does not count as touched for the deferred-minor rule), PD-5 (no pool I/O on the writer), PE-7 (C-21), PE-8 (the 4.5 s budget), PF-11 (one field added to one log line touches that function, not the file), PF-12 (the marker a delete writes, which R-H1 deliberately does not use), PG-3 (A-56), PG-21 (GD-2), PG-26 (GD-3), PG-33 (GD-4, GD-5).
 
 ## Deliberate deviations from the spec
 
-None. Revision 12 records three corrections where the spec and the code disagreed, each settled by an earlier ruling or by this plan: spec C5's "Packages/Sources Filenames" (the code validates `Sources` paths with `validateMemberPath`, ruling PG-21; design note 12), spec C3's and `docs/configuration.md`'s "no longer checked for changes or shown on the status page" for a detached-only repository (true only for one first seen after the upgrade: D-52), and spec §6.1's "its `url_path` anchor row is kept" (R-H2 changes it for `anchor_corrupt`).
+None. Revision 12 records one correction where the spec and the code disagreed — spec C3's and `docs/configuration.md`'s "no longer checked for changes or shown on the status page" for a detached-only repository, true only for one first seen after the upgrade (D-52) — and one behaviour change, spec §6.1's "its `url_path` anchor row is kept" (R-H2, with the pool file's removal: review C-1). Spec C5 already says `ParseSources` keeps `validateMemberPath` (revision 10, PG-21); revision 12 adds that the skipped paths are logged (review sweep M-2).
 
 ## Review Focus (H1 share)
 
 The input classes this plan's changes meet that the spec implies and no earlier test exercised, most likely first; each line's test is added to the task that owns the code:
 
-1. **One corrupt pool file named by several rows** (a flat suite and its `/.` twin, or two hosts remapped to one archive, cache the same `InRelease` bytes): R-H2 deletes every row that names the blob, under both schemes, releases each row's pin once, and leaves another blob's rows alone — Task 2 (`TestApplyLegacyAuditDecisions_CorruptAnchorDropsEveryRowOfItsBlob`).
+1. **A corrupt anchor whose upstream has not changed**, the usual bit rot, and **one corrupt pool file named by several rows** (a flat suite and its `/.` twin, or two hosts remapped to one archive, cache the same `InRelease` bytes): the audit removes the rotted file, so the client's next request misses, refetches the same bytes onto a fresh file and hits it after (review C-1), and R-H2 deletes every row that names the blob, under both schemes, releases each row's pin once, and leaves another blob's rows alone — Task 2 (`TestServeHTTP_ACorruptAnchorQuarantineRefetchesTheAnchor`'s `upstream unchanged` case, `TestApplyLegacyAuditDecisions_CorruptAnchorDropsEveryRowOfItsBlob`).
 2. **A deferred snapshot the audit later finds plain text** (with `keep_displaced = 0`): sub-job B keeps it while it is queued, so it still refuses an unsigned candidate; once the audit quarantines it as plain text it writes no marker, so the suite may then adopt unsigned — the trust R-H1 must neither lose nor invent — Task 1 (`TestRunSnapshotGCBatch_KeepsTheAuditsVerdict`).
 3. **A form body with a stray `%`** (`curl -d 'suite=/a%zz'`, a script that forgets `--data-urlencode`): 400 `malformed form body` from both mutating endpoints, never 413 — Task 5 (`TestMutatingEndpoints_MalformedBodyIs400`).
-4. **A panic in a GC tick** (a future bug in sub-job C, now in GC's goroutine): the tick is logged and the next tick runs; a pool-scan worker that panics never stalls the startup pass — Task 7 (`TestRun_RecoversATickPanicAndRunsTheNextTick`, `TestPoolScan_AWorkerPanicNeverStallsTheScan`).
+4. **A panic in a GC tick or the startup pass** (a future bug in sub-job C, now in GC's goroutine, or one persisted data triggers at every start): the tick is logged, the rotation moves past the pass, and the next tick runs; the startup pass reports it as an error and the daemon serves; a pool-scan worker that panics never stalls the startup pass — Task 7 (`TestRun_RecoversATickPanicAndRunsTheNextTick`, `TestPeriodicTick_APanickingPassDoesNotStarveTheNext`, `TestStartupPass_ReturnsAPanicAsAnError`, `TestPoolScan_AWorkerPanicNeverStallsTheScan`).
 5. **A Release-less suite whose upstream starts publishing a `Release`**: the status page stops calling it `refreshed without a Release` as soon as the first adoption is under way (the pending change set), and never shows it for a `dists/` suite or with adoption disabled — Task 4 (`TestSuiteEntries_Anchorless`).
 
 ## File map
@@ -147,12 +159,12 @@ The input classes this plan's changes meet that the spec implies and no earlier 
 | Area | Files | Task |
 |---|---|---|
 | Sub-job B and the audit queue | `internal/cache/gc.go` (`RunSnapshotGCBatch`), `internal/cache/f24_gc_test.go` (new) | 1 |
-| The corrupt anchor | `internal/cache/legacy_audit.go` (`LegacyAuditDecision.DropAnchorRows`, `LegacyAuditEffect`, `dropAnchorBlobRowsTx`), `legacy_audit_test.go` (`applyOne`), `corrupt_anchor_test.go` (new); `internal/freshness/legacy_audit.go` (`legacyVerdict.dropAnchorRows`, the quarantine line), `corrupt_anchor_test.go` (new); `internal/handler/corrupt_anchor_test.go` (new) | 2 |
+| The corrupt anchor | `internal/cache/legacy_audit.go` (`LegacyAuditDecision.DropAnchorRows`, `LegacyAuditEffect`, `dropAnchorBlobRowsTx`), `legacy_audit_test.go` (`applyOne`), `corrupt_anchor_test.go` (new); `internal/freshness/legacy_audit.go` (`legacyVerdict.dropAnchorRows`, `legacyDiscardAnchor` and the pool file's removal, the quarantine line), `corrupt_anchor_test.go` (new); `internal/handler/corrupt_anchor_test.go` (new) | 2 |
 | Event names | `internal/handler/{handler,suite_rows}.go`, `cmd/apt-cacher-ultra/main.go`, `internal/freshness/{adoption,anchorless,check,current_form,first_adoption,flip_barrier,freshness,legacy_audit,reaper}.go`, `internal/admin/handlers.go`, the tests that match them, `docs/log-fields.md`, `docs/configuration.md`; `internal/observability/event_names_test.go` (new: both guards) | 3 |
 | Status page and JSON | `internal/admin/status.go` (`suiteEntry.Anchorless`, `CheckStatus`, `gcInfo.RetiredReaped`, `adoptionEntry.Scheme`), `status_template.go`, `server.go` (`Config.CheckBackoff`), `status_annotations_test.go` (new), `status_test.go` (B-60), `json_contract_test.go`, `testdata/json_contract_golden.json`; `internal/observability/ring.go` (`AdoptionEvent.Scheme`); `internal/freshness/freshness.go`, `adoption_failure.go` (the ring's scheme), `retry.go` (`CheckBackoff`), `adoption_ring_test.go` (new); `cmd/apt-cacher-ultra/main.go` (wiring) | 4 |
 | Admin endpoints | `internal/admin/handlers.go` (`suiteForm`, `parseSuiteForm`), `server.go` (`OPTIONS /reconcile`), `forget_test.go` (F-16), `endpoint_form_test.go` (new); `internal/freshness/forget.go` (`suite_not_forgotten`), `forget_refusal_test.go` (new) | 5 |
 | The reaper | `internal/freshness/reaper.go`, `metrics.go`, `suite_lock.go` (F-25), `freshness.go` (`holdPurgeHook`), `clockstep.go`, `unsigned.go` (F-7), `reaper_signal_test.go` (new) | 6 |
-| GC | `internal/gc/gc.go` (`gcStore`, `periodicTick`, `recoverPanic`, `gc_panicked`), `snapshot.go` (F-3), `pool_scan.go` (recovers), `gc_store_test.go` (new); `internal/cache/gc.go` (`effectiveChunkRows`), `retired_chunk_test.go` (new) | 7 |
+| GC | `internal/gc/gc.go` (`gcStore`, `StartupPass`, `periodicTick`, `skipPanickedPass`, `recoverPanic`, `recoverPanicInto`, `logGCPanic`, `gc_panicked`), `snapshot.go` (F-3), `pool_scan.go` (recovers), `gc_store_test.go` (new); `internal/cache/gc.go` (`effectiveChunkRows`), `retired_chunk_test.go` (new) | 7 |
 | The check path | `internal/freshness/freshness.go` (`retryGate.holds`, `Reconcile`), `check.go` (`signedForm`), `current_form.go`, `first_adoption.go`, `probe.go` (a comment), `scheduler.go` (E-25 note, E-30 field), `check_path_test.go` (new) | 8 |
 | Scheduler and panic boundaries | `internal/freshness/scheduler.go` (`tickInterval`), `freshness.go` (`recoverGoroutine`), `adoption_failure.go` (`recoverAdoption`), `freshness_test.go` (a comment), `deferred_e_test.go` (E-43), `dod_e_test.go` (E-56), `scheduler_wiring_test.go` (new) | 9 |
 | Adoption members, the served anchor, Sources | `internal/freshness/member_verify.go` (E-10), `flip_barrier.go` (E-13), `sources_parse.go`, `adoption.go` (GD-2), `adoption_paths_test.go` (new) | 10 |
@@ -160,10 +172,10 @@ The input classes this plan's changes meet that the spec implies and no earlier 
 | Release Date | `internal/freshness/release_date.go`, `release_date_test.go` | 12 |
 | Simulations | `internal/freshness/sim_sched_test.go` (C-38, E-51), `sim_retry_test.go` (E-50, E-52, E-53), `dod_e_test.go` (E-55), `dod_f_test.go` (F-10, F-11); `internal/simtest/simtest.go` (`Unavailable`), `aptclient.go` (C-8), `aptclient_test.go` (C-5); `internal/flipgate/sim_test.go` (C-7); `internal/freshness/current_form_test.go` (R-H7) | 13 |
 | Test gaps | `internal/wallclock/wallclock.go` (doc), `wallclock_test.go`; `internal/aptpath/imports_test.go`, `encode_test.go`, `composers_test.go`; `internal/freshness/hot_set_test.go` (new), `reconcile_r1_test.go`, `first_adoption_test.go`, `suite_lock_test.go`; `internal/cache/schema_v7_test.go`, `sqlclock_test.go`, `gc_test.go` (C-12), `flip_state_test.go`, `cache_test.go` (drift: by hand), `adoption_failure_test.go`, `unsigned_form_test.go`; `internal/config/config_test.go`; `internal/gpg/failclosed_test.go`; `internal/simtest/clearsign.go`, `clearsign_test.go` | 14 |
-| Test output and flakes | `internal/admin/handlers.go` (`startRefresher`, F-23), `admin_test.go` (`startAdminServer`, `newAdminServer`), `refresher_test.go`, `shutdown_order_test.go` (new); `internal/gc/gc_test.go`; `internal/cache/open_cache_test.go`, `connpool_test.go`; `cmd/apt-cacher-ultra/suite_caps_wiring_test.go`, `shutdown_drain_test.go`, `legacy_audit_wiring_test.go`, `upstream_invalid_cert_test.go`, `adopt_unsigned_wiring_test.go`; the `cache.Open(…, nil)` and logger-less adopter sites of eight `internal/freshness` test files (`hot_prefetch_test.go`, a drift file, by hand) | 15 |
+| Test output and flakes | `internal/handler/phase2_chaos_test.go` (`holdSuiteBriefly`, `triggerUntilParked`, C-39), `phase2_detached_chaos_test.go`; `internal/admin/handlers.go` (`startRefresher`, F-23), `admin_test.go` (`startAdminServer`, `newAdminServer`), `refresher_test.go`, `shutdown_order_test.go` (new); `internal/gc/gc_test.go`; `internal/cache/open_cache_test.go`, `connpool_test.go`; `cmd/apt-cacher-ultra/suite_caps_wiring_test.go`, `shutdown_drain_test.go`, `legacy_audit_wiring_test.go`, `upstream_invalid_cert_test.go`, `adopt_unsigned_wiring_test.go`; the `cache.Open(…, nil)` and logger-less adopter sites of eight `internal/freshness` test files (`hot_prefetch_test.go`, a drift file, by hand) | 15 |
 | Comment nits; E-46 | `internal/proxy/proxy.go`, `internal/cache/legacy_audit.go`, `internal/freshness/legacy_audit.go`, `internal/handler/phase2_handler_test.go`, `fetch_seam_test.go`, `phase2_migration_test.go`, `internal/freshness/sim_burst_test.go`, `cmd/apt-cacher-ultra/main_test.go`; `internal/freshness/deferred_e_test.go` (deleted) and the six files its tests move to | 16 |
 | DoD | none: the DoD map and the module-wide checks | 17 |
-| Documentation | `docs/log-fields.md`, `docs/configuration.md`, `docs/admin-ui-spec.md`, `packaging/config/config.toml.default`, the spec, the overview, two comments (`internal/handler/wallclock_stamps_test.go`, `internal/freshness/anchorless.go`), the seven deferred files (deleted) | 18 |
+| Documentation | `internal/observability/event_docs_test.go` (new: every event has a row), `docs/log-fields.md`, `docs/configuration.md`, `docs/admin-ui-spec.md`, `packaging/config/config.toml.default`, the spec, the overview, two comments (`internal/handler/wallclock_stamps_test.go`, `internal/freshness/anchorless.go`), the seven deferred files (deleted) | 18 |
 
 No migration, no new package, no new dependency, no new config key.
 
@@ -191,7 +203,7 @@ No migration, no new package, no new dependency, no new config key.
 | A-55 | "Review Focus 2" said to be item 1 | done: the overview's Review Focus item 2 is "Paths with unusual bytes" (overview line 49), so `fetch_seam_test.go:90` is right as it stands |
 | A-56 | `handler.Fetcher` vs `freshness.Fetcher` naming | declined: naming only; a rename churns `handler`, `freshness` and `simtest` for no change in behaviour (PG-3). Cost if wrong: a reader confuses two interfaces whose doc comments tell them apart |
 | B-9 | Unicode whitespace in the Date parser | fix (T12): ASCII fields and trim, as apt's `isspace` |
-| B-10 | `TrimSpace(key)` accepts `Date :` | declined: whether apt's tag parser accepts a blank before the colon cannot be settled from this repository (no apt source here), the same trim serves `parseAcquireByHash`, and no Release file has one. Cost if wrong: such a file's Date is read where apt reads none, deciding one date rule on it |
+| B-10 | `TrimSpace(key)` accepts `Date :` | declined: no divergence — apt's tag parser also trims blanks before the colon (apt 3.3.2's `apt-sortpkgs` reads `Package : foo` as `Package`: review sweep M-3's probe; Release files go through the same parser), so `TrimSpace(key)` is parity; `TestReleaseDate`'s padded-key case pins it. Cost if wrong: none |
 | B-11 | `parseAptDate` shadows `ok` | fix (T12) |
 | B-12 | `aptStoi` aliases `aptSignedInt` | declined: the two names mirror two apt functions (`istream >> int`, `std::stoi`) with one Go behaviour, keeping the port readable against apt. Cost if wrong: a three-line function |
 | B-13 | `Date` read beyond the first paragraph | declined: this package's test verifiers hand the parsers the whole clearsign envelope as its plaintext (armor header and blank line first), so a first-paragraph reader finds no Date in their fixtures — the replay failed eight tests (`TestAdopter_SHA512OnlyReleaseAdopts`, the date-rule sims, the refusal tests); real Release files are one paragraph and the real verifier passes the signed text alone. An AIDEV-NOTE at `releaseDate` records it (T12). Cost if wrong: a Release whose Date sits in a second paragraph is date-checked where apt is not |
@@ -200,7 +212,7 @@ No migration, no new package, no new dependency, no new config key.
 | B-36 | four overlapping checker constructors | declined: test structure only; they differ in seeding and logger, and merging rewrites 15 tests for no change in what any proves. Cost if wrong: four 10-line constructors |
 | B-52 | phase B plan's Task 12 text stale | declined: an executed plan records what ran (historical by convention). Cost if wrong: none — later plans copy interfaces from the overview |
 | B-60 | `suites_healthy_no_lag` fixture sets a change stamp | fix (T4) |
-| B-63 | status page cannot say why a failing suite is not updating | fix (T4): `checks failing ×k · next scheduled check in …` (design note 6) |
+| B-63 | status page cannot say why a failing suite is not updating | fix (T4): `checks failing ×k · backoff ends in …` / `backoff over`, the count alone for a dormant never-adopted or record-paced suite (design note 6; reviews M-3, sweep M-5); a suite waiting for a slot is not shown (in-memory queue only) |
 | C-5 | two ledger properties unpinned | fix (T13): a held anchor then an 11 s filler is not checked; out-of-window updates leave `AnchorGens` empty |
 | C-6 | flipgate/handler periodic-client helpers repeated | declined: test helpers across three packages; consolidating churns three suites' simulations for no change in what they prove. Cost if wrong: four copies of two short helpers |
 | C-7 | colliding client ids in `flipgate/sim_test.go` | fix (T13): an id base per group |
@@ -212,7 +224,7 @@ No migration, no new package, no new dependency, no new config key.
 | C-36 | admin-ui-spec: adoption duration includes the barrier | fix (T18) |
 | C-37 | conffile comments for `max_duration`, `keep_displaced` | fix (T18) |
 | C-38 | 500-suite simulation over budget | fix (T13): 7.0 s → 2.9 s (design note 15) |
-| C-39 | one unexplained chaos-test failure | declined: not reproduced — 40 `-race` runs of `TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency` while the `freshness` and `cache` race suites loaded the machine all passed (this plan's replay), after phase C's four. No evidence to act on. Cost if wrong: an intermittent CI failure, to be investigated if it recurs |
+| C-39 | one unexplained chaos-test failure | fix (T15): phase 2's trigger in both chaos tests repeats its anchor GET every 20 ms until the member-fetch gate has a waiter (at most 5 s), as `waitForFlip` nudges — a single T1 is dropped (`resultBusy`, the check's TryLock peek) while a phase-1c T1 check still holds the suite after its 304, so no adoption starts; red: the suite held across the first trigger GET (review sweep I-1; a test-only fix) |
 | D-6 | fail-closed accept leg is LF-only and does not ask the sniff | fix (T14): a CRLF envelope with blanks on the marker line verifies, and `SniffInRelease` accepts it |
 | D-7 | `ClearsignedFixture` accepts a `-` line | fix (T14): it panics; the doc names the trimmed blanks |
 | D-9 | `Rejects*` tests satisfied by the helper's error | fix (T14): `InsertCandidateSnapshot` directly, after a checked `EnsureSuiteForTest` (drift file: by hand) |
@@ -255,7 +267,7 @@ No migration, no new package, no new dependency, no new config key.
 | E-39 | `refreshSigned` demotion untested | fix (T9) |
 | E-40 | small stale docs in the scheduler and tests | fix (T9) |
 | E-41 | `sim_burst_test.go` docstring | fix (T16) |
-| E-42 | a panicking log handler skips the panic's counters | fix (T9): the report alone under its own boundary |
+| E-42 | a panicking log handler skips the panic's counters | fix (T9): the report, then the counters and the ring event, each under its own boundary (review M-2) |
 | E-43 | the record's recover and B-20's DEBUG unasserted | fix (T9) |
 | E-45 | `recoverGoroutine`, `safeReschedule`, `safeTick` lack a second boundary | fix (T9): `unloggedPanic` around each report; `checkWorker` uses it |
 | E-46 | `deferred_e_test.go` grouped by provenance | fix (T16): its nine tests moved beside their subjects |
@@ -297,34 +309,34 @@ No migration, no new package, no new dependency, no new config key.
 | F-18 | `suite_reaped` names no evidence or stamp | fix (T6) (design note 9) |
 | F-19 | adoption outcomes show Host without its scheme | fix (T4) |
 | F-20 | admin test servers print migration lines | fix (T15) |
-| F-21 | GC's goroutines recover no panics | fix (T7) (design note 11) |
+| F-21 | GC's goroutines recover no panics | fix (T7) (design note 11): and the startup pass returns its panic as an error, and a panicking pass moves the rotation past itself (reviews I-1, M-1) |
 | F-22 | pool reads have no per-read timeout | declined: a read blocked in the kernel cannot be cancelled; abandoning it leaks a goroutine per read for as long as the filesystem hangs, and every pool reader (serves, GC, adoption) hangs the same way — a hung pool is a host failure the service manager's stop timeout handles. Cost if wrong: on a hung pool filesystem the reaper's run and its shutdown wait with every other pool reader |
 | F-23 | profiling test cleanup flake | fix (T15): the cleanup waits for `Shutdown` (30 s) and reports a slow one |
 | F-24 | sub-job B deletes audit-deferred signed history | fix (T1) (ruling R-H1) |
 | F-25 | `Purge` before `unlockDropped` inside `once.Do` | fix (T6): a deferred unlock |
 | F-26 | `sortCandidates`' AIDEV-NOTE says regardless reaps have no snapshot | fix (T6) |
 | GD-1 | the anchorless body-slot wait holds a host slot | declined: bounded by `checkDeadline`, no deadlock (a body-slot holder never waits for a host slot), failed checks back off; a short wait or a per-request timeout would make anchorless checks fail under contention and back off — a new failure mode for a rare idle slot. Cost if wrong: one of a host's slots idles up to 2 min while two slow anchorless bodies elsewhere hold the process's body slots |
-| GD-2 | `ParseSources` uses `validateMemberPath` | fix (T10, T18): kept (PG-21), spec C5 corrected, `source_paths_skipped` (design note 12) |
+| GD-2 | `ParseSources` uses `validateMemberPath` | fix (T10, T18): kept (PG-21), spec C5 gains the line, INFO `source_paths_skipped` (design note 12; reviews sweep M-2, M-8) |
 | GD-3 | the flat minted-suites simulation never evicts | declined: twin eviction is pinned at the cache layer (`TestCreateSuite_EvictionLeavesTheOtherSchemesTwin`), the handler's eviction path is the same `CreateSuite` for both layouts and phase D's sibling simulation evicts (ruling PG-26). Cost if wrong: a flat-only handler eviction regression is caught by the cache-level test alone |
-| GD-4 | one GET per cached `Contents-*` row per check | declined: the rows are bounded by the distinct names clients requested (apt-file asks one per architecture) and expire with `gc.url_path_ttl`; `Packages*`/`Sources*` go first and the deadline bounds the rest; a cap would need a rotation stamp the schema lacks (a 304 keeps `last_fetched_at`, so oldest-first never rotates). Cost if wrong: behind an upstream that answers 200 for any path, each check of that suite sends one GET per made-up name a client asked for within `url_path_ttl` |
-| GD-5 | an unsigned flat suite whose `Release` disappears | declined: ruling R-H5 — keep for 1.1.0: rare in the field; the kept snapshot keeps serving cached content when an upstream dies outright, where a drop would turn that into 404s; a drop adds a trust and serving state transition late in the release. Cost if wrong: an operator runs `/forget` on a rare suite after an alert. Recorded in spec §10 and the overview (T18) |
+| GD-4 | one GET per cached `Contents-*` row per check | declined: the rows are bounded by the distinct names clients requested (apt-file asks one per architecture) and expire with `gc.url_path_ttl`; `Packages*`/`Sources*` go first and the deadline bounds the rest; a cap would leave the rows past it unrefreshed, so a client that asks for one is served a stale file — trading a bounded request cost behind a misbehaving upstream for stale bytes served to every client (ranking by `last_requested_at`, indexed by `idx_url_path_last_req`, needs no rotation stamp, but still leaves the tail stale; review sweep M-4). Cost if wrong: behind an upstream that answers 200 for any path, each check of that suite sends one GET per made-up name a client asked for within `url_path_ttl` |
+| GD-5 | an unsigned flat suite whose `Release` disappears | declined: ruling R-H5 — keep for 1.1.0: rare in the field; the kept snapshot keeps serving cached content when an upstream dies outright, where a drop would turn that into 404s; a drop adds a trust and serving state transition late in the release. Cost if wrong: an operator runs `/forget` on a rare suite after an alert. A controller ruling, for the maintainer's confirmation (review sweep M-10). Recorded in spec §10 and the overview (T18) |
 | GD-6 | `canonical_scheme` and shutdown level on the absent-anchor tree's read failure | fix (T8) |
 
-Counts: fix 110, done 2, declined 23, maintainer 1 (136).
+Counts: fix 111, done 2, declined 23 (136); no row is the maintainer's (GD-5: ruling R-H5, for the maintainer's confirmation).
 
 ## For H3 (README and the 1.1.0 release notes)
 
 What H1 changes that H3 must mention:
 
-- **Upgrade (release notes, *Upgrading an existing cache*):** the legacy trust audit now also deletes the cached `url_path` rows of an `InRelease` whose pool file no longer matches its hash (`anchor_corrupt`), so clients fetch a fresh copy at their next update instead of being served bytes apt rejects; `legacy_snapshot_quarantined` carries `anchor_rows_deleted`. With `gc.keep_displaced = 0`, snapshot GC no longer deletes a snapshot the audit deferred (F-24: it kept never-downgrade from losing signed history). A detached-only repository (`Release` and `Release.gpg`, no `InRelease`) that an earlier release tracked stays tracked; only one first seen after the upgrade goes untracked while adoption is disabled (D-52 corrects phase D's wording; a release note copied from it must say the same).
-- **Admin (README's admin section, release notes):** the status JSON gains `suites[].anchorless`, `recent_adoptions[].scheme` and `gc.retired_reaped` (additive); the page gains a *Last requested* column, `refreshed without a Release` and `checks failing ×k · next scheduled check in …` in the Adoption cell, and `scheme://host` in Recent adoption outcomes. `POST /reconcile` and `POST /forget` answer 400 (not 413) to a body that is not a valid form, every error body ends in one newline, and `OPTIONS /reconcile` names `POST`.
-- **Logs and metrics (release notes):** the 43 renamed events (the tables under R-H3 and R-H6: old → new) are unreleased (nothing to migrate), but the release notes' list of new events uses the new names. Six prose messages `main` logs are already gone from this branch, reworded or dropped by phases A–G, and operators' alerts may match them: the `adoption.require_signature = false: unsigned upstream metadata would be adopted (auditable per SPEC2 §5.1)` startup WARN (now `adoption_require_signature_disabled`), `freshness: no baseline blob hash, skipping` and `freshness: no baseline Release blob hash, skipping` (the branch logs `freshness_no_baseline_anchor_hash` where they were), `freshness: persist anomaly failed`, `freshness: unexpected success status` and `seed suite_freshness failed`. From 1.1.0 on, every new log message is snake_case (Task 3's guard); new: `suite_reaper_run_complete`, `suite_not_forgotten` (DEBUG), `gc_panicked`, `reconcile_snapshot_read_failed`, `source_paths_skipped`, and the gauge `acu_suite_reaper_last_run_unixtime`; `acu_clock_steps_detected_total` now also counts the reaper's forward steps; `admin_reconcile_requested` gains `canonical_scheme` beside `scheme`; `suite_reaped` gains `last_requested_unixtime` and `evidence`; the stale-suites WARN gains `paced_stale`.
-- **Nothing left open:** GD-5 is decided (R-H5: keep; *Flat repositories* already documents the behaviour), and every prose message this branch added is renamed (R-H6).
+- **Upgrade (release notes, *Upgrading an existing cache*):** the legacy trust audit now also deletes the cached `url_path` rows of an `InRelease` whose pool file no longer matches its hash (`anchor_corrupt`) and removes the corrupt pool file, so clients fetch a fresh copy at their next update instead of being served bytes apt rejects, also when upstream still serves the same file; `legacy_snapshot_quarantined` carries `anchor_rows_deleted`, and ERROR `legacy_anchor_discard_failed` names a pool file the audit could not remove (then delete it by hand). A snapshot the audit cannot read at all keeps its rows and files, with ERROR `legacy_trust_audit_deferred` at every start, until the pool is fixed or the suite is forgotten. With `gc.keep_displaced = 0`, snapshot GC no longer deletes a snapshot the audit deferred (F-24: it kept never-downgrade from losing signed history). A detached-only repository (`Release` and `Release.gpg`, no `InRelease`) that an earlier release tracked stays tracked; only one first seen after the upgrade goes untracked while adoption is disabled (D-52 corrects phase D's wording; a release note copied from it must say the same).
+- **Admin (README's admin section, release notes):** the status JSON gains `suites[].anchorless`, `recent_adoptions[].scheme` and `gc.retired_reaped` (additive); the page gains a *Last requested* column, `refreshed without a Release` and `checks failing ×k · backoff ends in …` (or `backoff over`) in the Adoption cell, and `scheme://host` in Recent adoption outcomes. `POST /reconcile` and `POST /forget` answer 400 (not 413) to a body that is not a valid form, every error body ends in one newline, and `OPTIONS /reconcile` names `POST`.
+- **Logs and metrics (release notes):** the 43 renamed events (the tables under R-H3 and R-H6: old → new) are unreleased (nothing to migrate), but the release notes' list of new events uses the new names. Six prose messages `main` logs are already gone from this branch, reworded or dropped by phases A–G, and operators' alerts may match them: the `adoption.require_signature = false: unsigned upstream metadata would be adopted (auditable per SPEC2 §5.1)` startup WARN (now `adoption_require_signature_disabled`), `freshness: no baseline blob hash, skipping` and `freshness: no baseline Release blob hash, skipping` (the branch logs `freshness_check_skipped_no_baseline_anchor_hash` where they were), `freshness: persist anomaly failed`, `freshness: unexpected success status` and `seed suite_freshness failed`. From 1.1.0 on, every new log message is snake_case (Task 3's guard); new: `suite_reaper_run_complete`, `suite_not_forgotten` (DEBUG), `gc_panicked` (also for the startup pass, which no longer stops the daemon on a panic), `legacy_anchor_discard_failed`, `reconcile_snapshot_read_failed`, `source_paths_skipped` (INFO), and the gauge `acu_suite_reaper_last_run_unixtime`; `acu_clock_steps_detected_total` now also counts the reaper's forward steps; `admin_reconcile_requested` gains `canonical_scheme` beside `scheme`; `suite_reaped` gains `last_requested_unixtime` and `evidence` (a list of paths); the stale-suites WARN gains `paced_stale`.
+- **For the maintainer's confirmation:** GD-5 is decided by a controller ruling (R-H5: keep; *Flat repositories* already documents the behaviour); every prose message this branch added is renamed (R-H6).
 
 ## Tasks
 
 1. Sub-job B keeps snapshots the legacy trust audit has not judged (F-24, ruling R-H1)
-2. An `anchor_corrupt` quarantine deletes the rows of the corrupt blob (ruling R-H2)
+2. An `anchor_corrupt` quarantine deletes the rows of the corrupt blob, and the audit removes the blob (ruling R-H2, review C-1)
 3. snake_case event names and a guard against new prose messages (rulings R-H3, R-H6)
 4. The status page and JSON: `retired_reaped`, the anchorless refresh, failing checks, last requested, the adoption scheme (carry-forwards; B-60, B-63, D-50, F-14, F-19)
 5. The admin endpoints: one form parser, 400 for a malformed body, `OPTIONS`, `canonical_scheme`, a DEBUG line for a 409 (F-4, F-5, F-6, F-15, F-16)
@@ -337,7 +349,7 @@ What H1 changes that H3 must mention:
 12. The Release `Date` parser (B-9, B-11, B-14; B-13's note)
 13. Simulations and their harness, and the jitter test under the budget (C-5, C-7, C-8, C-38, E-50–E-53, E-55, E-75, F-10, F-11; rulings R-H4, R-H7)
 14. Test gaps in the cache, `aptpath`, `wallclock`, `gpg`, `config` and `simtest` (A-1, A-2, A-8, A-9, A-11, A-14, A-15, A-19–A-21, C-9, C-12, C-13, D-6, D-7, D-9, D-10, D-26, E-1, E-3, F-8, F-9)
-15. Test output and flakes (D-46, D-48, D-49, D-56, D-57, D-58, D-60, E-73, F-20, F-23)
+15. Test output and flakes (C-39, D-46, D-48, D-49, D-56, D-57, D-58, D-60, E-73, F-20, F-23)
 16. Comment nits and `deferred_e_test.go`'s move (A-10, A-26, A-27, D-28, D-29, D-30, E-35, E-41, E-46, E-74)
 17. Phase H1's definition of done
 18. Documentation, spec revision 12, the overview, the deferred files (C-36, C-37, D-52, D-55, E-24)
@@ -566,7 +578,14 @@ new:
 	// audit would only Drop it. Kept, it waits for the verdict: Keep marks
 	// the base, a quarantine retires it, and B or C then deletes it.
 	// Never PF-12's marker instead: the audit may still find it plain text,
-	// which must get no marker (spec §6.1).
+	// which must get no marker (spec §6.1). Cost (review M-9 of the H1
+	// plan): a snapshot the audit defers at every start (a pool file that
+	// keeps failing to read, or a classifier panic) keeps its members,
+	// package rows and blobs for the life of its suite; the remedy is the
+	// ERROR legacy_trust_audit_deferred at every start — fix the pool, or
+	// POST /forget the suite. The one deliberate marker for such a
+	// snapshot is PF-12's: a reap, eviction or forget of its suite marks
+	// its base (markSnapshotHistoryTx) before retiring it.
 	const selectSQL = `
 ```
 
@@ -630,17 +649,17 @@ EOF
 )"
 ```
 
-### Task 2: An `anchor_corrupt` quarantine deletes the rows of the corrupt blob (ruling R-H2)
+### Task 2: An `anchor_corrupt` quarantine deletes the rows of the corrupt blob, and the audit removes the blob (ruling R-H2, review C-1)
 
-The maintainer's decision (2026-10-24) on the overview's open decision: when the legacy trust audit quarantines a snapshot for `anchor_corrupt` — the stored `InRelease` blob's SHA-256 does not match its recorded hash — it also deletes the `url_path` rows that point at that blob, in the quarantine's own transaction, so the next client request fetches a fresh copy instead of being served bytes apt rejects. `anchor_oversized` and `anchor_missing` are unchanged (ruling R-H2, design note 2). Today the rows stay, and the hit path serves the rotted file (the handler test's red line).
+The maintainer's decision (2026-10-24) on the overview's open decision: when the legacy trust audit quarantines a snapshot for `anchor_corrupt` — the stored `InRelease` blob's SHA-256 does not match its recorded hash — it also deletes the `url_path` rows that point at that blob, in the quarantine's own transaction, and the audit removes the corrupt pool file before the batch commits, so the next client request fetches a fresh copy instead of being served bytes apt rejects. The removal is review C-1's: without it, an upstream that still serves the same `InRelease` — the usual bit rot — is refetched onto the rotted file, which the miss path's `Finalize` keeps (its dedup branch), and served from it. It runs on main's goroutine, never on the writer; a failed removal is logged (ERROR `legacy_anchor_discard_failed`) and the quarantine proceeds. `anchor_oversized` and `anchor_missing` are unchanged (ruling R-H2, design note 2). Today the rows stay, and the hit path serves the rotted file (the handler test's red line, for an unchanged and a changed upstream alike).
 
 **Files:**
 - Create: `internal/cache/corrupt_anchor_test.go`, `internal/freshness/corrupt_anchor_test.go`, `internal/handler/corrupt_anchor_test.go`
-- Modify: `internal/cache/legacy_audit.go` (`LegacyAuditDecision.DropAnchorRows`, `LegacyAuditEffect`, `ApplyLegacyAuditDecisions`, new `dropAnchorBlobRowsTx`), `internal/cache/legacy_audit_test.go` (`applyOne`), `internal/freshness/legacy_audit.go` (`legacyVerdict.dropAnchorRows`, the decision, the quarantine line, `auditLegacySnapshot`'s corrupt branch)
+- Modify: `internal/cache/legacy_audit.go` (`LegacyAuditDecision.DropAnchorRows`, `LegacyAuditEffect`, `ApplyLegacyAuditDecisions`, new `dropAnchorBlobRowsTx`), `internal/cache/legacy_audit_test.go` (`applyOne`), `internal/freshness/legacy_audit.go` (`legacyVerdict.dropAnchorRows`, the seam `legacyDiscardAnchor`, the pool file's removal, the decision, the quarantine line, `auditLegacySnapshot`'s corrupt branch)
 
 **Interfaces:**
-- Consumes: cache tests' `openCache`, `stubNow`, `seedBlob`, `commitInline`, `refcount` (`legacy_audit_test.go`); `deleteURLPathRowTx` (`gc_urlpath.go`); freshness tests' `newAdoptionTestEnv`, `adoptLegacy`, `realisticRelease`, `clearsignForTest`, `hashOf`, `lockedBuffer`, `logRecords`, `legacyAuditAnchorCap`; handler tests' `newSuiteRig`, `writeBlob`, `commitInlineSnapshot`, `rowInRelease`, `upFile`, `sha256Hex`, `silentLogger`.
-- Produces: `cache.LegacyAuditDecision.DropAnchorRows bool`; `cache.LegacyAuditEffect{WasCurrent bool; AnchorRowsDeleted int}`; `(*cache.Cache).ApplyLegacyAuditDecisions(ctx, []LegacyAuditDecision) (map[int64]LegacyAuditEffect, error)`; unexported `dropAnchorBlobRowsTx(ctx, tx, snapshotID, now int64) (int, error)`; the field `anchor_rows_deleted` on `legacy_snapshot_quarantined`; test helpers `putAnchorRow`, `urlPathGone` (cache), `rotBlob` (freshness).
+- Consumes: `(*cache.Cache).DiscardFinalizedBlob` (the integrity scanner's remedy); cache tests' `openCache`, `stubNow`, `seedBlob`, `commitInline`, `refcount` (`legacy_audit_test.go`); `deleteURLPathRowTx` (`gc_urlpath.go`); freshness tests' `newAdoptionTestEnv`, `adoptLegacy`, `realisticRelease`, `clearsignForTest`, `hashOf`, `lockedBuffer`, `logRecords`, `legacyAuditAnchorCap`; handler tests' `newSuiteRig`, `writeBlob`, `commitInlineSnapshot`, `rowInRelease`, `upFile`, `sha256Hex`, `silentLogger`.
+- Produces: `cache.LegacyAuditDecision.DropAnchorRows bool`; `cache.LegacyAuditEffect{WasCurrent bool; AnchorRowsDeleted int}`; `(*cache.Cache).ApplyLegacyAuditDecisions(ctx, []LegacyAuditDecision) (map[int64]LegacyAuditEffect, error)`; unexported `dropAnchorBlobRowsTx(ctx, tx, snapshotID, now int64) (int, error)`; the field `anchor_rows_deleted` on `legacy_snapshot_quarantined`; the event `legacy_anchor_discard_failed` (ERROR: `snapshot_id`, `canonical_host`, `suite_path`, `blob_hash`, `err`); the test seam `legacyDiscardAnchor func(*cache.Cache, string) error`; test helpers `putAnchorRow`, `urlPathGone` (cache), `rotBlob` (freshness).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -825,9 +844,10 @@ func TestAuditLegacySnapshot_OnlyACorruptAnchorDropsItsRows(t *testing.T) {
 // Ruling R-H2 end to end in the audit: two pre-v7 inline suites, one
 // whose stored InRelease rotted in the pool and one whose InRelease is
 // over the read cap. Both are quarantined; the rotted one's url_path
-// anchor row is deleted (anchor_rows_deleted 1 on its line), so the next
-// client request fetches a fresh copy; the oversized one, not proven bad,
-// keeps its row (anchor_rows_deleted 0).
+// anchor row is deleted (anchor_rows_deleted 1 on its line) and its pool
+// file removed (review C-1), so the next client request fetches a fresh
+// copy; the oversized one, not proven bad, keeps its row and its pool file
+// (anchor_rows_deleted 0).
 func TestRunLegacyTrustAudit_CorruptAnchorDropsItsRowsOversizedKeepsThem(t *testing.T) {
 	env := newAdoptionTestEnv(t)
 	ctx := context.Background()
@@ -839,6 +859,10 @@ func TestRunLegacyTrustAudit_CorruptAnchorDropsItsRowsOversizedKeepsThem(t *test
 		t.Fatal(err)
 	}
 	rotBlob(t, c, *snap.SingleAnchorHash)
+	bigSnap, err := c.GetSuiteSnapshot(ctx, big)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := c.ClearSignedSeenForTest(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -859,6 +883,12 @@ func TestRunLegacyTrustAudit_CorruptAnchorDropsItsRowsOversizedKeepsThem(t *test
 	if u, err := c.LookupURL(ctx, "http", "h", "/r/dists/big/InRelease"); err != nil || u.BlobHash == nil {
 		t.Fatalf("the oversized anchor's row: %+v, %v; want kept", u, err)
 	}
+	if _, err := os.Stat(c.BlobPath(*snap.SingleAnchorHash)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the rotted anchor's pool file: %v, want removed", err)
+	}
+	if _, err := os.Stat(c.BlobPath(*bigSnap.SingleAnchorHash)); err != nil {
+		t.Fatalf("the oversized anchor's pool file: %v, want kept", err)
+	}
 	want := map[string]float64{"anchor_corrupt": 1, "anchor_oversized": 0}
 	lines := logRecords(t, logs, "legacy_snapshot_quarantined")
 	for _, m := range lines {
@@ -869,6 +899,44 @@ func TestRunLegacyTrustAudit_CorruptAnchorDropsItsRowsOversizedKeepsThem(t *test
 	}
 	if len(lines) != 2 {
 		t.Fatalf("%d quarantine lines, want 2", len(lines))
+	}
+}
+
+// Ruling R-H2, review C-1: a pool file the audit cannot remove is logged
+// (ERROR legacy_anchor_discard_failed) and the quarantine proceeds: its
+// url_path rows still go, so a changed upstream still heals it.
+func TestRunLegacyTrustAudit_AFailedDiscardIsLoggedAndTheQuarantineProceeds(t *testing.T) {
+	env := newAdoptionTestEnv(t)
+	ctx := context.Background()
+	c := env.cache
+	rotten := adoptLegacy(t, env, "/r/dists/rotten", clearsignForTest(t, realisticRelease()+"Note: rotten\n"), "/r/pool/r_1_amd64.deb")
+	snap, err := c.GetSuiteSnapshot(ctx, rotten)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := *snap.SingleAnchorHash
+	rotBlob(t, c, hash)
+	if err := c.ClearSignedSeenForTest(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.EnqueueLegacyTrustAudit(ctx, rotten); err != nil {
+		t.Fatal(err)
+	}
+	prev := legacyDiscardAnchor
+	legacyDiscardAnchor = func(*cache.Cache, string) error { return errors.New("pool is read-only") }
+	t.Cleanup(func() { legacyDiscardAnchor = prev })
+	logs := &lockedBuffer{}
+	res, err := RunLegacyTrustAudit(ctx, c, slog.New(slog.NewJSONHandler(logs, nil)))
+	if err != nil || res.Quarantined != 1 {
+		t.Fatalf("audit = %+v, %v; want the rotted snapshot quarantined", res, err)
+	}
+	if _, err := c.LookupURL(ctx, "http", "h", "/r/dists/rotten/InRelease"); !errors.Is(err, cache.ErrNotFound) {
+		t.Fatalf("the rotted anchor's row: %v, want deleted", err)
+	}
+	recs := logRecords(t, logs, "legacy_anchor_discard_failed")
+	if len(recs) != 1 || recs[0]["level"] != "ERROR" || recs[0]["blob_hash"] != hash ||
+		recs[0]["err"] != "pool is read-only" || recs[0]["snapshot_id"] != float64(rotten) {
+		t.Fatalf("records %v, want one ERROR naming the snapshot, the blob and the error", recs)
 	}
 }
 ```
@@ -889,43 +957,56 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
-// Ruling R-H2 (the maintainer, 2026-10-24) through the handler: a pre-v7
-// inline suite whose stored InRelease rotted in the pool is quarantined
-// at startup (anchor_corrupt), and the audit deletes the url_path row that
-// served those bytes, so a client's next request is a miss that fetches a
-// fresh copy from upstream — not a hit on bytes apt rejects.
+// Ruling R-H2 (the maintainer, 2026-10-24; review C-1) through the
+// handler: a pre-v7 inline suite whose stored InRelease rotted in the pool
+// is quarantined at startup (anchor_corrupt); the audit deletes the
+// url_path row that served those bytes and removes the rotted pool file,
+// so a client's next request is a miss that fetches a fresh copy from
+// upstream, and the one after it a hit on that copy. Both when upstream
+// still serves the same InRelease — the usual bit rot: the miss path's
+// Finalize keeps an existing pool file of the same hash, so only the
+// removal heals it — and when it has moved on.
 func TestServeHTTP_ACorruptAnchorQuarantineRefetchesTheAnchor(t *testing.T) {
-	r := newSuiteRig(t, true, 0)
-	ctx := context.Background()
 	old := simtest.ClearsignedFixture("Origin: old\nSuite: c\n")
-	hash := writeBlob(t, r.h, old)
-	id := commitInlineSnapshot(t, r.h, "http", "127.0.0.1", "/r/dists/c", hash,
-		[]cache.SnapshotMember{{Path: "InRelease", BlobHash: hash, DeclaredSHA256: hash}}, nil)
-	p := r.c.BlobPath(hash)
-	if err := os.Remove(p); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(p, []byte("bit-rotted bytes"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.c.ClearSignedSeenForTest(ctx); err != nil { // a pre-v7 cache has no markers
-		t.Fatal(err)
-	}
-	if err := r.c.EnqueueLegacyTrustAudit(ctx, id); err != nil { // as the v7 migration does
-		t.Fatal(err)
-	}
-	if res, err := freshness.RunLegacyTrustAudit(ctx, r.c, silentLogger()); err != nil || res.Quarantined != 1 {
-		t.Fatalf("audit = %+v, %v; want the rotted snapshot quarantined", res, err)
-	}
-	r.serve("/r/dists/c/InRelease", upFile{body: rowInRelease})
-	rec := r.get("/r/dists/c/InRelease")
-	if rec.Code != http.StatusOK || rec.Header().Get("X-Cache") != "MISS" || rec.Body.String() != string(rowInRelease) {
-		t.Fatalf("status %d, X-Cache %q, body %q; want a miss serving upstream's fresh InRelease",
-			rec.Code, rec.Header().Get("X-Cache"), rec.Body.String())
-	}
-	u, err := r.c.LookupURL(ctx, "http", "127.0.0.1", "/r/dists/c/InRelease")
-	if err != nil || u.BlobHash == nil || *u.BlobHash != sha256Hex(rowInRelease) {
-		t.Fatalf("anchor row %+v, %v; want the fresh copy stored", u, err)
+	for _, tc := range []struct {
+		name     string
+		upstream []byte
+	}{{"upstream unchanged", old}, {"upstream changed", rowInRelease}} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newSuiteRig(t, true, 0)
+			ctx := context.Background()
+			hash := writeBlob(t, r.h, old)
+			id := commitInlineSnapshot(t, r.h, "http", "127.0.0.1", "/r/dists/c", hash,
+				[]cache.SnapshotMember{{Path: "InRelease", BlobHash: hash, DeclaredSHA256: hash}}, nil)
+			p := r.c.BlobPath(hash)
+			if err := os.Remove(p); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte("bit-rotted bytes"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.c.ClearSignedSeenForTest(ctx); err != nil { // a pre-v7 cache has no markers
+				t.Fatal(err)
+			}
+			if err := r.c.EnqueueLegacyTrustAudit(ctx, id); err != nil { // as the v7 migration does
+				t.Fatal(err)
+			}
+			if res, err := freshness.RunLegacyTrustAudit(ctx, r.c, silentLogger()); err != nil || res.Quarantined != 1 {
+				t.Fatalf("audit = %+v, %v; want the rotted snapshot quarantined", res, err)
+			}
+			r.serve("/r/dists/c/InRelease", upFile{body: tc.upstream})
+			for _, want := range []string{"MISS", "HIT"} {
+				rec := r.get("/r/dists/c/InRelease")
+				if rec.Code != http.StatusOK || rec.Header().Get("X-Cache") != want || rec.Body.String() != string(tc.upstream) {
+					t.Fatalf("status %d, X-Cache %q, body %q; want a %s serving upstream's InRelease",
+						rec.Code, rec.Header().Get("X-Cache"), rec.Body.String(), want)
+				}
+			}
+			u, err := r.c.LookupURL(ctx, "http", "127.0.0.1", "/r/dists/c/InRelease")
+			if err != nil || u.BlobHash == nil || *u.BlobHash != sha256Hex(tc.upstream) {
+				t.Fatalf("anchor row %+v, %v; want the fresh copy stored", u, err)
+			}
+		})
 	}
 }
 ```
@@ -935,11 +1016,11 @@ func TestServeHTTP_ACorruptAnchorQuarantineRefetchesTheAnchor(t *testing.T) {
 Run: `go test -gcflags=-e -count=1 -run 'TestApplyLegacyAuditDecisions' ./internal/cache/`
 Expected: build failure naming `unknown field DropAnchorRows in struct literal of type LegacyAuditDecision` (corrupt_anchor_test.go:51, :74, :95) and `undefined: LegacyAuditEffect` (:55, :75).
 
-Run: `go test -gcflags=-e -count=1 -run 'CorruptAnchor|OnlyACorruptAnchor' ./internal/freshness/`
-Expected: build failure naming `v.dropAnchorRows undefined (type legacyVerdict has no field or method dropAnchorRows)`.
+Run: `go test -gcflags=-e -count=1 -run 'CorruptAnchor|OnlyACorruptAnchor|AFailedDiscard' ./internal/freshness/`
+Expected: build failure naming `v.dropAnchorRows undefined (type legacyVerdict has no field or method dropAnchorRows)` (corrupt_anchor_test.go:53, :61) and `undefined: legacyDiscardAnchor` (:147, :148, :149).
 
-Run: `go test -count=1 -run TestServeHTTP_ACorruptAnchorQuarantineRefetchesTheAnchor ./internal/handler/`
-Expected: FAIL — `corrupt_anchor_test.go:45: status 200, X-Cache "HIT", body "bit-rotted bytes"; want a miss serving upstream's fresh InRelease` (today the rotted file is served).
+Run: `go test -count=1 -v -run TestServeHTTP_ACorruptAnchorQuarantineRefetchesTheAnchor ./internal/handler/`
+Expected: FAIL — both subtests, `upstream_unchanged` and `upstream_changed`, with `corrupt_anchor_test.go:55: status 200, X-Cache "HIT", body "bit-rotted bytes"; want a MISS serving upstream's InRelease` (today the rotted file is served from its row).
 
 - [ ] **Step 3: Implement the drop in the quarantine's transaction (`internal/cache/legacy_audit.go`)**
 
@@ -1134,7 +1215,25 @@ func dropAnchorBlobRowsTx(ctx context.Context, tx *sql.Tx, snapshotID, now int64
 
 In `internal/cache/legacy_audit_test.go`, `applyOne` reads the new result: its last line `return cur[id]` becomes `return cur[id].WasCurrent`.
 
-- [ ] **Step 4: The audit asks for it on `anchor_corrupt` only (`internal/freshness/legacy_audit.go`)**
+- [ ] **Step 4: The audit asks for it on `anchor_corrupt` only, and removes the pool file (`internal/freshness/legacy_audit.go`)**
+
+old:
+```go
+	// legacyClassify is auditLegacySnapshot's classifier; tests swap it to
+	// inject a panic.
+	legacyClassify = classifyLegacyInline
+)
+```
+new:
+```go
+	// legacyClassify is auditLegacySnapshot's classifier; tests swap it to
+	// inject a panic.
+	legacyClassify = classifyLegacyInline
+	// legacyDiscardAnchor removes a corrupt anchor's pool file (ruling
+	// R-H2); tests swap it to inject a failure.
+	legacyDiscardAnchor = func(c *cache.Cache, hash string) error { return c.DiscardFinalizedBlob(hash) }
+)
+```
 
 old:
 ```go
@@ -1160,9 +1259,35 @@ old:
 ```
 new:
 ```go
+			if v.dropAnchorRows {
+				// AIDEV-NOTE: ruling R-H2 as amended by review C-1 (phase H1).
+				// The rotted pool file goes too, not only its url_path rows:
+				// the miss path's Finalize keeps an existing pool/<hash>, so
+				// refetching an upstream InRelease that has not changed (the
+				// usual bit rot) would store onto, and serve, the rotted file.
+				// A corrupt file becomes a missing one, which the next request
+				// heals. It runs here, on main's goroutine before anything
+				// serves, before the batch commits and never on the writer
+				// (PD-5), as the integrity scanner's DiscardFinalizedBlob does.
+				// A commit lost after the removal re-audits the snapshot as
+				// anchor_missing at the next start (rows kept, file missing:
+				// healed at the next request). A failed removal is logged and
+				// the quarantine proceeds: its rows still go.
+				if err := legacyDiscardAnchor(c, *it.SingleAnchorHash); err != nil {
+					logger.Error("legacy_anchor_discard_failed",
+						"snapshot_id", it.SnapshotID,
+						"canonical_host", it.CanonicalHost,
+						"suite_path", it.SuitePath,
+						"blob_hash", *it.SingleAnchorHash,
+						"err", err,
+					)
+				}
+			}
 			decisions = append(decisions, cache.LegacyAuditDecision{SnapshotID: it.SnapshotID, Outcome: v.outcome,
 				DropAnchorRows: v.dropAnchorRows})
 ```
+
+(`dropAnchorRows` is set only on the `anchor_corrupt` branch, after `SingleAnchorHash` was read, so the dereference is safe.)
 
 old:
 ```go
@@ -1198,12 +1323,13 @@ new:
 ```go
 	sum := sha256.Sum256(blob)
 	if hex.EncodeToString(sum[:]) != *it.SingleAnchorHash {
-		// AIDEV-NOTE: ruling R-H2 (the maintainer, 2026-10-24). The bytes
-		// were read and hashed, so this is evidence: the quarantine also
-		// deletes the url_path rows that serve this pool file, and the next
+		// AIDEV-NOTE: ruling R-H2 (the maintainer, 2026-10-24; review C-1).
+		// The bytes were read and hashed, so this is evidence: the
+		// quarantine also deletes the url_path rows that serve this pool
+		// file, and RunLegacyTrustAudit removes the file itself, so the next
 		// client request fetches a fresh copy instead of bytes apt rejects.
 		// anchor_oversized (not read in full) and anchor_missing (a missing
-		// pool file already falls through to the miss path) keep their rows.
+		// pool file already falls through to the miss path) keep theirs.
 		return legacyVerdict{outcome: cache.LegacyAuditQuarantine, reason: "anchor_corrupt", dropAnchorRows: true}, nil
 	}
 ```
@@ -1220,10 +1346,15 @@ Expected: all `ok`.
 
 | Mutant | Fails |
 |---|---|
-| `dropAnchorRows: false` in the `anchor_corrupt` verdict | `freshness/corrupt_anchor_test.go:54` (`dropAnchorRows:false … want … true`), `freshness/corrupt_anchor_test.go:98: the rotted anchor's row: <nil>, want deleted`, `handler/corrupt_anchor_test.go:45: status 200, X-Cache "HIT", body "bit-rotted bytes"` |
+| No removal (`if v.dropAnchorRows {` before the discard becomes `if false {`; review C-1's red line) | `handler/corrupt_anchor_test.go:55: status 200, X-Cache "MISS", body "bit-rotted bytes"; want a MISS serving upstream's InRelease` (subtest `upstream_unchanged` only: a changed upstream still heals through the row delete), `freshness/corrupt_anchor_test.go:109: the rotted anchor's pool file: <nil>, want removed`, `freshness/corrupt_anchor_test.go:161: records [], want one ERROR naming the snapshot, the blob and the error` |
+| The removal for every inline quarantine (`if v.outcome == cache.LegacyAuditQuarantine && it.SingleAnchorHash != nil {`) | `freshness/corrupt_anchor_test.go:112: the oversized anchor's pool file: stat …: no such file or directory, want kept` |
+| A failed removal not logged (`… err != nil && false {`) | `freshness/corrupt_anchor_test.go:161: records [], want one ERROR naming the snapshot, the blob and the error` |
+| `dropAnchorRows: false` in the `anchor_corrupt` verdict | `freshness/corrupt_anchor_test.go:54` (`dropAnchorRows:false … want … true`), `:103: the rotted anchor's row: <nil>, want deleted`, `:156` (the same, in the failed-removal test), `handler/corrupt_anchor_test.go:55: status 200, X-Cache "HIT", body "bit-rotted bytes"` (both subtests) |
 | The row query scoped to one scheme and host (`… AND canonical_scheme = 'http' AND canonical_host = 'h'`) | `cache/corrupt_anchor_test.go:56: effect {WasCurrent:true AnchorRowsDeleted:1}, want current and 3 rows deleted` |
 | The `DropAnchorRows` validation removed (`if false {`) | `cache/corrupt_anchor_test.go:96: outcome 1 with DropAnchorRows: no error` |
-| `anchor_oversized` drops its rows too | `freshness/corrupt_anchor_test.go:62` and `:101: the oversized anchor's row: <nil>, cache: not found; want kept` |
+| `anchor_oversized` drops its rows too | `freshness/corrupt_anchor_test.go:62` and `:106: the oversized anchor's row: <nil>, cache: not found; want kept` |
+
+The first four rows were replayed in the revision of 2026-10-25 (a fresh copy of eadfd80 with Tasks 1–16 applied); the cache rows are unchanged from the draft's replay.
 
 - [ ] **Step 7: Commit**
 
@@ -1237,14 +1368,20 @@ When the audit quarantines a pre-v7 snapshot for anchor_corrupt (the
 stored InRelease no longer matches its hash) it now also deletes every
 url_path row that names that pool file, in the quarantine's own writer
 transaction, so the next client request fetches a fresh copy instead of
-bytes apt rejects (the maintainer's decision, ruling R-H2). The pool file
-is left to GC; anchor_oversized and anchor_missing are unchanged.
-legacy_snapshot_quarantined gains anchor_rows_deleted.
+bytes apt rejects (the maintainer's decision, ruling R-H2). The audit also
+removes the corrupt pool file, on main's goroutine before the batch
+commits: the miss path keeps an existing pool file of the same hash, so an
+upstream still serving the same InRelease was refetched onto the rotted
+file (review C-1). A failed removal logs ERROR legacy_anchor_discard_failed
+and the quarantine proceeds. anchor_oversized and anchor_missing are
+unchanged. legacy_snapshot_quarantined gains anchor_rows_deleted.
 
-Mutants: no drop fails freshness corrupt_anchor_test.go:54, :98 and
-handler corrupt_anchor_test.go:45; a scheme/host-scoped drop fails cache
-corrupt_anchor_test.go:56; no validation fails :96; an oversized drop
-fails freshness corrupt_anchor_test.go:62 and :101.
+Mutants: no removal fails handler corrupt_anchor_test.go:55 (upstream
+unchanged) and freshness corrupt_anchor_test.go:109, :161; a removal for
+every quarantine fails :112; an unlogged failure fails :161; no drop fails
+freshness :54, :103, :156 and handler :55; a scheme/host-scoped drop fails
+cache corrupt_anchor_test.go:56; no validation fails :96; an oversized drop
+fails freshness :62 and :106.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -1253,7 +1390,7 @@ EOF
 
 ### Task 3: snake_case event names (rulings R-H3 and R-H6)
 
-The 43 prose log messages this branch added — the 19 of the table under ruling R-H3 and the 24 of ruling R-H6's — become snake_case events, each keeping its level and fields, in the code that emits them, the tests that match them, the AIDEV-NOTEs and comments that quote them, `docs/log-fields.md` and `docs/configuration.md`. `docs/log-fields.md` gains a row for `adoption_require_signature_disabled`, whose prose message was its only explanation; the 11 renamed DEBUG lines it never documented stay undocumented (design note 3). The overview's and the spec's quotes of the current names change in Task 18 (the overview's carry-forward items, which list the old names as what H renames, and the spec's revision history keep them); the executed phase plans keep theirs (historical by convention). Two guard tests: `TestSweptEventNames` pins the 43 renames three ways, so a later prose name or a typo fails it; `TestLogMessagesAreSnakeCase` requires every log message of production code to be snake_case or one of the 78 prose messages `main` already logs, listed in the test, so a new prose message fails the build (ruling R-H6, design note 3). The renames are unreleased: nothing outside the repository depends on them.
+The 43 prose log messages this branch added — the 19 of the table under ruling R-H3 and the 24 of ruling R-H6's — become snake_case events, each keeping its level and fields, in the code that emits them, the tests that match them, the AIDEV-NOTEs and comments that quote them, `docs/log-fields.md` and `docs/configuration.md`. `docs/log-fields.md` gains a row for `adoption_require_signature_disabled`, whose prose message was its only explanation, and one shared row for the 11 renamed DEBUG lines it never documented, each with the meaning its prose carried; six of those are named to keep that meaning (review sweep M-6, design note 3). The overview's and the spec's quotes of the current names change in Task 18 (the overview's carry-forward items, which list the old names as what H renames, and the spec's revision history keep them); the executed phase plans keep theirs (historical by convention). Two guard tests: `TestSweptEventNames` pins the 43 renames three ways — no old name in any Go file, each new name in production code, a `docs/log-fields.md` row for each (a backquoted name in a table row's first cell) — so a later prose name or a typo fails it; `TestLogMessagesAreSnakeCase` requires every log message of production code to be snake_case or one of the 78 prose messages `main` already logs, listed in the test, so a new prose message fails the build (ruling R-H6, design note 3). Their failure messages say where to fix (review M-6). The renames are unreleased: nothing outside the repository depends on them.
 
 **Files:**
 - Create: `internal/observability/event_names_test.go`
@@ -1261,7 +1398,7 @@ The 43 prose log messages this branch added — the 19 of the table under ruling
 
 **Interfaces:**
 - Consumes: nothing new.
-- Produces: the 43 event names (the tables under R-H3 and R-H6), used by every later task; the guard's `logSinks` (a later helper that forwards a message parameter is added there) and `mainProseMessages` (a later rename of one of `main`'s prose messages removes it there).
+- Produces: the 43 event names (the tables under R-H3 and R-H6), used by every later task; the guard's `logSinks` (a later helper that forwards a message parameter is added there, and a later helper must not reuse a listed name for anything else — Task 7's GC helper is `logGCPanic` for that reason) and `mainProseMessages` (a later rename of one of `main`'s prose messages removes it there); the test helpers `logMessages(t) map[string]string` (every production log message with the first place it is logged) and `documentedEvents(t) map[string]bool` (the names `docs/log-fields.md` gives a row), which Task 18's `TestEveryEventIsDocumented` uses.
 
 - [ ] **Step 1: Write the failing guard tests**
 
@@ -1286,60 +1423,55 @@ import (
 
 // sweptEvent is a prose log message the flat-repository branch added and
 // the snake_case event it became.
-type sweptEvent struct {
-	old, event string
-	// documented: docs/log-fields.md has the event's row. The DEBUG lines
-	// it never documented stay undocumented (phase H1 design note 3).
-	documented bool
-}
+type sweptEvent struct{ old, event string }
 
 // sweptEvents are the 43 renamed messages: the 19 the overview listed
 // (ruling R-H3), then the 24 it did not (ruling R-H6).
 var sweptEvents = []sweptEvent{
-	{"suite onboarding failed", "suite_onboarding_failed", true},
-	{"suite signed-seen mark failed", "suite_signed_seen_mark_failed", true},
-	{"suite cap usage read failed", "suite_cap_usage_read_failed", true},
-	{"freshness: read anchor rows failed", "freshness_read_anchor_rows_failed", true},
-	{"freshness: read current snapshot failed", "freshness_read_current_snapshot_failed", true},
-	{"adoption: served anchor read failed; the flip barrier runs", "adoption_served_anchor_read_failed", true},
-	{"adoption: signed-anchor re-mark failed", "adoption_signed_anchor_remark_failed", true},
-	{"suite reaper: list suites failed", "suite_reaper_list_suites_failed", true},
-	{"suite reaper: read suite row failed", "suite_reaper_read_suite_row_failed", true},
-	{"suite reaper: delete metadata failed", "suite_reaper_delete_metadata_failed", true},
-	{"suite reaper: reap failed", "suite_reaper_reap_failed", true},
-	{"suite reaper: list unadopted anchors failed", "suite_reaper_list_unadopted_anchors_failed", true},
-	{"suite reaper: junk anchor reads failed", "suite_reaper_junk_anchor_reads_failed", true},
-	{"suite reaper: marker sweep failed", "suite_reaper_marker_sweep_failed", true},
-	{"admin: forget failed", "admin_forget_failed", true},
-	{"freshness: anchorless index over its size cap, dropped for the miss path", "freshness_anchorless_index_over_cap", true},
-	{"freshness: delete anchorless rows failed", "freshness_delete_anchorless_rows_failed", true},
-	{"suite reaper: list unadopted flat indexes failed", "suite_reaper_list_unadopted_flat_indexes_failed", true},
-	{"suite reaper: read signed evidence failed", "suite_reaper_read_signed_evidence_failed", true},
+	{"suite onboarding failed", "suite_onboarding_failed"},
+	{"suite signed-seen mark failed", "suite_signed_seen_mark_failed"},
+	{"suite cap usage read failed", "suite_cap_usage_read_failed"},
+	{"freshness: read anchor rows failed", "freshness_read_anchor_rows_failed"},
+	{"freshness: read current snapshot failed", "freshness_read_current_snapshot_failed"},
+	{"adoption: served anchor read failed; the flip barrier runs", "adoption_served_anchor_read_failed"},
+	{"adoption: signed-anchor re-mark failed", "adoption_signed_anchor_remark_failed"},
+	{"suite reaper: list suites failed", "suite_reaper_list_suites_failed"},
+	{"suite reaper: read suite row failed", "suite_reaper_read_suite_row_failed"},
+	{"suite reaper: delete metadata failed", "suite_reaper_delete_metadata_failed"},
+	{"suite reaper: reap failed", "suite_reaper_reap_failed"},
+	{"suite reaper: list unadopted anchors failed", "suite_reaper_list_unadopted_anchors_failed"},
+	{"suite reaper: junk anchor reads failed", "suite_reaper_junk_anchor_reads_failed"},
+	{"suite reaper: marker sweep failed", "suite_reaper_marker_sweep_failed"},
+	{"admin: forget failed", "admin_forget_failed"},
+	{"freshness: anchorless index over its size cap, dropped for the miss path", "freshness_anchorless_index_over_cap"},
+	{"freshness: delete anchorless rows failed", "freshness_delete_anchorless_rows_failed"},
+	{"suite reaper: list unadopted flat indexes failed", "suite_reaper_list_unadopted_flat_indexes_failed"},
+	{"suite reaper: read signed evidence failed", "suite_reaper_read_signed_evidence_failed"},
 	// ruling R-H6
-	{"adoption: read prior snapshot failed", "adoption_read_prior_snapshot_failed", true},
-	{"adoption.require_signature = false: an empty keyring is allowed at startup; plain-text or malformed InRelease files are never adopted as signed metadata, and with an empty keyring signed suites cannot adopt until keys are installed or adoption.accept_any_signer is set", "adoption_require_signature_disabled", true},
-	{"displaced snapshot lookup failed", "displaced_snapshot_lookup_failed", true},
-	{"freshness: anchorless index failed its sniff, kept", "freshness_anchorless_index_sniff_failed", false},
-	{"freshness: check cancelled", "freshness_check_cancelled", false},
-	{"freshness: check ended by shutdown", "freshness_check_ended_by_shutdown", false},
-	{"freshness: clamp adoption retry failed", "freshness_clamp_adoption_retry_failed", true},
-	{"freshness: clear adoption failure failed", "freshness_clear_adoption_failure_failed", true},
-	{"freshness: deferred never-adopted suite paced until its retry or the next refresh check", "freshness_deferred_never_adopted_suite_paced", false},
-	{"freshness: never-adopted suite without a client-created anchor or flat index row, dormant", "freshness_never_adopted_suite_dormant_no_client_row", false},
-	{"freshness: never-adopted suite without recent interest, dormant", "freshness_never_adopted_suite_dormant_no_interest", false},
-	{"freshness: no baseline anchor hash, skipping", "freshness_no_baseline_anchor_hash", false},
-	{"freshness: persist failure bump after a panic failed", "freshness_persist_failure_bump_after_panic_failed", true},
-	{"freshness: read suite row after a panic failed", "freshness_read_suite_row_after_panic_failed", true},
-	{"freshness: refused suite paced until its retry", "freshness_refused_suite_paced", false},
-	{"freshness: repair deferred, no adoption slot", "freshness_repair_deferred_no_adoption_slot", false},
-	{"legacy trust audit: cached anchor skipped", "legacy_trust_audit_cached_anchor_skipped", false},
-	{"shutdown wait panicked", "shutdown_wait_panicked", true},
-	{"snapshot adopted_at lookup failed", "snapshot_adopted_at_lookup_failed", true},
-	{"suite cached anchor read failed", "suite_cached_anchor_read_failed", true},
-	{"suite file head read failed", "suite_file_head_read_failed", true},
-	{"suite reaper: suite busy, retried next run", "suite_reaper_suite_busy", true},
-	{"suite signed-seen backstop read failed", "suite_signed_seen_backstop_read_failed", true},
-	{"suite touch failed", "suite_touch_failed", false},
+	{"adoption: read prior snapshot failed", "adoption_read_prior_snapshot_failed"},
+	{"adoption.require_signature = false: an empty keyring is allowed at startup; plain-text or malformed InRelease files are never adopted as signed metadata, and with an empty keyring signed suites cannot adopt until keys are installed or adoption.accept_any_signer is set", "adoption_require_signature_disabled"},
+	{"displaced snapshot lookup failed", "displaced_snapshot_lookup_failed"},
+	{"freshness: anchorless index failed its sniff, kept", "freshness_anchorless_index_sniff_failed_kept"},
+	{"freshness: check cancelled", "freshness_check_cancelled"},
+	{"freshness: check ended by shutdown", "freshness_check_ended_by_shutdown"},
+	{"freshness: clamp adoption retry failed", "freshness_clamp_adoption_retry_failed"},
+	{"freshness: clear adoption failure failed", "freshness_clear_adoption_failure_failed"},
+	{"freshness: deferred never-adopted suite paced until its retry or the next refresh check", "freshness_deferred_never_adopted_suite_paced_until_retry"},
+	{"freshness: never-adopted suite without a client-created anchor or flat index row, dormant", "freshness_never_adopted_suite_dormant_no_client_created_row"},
+	{"freshness: never-adopted suite without recent interest, dormant", "freshness_never_adopted_suite_dormant_no_recent_interest"},
+	{"freshness: no baseline anchor hash, skipping", "freshness_check_skipped_no_baseline_anchor_hash"},
+	{"freshness: persist failure bump after a panic failed", "freshness_persist_failure_bump_after_panic_failed"},
+	{"freshness: read suite row after a panic failed", "freshness_read_suite_row_after_panic_failed"},
+	{"freshness: refused suite paced until its retry", "freshness_refused_suite_paced_until_retry"},
+	{"freshness: repair deferred, no adoption slot", "freshness_repair_deferred_no_adoption_slot"},
+	{"legacy trust audit: cached anchor skipped", "legacy_trust_audit_cached_anchor_skipped"},
+	{"shutdown wait panicked", "shutdown_wait_panicked"},
+	{"snapshot adopted_at lookup failed", "snapshot_adopted_at_lookup_failed"},
+	{"suite cached anchor read failed", "suite_cached_anchor_read_failed"},
+	{"suite file head read failed", "suite_file_head_read_failed"},
+	{"suite reaper: suite busy, retried next run", "suite_reaper_suite_busy"},
+	{"suite signed-seen backstop read failed", "suite_signed_seen_backstop_read_failed"},
+	{"suite touch failed", "suite_touch_failed"},
 }
 
 // mainProseMessages are the prose messages main already logs. They are
@@ -1460,7 +1592,8 @@ type goFile struct {
 
 var guardFset = token.NewFileSet()
 
-// parseTree parses every Go file under internal/ and cmd/ but this one.
+// parseTree parses every Go file under internal/ and cmd/ but this
+// package's guard tests.
 func parseTree(t *testing.T) []goFile {
 	t.Helper()
 	root := filepath.Join("..", "..")
@@ -1492,53 +1625,15 @@ func parseTree(t *testing.T) []goFile {
 	return files
 }
 
-// Rulings R-H3 and R-H6 (phase H1): the 43 messages are snake_case. No Go
-// file under internal/ or cmd/ — tests included — carries an old prose
-// message; each new name is a string literal of production code (the
-// reaper's step names are constants, so a literal, not only a call
-// argument, counts); and docs/log-fields.md documents each documented one.
-func TestSweptEventNames(t *testing.T) {
-	literals := map[string]bool{}
-	for _, f := range parseTree(t) {
-		for _, e := range sweptEvents {
-			if strings.Contains(f.src, e.old) {
-				t.Errorf("%s still says %q", f.rel, e.old)
-			}
-		}
-		if strings.HasSuffix(f.rel, "_test.go") {
-			continue
-		}
-		ast.Inspect(f.file, func(n ast.Node) bool {
-			if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING {
-				if s, err := strconv.Unquote(lit.Value); err == nil {
-					literals[s] = true
-				}
-			}
-			return true
-		})
-	}
-	doc, err := os.ReadFile(filepath.Join("..", "..", "docs", "log-fields.md"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, e := range sweptEvents {
-		if !literals[e.event] {
-			t.Errorf("no production code emits %s (was %q)", e.event, e.old)
-		}
-		if e.documented && !strings.Contains(string(doc), "`"+e.event+"`") {
-			t.Errorf("docs/log-fields.md does not document %s", e.event)
-		}
-	}
-}
-
-// Ruling R-H6 (phase H1): every log message of production code is a
-// snake_case event or one of main's prose messages, so a new prose message
-// fails the build. A message is a string literal or a constant of its
-// package; one that is not must be a forwarding helper's parameter (the
-// helper is in logSinks, so its callers are checked) or be listed in
-// fieldMessages. Each allowlisted prose message must still be logged, so
-// the list never outlives a rename.
-func TestLogMessagesAreSnakeCase(t *testing.T) {
+// logMessages returns every log message of production code (internal/
+// and cmd/, test files aside) with the first place it is logged: the
+// message argument of each logSinks call, when it is a string literal or
+// a string constant of its package; the constants fieldMessages lists for
+// a field. Any other message argument is reported (t.Errorf) unless it is
+// a parameter of a forwarding helper logSinks lists, whose own callers
+// are checked.
+func logMessages(t *testing.T) map[string]string {
+	t.Helper()
 	files := parseTree(t)
 	consts := map[string]map[string]string{} // package directory -> name -> value
 	for _, f := range files {
@@ -1569,15 +1664,10 @@ func TestLogMessagesAreSnakeCase(t *testing.T) {
 			}
 		}
 	}
-	allowed := map[string]bool{}
-	for _, m := range mainProseMessages {
-		allowed[m] = true
-	}
-	logged := map[string]bool{}
-	check := func(where, msg string) {
-		logged[msg] = true
-		if !snakeCase.MatchString(msg) && !allowed[msg] {
-			t.Errorf("%s: log message %q is not snake_case (and not one of main's prose messages)", where, msg)
+	msgs := map[string]string{}
+	add := func(where, msg string) {
+		if _, ok := msgs[msg]; !ok {
+			msgs[msg] = where
 		}
 	}
 	for _, f := range files {
@@ -1618,12 +1708,12 @@ func TestLogMessagesAreSnakeCase(t *testing.T) {
 			case *ast.BasicLit:
 				if a.Kind == token.STRING {
 					s, _ := strconv.Unquote(a.Value)
-					check(where, s)
+					add(where, s)
 					return true
 				}
 			case *ast.Ident:
 				if v, ok := consts[dir][a.Name]; ok {
-					check(where, v)
+					add(where, v)
 					return true
 				}
 				if forwardsParam(stack, a.Name) {
@@ -1633,7 +1723,9 @@ func TestLogMessagesAreSnakeCase(t *testing.T) {
 			key := f.rel + " " + types.ExprString(arg)
 			names, ok := fieldMessages[key]
 			if !ok {
-				t.Errorf("%s: log message %s is neither a literal, a constant nor a listed forwarding helper's parameter", where, types.ExprString(arg))
+				t.Errorf("%s: log message %s is neither a literal, a constant nor a listed forwarding helper's parameter; "+
+					"add the helper to logSinks (or the expression to fieldMessages) in internal/observability/event_names_test.go",
+					where, types.ExprString(arg))
 				return true
 			}
 			for _, c := range names {
@@ -1642,13 +1734,93 @@ func TestLogMessagesAreSnakeCase(t *testing.T) {
 					t.Errorf("%s: constant %s of fieldMessages[%q] not found", where, c, key)
 					continue
 				}
-				check(where+" ("+c+")", v)
+				add(where+" ("+c+")", v)
 			}
 			return true
 		})
 	}
+	return msgs
+}
+
+// Rulings R-H3 and R-H6 (phase H1): the 43 messages are snake_case. No Go
+// file under internal/ or cmd/ — tests included — carries an old prose
+// message; each new name is a string literal of production code (the
+// reaper's step names are constants, so a literal, not only a call
+// argument, counts); and docs/log-fields.md gives each one a row.
+func TestSweptEventNames(t *testing.T) {
+	literals := map[string]bool{}
+	for _, f := range parseTree(t) {
+		for _, e := range sweptEvents {
+			if strings.Contains(f.src, e.old) {
+				t.Errorf("%s still says %q", f.rel, e.old)
+			}
+		}
+		if strings.HasSuffix(f.rel, "_test.go") {
+			continue
+		}
+		ast.Inspect(f.file, func(n ast.Node) bool {
+			if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+				if s, err := strconv.Unquote(lit.Value); err == nil {
+					literals[s] = true
+				}
+			}
+			return true
+		})
+	}
+	documented := documentedEvents(t)
+	for _, e := range sweptEvents {
+		if !literals[e.event] {
+			t.Errorf("no production code emits %s (was %q)", e.event, e.old)
+		}
+		if !documented[e.event] {
+			t.Errorf("docs/log-fields.md has no row for %s", e.event)
+		}
+	}
+}
+
+// documentedEvents returns the names docs/log-fields.md gives a row: each
+// backquoted name in the first cell of a table row (one row may name
+// several events, as the suite reaper's failures share one). A mention
+// elsewhere — in another row's meaning, say — is no row.
+func documentedEvents(t *testing.T) map[string]bool {
+	t.Helper()
+	doc, err := os.ReadFile(filepath.Join("..", "..", "docs", "log-fields.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]bool{}
+	for _, line := range strings.Split(string(doc), "\n") {
+		cells := strings.SplitN(line, "|", 3)
+		if !strings.HasPrefix(line, "| ") || len(cells) < 3 {
+			continue
+		}
+		parts := strings.Split(cells[1], "`")
+		for i := 1; i < len(parts); i += 2 {
+			out[parts[i]] = true
+		}
+	}
+	return out
+}
+
+// Ruling R-H6 (phase H1): every log message of production code is a
+// snake_case event or one of main's prose messages, so a new prose message
+// fails the build (logMessages says which messages it can read). Each
+// allowlisted prose message must still be logged, so the list never
+// outlives a rename.
+func TestLogMessagesAreSnakeCase(t *testing.T) {
+	allowed := map[string]bool{}
 	for _, m := range mainProseMessages {
-		if !logged[m] {
+		allowed[m] = true
+	}
+	msgs := logMessages(t)
+	for msg, where := range msgs {
+		if !snakeCase.MatchString(msg) && !allowed[msg] {
+			t.Errorf("%s: log message %q is not snake_case (and not one of main's prose messages); "+
+				"use a snake_case event name and document it in docs/log-fields.md", where, msg)
+		}
+	}
+	for _, m := range mainProseMessages {
+		if _, ok := msgs[m]; !ok {
 			t.Errorf("main's prose message %q is no longer logged: remove it from mainProseMessages", m)
 		}
 	}
@@ -1701,11 +1873,11 @@ func hasSink(name string) bool {
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `go test -count=1 -run 'TestSweptEventNames|TestLogMessagesAreSnakeCase' ./internal/observability/`
-Expected: FAIL with 197 error lines:
-- 73 `event_names_test.go:235: <file> still says "<prose>"`, one per file and old message; the first is `internal/admin/forget_test.go still says "admin: forget failed"`;
-- 43 `event_names_test.go:256: no production code emits <event> (was "<prose>")`;
-- 32 `event_names_test.go:259: docs/log-fields.md does not document <event>`: R-H3's 19, the 12 of R-H6's that `docs/log-fields.md` documents under their prose names, and `adoption_require_signature_disabled`;
-- 49 `event_names_test.go:310: <file>:<line>: log message "<prose>" is not snake_case (and not one of main's prose messages)`, one per call site of the 43 (`freshness: check cancelled` has five; the reaper's three step constants are reported at their one `h.step` site); the first is `internal/admin/handlers.go:683: log message "admin: forget failed" …`.
+Expected: FAIL with 202 error lines:
+- 73 `event_names_test.go:348: <file> still says "<prose>"`, one per file and old message; the first is `internal/admin/forget_test.go still says "admin: forget failed"`;
+- 43 `event_names_test.go:366: no production code emits <event> (was "<prose>")`;
+- 43 `event_names_test.go:369: docs/log-fields.md has no row for <event>`;
+- 43 `event_names_test.go:411: <file>:<line>: log message "<prose>" is not snake_case (and not one of main's prose messages); use a snake_case event name and document it in docs/log-fields.md`, one per message at the first place it is logged (in no fixed order: the messages come from a map; the reaper's three step constants are reported at their one `h.step` site, as `reaper.go:524 (stepReap)`).
 
 No other line: at this commit every non-literal message is a listed helper's parameter or `h.step`, and each of `main`'s 78 is still logged.
 
@@ -1742,18 +1914,18 @@ pairs=(
   'adoption: read prior snapshot failed|adoption_read_prior_snapshot_failed'
   'adoption.require_signature = false: an empty keyring is allowed at startup; plain-text or malformed InRelease files are never adopted as signed metadata, and with an empty keyring signed suites cannot adopt until keys are installed or adoption.accept_any_signer is set|adoption_require_signature_disabled'
   'displaced snapshot lookup failed|displaced_snapshot_lookup_failed'
-  'freshness: anchorless index failed its sniff, kept|freshness_anchorless_index_sniff_failed'
+  'freshness: anchorless index failed its sniff, kept|freshness_anchorless_index_sniff_failed_kept'
   'freshness: check cancelled|freshness_check_cancelled'
   'freshness: check ended by shutdown|freshness_check_ended_by_shutdown'
   'freshness: clamp adoption retry failed|freshness_clamp_adoption_retry_failed'
   'freshness: clear adoption failure failed|freshness_clear_adoption_failure_failed'
-  'freshness: deferred never-adopted suite paced until its retry or the next refresh check|freshness_deferred_never_adopted_suite_paced'
-  'freshness: never-adopted suite without a client-created anchor or flat index row, dormant|freshness_never_adopted_suite_dormant_no_client_row'
-  'freshness: never-adopted suite without recent interest, dormant|freshness_never_adopted_suite_dormant_no_interest'
-  'freshness: no baseline anchor hash, skipping|freshness_no_baseline_anchor_hash'
+  'freshness: deferred never-adopted suite paced until its retry or the next refresh check|freshness_deferred_never_adopted_suite_paced_until_retry'
+  'freshness: never-adopted suite without a client-created anchor or flat index row, dormant|freshness_never_adopted_suite_dormant_no_client_created_row'
+  'freshness: never-adopted suite without recent interest, dormant|freshness_never_adopted_suite_dormant_no_recent_interest'
+  'freshness: no baseline anchor hash, skipping|freshness_check_skipped_no_baseline_anchor_hash'
   'freshness: persist failure bump after a panic failed|freshness_persist_failure_bump_after_panic_failed'
   'freshness: read suite row after a panic failed|freshness_read_suite_row_after_panic_failed'
-  'freshness: refused suite paced until its retry|freshness_refused_suite_paced'
+  'freshness: refused suite paced until its retry|freshness_refused_suite_paced_until_retry'
   'freshness: repair deferred, no adoption slot|freshness_repair_deferred_no_adoption_slot'
   'legacy trust audit: cached anchor skipped|legacy_trust_audit_cached_anchor_skipped'
   'shutdown wait panicked|shutdown_wait_panicked'
@@ -1773,7 +1945,7 @@ for p in "${pairs[@]}"; do
 done
 ```
 
-Then five quotes the script cannot match, because they quote part of a message or split it across lines (the replay's race run caught the first), and the new row:
+Then four quotes the script cannot match, because they quote part of a message or split it across lines (the replay's race run caught the first), and two new rows:
 
 `internal/freshness/anchorless_test.go` (`TestCheck_AnchorlessAnswersByStatus`, which counts the over-cap line by a fragment):
 
@@ -1820,6 +1992,12 @@ new:
 | `adoption_require_signature_disabled` | WARN | none | Logged at start when `adoption.require_signature = false`: an empty keyring is allowed at startup. Plain-text or malformed `InRelease` files are never adopted as signed metadata either way, and with an empty keyring signed suites cannot adopt until keys are installed or `adoption.accept_any_signer` is set. |
 ```
 
+and after the row of `freshness_read_current_snapshot_failed`, the 11 renamed DEBUG lines' shared row (review sweep M-6):
+
+```
+| `freshness_check_cancelled`, `freshness_check_ended_by_shutdown`, `freshness_check_skipped_no_baseline_anchor_hash`, `freshness_refused_suite_paced_until_retry`, `freshness_deferred_never_adopted_suite_paced_until_retry`, `freshness_never_adopted_suite_dormant_no_recent_interest`, `freshness_never_adopted_suite_dormant_no_client_created_row`, `freshness_anchorless_index_sniff_failed_kept`, `freshness_repair_deferred_no_adoption_slot`, `legacy_trust_audit_cached_anchor_skipped`, `suite_touch_failed` | DEBUG | `canonical_host`; `suite_path`, except for the sniff and the cached anchor, which name their file as `path`; `step` and `err` (`freshness_check_ended_by_shutdown`); `anchor` (`freshness_check_skipped_no_baseline_anchor_hash`); `reason` (the two `…_paced_until_retry`); `err` (`legacy_trust_audit_cached_anchor_skipped`, `suite_touch_failed`) | Routine outcomes, each named by what its message said before phase H1: `freshness_check_cancelled` — a check's request was cancelled (its context ended, as at shutdown), so it wrote nothing; `freshness_check_ended_by_shutdown` — a shutdown ended the check's local `step`: nothing written, not a failed check; `freshness_check_skipped_no_baseline_anchor_hash` — the suite has no cached hash of its `anchor` to compare with, so the check is skipped; `freshness_refused_suite_paced_until_retry` — an adopted suite its record paces (`reason`) is not probed before the record's retry time; `freshness_deferred_never_adopted_suite_paced_until_retry` — a never-adopted suite whose attempt was deferred is not probed until its record's retry or its next refresh check; `freshness_never_adopted_suite_dormant_no_recent_interest` — a never-adopted suite no client asked for in 7 days is dormant; `freshness_never_adopted_suite_dormant_no_client_created_row` — a never-adopted suite without a client-created anchor or flat index row is dormant; `freshness_anchorless_index_sniff_failed_kept` — an anchorless refresh's 200 for the index at `path` failed its sniff, so the cached row is kept (`acu_anchorless_sniff_rejected_total{host}`); `freshness_repair_deferred_no_adoption_slot` — a repair found no adoption slot and waits for a later unchanged check (`acu_repair_deferred_total{host}`); `legacy_trust_audit_cached_anchor_skipped` — the startup marker pass could not read the cached anchor at `path` and went on without it; `suite_touch_failed` — a suite's client-interest stamp could not be written; a later serve writes it. |
+```
+
 Then: `gofmt -l internal cmd` must list only the five drift files (the renames change string values, never an alignment). Read the `docs/log-fields.md` diff: the nine `suite_reaper_*` failure events share their row as the prose names did, and each other renamed event keeps its row. `grep -rnE 'over its size cap|served anchor read failed|signed-anchor re-mark|repair deferred, no adoption|backstop read failed|suite busy, retried' internal cmd docs/log-fields.md docs/configuration.md` must find nothing but `event_names_test.go`'s table and `anchorless.go:73`'s "The cached signed-anchor re-mark runs first" (prose about the step, not its event; the other fragments that remain — `forget failed\n`, `delete anchorless rows:` — are an HTTP body and an error prefix, not events; `touch failed` is `main`'s own message).
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -1834,14 +2012,16 @@ Expected: all `ok` (the tests that matched a prose name now match its event).
 
 | Mutant | Fails |
 |---|---|
-| `stepReap = "suite reaper: reap failed"` restored in `reaper.go` | `event_names_test.go:235: internal/freshness/reaper.go still says "suite reaper: reap failed"`, `event_names_test.go:256: no production code emits suite_reaper_reap_failed (was "suite reaper: reap failed")` and `event_names_test.go:310: internal/freshness/reaper.go:524 (stepReap): log message "suite reaper: reap failed" is not snake_case …` (the reaper's own tests assert only that no such line is logged) |
+| `stepReap = "suite reaper: reap failed"` restored in `reaper.go` | `event_names_test.go:348: internal/freshness/reaper.go still says "suite reaper: reap failed"`, `event_names_test.go:366: no production code emits suite_reaper_reap_failed (was "suite reaper: reap failed")` and `event_names_test.go:411: internal/freshness/reaper.go:524 (stepReap): log message "suite reaper: reap failed" is not snake_case …` (the reaper's own tests assert only that no such line is logged) |
 | `admin_forget_failed` misspelt `admin_forget_fail` in the WARN call of `handlers.go` | `forget_test.go:289: admin_forget_failed lines []; want one at WARN with the error` (the DEBUG call still emits the name, and the misspelling is snake_case, so the guards pass: the per-call tests own each call) |
-| The `docs/log-fields.md` row of `suite_reaper_marker_sweep_failed` reverted | `event_names_test.go:259: docs/log-fields.md does not document suite_reaper_marker_sweep_failed` |
-| A new prose message: `gc_run_complete` logged as `gc run complete` by the startup pass in `internal/gc/gc.go` | `event_names_test.go:310: internal/gc/gc.go:289: log message "gc run complete" is not snake_case (and not one of main's prose messages)` |
-| A message in a variable: `msg := "suite_touch_failed"; h.logger.Debug(msg, …)` in `suite_rows.go` | `event_names_test.go:366: internal/handler/suite_rows.go:538: log message msg is neither a literal, a constant nor a listed forwarding helper's parameter` |
-| `main`'s `touch failed` renamed `touch_failed` in `suite_rows.go` | `event_names_test.go:382: main's prose message "touch failed" is no longer logged: remove it from mainProseMessages` |
-| `"touch failed"` dropped from `mainProseMessages` (the test file: its lines shift up by one) | `event_names_test.go:309: internal/handler/suite_rows.go:532: log message "touch failed" is not snake_case (and not one of main's prose messages)` |
-| `logGoroutinePanic` dropped from `logSinks` (as above) | `event_names_test.go:365: internal/handler/handler.go:1404: log message event is neither a literal, a constant nor a listed forwarding helper's parameter` |
+| `suite_reaper_marker_sweep_failed` reverted to its prose in its `docs/log-fields.md` row | `event_names_test.go:369: docs/log-fields.md has no row for suite_reaper_marker_sweep_failed` |
+| `freshness_check_cancelled` reverted to its prose in the shared DEBUG row's first cell (its meaning still names it) | `event_names_test.go:369: docs/log-fields.md has no row for freshness_check_cancelled` |
+| The shared DEBUG row removed | eleven `event_names_test.go:369: docs/log-fields.md has no row for …` lines, one per event of the row |
+| A new prose message: `gc_run_complete` logged as `gc run complete` by the startup pass in `internal/gc/gc.go` | `event_names_test.go:411: internal/gc/gc.go:289: log message "gc run complete" is not snake_case (and not one of main's prose messages); use a snake_case event name and document it in docs/log-fields.md` |
+| A message in a variable: `msg := "suite_touch_failed"; h.logger.Debug(msg, …)` in `suite_rows.go` | `event_names_test.go:319: internal/handler/suite_rows.go:538: log message msg is neither a literal, a constant nor a listed forwarding helper's parameter; add the helper to logSinks (or the expression to fieldMessages) in internal/observability/event_names_test.go` |
+| `main`'s `touch failed` renamed `touch_failed` in `suite_rows.go` | `event_names_test.go:417: main's prose message "touch failed" is no longer logged: remove it from mainProseMessages` |
+| `"touch failed"` dropped from `mainProseMessages` (the test file: its lines shift up by one) | `event_names_test.go:410: internal/handler/suite_rows.go:532: log message "touch failed" is not snake_case (and not one of main's prose messages); …` |
+| `logGoroutinePanic` dropped from `logSinks` (as above) | `event_names_test.go:318: internal/handler/handler.go:1404: log message event is neither a literal, a constant nor a listed forwarding helper's parameter; …` |
 
 - [ ] **Step 6: Commit**
 
@@ -1857,10 +2037,11 @@ and 24 more: freshness: check cancelled, suite touch failed, ...) become
 snake_case events in the style of the existing ones, each keeping its
 level and fields, in the code, the tests, the comments, docs/log-fields.md
 and docs/configuration.md (rulings R-H3 and R-H6). They are unreleased.
-One guard test pins that no old name is left, that production code emits
-each new one and that log-fields documents it; another fails any log
-message that is not snake_case, the 78 prose messages main already logs
-excepted.
+The 11 DEBUG lines log-fields never documented share one row, each with
+the meaning its prose carried, and six are named to keep it. One guard
+test pins that no old name is left, that production code emits each new
+one and that log-fields gives it a row; another fails any log message that
+is not snake_case, the 78 prose messages main already logs excepted.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -1869,7 +2050,7 @@ EOF
 
 ### Task 4: The status page and JSON: `retired_reaped`, the anchorless refresh, failing checks, last requested, the adoption scheme (carry-forwards; B-60, B-63, D-50, F-14, F-19)
 
-Two overview carry-forwards and five deferred items, all on the admin status page: the F carry-forward (`gc.LastRunSummary.RetiredReaped` is not copied into the gc block: `gcInfoFromSummary` copies it), the G carry-forward (the anchorless refresh visible: `suites[].anchorless`, design note 5), B-63 (failing checks say so and when the next scheduled check comes, design note 6), F-14 (a *Last requested* column), F-19 (`scheme://host` in Recent adoption outcomes, through `AdoptionEvent.Scheme`), D-50 (the Suites empty state in the admin-ui-spec's words) and B-60 (a fixture that contradicted its name). Every JSON change is additive to the locked contract (`TestJSONContractPreserved`'s golden gains three fields). `docs/admin-ui-spec.md` follows in Task 18.
+Two overview carry-forwards and five deferred items, all on the admin status page: the F carry-forward (`gc.LastRunSummary.RetiredReaped` is not copied into the gc block: `gcInfoFromSummary` copies it), the G carry-forward (the anchorless refresh visible: `suites[].anchorless`, design note 5), B-63 (failing checks say so and when their backoff ends, the count alone for a suite the backoff does not schedule; design note 6), F-14 (a *Last requested* column), F-19 (`scheme://host` in Recent adoption outcomes, through `AdoptionEvent.Scheme`), D-50 (the Suites empty state in the admin-ui-spec's words) and B-60 (a fixture that contradicted its name). Every JSON change is additive to the locked contract (`TestJSONContractPreserved`'s golden gains three fields). `docs/admin-ui-spec.md` follows in Task 18.
 
 **Files:**
 - Create: `internal/admin/status_annotations_test.go`, `internal/freshness/adoption_ring_test.go`
@@ -1938,28 +2119,37 @@ func TestSuiteEntries_Anchorless(t *testing.T) {
 	}
 }
 
-// Deferred minor B-63 (design note 6): a suite whose checks keep ending
-// unknown says so, and when the scheduler checks it next — after its
-// backoff from the last check, "now" once that is past — and without a
-// backoff function only the count. A record's own text is kept apart.
-func TestSuiteEntries_FailingChecksSayWhenTheNextCheckComes(t *testing.T) {
+// Deferred minor B-63 (design note 6; reviews M-3 and M-5): a suite whose
+// checks keep ending unknown says so, and when its backoff from the last
+// check ends — "backoff over" once it has — and without a backoff
+// function only the count. A suite the scheduler does not queue on that
+// backoff shows the count alone: a never-adopted suite no client asked
+// for in 7 days, an adopted one its anchor_absent record paces. A
+// record's own text is kept apart.
+func TestSuiteEntries_FailingChecksSayWhenTheBackoffEnds(t *testing.T) {
 	now := int64(1_800_000_000)
 	backoff := func(k int64) time.Duration { return time.Duration(k) * time.Minute }
-	recent, old := now-60, now-600
-	reason := "gpg_failed"
+	recent, old, stale := now-60, now-600, now-8*24*3600
+	reason, absent := "gpg_failed", "anchor_absent"
+	snap := int64(7)
 	es := []suiteEntry{
-		{SuitePath: "/a", CheckFailCount: 3, LastCheckUnixTime: &recent},
-		{SuitePath: "/b", CheckFailCount: 2, LastCheckUnixTime: &old},
-		{SuitePath: "/c", CheckFailCount: 0, LastCheckUnixTime: &recent},
-		{SuitePath: "/d", CheckFailCount: 1, LastCheckUnixTime: &recent, AdoptionStatus: "adoption failing 1m · gpg_failed · retry due",
-			AdoptionFailReason: &reason, AdoptionFailCount: 1},
+		{SuitePath: "/a", CheckFailCount: 3, LastCheckUnixTime: &recent, LastRequestedUnixTime: &recent},
+		{SuitePath: "/b", CheckFailCount: 2, LastCheckUnixTime: &old, CurrentSnapshotID: &snap},
+		{SuitePath: "/c", CheckFailCount: 0, LastCheckUnixTime: &recent, LastRequestedUnixTime: &recent},
+		{SuitePath: "/d", CheckFailCount: 1, LastCheckUnixTime: &recent, LastRequestedUnixTime: &recent,
+			AdoptionStatus: "adoption failing 1m · gpg_failed · retry due", AdoptionFailReason: &reason, AdoptionFailCount: 1},
+		{SuitePath: "/dormant", CheckFailCount: 2, LastCheckUnixTime: &old, LastRequestedUnixTime: &stale},
+		{SuitePath: "/paced", CheckFailCount: 1, LastCheckUnixTime: &old, CurrentSnapshotID: &snap,
+			AdoptionFailReason: &absent, AdoptionFailCount: 2},
 	}
 	annotateSuiteEntries(es, true, backoff, now)
 	for i, want := range []string{
-		"checks failing ×3 · next scheduled check in 2m",
-		"checks failing ×2 · next scheduled check now",
+		"checks failing ×3 · backoff ends in 2m",
+		"checks failing ×2 · backoff over",
 		"",
-		"checks failing ×1 · next scheduled check now",
+		"checks failing ×1 · backoff over",
+		"checks failing ×2",
+		"checks failing ×1",
 	} {
 		if es[i].CheckStatus != want {
 			t.Errorf("%s: %q, want %q", es[i].SuitePath, es[i].CheckStatus, want)
@@ -1968,10 +2158,15 @@ func TestSuiteEntries_FailingChecksSayWhenTheNextCheckComes(t *testing.T) {
 	if es[3].AdoptionStatus != "adoption failing 1m · gpg_failed · retry due" {
 		t.Fatalf("the record's text became %q", es[3].AdoptionStatus)
 	}
-	nb := []suiteEntry{{SuitePath: "/e", CheckFailCount: 4, LastCheckUnixTime: &recent}}
+	nb := []suiteEntry{{SuitePath: "/e", CheckFailCount: 4, LastCheckUnixTime: &recent, LastRequestedUnixTime: &recent}}
 	annotateSuiteEntries(nb, true, nil, now)
 	if nb[0].CheckStatus != "checks failing ×4" {
 		t.Fatalf("without a backoff: %q, want the count alone", nb[0].CheckStatus)
+	}
+	off := []suiteEntry{{SuitePath: "/off", CheckFailCount: 2, LastCheckUnixTime: &old, LastRequestedUnixTime: &stale}}
+	annotateSuiteEntries(off, false, backoff, now)
+	if off[0].CheckStatus != "checks failing ×2 · backoff over" {
+		t.Fatalf("adoption disabled: %q, want the backoff (no dormancy without an adopter)", off[0].CheckStatus)
 	}
 }
 
@@ -2013,7 +2208,7 @@ func TestStatusHTML_ShowsTheSweepsCells(t *testing.T) {
 		{Scheme: "https", Host: "fury.example", SuitePath: "/org/deb", Flat: true, Anchorless: true,
 			AdoptionStatus: "refreshed without a Release", LastRequestedUnixTime: &requested},
 		{Scheme: "http", Host: "h", SuitePath: "/r/dists/x", AdoptionStatus: "refused: upstream_older · retry due",
-			CheckStatus: "checks failing ×3 · next scheduled check in 2m"},
+			CheckStatus: "checks failing ×3 · backoff ends in 2m"},
 	}
 	m.RecentAdoptions = []adoptionEntry{{Scheme: "http", Host: "archive.ubuntu.com", SuitePath: "dists/noble", Outcome: "success"}}
 	m.GC.RetiredReaped = 6
@@ -2022,7 +2217,7 @@ func TestStatusHTML_ShowsTheSweepsCells(t *testing.T) {
 		"<th>Last requested",
 		`<td data-label="Last requested" class="time">`+string(formatUnixTimePtrTag(&requested))+`</td>`,
 		`<td data-label="Adoption" class="mono">refreshed without a Release</td>`,
-		`<td data-label="Adoption" class="mono">refused: upstream_older · retry due &middot; checks failing ×3 · next scheduled check in 2m</td>`,
+		`<td data-label="Adoption" class="mono">refused: upstream_older · retry due &middot; checks failing ×3 · backoff ends in 2m</td>`,
 		`<td data-label="Host" class="host">http://archive.ubuntu.com</td>`,
 		`<div class="k">Retired reaped</div>`,
 		`<div class="v"><code>6</code></div>`,
@@ -2127,8 +2322,8 @@ new:
 // CheckBackoff is the scheduler's backoff after a streak of failCount
 // checks that ended unknown (check_fail_count, spec C4/C11): no failing
 // suite is queued before last_check_at + CheckBackoff(failCount). The
-// admin status page shows when the next scheduled check comes (deferred
-// minor B-63) through admin.Config.CheckBackoff, which main sets to this.
+// admin status page shows when that backoff ends (deferred minor B-63)
+// through admin.Config.CheckBackoff, which main sets to this.
 func CheckBackoff(failCount int64) time.Duration { return backoffDelay(failCount) }
 ```
 
@@ -2139,8 +2334,8 @@ func CheckBackoff(failCount int64) time.Duration { return backoffDelay(failCount
 ```go
 	// CheckBackoff is OPTIONAL: the scheduler's backoff after a streak
 	// of failed checks (freshness.CheckBackoff, which cmd wires), for the
-	// suites table's "checks failing ×k · next scheduled check in …"
-	// (deferred minor B-63). nil: the text has no "next" part. A
+	// suites table's "checks failing ×k · backoff ends in …" (deferred
+	// minor B-63). nil: the text is the count alone. A
 	// function, not an import: admin does not import internal/freshness.
 	CheckBackoff func(failCount int64) time.Duration
 ```
@@ -2159,8 +2354,8 @@ func CheckBackoff(failCount int64) time.Duration { return backoffDelay(failCount
 and after `AdoptionStatus  string \`json:"-"\``:
 
 ```go
-	// CheckStatus is "checks failing ×k · next scheduled check in …" for
-	// a suite whose checks keep ending unknown (deferred minor B-63);
+	// CheckStatus is "checks failing ×k · backoff ends in …" for a suite
+	// whose checks keep ending unknown (deferred minor B-63);
 	// annotateSuiteEntries sets it, and the Adoption cell shows it after
 	// AdoptionStatus.
 	CheckStatus string `json:"-"`
@@ -2257,9 +2452,12 @@ Before `laggingAnnotation`, add:
 // annotateSuiteEntries derives what the suites table shows beyond the
 // rows' own fields: Anchorless (JSON and HTML: "refreshed without a
 // Release" in the Adoption cell) and CheckStatus (HTML: "checks failing
-// ×k · next scheduled check in d", or "… check now" once that time has
-// passed; without a backoff function, only "checks failing ×k").
-// adoptionEnabled is the status page's own signal (Server.adoptionEnabled).
+// ×k · backoff ends in d", or "… backoff over" once it has: the earliest
+// the scheduler may check the suite — a client's T1 may come sooner, a
+// not-yet-stale suite later; the count alone for a suite the scheduler
+// does not queue on its backoff (unscheduled) or without a backoff
+// function). adoptionEnabled is the status page's own signal
+// (Server.adoptionEnabled).
 //
 // AIDEV-NOTE: phase G ruling PG-14 (design note 5 of the H1 plan).
 // Anchorless is derived, not stored: adoption enabled, a flat suite, no
@@ -2270,8 +2468,12 @@ Before `laggingAnnotation`, add:
 // set (checkFirst), a refusal or failure writes a record, a commit sets
 // the current snapshot. With adoption disabled no anchorless check runs,
 // and the Phase-1 check bumps last_success_at for an InRelease too, so
-// the field is false there. If the freshness side changes any of these,
-// change the derivation (TestSuiteEntries_Anchorless).
+// the field is false there. One exception, for one check: a flat suite
+// whose row an adoption-disabled InRelease miss created has
+// last_success_at set (suiteSeed stamps it), so after adoption is
+// enabled the field reads true until the suite's first check (review M-11
+// of the H1 plan). If the freshness side changes any of these, change the
+// derivation (TestSuiteEntries_Anchorless).
 func annotateSuiteEntries(es []suiteEntry, adoptionEnabled bool, checkBackoff func(int64) time.Duration, now int64) {
 	for i := range es {
 		e := &es[i]
@@ -2284,15 +2486,48 @@ func annotateSuiteEntries(es []suiteEntry, adoptionEnabled bool, checkBackoff fu
 			continue
 		}
 		e.CheckStatus = "checks failing ×" + strconv.FormatInt(e.CheckFailCount, 10)
-		if checkBackoff != nil && e.LastCheckUnixTime != nil {
-			next := *e.LastCheckUnixTime + int64(checkBackoff(e.CheckFailCount)/time.Second)
-			if next > now {
-				e.CheckStatus += " · next scheduled check in " + durationOf(next-now)
-			} else {
-				e.CheckStatus += " · next scheduled check now"
-			}
+		if checkBackoff == nil || e.LastCheckUnixTime == nil || unscheduled(e, adoptionEnabled, now) {
+			continue
+		}
+		next := *e.LastCheckUnixTime + int64(checkBackoff(e.CheckFailCount)/time.Second)
+		if next > now {
+			e.CheckStatus += " · backoff ends in " + durationOf(next-now)
+		} else {
+			e.CheckStatus += " · backoff over"
 		}
 	}
+}
+
+// statusInterestWindow mirrors freshness's interestWindow (spec C4
+// Dispatch 3), which admin does not import.
+//
+// AIDEV-NOTE: unscheduled mirrors the scheduler's suiteDue (review M-5 of
+// the H1 plan): change both together.
+const statusInterestWindow = 7 * 24 * time.Hour
+
+// unscheduled reports a suite the scheduler does not queue on its failing
+// checks' backoff: with adoption enabled, a never-adopted suite no client
+// asked for within the interest window (dormant), and an adopted suite
+// its anchor_absent or unsigned_disabled record paces (rulings PE-2,
+// PE-12; the record's own text shows its retry). The Adoption cell then
+// shows the failing count alone: "backoff over" would promise a check that
+// never comes.
+func unscheduled(e *suiteEntry, adoptionEnabled bool, now int64) bool {
+	if !adoptionEnabled {
+		return false
+	}
+	if e.CurrentSnapshotID == nil {
+		if e.LastRequestedUnixTime == nil {
+			return true
+		}
+		d := now - *e.LastRequestedUnixTime
+		if d < 0 {
+			d = -d // a stamp in the future counts as interest within the window, as interested reads it
+		}
+		return d >= int64(statusInterestWindow/time.Second)
+	}
+	return e.AdoptionFailCount > 0 && e.AdoptionFailReason != nil &&
+		(*e.AdoptionFailReason == cache.ReasonAnchorAbsent || *e.AdoptionFailReason == cache.ReasonUnsignedDisabled)
 }
 
 // adoptionEnabled is the status page's signal that adoption is on: a
@@ -2458,10 +2693,13 @@ Expected: all `ok`.
 |---|---|
 | Drop `&& e.InReleaseChangeSeenAtUnixTime == nil` from the derivation | `status_annotations_test.go:46: anchorless true, want false` (subtest `a first adoption under way`) |
 | `e.Anchorless = e.Flat && …` (adoption enabled ignored) | `status_annotations_test.go:46: anchorless true, want false` (subtest `adoption disabled`) |
-| `next := now + int64(…)` (the last check ignored) | `status_annotations_test.go:79: /a: "checks failing ×3 · next scheduled check in 3m", want "… in 2m"` (and `/b`, `/d`) |
-| `RetiredReaped: summary.RetiredReaped,` dropped from `gcInfoFromSummary` | `status_annotations_test.go:106: gc block {… RetiredReaped:0 …}, want {… RetiredReaped:6 …}` |
+| `next := now + int64(…)` (the last check ignored) | `status_annotations_test.go:88: /a: "checks failing ×3 · backoff ends in 3m", want "checks failing ×3 · backoff ends in 2m"` (and `/b`, `/d`, and `:102` for adoption disabled) |
+| `unscheduled` ignores a dormant suite (its never-adopted branch returns false; reviews M-3, sweep M-5) | `status_annotations_test.go:88: /dormant: "checks failing ×2 · backoff over", want "checks failing ×2"` |
+| `unscheduled` ignores a record that paces (`return false && …`) | `status_annotations_test.go:88: /paced: "checks failing ×1 · backoff over", want "checks failing ×1"` |
+| `unscheduled` without its `!adoptionEnabled` guard | `status_annotations_test.go:102: adoption disabled: "checks failing ×2", want the backoff (no dormancy without an adopter)` |
+| `RetiredReaped: summary.RetiredReaped,` dropped from `gcInfoFromSummary` | `status_annotations_test.go:120: gc block {… RetiredReaped:0 …}, want {… RetiredReaped:6 …}` |
 | `Scheme:` dropped from `recoverAdoption`'s `Record` | `adoption_ring_test.go:18: event {Scheme: … Outcome:panicked …}: scheme "", want http` |
-| The adoptions table's Host cell without the scheme | `status_annotations_test.go:135: rendered HTML missing "<td data-label=\"Host\" class=\"host\">http://archive.ubuntu.com</td>"` |
+| The adoptions table's Host cell without the scheme | `status_annotations_test.go:149: rendered HTML missing "<td data-label=\"Host\" class=\"host\">http://archive.ubuntu.com</td>"` |
 
 - [ ] **Step 9: Commit**
 
@@ -2474,8 +2712,10 @@ Status page: retired_reaped, the anchorless refresh, failing checks
 The gc block copies retired_reaped (the F carry-forward); suites[] gains
 the derived anchorless field and the Adoption cell says "refreshed
 without a Release" (the G carry-forward, ruling PG-14); a suite whose
-checks keep failing says so and when its next scheduled check comes
-(B-63, through admin.Config.CheckBackoff = freshness.CheckBackoff); the
+checks keep failing says so and when its backoff ends, the count alone
+for a dormant or record-paced suite the backoff does not schedule (B-63,
+reviews M-3 and M-5, through admin.Config.CheckBackoff =
+freshness.CheckBackoff); the
 table gains a Last requested column (F-14); Recent adoption outcomes show
 scheme://host from the ring's new Scheme (F-19); the Suites empty state
 uses the admin-ui-spec's words (D-50); a contradicting fixture is fixed
@@ -2760,7 +3000,10 @@ type suiteForm struct {
 // reports false it has answered.
 //
 // AIDEV-NOTE: http.Error appends the newline: messages carry none, so
-// every error body ends in exactly one (deferred minor F-6).
+// every error body ends in exactly one (deferred minor F-6). Call it only
+// after requireMutationGuard (review M-10 of the H1 plan): it reads and
+// limits the body, and a 400 or 413 before the guard would answer an
+// unauthenticated cross-origin request with more than the guard's 403.
 func parseSuiteForm(w http.ResponseWriter, r *http.Request) (suiteForm, bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 	if err := r.ParseForm(); err != nil {
@@ -3032,6 +3275,7 @@ package freshness
 
 import (
 	"context"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -3122,7 +3366,7 @@ func TestReaper_SuiteReapedNamesItsEvidence(t *testing.T) {
 		t.Fatalf("idle line %v, want last_requested_unixtime %d and no evidence", m, idleAt)
 	}
 	if m := got["/r/dists/junk"]; m == nil || m["reason"] != "junk" ||
-		m["evidence"] != "/r/dists/junk/InRelease /r/dists/junk/Release" || m["last_requested_unixtime"] != nil {
+		!reflect.DeepEqual(m["evidence"], []any{"/r/dists/junk/InRelease", "/r/dists/junk/Release"}) || m["last_requested_unixtime"] != nil {
 		t.Fatalf("junk line %v, want the two anchors as evidence", m)
 	}
 }
@@ -3316,7 +3560,7 @@ new:
 	case c.reason == "idle" && c.requested != nil:
 		attrs = append(attrs, "last_requested_unixtime", *c.requested) // the stamp the cutoff judged (F-18)
 	case c.reason == "junk":
-		attrs = append(attrs, "evidence", strings.Join(c.evidence, " ")) // the rows judged junk (F-18)
+		attrs = append(attrs, "evidence", c.evidence) // the rows judged junk (F-18): a list, since a path may hold a space
 	}
 	if settled {
 		attrs = append(attrs, "settled", true)
@@ -3463,6 +3707,7 @@ Expected: `ok`. Simulations this task touches through the reaper (`TestDoD_Ninet
 | `clockStepsTotal.Inc()` removed from `deferredByForwardStep` | `reaper_signal_test.go:71: acu_clock_steps_detected_total grew by 0 at the forward step, want 1` |
 | The idle `last_requested_unixtime` attribute removed | `reaper_signal_test.go:92: idle line map[… reason:idle …], want last_requested_unixtime 1797235200 and no evidence` |
 | `HoldSuite`'s release back to `Purge` then `unlockDropped`, no `defer` | `reaper_signal_test.go:123: the suite's mutex leaked: a later hold was refused` |
+| `evidence` joined by spaces again (`strings.Join(c.evidence, " ")`; review M-7) | `reaper_signal_test.go:97: junk line map[… evidence:/r/dists/junk/InRelease /r/dists/junk/Release …], want the two anchors as evidence` |
 
 - [ ] **Step 8: Commit**
 
@@ -3475,8 +3720,8 @@ Reaper: a run line and a liveness gauge; suite_reaped names its evidence
 A completed reaper run logs suite_reaper_run_complete and sets
 acu_suite_reaper_last_run_unixtime, so a reaper that stops is visible
 (F-13); the forward-step report counts in acu_clock_steps_detected_total
-(F-17); suite_reaped names an idle reap's stamp and a junk reap's rows
-(F-18); a panicking flip-gate purge no longer leaks a suite's mutex: the
+(F-17); suite_reaped names an idle reap's stamp and a junk reap's rows,
+a list since a path may hold a space (F-18, review M-7); a panicking flip-gate purge no longer leaks a suite's mutex: the
 unlock is deferred (F-25); sortCandidates' AIDEV-NOTE is exact about
 legacy snapshots (F-26); two history-only comments lose the history
 (F-7).
@@ -3486,17 +3731,17 @@ EOF
 )"
 ```
 
-### Task 7: GC: a store seam, sub-job C's deadline and chunk, recovered panics (F-1, F-2, F-3, F-21)
+### Task 7: GC: a store seam, sub-job C's deadline and chunk, recovered panics (F-1, F-2, F-3, F-21; reviews I-1, M-1)
 
-Sub-job C (phase F) runs in GC's goroutine, which recovers no panic (F-21, design note 11); its deadline check (F-1) and its chunk size (F-2: mutants C22 and C23 survived) are untested; and its result embeds a struct whose promoted `Total()` leaves out the retired reaps (F-3). A narrow seam, `gcStore` (design note 18), lets tests reach C's calls without a 10,001-row fixture — such a fixture took 4.9 s under `-race` in the replay — and the cache's default chunk becomes a small pure function. `docs/log-fields.md` gains `gc_panicked` in Task 18.
+Sub-job C (phase F) runs in GC's goroutine, which recovers no panic (F-21, design note 11); its deadline check (F-1) and its chunk size (F-2: mutants C22 and C23 survived) are untested; and its result embeds a struct whose promoted `Total()` leaves out the retired reaps (F-3). A narrow seam, `gcStore` (design note 18), lets tests reach C's calls without a 10,001-row fixture — such a fixture took 4.9 s under `-race` in the replay — and the cache's default chunk becomes a small pure function. Two design-review findings complete the recovers: the startup pass, which runs on main's goroutine before any listener, returns a panic as an error, which main logs before it serves, instead of crash-looping at every start (review I-1); and a tick's panic moves the pass rotation past the pass that panicked, so a pass that panics on every tick cannot starve the passes after it (review M-1). `docs/log-fields.md` gains `gc_panicked` in Task 18.
 
 **Files:**
 - Create: `internal/gc/gc_store_test.go`, `internal/cache/retired_chunk_test.go`
-- Modify: `internal/gc/gc.go` (`GC.store`, `New`, `Run`, new `periodicTick`, `gcStore`, `gcPanicStacks`, `recoverPanic`, `runTick`'s two counts), `internal/gc/snapshot.go` (`snapshotPassResult.batch`, `g.store`), `internal/gc/pool_scan.go` (rewritten: `scanCounters`, `scanPoolFile`, the producer's recover), `internal/cache/gc.go` (`effectiveChunkRows`)
+- Modify: `internal/gc/gc.go` (`GC.store`, `New`, `StartupPass`, `Run`, new `periodicTick`, `skipPanickedPass`, `gcStore`, `gcPanicStacks`, `recoverPanic`, `recoverPanicInto`, `logGCPanic`, `runTick`'s two counts), `internal/gc/snapshot.go` (`snapshotPassResult.batch`, `g.store`), `internal/gc/pool_scan.go` (rewritten: `scanCounters`, `scanPoolFile`, the producer's recover), `internal/cache/gc.go` (`effectiveChunkRows`)
 
 **Interfaces:**
 - Consumes: gc tests' `captureLogger`, `openTestCache`, `writePoolFile`.
-- Produces: unexported `gcStore` interface (`RunSnapshotGCBatch`, `RunRetiredSnapshotGCChunk`, `HashKnown`), `GC.store`, `(*GC).periodicTick(ctx)`, `(*GC).recoverPanic(where string)`, `(*GC).scanPoolFile(ctx, poolRoot, prefix, name string, counts *scanCounters)`, `scanCounters`; `cache.effectiveChunkRows(maxRows int) int`; the ERROR event `gc_panicked` (`where`, `panic`, `stack`).
+- Produces: unexported `gcStore` interface (`RunSnapshotGCBatch`, `RunRetiredSnapshotGCChunk`, `HashKnown`), `GC.store`, `(*GC).StartupPass(ctx) (err error)` (a panic as an error), `(*GC).periodicTick(ctx)`, `(*GC).skipPanickedPass(passesDone *bool)`, `(*GC).recoverPanic(where string)`, `(*GC).recoverPanicInto(where string, err *error)`, `(*GC).logGCPanic(where string, v any)` (named so: `reportPanic` is a forwarding helper's name in Task 3's `logSinks`, and the guard would read this one's `where` as a message), `(*GC).scanPoolFile(ctx, poolRoot, prefix, name string, counts *scanCounters)`, `scanCounters`; `cache.effectiveChunkRows(maxRows int) int`; the ERROR event `gc_panicked` (`where`: `tick`, `startup`, `pool_scan_worker`, `pool_scan_producer`; `panic`, `stack`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3643,8 +3888,9 @@ func TestSnapshotPassResult_PromotesNoTotal(t *testing.T) {
 
 // Deferred minor F-21 (design note 11), Review Focus 4: a panic in a
 // periodic tick — here in the snapshot pass — is recovered and logged
-// (gc_panicked, where=tick, with its stack), and the next tick runs on
-// schedule.
+// (gc_panicked, where=tick, with its stack), and the next ticks run on
+// schedule: the blob pass the rotation moved to, then a full rotation
+// whose snapshot pass runs again (review M-1).
 func TestRun_RecoversATickPanicAndRunsTheNextTick(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		logger, buf := captureLogger()
@@ -3653,23 +3899,67 @@ func TestRun_RecoversATickPanicAndRunsTheNextTick(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
 		go func() { g.Run(ctx); close(done) }()
-		time.Sleep(2*time.Hour + time.Minute) // two ticks
+		time.Sleep(3*time.Hour + time.Minute) // three ticks
 		cancel()
 		<-done
 		f.mu.Lock()
 		batches := f.batches
 		f.mu.Unlock()
 		if batches < 2 {
-			t.Fatalf("%d snapshot batches, want the second tick's too", batches)
+			t.Fatalf("%d snapshot batches, want the third tick's too", batches)
 		}
 		ev := gcEvents(t, buf, "gc_panicked")
 		if len(ev) != 1 || ev[0]["level"] != "ERROR" || ev[0]["where"] != "tick" || ev[0]["panic"] != "snapshot batch bug" {
 			t.Fatalf("gc_panicked lines %v, want one at ERROR, where=tick", ev)
 		}
-		if runs := gcEvents(t, buf, "gc_run_complete"); len(runs) != 1 {
-			t.Fatalf("%d gc_run_complete lines, want 1 (the tick after the panic)", len(runs))
+		if runs := gcEvents(t, buf, "gc_run_complete"); len(runs) != 2 {
+			t.Fatalf("%d gc_run_complete lines, want 2 (the ticks after the panic)", len(runs))
 		}
 	})
+}
+
+// Review M-1 of the H1 plan: a pass that panics on every tick — here the
+// snapshot pass's batch — moves the rotation past itself, so the blob pass
+// after it still runs: the tick after the panic is the blob pass's, and
+// the one after that comes back to the url-path and snapshot passes.
+func TestPeriodicTick_APanickingPassDoesNotStarveTheNext(t *testing.T) {
+	logger, buf := captureLogger()
+	f := &fakeStore{batchPanics: 1000}
+	g, _ := storeGC(t, f, 2, logger)
+	ctx := context.Background()
+	g.periodicTick(ctx) // the url-path pass (off: no TTL), then the snapshot pass panics
+	if g.nextPass != blobPass {
+		t.Fatalf("after a snapshot-pass panic the rotation is at pass %d, want the blob pass (%d)", g.nextPass, blobPass)
+	}
+	g.periodicTick(ctx) // the blob pass
+	if g.nextPass != urlPathPass {
+		t.Fatalf("after the blob pass the rotation is at pass %d, want the url-path pass (%d)", g.nextPass, urlPathPass)
+	}
+	if runs := gcEvents(t, buf, "gc_run_complete"); len(runs) != 1 {
+		t.Fatalf("%d gc_run_complete lines, want 1 (the blob pass's tick)", len(runs))
+	}
+	g.periodicTick(ctx) // the snapshot pass again
+	if ev := gcEvents(t, buf, "gc_panicked"); len(ev) != 2 {
+		t.Fatalf("%d gc_panicked lines, want 2 (the snapshot pass, twice)", len(ev))
+	}
+}
+
+// Review I-1 of the H1 plan: a panic in the startup pass — which runs on
+// main's goroutine before any listener — is recovered and returned as an
+// error, which main logs (gc startup pass failed) before it serves; a
+// panic at every start would otherwise be a crash loop that never serves.
+func TestStartupPass_ReturnsAPanicAsAnError(t *testing.T) {
+	logger, buf := captureLogger()
+	f := &fakeStore{batchPanics: 1}
+	g, _ := storeGC(t, f, 2, logger)
+	err := g.StartupPass(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "gc startup: panicked: snapshot batch bug") {
+		t.Fatalf("StartupPass = %v, want the panic as an error", err)
+	}
+	ev := gcEvents(t, buf, "gc_panicked")
+	if len(ev) != 1 || ev[0]["level"] != "ERROR" || ev[0]["where"] != "startup" || ev[0]["panic"] != "snapshot batch bug" {
+		t.Fatalf("gc_panicked lines %v, want one at ERROR, where=startup", ev)
+	}
 }
 
 // Deferred minor F-21, Review Focus 4: a pool-scan job that panics is
@@ -3822,7 +4112,33 @@ func (c *Cache) RunRetiredSnapshotGCChunk(ctx context.Context, maxRows int) (rea
 	store gcStore
 ```
 
-and `New`'s two returns become `return &GC{cfg: cfg, store: cfg.Cache}, nil`. In `runTick`, `res.orphanCandidatesReaped += snap.OrphanReaped` and `res.displacedReaped += snap.DisplacedReaped` read `snap.batch.OrphanReaped` and `snap.batch.DisplacedReaped`. `Run`'s tick case becomes:
+and `New`'s two returns become `return &GC{cfg: cfg, store: cfg.Cache}, nil`. `StartupPass`:
+
+old:
+```go
+// When Enabled = false, returns nil immediately.
+func (g *GC) StartupPass(ctx context.Context) error {
+	if !g.cfg.Enabled {
+		return nil
+	}
+```
+new:
+```go
+// When Enabled = false, returns nil immediately.
+//
+// A panic is recovered and returned as an error (gc_panicked,
+// where=startup), which main logs before it serves: this pass runs on
+// main's goroutine before any listener, and a panic that persisted data
+// triggers would otherwise recur at every start (review I-1 of the H1
+// plan).
+func (g *GC) StartupPass(ctx context.Context) (err error) {
+	defer g.recoverPanicInto("startup", &err)
+	if !g.cfg.Enabled {
+		return nil
+	}
+```
+
+(main already logs a returned error as WARN `gc startup pass failed` and serves on.) In `runTick`, `res.orphanCandidatesReaped += snap.OrphanReaped` and `res.displacedReaped += snap.DisplacedReaped` read `snap.batch.OrphanReaped` and `snap.batch.DisplacedReaped`. `Run`'s tick case becomes:
 
 ```go
 		case <-t.C:
@@ -3834,18 +4150,24 @@ and `New`'s two returns become `return &GC{cfg: cfg, store: cfg.Cache}, nil`. In
 		}
 ```
 
-and the case's former body — every line from `start := time.Now()` through the `g.recordLastRun(LastRunSummary{…})` call, unchanged, one tab less indented — moves into a new method after `Run`:
+and the case's former body — every line from `start := time.Now()` through the `g.recordLastRun(LastRunSummary{…})` call, unchanged, one tab less indented — moves into a new method after `Run`; the line, the metrics and the last-run summary stay inside it, so a tick that panicked leaves `acu_gc_last_run_unixtime` as it was:
 
 ```go
 // periodicTick is one periodic tick: the passes (runTick), its
 // gc_run_complete line, metrics and last-run summary. A panic is
 // recovered here — logged gc_panicked, where=tick — and the next tick
 // comes as scheduled (deferred minor F-21: sub-job C runs in this
-// goroutine since phase F).
+// goroutine since phase F). The line, the metrics and the last-run
+// summary stay inside the recovered function, so a tick that panicked
+// leaves acu_gc_last_run_unixtime as it was: its age is the alert. A
+// panic in a pass moves the rotation past that pass (skipPanickedPass).
 func (g *GC) periodicTick(ctx context.Context) {
+	passesDone := false
+	defer g.skipPanickedPass(&passesDone)
 	defer g.recoverPanic("tick")
 	start := time.Now()
 	tick, err := g.runTick(ctx, "periodic")
+	passesDone = true
 	// … the rest of the former case body, unchanged, through g.recordLastRun(…) …
 }
 ```
@@ -3862,6 +4184,27 @@ type gcStore interface {
 	RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGraceSeconds int64, keepDisplaced int) (cache.SnapshotGCBatchResult, error)
 	RunRetiredSnapshotGCChunk(ctx context.Context, maxRows int) (reaped int, more bool, err error)
 	HashKnown(ctx context.Context, hash string) (bool, error)
+}
+
+// skipPanickedPass is deferred by periodicTick before its recoverPanic,
+// so it runs after it: when the passes did not finish (a recovered panic),
+// it moves the rotation past the pass in progress — g.nextPass, which
+// runTick advances only when a pass completes — so a pass that panics on
+// every tick cannot starve the passes after it: the blob pass keeps
+// reclaiming disk while a sub-job's bug waits for its fix (review M-1 of
+// the H1 plan).
+func (g *GC) skipPanickedPass(passesDone *bool) {
+	if *passesDone {
+		return
+	}
+	switch g.nextPass {
+	case urlPathPass:
+		g.nextPass = snapshotPass
+	case snapshotPass:
+		g.nextPass = blobPass
+	default:
+		g.nextPass = urlPathPass
+	}
 }
 
 // gcPanicStacks holds the wheres whose gc_panicked line carried a stack.
@@ -3882,6 +4225,25 @@ func (g *GC) recoverPanic(where string) {
 	if v == nil {
 		return
 	}
+	g.logGCPanic(where, v)
+}
+
+// recoverPanicInto is recoverPanic for a function that returns an error
+// (StartupPass): it also sets *err, so the caller sees the panic as a
+// failure. Like recoverPanic it works only as the deferred function itself
+// (defer g.recoverPanicInto(where, &err)).
+func (g *GC) recoverPanicInto(where string, err *error) {
+	v := recover()
+	if v == nil {
+		return
+	}
+	*err = fmt.Errorf("gc %s: panicked: %v", where, v)
+	g.logGCPanic(where, v)
+}
+
+// logGCPanic logs a recovered panic as ERROR gc_panicked; a logger that
+// panics in turn is contained: that panic is dropped.
+func (g *GC) logGCPanic(where string, v any) {
 	defer func() { _ = recover() }()
 	attrs := []any{"where", where, "panic", fmt.Sprint(v)}
 	if _, seen := gcPanicStacks.LoadOrStore(where, true); !seen {
@@ -4187,6 +4549,10 @@ Expected: all `ok`.
 | Sub-job C's `if expired()` check removed (F-1) | `gc_store_test.go:122: expired false, <nil>, 101 chunks; want the deadline after 2 chunks` |
 | `defer g.recoverPanic("tick")` removed | the test binary panics: `panic: snapshot batch bug` from `TestRun_RecoversATickPanicAndRunsTheNextTick` |
 | `defer g.recoverPanic("pool_scan_worker")` removed | the test binary panics: `panic: hash lookup bug` from `TestPoolScan_AWorkerPanicNeverStallsTheScan` |
+| `defer g.recoverPanicInto("startup", &err)` removed (review I-1) | the test binary panics: `panic: snapshot batch bug [recovered, repanicked]` from `TestStartupPass_ReturnsAPanicAsAnError` |
+| `recoverPanicInto` sets no error (`*err = …` dropped) | `gc_store_test.go:207: StartupPass = <nil>, want the panic as an error` |
+| `defer g.skipPanickedPass(&passesDone)` removed (review M-1) | `gc_store_test.go:182: after a snapshot-pass panic the rotation is at pass 1, want the blob pass (2)` |
+| `passesDone = true` removed (every tick skips a pass) | `gc_store_test.go:186: after the blob pass the rotation is at pass 1, want the url-path pass (0)` |
 
 - [ ] **Step 7: Commit**
 
@@ -4198,7 +4564,12 @@ GC: recover panics in its goroutines; pin sub-job C's deadline and chunk
 
 A panic in a periodic tick, a pool-scan job or the pool-scan producer is
 recovered and logged gc_panicked; the next tick runs, the scan ends
-(F-21; sub-job C runs in GC's goroutine since phase F). Through a narrow
+(F-21; sub-job C runs in GC's goroutine since phase F). A tick's panic
+moves the pass rotation past the pass that panicked, so the passes after
+it still run (review M-1), and the startup pass, which runs on main's
+goroutine before any listener, returns its panic as an error that main
+logs before it serves, instead of crash-looping at every start (review
+I-1). Through a narrow
 gcStore seam, tests pin that sub-job C stops at the tick's deadline (F-1)
 and asks the cache for its own 10,000-row chunk, and the cache's default
 is a pure function with its own test (F-2: mutants C22 and C23). The
@@ -4729,7 +5100,7 @@ EOF
 
 ### Task 9: The scheduler's wiring and the panic boundaries (B-27, E-38, E-39, E-40, E-42, E-43, E-45, E-56)
 
-Three panic boundaries report a panic with no second recover, so a panicking log handler escapes them (E-45: `recoverGoroutine`, `safeReschedule`, `safeTick`), and the adoption's boundary loses its counters and ring event along with the report (E-42); `checkWorker` open-codes `unloggedPanic`. The rest pin wiring no test reached (E-38, E-39, E-43, B-27) and fix stale docs (E-40) and a hard-coded tick (E-56). No log line or metric changes: `acu_freshness_unlogged_panics_total` already counts what a boundary cannot log.
+Three panic boundaries report a panic with no second recover, so a panicking log handler escapes them (E-45: `recoverGoroutine`, `safeReschedule`, `safeTick`), and the adoption's boundary loses its counters and ring event along with the report (E-42: the report gets its own boundary, and the counters and ring event another, so neither can escape — review M-2); `checkWorker` open-codes `unloggedPanic`. The rest pin wiring no test reached (E-38, E-39, E-43, B-27) and fix stale docs (E-40) and a hard-coded tick (E-56). No log line or metric changes: `acu_freshness_unlogged_panics_total` already counts what a boundary cannot log.
 
 **Files:**
 - Create: `internal/freshness/scheduler_wiring_test.go`
@@ -4923,6 +5294,26 @@ func escaped(f func()) (v any) {
 	return nil
 }
 
+// Review M-2 of the H1 plan: a panic in the adoption boundary's counters
+// or ring event — here the clock the ring event reads — is contained by
+// its own boundary and counted unlogged; it never escapes the adoption
+// goroutine (the record's own recover takes the clock's second panic).
+func TestRecoverAdoption_APanickingRingEventIsContained(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.checker.now = func() time.Time { panic("clock bug") }
+	req := &adoptionRequest{suite: SuiteRef{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite}, key: testHex64}
+	before := unlogged()
+	if v := escaped(func() {
+		defer r.checker.recoverAdoption(req, time.Now())
+		panic("adoption bug")
+	}); v != nil {
+		t.Fatalf("a panic escaped the adoption boundary: %v", v)
+	}
+	if got := unlogged() - before; got != 1 {
+		t.Fatalf("unlogged panics rose by %v, want 1 (the ring event's)", got)
+	}
+}
+
 // Deferred minor E-43 (B-18's second site): a panic while a failure record
 // is written is reported — adoption_panicked, where=record — under its own
 // boundary, so a log handler that panics too is contained and counted.
@@ -5024,11 +5415,11 @@ Run: `go test -count=1 -run 'TestRun_AnOfferWhoseWake|TestTick_DemotesAWaiter|Te
 Expected: FAIL with
 ```
 scheduler_wiring_test.go:159: acu_adoption_total{outcome=panicked} rose by 0, want 1
-scheduler_wiring_test.go:245: recoverGoroutine: a panic escaped: log handler bug: adoption_panicked
-scheduler_wiring_test.go:245: safeReschedule: a panic escaped: log handler bug: freshness_check_panicked
-scheduler_wiring_test.go:245: safeTick: a panic escaped: log handler bug: freshness_check_panicked
+scheduler_wiring_test.go:265: recoverGoroutine: a panic escaped: log handler bug: adoption_panicked
+scheduler_wiring_test.go:265: safeReschedule: a panic escaped: log handler bug: freshness_check_panicked
+scheduler_wiring_test.go:265: safeTick: a panic escaped: log handler bug: freshness_check_panicked
 ```
-The other four pin wiring that holds (E-38, E-39, E-43's record site, B-27): Step 6's mutants are their red.
+The other five pin wiring that holds (E-38, E-39, E-43's record site, B-27, and review M-2's ring event, which today's single boundary contains): Step 6's mutants are their red.
 
 - [ ] **Step 3: The boundaries (E-42, E-45)**
 
@@ -5055,20 +5446,24 @@ old:
 ```
 new:
 ```go
-	// Only the report runs under its own boundary (B-18, deferred minor
-	// E-42): a panicking log handler must neither escape nor skip the
-	// counters, the ring event and the record below.
+	// The report, then the counters and the ring event, each run under
+	// their own boundary (B-18, deferred minor E-42; review M-2 of the H1
+	// plan): a panicking log handler must not skip the counters, and
+	// neither may escape the adoption goroutine or skip the record below,
+	// which recovers its own panics.
 	unloggedPanic(func() { c.reportPanic("adoption_panicked", "adoption", req.suite, r) })
-	d := time.Since(start)
-	host := req.suite.CanonicalHost
-	adoptionTotal.Inc("panicked", host)
-	adoptionDurationSeconds.Observe(d.Seconds(), "panicked", host)
-	if c.adoptionRing != nil {
-		c.adoptionRing.Record(observability.AdoptionEvent{
-			Scheme: req.suite.CanonicalScheme, Host: host, SuitePath: req.suite.SuitePath, Outcome: "panicked", Reason: cache.ReasonPanic,
-			CompletedUnixSec: c.now().Unix(), DurationSeconds: d.Seconds(),
-		})
-	}
+	unloggedPanic(func() {
+		d := time.Since(start)
+		host := req.suite.CanonicalHost
+		adoptionTotal.Inc("panicked", host)
+		adoptionDurationSeconds.Observe(d.Seconds(), "panicked", host)
+		if c.adoptionRing != nil {
+			c.adoptionRing.Record(observability.AdoptionEvent{
+				Scheme: req.suite.CanonicalScheme, Host: host, SuitePath: req.suite.SuitePath, Outcome: "panicked", Reason: cache.ReasonPanic,
+				CompletedUnixSec: c.now().Unix(), DurationSeconds: d.Seconds(),
+			})
+		}
+	})
 	c.recordAdoptionFailure(req, cache.ReasonPanic)
 ```
 
@@ -5144,11 +5539,12 @@ Expected: `ok`. `TestRun_AnOfferWhoseWakeWasSpentIsReofferedAtOnce` is a synctes
 | the restart offset `+ 1` (B-27, lower bound) | `scheduler_wiring_test.go:136: rand 0: next retry = 1800000001, want now + 0` |
 | the restart offset over `spread+1` (B-27, upper bound) | `scheduler_wiring_test.go:136: rand 0.999: next retry = 1800000900, want now + 899` |
 | the panicked counter back under the report's boundary (E-42) | `scheduler_wiring_test.go:159: acu_adoption_total{outcome=panicked} rose by 0, want 1` |
-| the record site's bare `reportPanic` (E-43) | `scheduler_wiring_test.go:197: a panic escaped the record: log handler bug: adoption_panicked` |
+| the counters and the ring event outside any boundary (review M-2: E-42's report-only boundary of the draft) | `scheduler_wiring_test.go:193: a panic escaped the adoption boundary: clock bug` |
+| the record site's bare `reportPanic` (E-43) | `scheduler_wiring_test.go:217: a panic escaped the record: log handler bug: adoption_panicked` |
 | the record write's `adoption_failure_record_failed` line removed (E-43) | `deferred_e_test.go:143: adoption_failure_record_failed lines []; want one at DEBUG …` |
-| `recoverGoroutine`'s bare `reportPanic` (E-45) | `scheduler_wiring_test.go:245: recoverGoroutine: a panic escaped: log handler bug: adoption_panicked` |
-| `safeReschedule`'s bare `reportPanic` (E-45) | `scheduler_wiring_test.go:245: safeReschedule: a panic escaped: …` |
-| `safeTick`'s bare `reportPanic` (E-45) | `scheduler_wiring_test.go:245: safeTick: a panic escaped: …` |
+| `recoverGoroutine`'s bare `reportPanic` (E-45) | `scheduler_wiring_test.go:265: recoverGoroutine: a panic escaped: log handler bug: adoption_panicked` |
+| `safeReschedule`'s bare `reportPanic` (E-45) | `scheduler_wiring_test.go:265: safeReschedule: a panic escaped: …` |
+| `safeTick`'s bare `reportPanic` (E-45) | `scheduler_wiring_test.go:265: safeTick: a panic escaped: …` |
 
 E-38's other mutant — dropping the generation stamp at dispatch (`withGen`) — survives: it shows only when the peek before an offer was wrong, which no test can stage without a seam in `admission` (noted for the reviewer; the stamp is one line beside its AIDEV-NOTE).
 
@@ -5162,9 +5558,10 @@ Scheduler: second panic boundaries; pin B-45's wiring and the demotion
 
 recoverGoroutine, safeReschedule and safeTick report a panic under
 unloggedPanic, so a panicking log handler no longer escapes into Run;
-checkWorker uses the helper it open-coded (E-45). recoverAdoption keeps
-only the report under that boundary, so the panicked counter, histogram
-and ring event survive a broken logger (E-42). Tests pin Run's B-45
+checkWorker uses the helper it open-coded (E-45). recoverAdoption puts
+the report under one boundary and the counters and ring event under
+another, so they survive a broken logger (E-42) and their own panic
+never escapes the adoption goroutine (review M-2). Tests pin Run's B-45
 wiring (E-38), refreshSigned's demotion (E-39), the record site's
 boundary and the shutdown DEBUG line (E-43), and the restart spread's
 bounds (B-27). tickInterval is the scheduler's tick for Run and tests
@@ -5177,7 +5574,7 @@ EOF
 
 ### Task 10: Members, the served anchor and Sources (E-10, E-11, E-13, E-14, GD-2)
 
-A member's fetch destination stops exposing `Finalize` (E-10); a SHA512-only size mismatch and the release parser's two hash-block errors get exact tests (E-11); the served-anchor read before the flip barrier logs DEBUG when a shutdown cut it short (E-13, design note 21), and it and the startup marker pass's skipped anchor get the tests they lacked (E-14); `ParseSources` counts the paths `validateMemberPath` refuses and the adoption says so once per `Sources` file (GD-2, design note 12). Task 18 adds `source_paths_skipped` and `adoption_served_anchor_read_failed`'s DEBUG case to `docs/log-fields.md` and corrects spec C5.
+A member's fetch destination stops exposing `Finalize` (E-10); a SHA512-only size mismatch and the release parser's two hash-block errors get exact tests (E-11); the served-anchor read before the flip barrier logs DEBUG when a shutdown cut it short (E-13, design note 21), and it and the startup marker pass's skipped anchor get the tests they lacked (E-14); `ParseSources` counts the paths `validateMemberPath` refuses and the adoption says so once per `Sources` file, at INFO, since the line repeats at every adoption and the operator cannot act on it (GD-2, design note 12, review M-8). Task 18 adds `source_paths_skipped` and `adoption_served_anchor_read_failed`'s DEBUG case to `docs/log-fields.md` and the line to spec C5, which already says `ParseSources` keeps `validateMemberPath` (revision 10; review sweep M-2).
 
 **Files:**
 - Create: `internal/freshness/adoption_paths_test.go`
@@ -5350,9 +5747,10 @@ func TestParseSources_CountsTheSkippedPaths(t *testing.T) {
 }
 
 // Deferred minor GD-2: an adoption whose Sources file had paths skipped
-// says so once for that file (source_paths_skipped, WARN); the suite
+// says so once for that file (source_paths_skipped, INFO: review M-8);
+// the suite
 // still adopts with the rows that passed.
-func TestAdopter_SourcesWithSkippedPathsWarnsOnce(t *testing.T) {
+func TestAdopter_SourcesWithSkippedPathsLogsOnce(t *testing.T) {
 	logs := &lockedBuffer{}
 	c, err := cache.Open(context.Background(), t.TempDir(), discardLogger())
 	if err != nil {
@@ -5377,9 +5775,9 @@ func TestAdopter_SourcesWithSkippedPathsWarnsOnce(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	recs := logRecords(t, logs, "source_paths_skipped")
-	if len(recs) != 1 || recs[0]["level"] != "WARN" || recs[0]["member_path"] != "main/source/Sources" ||
+	if len(recs) != 1 || recs[0]["level"] != "INFO" || recs[0]["member_path"] != "main/source/Sources" ||
 		recs[0]["count"] != float64(1) || recs[0]["first"] != "pool/main/o/odd%2b/odd_1.dsc" || recs[0]["canonical_scheme"] != "http" {
-		t.Fatalf("source_paths_skipped records %v, want one WARN for the Sources file, count 1, first the odd path", recs)
+		t.Fatalf("source_paths_skipped records %v, want one INFO for the Sources file, count 1, first the odd path", recs)
 	}
 	sf, err := c.GetSuiteFreshness(context.Background(), "http", suite.CanonicalHost, suite.SuitePath)
 	if err != nil || sf.CurrentSnapshotID == nil {
@@ -5486,13 +5884,13 @@ new:
 
 (the same rows as before; a file whose hash or filename is malformed is still dropped before this, uncounted).
 
-`adoption.go` `buildSourceHashes`: its doc's `SPEC6_5 §11 H3/H4/H11 per-stanza skips happen inside ParseSources silently — … per-stanza visibility is a future phase.` reads `SPEC6_5 §11 H3/H4 per-stanza skips happen inside ParseSources silently — operators see the per-Sources-file granularity at the source_parsed Debug log; the H11 skips (a path validateMemberPath refuses) are counted and logged once per Sources file at WARN, source_paths_skipped (deferred minor GD-2).` After the `source_parsed` DEBUG call:
+`adoption.go` `buildSourceHashes`: its doc's `SPEC6_5 §11 H3/H4/H11 per-stanza skips happen inside ParseSources silently — … per-stanza visibility is a future phase.` reads `SPEC6_5 §11 H3/H4 per-stanza skips happen inside ParseSources silently — operators see the per-Sources-file granularity at the source_parsed Debug log; the H11 skips (a path validateMemberPath refuses) are counted and logged once per Sources file at INFO, source_paths_skipped (deferred minor GD-2; INFO, review M-8: it repeats at every adoption and the operator cannot act on it).` After the `source_parsed` DEBUG call:
 
 ```go
 		if stats.PathsSkipped > 0 {
 			// Ruling PG-21 keeps validateMemberPath for a Sources file's
 			// paths: one with a "%" or a "." segment gets no source row.
-			a.logger.Warn("source_paths_skipped",
+			a.logger.Info("source_paths_skipped",
 				"canonical_scheme", suite.CanonicalScheme,
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
@@ -5523,7 +5921,8 @@ Expected: `ok`.
 | the served-anchor line sent to a discarding logger (E-14, C-16) | `adoption_paths_test.go:99: records [], want one at WARN naming the anchor` (and at DEBUG) |
 | the marker pass's skipped-anchor line sent to a discarding logger (E-14, A-49) | `adoption_paths_test.go:134: records [], want one DEBUG naming the anchor and the error` |
 | a failed `Directory` skips its files uncounted (GD-2) | `adoption_paths_test.go:154: skipped 1, first "pool/main/b/b/b_1%2b.tar.gz"; want 3 and ./pool/a/a_1.dsc` |
-| `source_paths_skipped` never logged (GD-2) | `adoption_paths_test.go:188: source_paths_skipped records [], want one WARN …` |
+| `source_paths_skipped` never logged (GD-2) | `adoption_paths_test.go:188: source_paths_skipped records [], want one INFO …` |
+| `source_paths_skipped` back at WARN (review M-8) | `adoption_paths_test.go:188: source_paths_skipped records [map[… level:WARN …]], want one INFO …` |
 
 - [ ] **Step 7: Commit**
 
@@ -5538,7 +5937,8 @@ finalize a member (E-10). The served-anchor read before the flip barrier
 logs DEBUG when a shutdown cut it short (E-13), and it and the marker
 pass's skipped anchor are now asserted (E-14). ParseSources keeps
 validateMemberPath (ruling PG-21) but counts the paths it refuses, and
-the adoption logs source_paths_skipped once per Sources file (GD-2).
+the adoption logs INFO source_paths_skipped once per Sources file (GD-2;
+INFO, review M-8: it repeats at every adoption).
 Tests pin a SHA512-only size mismatch and the parser's two hash-block
 errors in full (E-11).
 
@@ -6237,7 +6637,7 @@ new:
 
 - [ ] **Step 7: The jitter test under the budget (ruling R-H7)**
 
-`internal/freshness/current_form_test.go`, `TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds`. Its rig's clock is virtual (`r.clock.advance`): the test never waits on wall time, and its 7.6–8.0 s under `-race` are 1,440 checks of about 5 ms each (SQLite reads and writes per check), which a `testing/synctest` bubble would not shorten. Fewer checks keep every assertion: with the same seed, a check every five minutes gives 48 lateral windows (the floor is 30), 15 with two detached attempts (the floor is one), none early and none with three; every two minutes gave 48, 18, none and none. (Every three, four and six minutes took 5.2 s, 4.1 s and 2.9 s, the last with 10 windows of two.)
+`internal/freshness/current_form_test.go`, `TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds`. Its rig's clock is virtual (`r.clock.advance`): the test never waits on wall time, and its 7.6–8.0 s under `-race` are 1,440 checks of about 5 ms each (SQLite reads and writes per check), which a `testing/synctest` bubble would not shorten. Fewer checks keep every assertion: with the same seed, a check every five minutes gives 48 lateral windows (the floor is 30), 15 with two detached attempts (the floor is one), none early and none with three; every two minutes gave 48, 18, none and none. (Every three, four and six minutes took 5.2 s, 4.1 s and 2.9 s, the last with 10 windows of two.) The cost is resolution: a lateral hold released early by less than the five-minute cadence passes unseen; the mutants below release it 10 and about 27 minutes early (review M-4, which the comment records).
 
 old:
 ```go
@@ -6255,7 +6655,9 @@ new:
 // -race, 1,440 checks took 7.6-8.0 s — and a synctest bubble would not
 // shorten it. 576 checks keep every assertion with the same seed (48
 // lateral windows, 15 with two detached attempts, none early) and kill the
-// lateral-hold mutants the two-minute cadence killed.
+// lateral-hold mutants the two-minute cadence killed; an early release
+// shorter than the five-minute cadence is below this test's resolution
+// (review M-4).
 func TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds(t *testing.T) {
 ```
 
@@ -6300,8 +6702,8 @@ Run Step 1's two commands three times again. Every time must be under 4.5 s (PE-
 | `classOf` ignores the streak (C-38) | `sim_sched_test.go:370: S checked 0 times in phase 2, want at least 2` |
 | the reaper starts a goroutine per run that exits at the stop (F-10) | `dod_f_test.go:363: day 0, 09:00, mid-boot: 10 goroutines, the first boot had 8` |
 | `reapInterval = 2 * time.Hour` (F-11) | `dod_f_test.go:569: /r/dists/gcd not reaped by the hourly run after its deadline, although url_path GC took its anchor` |
-| `lateralHeld` never holds (`if h.key != key || nowUnix >= h.retryAt {` becomes `if true {`; R-H7) | `current_form_test.go:1309: +30 min: the lateral InRelease was attempted 1605 s before its own retry time` |
-| `lateralHeld` releases ten minutes early (`nowUnix >= h.retryAt-600`; R-H7) | `current_form_test.go:1309: +50 min: the lateral InRelease was attempted 405 s before its own retry time` |
+| `lateralHeld` never holds (`if h.key != key || nowUnix >= h.retryAt {` becomes `if true {`; R-H7) | `current_form_test.go:1311: +30 min: the lateral InRelease was attempted 1605 s before its own retry time` |
+| `lateralHeld` releases ten minutes early (`nowUnix >= h.retryAt-600`; R-H7) | `current_form_test.go:1311: +50 min: the lateral InRelease was attempted 405 s before its own retry time` |
 
 E-50's floors have margins of 3 and 4 checks. The replay tried two single-site production mutants a clock step could expose — `suiteDue` reading a future `last_success_at` as fresh, and the cooldown gate taking a future `last_check_at` as "just checked" — and both survive this simulation, its new floors included (the I-7 and B-38 unit tests catch them), so the floors stand as liveness guards, as the run floor does. E-52's case and E-55's sum pin behaviour across a forward step and for the two other anchor files; a mutant reaching them only there would need a clock or URL the code does not have.
 
@@ -6918,17 +7320,17 @@ EOF
 )"
 ```
 
-### Task 15: Test output and flakes (D-46, D-48, D-49, D-56, D-57, D-58, D-60, E-73, F-20, F-23)
+### Task 15: Test output and flakes (C-39, D-46, D-48, D-49, D-56, D-57, D-58, D-60, E-73, F-20, F-23)
 
-The test output of `internal/admin`, `internal/freshness`, `internal/gc`, `internal/cache` and `cmd` is made silent but for the tests' own `t.Log` lines (D-48, D-56, D-58, F-20): the replay's `go test -v` lines that are not go test's own went from 2132, 603, 518, 34 and 30 to 18, 5, 0, 20 and 0 — every one left a `t.Logf`. The daemon-start loop of the `cmd` tests gets one helper with a timed client that drains the daemon on failure (D-46, D-49); a log assertion reads the decoded record (E-73) and another runs after `Close` (D-60). The intermittent `TestProfilingRoutesOptInAndPrivate` cleanup failure (D-57, F-23) has two fixes, one in production code: the admin server's refresher no longer starts after a `Shutdown` that came during `Serve`'s first refresh (nothing would ever stop it), and the test server's cleanup waits for `Shutdown` and `Serve` before closing the cache. That this ends the flake is not shown: it failed 1 in 60 loaded runs at phase F's base; see Step 7.
+The test output of `internal/admin`, `internal/freshness`, `internal/gc`, `internal/cache` and `cmd` is made silent but for the tests' own `t.Log` lines (D-48, D-56, D-58, F-20): the replay's `go test -v` lines that are not go test's own went from 2132, 603, 518, 34 and 30 to 18, 5, 0, 20 and 0 — every one left a `t.Logf`. The daemon-start loop of the `cmd` tests gets one helper with a timed client that drains the daemon on failure (D-46, D-49); a log assertion reads the decoded record (E-73) and another runs after `Close` (D-60); the chaos tests' phase-2 trigger repeats until the gate parks the adoption (C-39, a race the code shows: review sweep I-1). The intermittent `TestProfilingRoutesOptInAndPrivate` cleanup failure (D-57, F-23) has two fixes, one in production code: the admin server's refresher no longer starts after a `Shutdown` that came during `Serve`'s first refresh (nothing would ever stop it), and the test server's cleanup waits for `Shutdown` and `Serve` before closing the cache. That this ends the flake is not shown: it failed 1 in 60 loaded runs at phase F's base; see Step 8.
 
 **Files:**
 - Create: `internal/admin/shutdown_order_test.go`
-- Modify: `internal/admin/handlers.go` (`startRefresher`), `internal/admin/admin_test.go` (`startAdminServer`, new `newAdminServer`), `internal/admin/refresher_test.go`, `internal/gc/gc_test.go`, `internal/cache/open_cache_test.go`, `internal/cache/connpool_test.go`, `cmd/apt-cacher-ultra/suite_caps_wiring_test.go` (new `probeClient`, `waitServing`), `cmd/apt-cacher-ultra/shutdown_drain_test.go`, `cmd/apt-cacher-ultra/legacy_audit_wiring_test.go`, `cmd/apt-cacher-ultra/upstream_invalid_cert_test.go`, `cmd/apt-cacher-ultra/adopt_unsigned_wiring_test.go`, and in `internal/freshness`: `adoption_test.go`, `adoption_date_test.go`, `capacity_test.go`, `freshness_test.go`, `hot_prefetch_test.go` (a drift file: by hand), `panic_recovery_test.go`, `phase6_7_skip_repair_test.go`, `scheduler_test.go`
+- Modify: `internal/handler/phase2_chaos_test.go` (new `holdSuiteBriefly`, `triggerUntilParked`; phase 2's trigger), `internal/handler/phase2_detached_chaos_test.go` (phase 2's trigger), `internal/admin/handlers.go` (`startRefresher`), `internal/admin/admin_test.go` (`startAdminServer`, new `newAdminServer`), `internal/admin/refresher_test.go`, `internal/gc/gc_test.go`, `internal/cache/open_cache_test.go`, `internal/cache/connpool_test.go`, `cmd/apt-cacher-ultra/suite_caps_wiring_test.go` (new `probeClient`, `waitServing`), `cmd/apt-cacher-ultra/shutdown_drain_test.go`, `cmd/apt-cacher-ultra/legacy_audit_wiring_test.go`, `cmd/apt-cacher-ultra/upstream_invalid_cert_test.go`, `cmd/apt-cacher-ultra/adopt_unsigned_wiring_test.go`, and in `internal/freshness`: `adoption_test.go`, `adoption_date_test.go`, `capacity_test.go`, `freshness_test.go`, `hot_prefetch_test.go` (a drift file: by hand), `panic_recovery_test.go`, `phase6_7_skip_repair_test.go`, `scheduler_test.go`
 
 **Interfaces:**
 - Consumes: `discardLogger()` (freshness), `silentBuildLogger()` (cmd), `discardSlog()` (cache), `slog.DiscardHandler`.
-- Produces: admin test helper `newAdminServer(t *testing.T, opts ...adminOpt) (*Server, net.Listener, *cache.Cache)`; cmd test helper `waitServing(t *testing.T, addr string, cancel context.CancelFunc, done <-chan error)` and `probeClient`.
+- Produces: handler test helpers `holdSuiteBriefly(t *testing.T, stack *phase2ChaosStack, host string, d time.Duration)` and `triggerUntilParked(t *testing.T, stack *phase2ChaosStack, gate *chaos2Gate, srvURL, path string, timeout time.Duration) error`; admin test helper `newAdminServer(t *testing.T, opts ...adminOpt) (*Server, net.Listener, *cache.Cache)`; cmd test helper `waitServing(t *testing.T, addr string, cancel context.CancelFunc, done <-chan error)` and `probeClient`.
 
 - [ ] **Step 1: Measure the noise before**
 
@@ -7145,7 +7547,133 @@ new:
 	}
 ```
 
-- [ ] **Step 6: Run and measure after**
+- [ ] **Step 6: The chaos tests' phase-2 trigger (C-39, review sweep I-1)**
+
+Both chaos tests start phase 2's adoption with one anchor GET. Its T1 check is dropped (`resultBusy`: the check's TryLock peek) while a phase-1c T1 check still holds the suite after its 304 — `stack.checker.WaitForAdoptions()` waits for adoptions, not for those checks — and then no adoption starts and `WaitForWaiter(5 * time.Second)` fails: the "unexplained" failure C-39 recorded, a window load widens. `waitForFlip` already nudges every 20 ms for this reason; phase 2's trigger now does too, and the tests hold the suite for 100 ms across the first trigger GET, so the window the fix closes is certain in every run. A test-only change.
+
+At the end of `internal/handler/phase2_chaos_test.go`:
+
+```go
+// holdSuiteBriefly holds the chaos suite's mutex for d, from a goroutine,
+// as a phase-1c T1 check still finishing its writes would (deferred minor
+// C-39). It retries the hold (HoldSuite does not wait) for up to 5 s.
+func holdSuiteBriefly(t *testing.T, stack *phase2ChaosStack, host string, d time.Duration) {
+	t.Helper()
+	key := cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: host, SuitePath: chaos2Suite}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if release, ok := stack.checker.HoldSuite(key); ok {
+			go func() {
+				time.Sleep(d)
+				release(false)
+			}()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("could not hold the chaos suite")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// triggerUntilParked GETs path every 20 ms until the member-fetch gate
+// parks an adoption, for at most timeout (deferred minor C-39): one GET's
+// T1 check is dropped (resultBusy) while anything else holds the suite,
+// and then no adoption starts — the reason waitForFlip nudges too. Every
+// answer must be 200.
+func triggerUntilParked(t *testing.T, stack *phase2ChaosStack, gate *chaos2Gate, srvURL, path string, timeout time.Duration) error {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		rec := httptest.NewRecorder()
+		stack.handler.ServeHTTP(rec, proxyReq("GET", srvURL, path))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("trigger adoption %s: status=%d body=%q", path, rec.Code, rec.Body.String())
+		}
+		if gate.WaitForWaiter(20*time.Millisecond) == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("no waiter arrived within %v", timeout)
+		}
+	}
+}
+```
+
+`phase2_chaos_test.go`, phase 2:
+
+old:
+```go
+	memberFetchGate.Close()
+	current.Store(&snapB)
+
+	rec := httptest.NewRecorder()
+	stack.handler.ServeHTTP(rec, proxyReq("GET", srv.URL, chaos2Suite+"/InRelease"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("trigger adoption: status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if err := memberFetchGate.WaitForWaiter(5 * time.Second); err != nil {
+		t.Fatalf("adoption never reached member-fetch gate: %v", err)
+	}
+```
+new:
+```go
+	memberFetchGate.Close()
+	current.Store(&snapB)
+
+	// Deferred minor C-39: a phase-1c T1 check may still hold the suite
+	// when the trigger's T1 check peeks, and that check is then dropped
+	// (resultBusy: the check's TryLock peek), so no adoption starts. Hold
+	// the suite for 100 ms across the first trigger GET, making the window
+	// certain, and trigger until the gate parks the adoption.
+	holdSuiteBriefly(t, stack, upstreamURL.Hostname(), 100*time.Millisecond)
+	if err := triggerUntilParked(t, stack, memberFetchGate, srv.URL, chaos2Suite+"/InRelease", 5*time.Second); err != nil {
+		t.Fatalf("adoption never reached member-fetch gate: %v", err)
+	}
+```
+
+`phase2_detached_chaos_test.go`, phase 2:
+
+old:
+```go
+	memberFetchGate.Close()
+	current.Store(&snapB)
+
+	rec := httptest.NewRecorder()
+	stack.handler.ServeHTTP(rec, proxyReq("GET", srv.URL, chaos2Suite+"/Release"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("trigger detached adoption: status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if err := memberFetchGate.WaitForWaiter(5 * time.Second); err != nil {
+		t.Fatalf("detached adoption never reached member-fetch gate: %v", err)
+	}
+```
+new:
+```go
+	memberFetchGate.Close()
+	current.Store(&snapB)
+
+	// Deferred minor C-39: a phase-1c T1 check may still hold the suite
+	// when the trigger's T1 check peeks, and that check is then dropped
+	// (resultBusy: the check's TryLock peek), so no adoption starts. Hold
+	// the suite for 100 ms across the first trigger GET, making the window
+	// certain, and trigger until the gate parks the adoption.
+	holdSuiteBriefly(t, stack, upstreamURL.Hostname(), 100*time.Millisecond)
+	if err := triggerUntilParked(t, stack, memberFetchGate, srv.URL, chaos2Suite+"/Release", 5*time.Second); err != nil {
+		t.Fatalf("detached adoption never reached member-fetch gate: %v", err)
+	}
+```
+
+Red first: with the hold in place but the single trigger GET kept (the old blocks with the hold's two statements added before them), run `go test -race -count=1 -run 'TestPhase2Chaos_AdoptionFlipUnderConcurrency$|TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency$' ./internal/handler/`
+Expected: FAIL —
+```
+phase2_chaos_test.go:185: adoption never reached member-fetch gate: no waiter arrived within 5s
+phase2_detached_chaos_test.go:178: detached adoption never reached member-fetch gate: no waiter arrived within 5s
+```
+
+Then with the new blocks, the same command: both `PASS` (replay: 3.16 s and 3.68 s). And `go test -race -count=20 -run '…the same two…' ./internal/handler/`: `ok` (replay: 133.7 s for the forty runs).
+
+- [ ] **Step 7: Run and measure after**
 
 Run: `go test -count=1 ./...`
 Expected: every package `ok`.
@@ -7156,20 +7684,21 @@ Expected: 18, 5, 0, 20, 0 — each remaining line a test's `t.Logf` (`budget_tes
 Run: `go test -race -count=1 ./internal/admin/ ./internal/gc/ ./internal/cache/ ./internal/freshness/ ./cmd/...`
 Expected: all `ok`.
 
-- [ ] **Step 7: Mutation checks** (one at a time, each reverted)
+- [ ] **Step 8: Mutation checks** (one at a time, each reverted)
 
 | Mutant | Fails |
 |---|---|
 | `Cache.Close` logs `slog.Info("cache closing")` (D-60) | `open_cache_test.go:41: openCache logged: …` |
 | `startRefresher` without `\|\| s.shutdownStarted` (F-23) | `shutdown_order_test.go:26: a refresher started after Shutdown: nothing stops it` |
+| Phase 2's trigger back to one GET, the hold kept (C-39) | `phase2_chaos_test.go:185: adoption never reached member-fetch gate: no waiter arrived within 5s` and `phase2_detached_chaos_test.go:178: detached adoption never reached member-fetch gate: …` (Step 6's red) |
 
-D-46 and D-49 change only a failure path; D-48, D-56, D-58 and F-20 are pinned by Step 6's counts; E-73 tolerates a key order no mutant changes. Whether F-23's two fixes end the profiling test's flake cannot be shown here: it reproduced 1 in 60 loaded runs at phase F's base and never at its head; the race they close (the cache closed while `Serve`'s first refresh, which `Shutdown` did not wait for, still ran) is the likely cause the item names, not a proven one.
+D-46 and D-49 change only a failure path; D-48, D-56, D-58 and F-20 are pinned by Step 7's counts; E-73 tolerates a key order no mutant changes. Whether F-23's two fixes end the profiling test's flake cannot be shown here: it reproduced 1 in 60 loaded runs at phase F's base and never at its head; the race they close (the cache closed while `Serve`'s first refresh, which `Shutdown` did not wait for, still ran) is the likely cause the item names, not a proven one.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-gofmt -l internal/admin internal/gc internal/cache/open_cache_test.go internal/cache/connpool_test.go cmd/apt-cacher-ultra/suite_caps_wiring_test.go cmd/apt-cacher-ultra/shutdown_drain_test.go cmd/apt-cacher-ultra/legacy_audit_wiring_test.go cmd/apt-cacher-ultra/upstream_invalid_cert_test.go cmd/apt-cacher-ultra/adopt_unsigned_wiring_test.go internal/freshness/adoption_test.go internal/freshness/adoption_date_test.go internal/freshness/capacity_test.go internal/freshness/freshness_test.go internal/freshness/panic_recovery_test.go internal/freshness/phase6_7_skip_repair_test.go internal/freshness/scheduler_test.go
-git add internal/admin/handlers.go internal/admin/admin_test.go internal/admin/refresher_test.go internal/admin/shutdown_order_test.go internal/gc/gc_test.go internal/cache/open_cache_test.go internal/cache/connpool_test.go cmd/apt-cacher-ultra/suite_caps_wiring_test.go cmd/apt-cacher-ultra/shutdown_drain_test.go cmd/apt-cacher-ultra/legacy_audit_wiring_test.go cmd/apt-cacher-ultra/upstream_invalid_cert_test.go cmd/apt-cacher-ultra/adopt_unsigned_wiring_test.go internal/freshness/adoption_test.go internal/freshness/adoption_date_test.go internal/freshness/capacity_test.go internal/freshness/freshness_test.go internal/freshness/hot_prefetch_test.go internal/freshness/panic_recovery_test.go internal/freshness/phase6_7_skip_repair_test.go internal/freshness/scheduler_test.go
+gofmt -l internal/admin internal/gc internal/cache/open_cache_test.go internal/cache/connpool_test.go cmd/apt-cacher-ultra/suite_caps_wiring_test.go cmd/apt-cacher-ultra/shutdown_drain_test.go cmd/apt-cacher-ultra/legacy_audit_wiring_test.go cmd/apt-cacher-ultra/upstream_invalid_cert_test.go cmd/apt-cacher-ultra/adopt_unsigned_wiring_test.go internal/freshness/adoption_test.go internal/freshness/adoption_date_test.go internal/freshness/capacity_test.go internal/freshness/freshness_test.go internal/freshness/panic_recovery_test.go internal/freshness/phase6_7_skip_repair_test.go internal/freshness/scheduler_test.go internal/handler/phase2_chaos_test.go internal/handler/phase2_detached_chaos_test.go
+git add internal/handler/phase2_chaos_test.go internal/handler/phase2_detached_chaos_test.go internal/admin/handlers.go internal/admin/admin_test.go internal/admin/refresher_test.go internal/admin/shutdown_order_test.go internal/gc/gc_test.go internal/cache/open_cache_test.go internal/cache/connpool_test.go cmd/apt-cacher-ultra/suite_caps_wiring_test.go cmd/apt-cacher-ultra/shutdown_drain_test.go cmd/apt-cacher-ultra/legacy_audit_wiring_test.go cmd/apt-cacher-ultra/upstream_invalid_cert_test.go cmd/apt-cacher-ultra/adopt_unsigned_wiring_test.go internal/freshness/adoption_test.go internal/freshness/adoption_date_test.go internal/freshness/capacity_test.go internal/freshness/freshness_test.go internal/freshness/hot_prefetch_test.go internal/freshness/panic_recovery_test.go internal/freshness/phase6_7_skip_repair_test.go internal/freshness/scheduler_test.go
 git commit -m "$(cat <<'EOF'
 Tests: silent output, one daemon-start helper; no refresher after Shutdown
 
@@ -7182,7 +7711,10 @@ and a drain on failure (D-46, D-49). A log assertion decodes its record
 (E-73) and another runs after Close (D-60). The admin server no longer
 starts a refresher after a Shutdown that came during Serve's first
 refresh, and the test server's cleanup waits for Shutdown and Serve
-before closing the cache (D-57, F-23).
+before closing the cache (D-57, F-23). The chaos tests' phase-2 trigger
+repeats every 20 ms until the gate parks the adoption, with the suite
+held across its first GET: one GET's T1 check was dropped while a
+phase-1c check still held the suite, and no adoption started (C-39).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -7302,7 +7834,7 @@ EOF
 
 ### Task 17: Phase H1's definition of done
 
-No new code: the brief's mandatory DoD, mapped to the tests that prove each item, and the checks that span the tasks, run on the tree at the end of Task 16. Run Step 1 before Task 18, which deletes the seven files it reads. Every output below is the replay's (the scratch tree at 6786529 with Tasks 1–16 applied).
+No new code: the brief's mandatory DoD, mapped to the tests that prove each item, and the checks that span the tasks, run on the tree at the end of Task 16. Run Step 1 before Task 18, which deletes the seven files it reads. Every output below is the replay's (the revision of 2026-10-25: a fresh copy of eadfd80, whose code is 6786529's, with Tasks 1–16 applied).
 
 **Files:** none. The task changes no file and has no commit; its outputs go in the phase's final report.
 
@@ -7317,7 +7849,7 @@ No new code: the brief's mandatory DoD, mapped to the tests that prove each item
 | Every deferred ID has a disposition, and every `fix` row maps to a task | the table; 1, 4–16, 18 | Step 1 |
 | F-24's probe fails at HEAD and passes after Task 1 | 1 | `TestRunSnapshotGCBatch_KeepsAuditDeferredSignedHistory`: Task 1 Step 2 (red at 6786529), Step 4 (green) |
 | R-H2's tests: the rows of a corrupt anchor are gone after the audit, a client request misses and refetches, an oversized anchor keeps its rows | 2 | `TestApplyLegacyAuditDecisions_CorruptAnchorDropsEveryRowOfItsBlob`, `TestApplyLegacyAuditDecisions_DropAnchorRowsNeedsAQuarantine`, `TestAuditLegacySnapshot_OnlyACorruptAnchorDropsItsRows`, `TestRunLegacyTrustAudit_CorruptAnchorDropsItsRowsOversizedKeepsThem`, `TestServeHTTP_ACorruptAnchorQuarantineRefetchesTheAnchor` |
-| R-H3's and R-H6's renames, with `docs/log-fields.md` updated; a new prose message fails the build | 3 | `TestSweptEventNames` (no old name in any Go file, each new name in production code, each documented one in `docs/log-fields.md`), `TestLogMessagesAreSnakeCase` (every message snake_case or one of `main`'s 78) |
+| R-H3's and R-H6's renames, with `docs/log-fields.md` updated; a new prose message fails the build | 3 | `TestSweptEventNames` (no old name in any Go file, each new name in production code, each with a `docs/log-fields.md` row), `TestLogMessagesAreSnakeCase` (every message snake_case or one of `main`'s 78) |
 | The admin `retired_reaped` beside `displaced_reaped`: JSON, GC panel, `docs/admin-ui-spec.md` | 4, 18 | `TestGCInfoFromSummary_CopiesEveryShownField`, `TestStatusHTML_ShowsTheSweepsCells`, `TestJSONContractPreserved` (its golden regenerated in Task 4); admin-ui-spec §4.6 (Task 18) |
 | The anchorless refresh visible in `suites[]` and on the page, additive | 4 | `TestSuiteEntries_Anchorless`, `TestStatusHTML_ShowsTheSweepsCells`, `TestJSONContractPreserved` |
 | `docs/log-fields.md`'s gaps: `adoption_member_skipped` (with `declared_sha512`), `snapshot_index_target_404` (the layout-aware architecture), `admin_reconcile_requested` | 18 | Task 18's log-fields diff; `admin_reconcile_requested`'s fields are pinned by `TestEndpoint_Reconcile_LogsBothSchemeFields` (Task 5) |
@@ -7325,8 +7857,10 @@ No new code: the brief's mandatory DoD, mapped to the tests that prove each item
 | `go test -race ./...` and `golangci-lint run ./...` clean; `gofmt -l .` shows only the five drift files | all | Steps 2–4 |
 | Every simulation under 4.5 s with `-race` | 13 (R-H4) | Step 5 |
 | `TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds` under 4.5 s with `-race`, every assertion kept (R-H7) | 13 | Task 13 Step 8's table; Step 5 |
-| GD-5 recorded as decided (R-H5) | 18 | spec §10 item 12, the overview's decided entries |
-| The seven deferred files deleted; the overview updated | 18 | Task 18 Steps 7 and 8 |
+| GD-5 recorded as decided (R-H5), for the maintainer's confirmation | 18 | spec §10 item 12, the overview's decided entries |
+| The docs of H1's own changes (`docs/log-fields.md`, `docs/configuration.md`, `docs/admin-ui-spec.md`, the conffile) and spec revision 12 | 18 | Task 18 Steps 2–7; `TestEveryEventIsDocumented` (every snake_case event has a `docs/log-fields.md` row, `main`'s 87 without one listed; review sweep M-11) |
+| R-H2 heals an unchanged upstream (review C-1) | 2 | `TestServeHTTP_ACorruptAnchorQuarantineRefetchesTheAnchor`'s `upstream unchanged` case; Task 2 Step 6's first mutant |
+| The seven deferred files deleted; the overview updated | 18 | Task 18 Steps 8 and 9 |
 
 - [ ] **Step 1: Every deferred ID has exactly one row, and every `fix` row's ID is named in its task**
 
@@ -7345,9 +7879,9 @@ Expected:
 136
 136
 same IDs
-     24 declined
+     23 declined
       2 done
-    110 fix
+    111 fix
 ```
 
 Then run:
@@ -7368,7 +7902,7 @@ print(f"{rows} fix rows, {bad} not named in their task")
 EOF
 ```
 
-Expected: `110 fix rows, 0 not named in their task`.
+Expected: `111 fix rows, 0 not named in their task`.
 
 - [ ] **Step 2: The race detector over the module**
 
@@ -7401,29 +7935,167 @@ On a quiet machine (no other build or test running), run:
 go test -race -p 1 -count=3 -v -run '^(TestSim[A-Za-z0-9_]*|TestDoD_[A-Za-z0-9_]*|TestServeHTTP_Minted[A-Za-z0-9_]*AtScale|TestLedger_[A-Za-z0-9_]*|TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds)$' ./internal/flipgate/ ./internal/freshness/ ./internal/handler/ ./internal/simtest/ 2>&1 | grep -E '^--- ' | sort -t'(' -k2 -rn | head -20
 ```
 
-Expected: PASS, every line under 4.5 s. In Step 2's module-wide run packages run in parallel and simulations take up to twice as long; the budget is this step's. A line over 4.5 s means a busy machine first: rerun that test with `-count=5`; an over-budget time that repeats on a quiet machine fails the DoD.
+Expected: PASS, every line under 4.5 s. Then record, for the release notes and the next coarsening, the machine's CPU count (`nproc`) and the three simulations closest to the budget — `TestSimScheduler_StallingHostWithAdoptionContention`, `TestDoD_NinetyDaysOfReapingWithRestarts`, `TestSimRetry_LongRunDateRulesAndClockSteps` — from this run (`-p 1`); any above 4.0 s is flagged as the next candidate for coarsening (review M-5: R-H7's own reason, the risk a 4-vCPU runner exposes, applies to them). In Step 2's module-wide run packages run in parallel and simulations take up to twice as long; the budget is this step's. A line over 4.5 s means a busy machine first: rerun that test with `-count=5`; an over-budget time that repeats on a quiet machine fails the DoD.
 
-Replay: 50 tests, three runs each, all PASS. The slowest (min–max): `TestServeHTTP_MintedSuitesAtScale` 4.10–4.23 s (untouched by H1; phase G recorded 3.93–4.06 s), `TestServeHTTP_MintedFlatSuitesAtScale` 2.49–4.01 s, `TestDoD_NinetyDaysOfReapingWithRestarts` 3.55–3.81 s, `TestSimRetry_LongRunDateRulesAndClockSteps` 3.62–3.78 s, `TestSimSmoke_30DaysPeriodicRefresh` 2.86–3.73 s, `TestSimScheduler_StallingHostWithAdoptionContention` 3.42–3.69 s, `TestSimScheduler_FiveHundredStallingOneHealthy` 2.92–3.63 s (C-38), `TestSimCapacity_UpgradeBurst` 3.41–3.52 s, `TestSimFlip_DetachedBusySuiteStraddlesOnlyWithoutTheBarrier` 3.34–3.99 s; every other one under 3.5 s. Three single runs went over while another session's e2e containers ran on the machine — `TestSimScheduler_StallingHostWithAdoptionContention` 6.07 s, `TestSimFlip_DetachedBusySuiteStraddlesOnlyWithoutTheBarrier` 5.69 s, `TestDoD_NinetyDaysOfReapingWithRestarts` 5.28 s — and five more runs of each, the machine quieter, gave 3.42–3.52 s, 3.34–3.49 s and 3.55–3.81 s (the ranges above include them). `TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds` (R-H7), measured on its own after its coarsening: 3.39–3.46 s.
+Replay (the revision of 2026-10-25, a quiet machine with 12 CPUs, load below 1): 50 tests, three runs each, all PASS. The slowest (min–max): `TestServeHTTP_MintedSuitesAtScale` 3.89–3.96 s (untouched by H1; phase G recorded 3.93–4.06 s), `TestDoD_NinetyDaysOfReapingWithRestarts` 3.69–3.76 s, `TestSimRetry_LongRunDateRulesAndClockSteps` 3.63–3.70 s, `TestSimFlip_DetachedBusySuiteStraddlesOnlyWithoutTheBarrier` 3.48–3.56 s, `TestSimScheduler_StallingHostWithAdoptionContention` 3.51–3.55 s, `TestSimCapacity_UpgradeBurst` 3.24–3.27 s, `TestSimFlappingMirror_NeverFlipsBack` 3.14–3.25 s, `TestSimScheduler_FiveHundredStallingOneHealthy` 2.95–2.97 s (C-38); every other one under 3 s. `TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds` (R-H7), measured on its own after its coarsening: 3.39–3.46 s. Review M-5's three: none above 4.0 s on this machine; `TestServeHTTP_MintedSuitesAtScale`, the closest to the budget, is phase D's and untouched here. A 4-vCPU runner is slower: the first to coarsen there are the Minted test and the 90-day DoD.
 
 ### Task 18: Documentation, spec revision 12, the overview, the deferred files (C-36, C-37, D-52, D-55, E-24)
 
-The operator documentation of H1's own changes (Task 3 renamed the events in the docs already), spec revision 12, the overview's H1 part, two code comments that name a deferred file, and the deletion of the seven deferred files. README and the release notes are H3's ("For H3" above lists what they must say).
+The operator documentation of H1's own changes (Task 3 renamed the events in the docs already), spec revision 12, the overview's H1 part, two code comments that name a deferred file, and the deletion of the seven deferred files. A guard test comes first: every snake_case event production code logs must have a `docs/log-fields.md` row, `main`'s 87 without one listed (review sweep M-11); it fails until this task's rows land, and it found one more gap, phase E's `adoption_repair_declarations_unavailable`. README and the release notes are H3's ("For H3" above lists what they must say).
 
-**Every deferred minor, as this plan leaves it.** All 136 have their row in the disposition table (Task 17 Step 1 checked it before this task deletes the files). Taken in this task: C-36 (`docs/admin-ui-spec.md` §4.6: a Recent Adoptions duration includes the flip barrier's wait), C-37 (the conffile's `max_duration` and `keep_displaced` comments), D-52 (the detached-only wording in `docs/configuration.md` and spec C3), D-55 (the overview's (D) H item moves under Carry-forwards' **H:**, closed by R-H3), E-24 (documented in *Eager first adoption*, design note 13); and the documentation halves of E-75 (spec: C-38's measurement is Task 13's), GD-2 (spec C5) and GD-5 (declined by ruling R-H5: spec §10 item 12 and the overview record the decision).
+**Every deferred minor, as this plan leaves it.** All 136 have their row in the disposition table (Task 17 Step 1 checked it before this task deletes the files). Taken in this task: C-36 (`docs/admin-ui-spec.md` §4.6: a Recent Adoptions duration includes the flip barrier's wait), C-37 (the conffile's `max_duration` and `keep_displaced` comments), D-52 (the detached-only wording in `docs/configuration.md` and spec C3), D-55 (the overview's (D) H item moves under Carry-forwards' **H:**, closed by R-H3), E-24 (documented in *Eager first adoption*, design note 13); and the documentation halves of E-75 (spec: C-38's measurement is Task 13's), GD-2 (spec C5) and GD-5 (declined by ruling R-H5, for the maintainer's confirmation: spec §10 item 12 and the overview record the decision).
 
 **Files:**
+- Create: `internal/observability/event_docs_test.go`
 - Modify: `docs/configuration.md`, `docs/log-fields.md`, `docs/admin-ui-spec.md`, `packaging/config/config.toml.default` (comments only), `docs/superpowers/specs/2026-09-27-flat-repositories-design.md`, `docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md`, `internal/handler/wallclock_stamps_test.go` (a comment), `internal/freshness/anchorless.go` (an AIDEV-NOTE)
 - Delete: `docs/superpowers/plans/2026-09-28-flat-repositories-{A,B,C,D,E,F,G}-deferred.md`
 
 **Interfaces:**
-- Consumes: the names every earlier task produced, as built: the events `suite_reaper_run_complete`, `suite_not_forgotten`, `gc_panicked`, `reconcile_snapshot_read_failed`, `source_paths_skipped`; the fields `anchor_rows_deleted`, `paced_stale`, `last_requested_unixtime` and `evidence` (`suite_reaped`), `canonical_scheme` (the admin lines); the gauge `acu_suite_reaper_last_run_unixtime`; the JSON fields `suites[].anchorless`, `recent_adoptions[].scheme`, `gc.retired_reaped`.
-- Produces: nothing code uses.
+- Consumes: Task 3's test helpers `logMessages(t)`, `documentedEvents(t)` and `snakeCase`; the names every earlier task produced, as built: the events `suite_reaper_run_complete`, `suite_not_forgotten`, `gc_panicked` (with `where=startup`), `legacy_anchor_discard_failed`, `reconcile_snapshot_read_failed`, `source_paths_skipped` (INFO); the fields `anchor_rows_deleted`, `paced_stale`, `last_requested_unixtime` and `evidence` (`suite_reaped`; a list), `canonical_scheme` (the admin lines); the gauge `acu_suite_reaper_last_run_unixtime`; the JSON fields `suites[].anchorless`, `recent_adoptions[].scheme`, `gc.retired_reaped`; the status texts `checks failing ×k · backoff ends in …` / `backoff over`.
+- Produces: `TestEveryEventIsDocumented` and its list `mainEventsWithoutARow`, which a later rename or a new row of one of `main`'s events shrinks.
 
 Each diff below was produced against the tree at the end of Task 17 (Tasks 1–16 applied) and applies with `git apply` (`patch -p1` also does); a hunk that does not apply means an earlier task's docs differ from the replay's — then edit by hand to the `+` text.
 
-- [ ] **Step 1: `docs/configuration.md`**
+- [ ] **Step 1: Write the failing docs test**
 
-*Upgrading an existing cache*: a detached-only repository is untracked only when first seen after the upgrade (D-52); a corrupt stored `InRelease`'s cached copies are deleted by the audit (R-H2). *Eager first adoption*: E-24's paragraph (design note 13). The `keep_displaced` row: F-24 (R-H1). *Suite reaping*: the run line and its gauge (F-13). *Forgetting a suite*: 400 for a body that is not a form, 413 for one over 8 KiB (F-5), and a 409's DEBUG line (F-15).
+Create `internal/observability/event_docs_test.go`:
+
+```go
+package observability
+
+import "testing"
+
+// mainEventsWithoutARow are the snake_case events main already logs that
+// have no docs/log-fields.md row (some are described in its prose
+// sections; they predate the flat-repository branch). Every other event
+// must have a row there (review sweep M-11 of the H1 plan); giving one of
+// these a row removes it here.
+var mainEventsWithoutARow = []string{
+	"admin_authenticated",
+	"admin_cpu_profile_finished",
+	"admin_cpu_profile_started",
+	"admin_disabled",
+	"admin_profile_write_failed",
+	"admin_refresh_complete",
+	"admin_request",
+	"admin_scrape_error",
+	"admin_status_render_failed",
+	"admin_unauthenticated_non_loopback",
+	"adoption_blocked_serve_target_missing",
+	"adoption_byhash_fallback",
+	"adoption_form_drift",
+	"adoption_gpg_failed",
+	"adoption_heartbeat_blobs_failed",
+	"adoption_heartbeat_failed",
+	"adoption_hot_prefetch_complete",
+	"adoption_hot_prefetch_partial",
+	"adoption_hot_prefetch_started",
+	"adoption_member_repair_failed",
+	"adoption_member_repaired",
+	"adoption_member_retry",
+	"adoption_parse_failed",
+	"adoption_reconcile_member_failed",
+	"adoption_reconcile_snapshot_displaced",
+	"adoption_repair_bump_failed",
+	"adoption_repair_pass",
+	"adoption_repair_snapshot_displaced",
+	"adoption_required_index_target_missing",
+	"adoption_short_keyid_fallback",
+	"adoption_snapshot_reconciled",
+	"adoption_success",
+	"adoption_unpinned_suite",
+	"adoption_untrusted_signer",
+	"adoption_unverified_signer",
+	"at_rest_corruption",
+	"at_rest_scan_finished",
+	"at_rest_scan_started",
+	"freshness_check",
+	"gc_disabled",
+	"gc_pool_malformed_name",
+	"gc_pool_misplaced_file",
+	"gc_pool_scan_dir_failed",
+	"gc_pool_scan_lookup_failed",
+	"gc_pool_unexpected_root_file",
+	"gc_pool_unexpected_subdir",
+	"gc_pool_unlink_failed",
+	"gc_pool_unlink_skipped_invalid_hash",
+	"gc_run_complete",
+	"gc_tick_deadline_reached",
+	"gc_tick_failed",
+	"hash_validation_failure",
+	"hit_path_hash_evicted",
+	"hot_prefetch_budget_unbounded",
+	"hot_prefetch_deb_failed",
+	"hot_prefetch_hash_mismatch",
+	"htpasswd_reload_failed",
+	"metrics_series_cap_reached",
+	"mitm_ca_generated",
+	"mitm_ca_generation_failed",
+	"mitm_ca_load_failed",
+	"mitm_ca_loaded",
+	"mitm_ca_lock_timeout",
+	"mitm_ca_name_constraints_skipped",
+	"mitm_ca_unconstrained_refused",
+	"mitm_cert_cache_evicted",
+	"mitm_cert_issued",
+	"mitm_clock_skew",
+	"mitm_connect",
+	"package_hash_incomplete_binary_skipped",
+	"package_hash_miss",
+	"pdiff_index_parse_failed",
+	"pdiff_index_parsed",
+	"refresher_query_failed",
+	"refuse_unvouched_debs_inert",
+	"request",
+	"schema_migrating",
+	"snapshot_member_refetch_mismatch",
+	"source_hash_conflict",
+	"source_parse_failed",
+	"source_parsed",
+	"stale_serve",
+	"tls_mitm_enabled",
+	"tls_mitm_enabled_ca_undistributed",
+	"tls_mitm_narrowing_regex_set",
+	"unvouched_deb_passthrough_no_coverage",
+	"unvouched_deb_refused",
+}
+
+// Review sweep M-11 of the H1 plan: every snake_case event production code
+// logs has a docs/log-fields.md row (documentedEvents), main's events
+// without one excepted; each of those is still logged and still without a
+// row, so the list stays exact.
+func TestEveryEventIsDocumented(t *testing.T) {
+	documented := documentedEvents(t)
+	known := map[string]bool{}
+	for _, e := range mainEventsWithoutARow {
+		known[e] = true
+	}
+	msgs := logMessages(t)
+	for msg, where := range msgs {
+		if !snakeCase.MatchString(msg) {
+			continue
+		}
+		switch {
+		case !documented[msg] && !known[msg]:
+			t.Errorf("%s: event %s has no row in docs/log-fields.md; add one", where, msg)
+		case documented[msg] && known[msg]:
+			t.Errorf("%s has a docs/log-fields.md row now: remove it from mainEventsWithoutARow", msg)
+		}
+	}
+	for _, e := range mainEventsWithoutARow {
+		if _, ok := msgs[e]; !ok {
+			t.Errorf("%s is no longer logged: remove it from mainEventsWithoutARow", e)
+		}
+	}
+}
+```
+
+Run: `go test -count=1 -run TestEveryEventIsDocumented ./internal/observability/`
+Expected: FAIL with ten lines `event_docs_test.go:117: <file>:<line>: event <event> has no row in docs/log-fields.md; add one`, for `admin_reconcile_requested`, `adoption_member_skipped`, `adoption_repair_declarations_unavailable`, `gc_panicked`, `legacy_anchor_discard_failed`, `reconcile_snapshot_read_failed`, `snapshot_index_target_404`, `source_paths_skipped`, `suite_not_forgotten` and `suite_reaper_run_complete` (in no fixed order).
+
+- [ ] **Step 2: `docs/configuration.md`**
+
+*Upgrading an existing cache*: a detached-only repository is untracked only when first seen after the upgrade (D-52); a corrupt stored `InRelease`'s cached copies are deleted, under any scheme or host, and the corrupt file removed, so an unchanged upstream heals too (R-H2, reviews C-1 and sweep M-7); a snapshot the audit cannot read at all keeps its rows and files until the pool is fixed or the suite forgotten (review M-9). *Eager first adoption*: E-24's paragraph (design note 13). The `keep_displaced` row: F-24 (R-H1). *Suite reaping*: the run line and its gauge (F-13). *Forgetting a suite*: 400 for a body that is not a form, 413 for one over 8 KiB (F-5), and a 409's DEBUG line (F-15).
 
 ````diff
 diff --git a/docs/configuration.md b/docs/configuration.md
@@ -7458,22 +8130,28 @@ diff --git a/docs/configuration.md b/docs/configuration.md
  First adoptions never take the last free adoption slot, which is kept for
  suites that already serve a signed snapshot (see *Capacity and
  fairness*): with the default `max_concurrent_adoptions = 2` a first
-@@ -687,7 +696,13 @@
+@@ -687,7 +696,19 @@
  false`, or one carrying declarations outside its signature — or whose pool
  file is missing or corrupt, is quarantined: it stops serving and vouching,
  its suite is served from the ordinary cache, and a `legacy_snapshot_quarantined`
 -line names it. A suite quarantined for declarations outside its signature
 +line names it. When the stored `InRelease` is corrupt — its bytes no longer
 +match the hash recorded for them — the audit also deletes every cached copy
-+of it (each `url_path` row that holds that file, under either scheme; the
-+line's `anchor_rows_deleted` counts them), so the next client update fetches
-+a fresh one from upstream instead of being served bytes apt rejects; a
-+missing file, or one too large for the audit to read (`anchor_oversized`,
-+not proven bad), keeps its rows. A suite quarantined for declarations outside its signature
++of it (each `url_path` row that holds that file, under any scheme or host;
++the line's `anchor_rows_deleted` counts them) and removes the corrupt file,
++so the next client update fetches a fresh one from upstream instead of
++being served bytes apt rejects, also when upstream still serves the same
++file (`legacy_anchor_discard_failed` says when the file could not be
++removed); a missing file, or one too large for the audit to read
++(`anchor_oversized`, not proven bad), keeps its rows. A snapshot whose
++pool file cannot be read at all is deferred, not judged: an ERROR
++`legacy_trust_audit_deferred` names it at every start, and it keeps its
++rows and files until the pool is fixed or the suite is forgotten
++(`POST /forget`). A suite quarantined for declarations outside its signature
  adopts again on its first freshness check, because its tampered copy never
  matches a clean upstream; one quarantined because its stored file was lost
  or corrupt waits for the next upstream change, and may have no record that
-@@ -819,7 +834,7 @@
+@@ -819,7 +840,7 @@
  | `snapshot_batch_size` | integer | `10` | Maximum snapshots removed per batch. Snapshot deletion can cascade through many member rows. At least `1`. |
  | `max_tick_duration` | duration | `"5m"` | Budget for startup/periodic GC passes, checked between batches; remaining work resumes later. The startup pass, which runs before the listeners serve, leaves the retired snapshots (of a reaped, evicted or forgotten suite, or one the upgrade's trust audit quarantined) to the periodic passes, normally the first one after the start (see *Suite reaping*); it deletes only a retired one never adopted whose heartbeat went stale, as it does any abandoned adoption candidate. Must be positive. |
  | `blob_grace` | duration | `"5m"` | Grace after a blob's reference count reaches zero before deletion. At least `"1s"`, and greater than twice `heartbeat_interval`. |
@@ -7482,7 +8160,7 @@ diff --git a/docs/configuration.md b/docs/configuration.md
  | `pool_scan_workers` | integer | `4` | Workers for the startup orphan-file scan. At least `1`. |
  | `heartbeat_interval` | duration | `"60s"` | Refresh in-progress adoption liveness and blob protection. Positive and subject to both bounds below. |
  | `url_path_ttl` | duration | `"168h"` | Requests within this window protect cached URL rows. Older or never-requested rows are evaluated against snapshot/version retention and hold grace. `"0s"` disables URL-path expiration; other values must be at least `"1m"`. |
-@@ -865,7 +880,10 @@
+@@ -865,7 +886,10 @@
  tree — a flat repository's root files, never its `./` twin's — in
  batches of 1,000 files), retires its snapshots and deletes its
  row (INFO `suite_reaped`; `acu_suites_reaped_total{reason}` counts the
@@ -7494,7 +8172,7 @@ diff --git a/docs/configuration.md b/docs/configuration.md
  lose the version retention its snapshot gave them
  (`retention.max_versions_per_package` counts versions in current
  snapshots only; a package another suite's snapshot lists keeps that
-@@ -1071,8 +1089,9 @@
+@@ -1071,8 +1095,9 @@
      --data-urlencode 'suite=/ubuntu/24.04/prod/dists/noble'
  # 202 Accepted = forgotten (the work is done when the answer comes); the body
  #   names the suite, the signed-path records deleted and the suites that kept them
@@ -7506,7 +8184,7 @@ diff --git a/docs/configuration.md b/docs/configuration.md
  # 403 = the header is missing, a browser request from another origin, or,
  #   without htpasswd_file, a host name other than localhost or listen's (use the address)
  # 409 = busy (being checked or adopted: try again) or no such suite (check the
-@@ -1090,7 +1109,9 @@
+@@ -1090,7 +1115,9 @@
  request refused with 400, 403 or 413 is not), and each suite forgotten
  as INFO `suite_forgotten` — with `settled=true` when its final delete
  committed although the request then failed (500, or 503 at shutdown)
@@ -7519,15 +8197,15 @@ diff --git a/docs/configuration.md b/docs/configuration.md
  
 ````
 
-- [ ] **Step 2: `docs/log-fields.md`**
+- [ ] **Step 3: `docs/log-fields.md`**
 
-The unlogged-panics counter names the boundaries Task 9 added (E-45); the reaper's gauge (F-13); the table's intro names `internal/gc` (F-21); the stale-suites WARN's `paced_stale` (E-30); `freshness_read_anchor_rows_failed` carries `canonical_scheme` on every line and is DEBUG at shutdown on every path (GD-6); `adoption_member_skipped` and `snapshot_index_target_404` (the G carry-forward), `admin_reconcile_requested` (never documented; with F-16's `canonical_scheme`); `reconcile_snapshot_read_failed` (E-31); `clock_step_detected`'s forward step counted (F-17) and its cooldown wording (E-37); `legacy_snapshot_quarantined`'s `anchor_rows_deleted` (R-H2); `adoption_served_anchor_read_failed` at DEBUG on shutdown (E-13); `suite_reaped`'s fields (F-18); `canonical_scheme` on the two forget lines (F-16) and `suite_not_forgotten` (F-15); `suite_reaper_run_complete` (F-13); `gc_panicked` (F-21); `source_paths_skipped` (GD-2).
+The unlogged-panics counter names the boundaries Task 9 added (E-45, review M-2); the reaper's gauge (F-13); the table's intro names `internal/gc` (F-21); the stale-suites WARN's `paced_stale` (E-30); `freshness_read_anchor_rows_failed` carries `canonical_scheme` on every line and is DEBUG at shutdown on every path (GD-6); `adoption_member_skipped` and `snapshot_index_target_404` (the G carry-forward), `admin_reconcile_requested` (never documented; with F-16's `canonical_scheme`); `reconcile_snapshot_read_failed` (E-31); `clock_step_detected`'s forward step counted (F-17) and its cooldown wording (E-37); `legacy_snapshot_quarantined`'s `anchor_rows_deleted` and the pool file's removal (R-H2, review C-1), with the new ERROR `legacy_anchor_discard_failed`; `adoption_served_anchor_read_failed` at DEBUG on shutdown (E-13); `suite_reaped`'s fields, `evidence` a list (F-18, review M-7); `canonical_scheme` on the two forget lines (F-16) and `suite_not_forgotten` (F-15); `suite_reaper_run_complete` (F-13); `gc_panicked`, with `where=startup` and the rotation (F-21, reviews I-1 and M-1); `source_paths_skipped` at INFO (GD-2, review M-8); `adoption_repair_declarations_unavailable`, a phase E DEBUG line `TestEveryEventIsDocumented` found undocumented.
 
 ````diff
 diff --git a/docs/log-fields.md b/docs/log-fields.md
 --- a/docs/log-fields.md
 +++ b/docs/log-fields.md
-@@ -193,9 +193,10 @@
+@@ -193,9 +193,11 @@
  (suites refused within the last 10 minutes, or the last minute for a busy
  refusal; updated within a minute). The
  scheduler adds the unlabelled counter `acu_freshness_unlogged_panics_total`
@@ -7535,13 +8213,14 @@ diff --git a/docs/log-fields.md b/docs/log-fields.md
 -or the adoption heartbeat — that could not be logged because reporting
 -them panicked too: a bug, please report it).
 +(recovered panics — of a scheduled check, a scheduler tick, the start-time
-+retry spread, an adoption, its failure record, the adoption heartbeat, a
-+repair or reconcile, a suite reaper run or `POST /forget` — that could not
-+be logged because reporting them panicked too: a bug, please report it).
++retry spread, an adoption, its counters and admin ring event, its failure
++record, the adoption heartbeat, a repair or reconcile, a suite reaper run or
++`POST /forget` — that could not be logged because reporting them panicked
++too, or that struck the counting itself: a bug, please report it).
  `acu_adoption_duration_seconds` includes the barrier's wait (at most
  140 s). Eager adoption (spec C4, C10) adds `acu_repair_deferred_total{host}`
  (repairs and reconciles of an unchanged suite deferred because no adoption
-@@ -206,7 +207,11 @@
+@@ -206,7 +208,11 @@
  wait is part of the request line's `duration_ms`). Suite reaping (spec C9)
  adds the counter `acu_suites_reaped_total{reason}` (suites the suite
  reaper deleted, by `reason`: `idle`, `non_canonical`, `junk`, settled
@@ -7554,7 +8233,7 @@ diff --git a/docs/log-fields.md b/docs/log-fields.md
  snapshots that snapshot GC deleted: those of reaped, forgotten and
  evicted suites, and those the upgrade's trust audit quarantined), whose
  per-pass count the `gc_run_complete` line carries as `retired_reaped`
-@@ -315,9 +320,9 @@
+@@ -315,9 +321,9 @@
  failure and refusal records and their retry schedule, wall-clock step
  detection, the startup legacy trust audit, the flip barrier, suite rows
  (cap refusals, evictions, reaping and `POST /forget`), a slow shutdown
@@ -7567,7 +8246,7 @@ diff --git a/docs/log-fields.md b/docs/log-fields.md
  
  | Event | Level | Fields | Meaning |
  |---|---|---|---|
-@@ -338,21 +343,23 @@
+@@ -338,22 +344,25 @@
  | `adoption_repair_list_failed` | WARN | `canonical_host`, `suite_path`, `snapshot_id`, `err` | The repair decision could not list the snapshot's repairable skipped members; no repair runs this check, the next unchanged check asks again. |
  | `freshness_clamp_adoption_retry_failed` | WARN | `canonical_host`, `suite_path`, `err` | A retry time left in the future by a backward clock step could not be clamped; the next check tries again. |
  | `freshness_clear_adoption_failure_failed` | WARN | `canonical_host`, `suite_path`, `err` | Upstream serves the current content again but the failure record could not be cleared; the next check tries again. |
@@ -7577,6 +8256,7 @@ diff --git a/docs/log-fields.md b/docs/log-fields.md
 -| `freshness_read_anchor_rows_failed` | WARN | `err`, `canonical_scheme` (not yet on the line of an adopted suite whose current anchor is absent), `canonical_host`, `suite_path` | A check could not read the suite's cached anchor rows (`url_path`). A suite without a snapshot is not probed this time — no request, nothing written; the next check tries again. A suite whose current anchor is absent probes the other forms at their canonical URLs instead. A flat suite without a snapshot has its cached `Packages`, `Sources` and `Contents-*` rows read once, with its anchor rows, before any request — they serve both the test for a client's fetch and the anchorless refresh — and a failure of that read (`err` starts `read flat index rows:`) logs the same line, with the same result. Nothing is stamped, so every check of a suite without a snapshot past the `cooldown` since its last recorded check reads and logs again; none sends a request. For a suite without a snapshot, a read that a shutdown cut short is not logged here (DEBUG only). |
 +| `freshness_read_anchor_rows_failed` | WARN | `err`, `canonical_scheme`, `canonical_host`, `suite_path` | A check could not read the suite's cached anchor rows (`url_path`). A suite without a snapshot is not probed this time — no request, nothing written; the next check tries again. A suite whose current anchor is absent probes the other forms at their canonical URLs instead. A flat suite without a snapshot has its cached `Packages`, `Sources` and `Contents-*` rows read once, with its anchor rows, before any request — they serve both the test for a client's fetch and the anchorless refresh — and a failure of that read (`err` starts `read flat index rows:`) logs the same line, with the same result. Nothing is stamped, so every check of a suite without a snapshot past the `cooldown` since its last recorded check reads and logs again; none sends a request. A read that a shutdown cut short is not logged here (DEBUG only). |
  | `freshness_read_current_snapshot_failed` | WARN | `err`, `snapshot_id`, `canonical_host`, `suite_path` | A check whose absent anchor's probe tree found a form it may adopt could not read the suite's current snapshot, so it cannot tell an anchor that merely came back from new content: the check fails (`freshness check failed`) rather than re-adopting the current content. A shutdown that ends the read is not logged here. |
+ | `freshness_check_cancelled`, `freshness_check_ended_by_shutdown`, `freshness_check_skipped_no_baseline_anchor_hash`, `freshness_refused_suite_paced_until_retry`, `freshness_deferred_never_adopted_suite_paced_until_retry`, `freshness_never_adopted_suite_dormant_no_recent_interest`, `freshness_never_adopted_suite_dormant_no_client_created_row`, `freshness_anchorless_index_sniff_failed_kept`, `freshness_repair_deferred_no_adoption_slot`, `legacy_trust_audit_cached_anchor_skipped`, `suite_touch_failed` | DEBUG | `canonical_host`; `suite_path`, except for the sniff and the cached anchor, which name their file as `path`; `step` and `err` (`freshness_check_ended_by_shutdown`); `anchor` (`freshness_check_skipped_no_baseline_anchor_hash`); `reason` (the two `…_paced_until_retry`); `err` (`legacy_trust_audit_cached_anchor_skipped`, `suite_touch_failed`) | Routine outcomes, each named by what its message said before phase H1: `freshness_check_cancelled` — a check's request was cancelled (its context ended, as at shutdown), so it wrote nothing; `freshness_check_ended_by_shutdown` — a shutdown ended the check's local `step`: nothing written, not a failed check; `freshness_check_skipped_no_baseline_anchor_hash` — the suite has no cached hash of its `anchor` to compare with, so the check is skipped; `freshness_refused_suite_paced_until_retry` — an adopted suite its record paces (`reason`) is not probed before the record's retry time; `freshness_deferred_never_adopted_suite_paced_until_retry` — a never-adopted suite whose attempt was deferred is not probed until its record's retry or its next refresh check; `freshness_never_adopted_suite_dormant_no_recent_interest` — a never-adopted suite no client asked for in 7 days is dormant; `freshness_never_adopted_suite_dormant_no_client_created_row` — a never-adopted suite without a client-created anchor or flat index row is dormant; `freshness_anchorless_index_sniff_failed_kept` — an anchorless refresh's 200 for the index at `path` failed its sniff, so the cached row is kept (`acu_anchorless_sniff_rejected_total{host}`); `freshness_repair_deferred_no_adoption_slot` — a repair found no adoption slot and waits for a later unchanged check (`acu_repair_deferred_total{host}`); `legacy_trust_audit_cached_anchor_skipped` — the startup marker pass could not read the cached anchor at `path` and went on without it; `suite_touch_failed` — a suite's client-interest stamp could not be written; a later serve writes it. |
  | `adoption_member_mismatch` | WARN | `canonical_host`, `suite_path`, `path`, and `declared_sha256`/`actual_sha256` — or `declared_sha512`/`actual_sha512` when the member's SHA512 is the hash that failed | A member's bytes did not match the hash its `Release` declares (every declared SHA256 and SHA512 is checked), and the adoption fails (outcome `member_mismatch`). Fetched bytes never reach the pool. A pool file reused under its declared SHA256 whose SHA512 differs from the declared one — the `Release`'s two declarations disagree, so a fetch would bring the same bytes — is logged with `declared_sha512`/`actual_sha512`, is not fetched again, and is kept. |
 +| `adoption_member_skipped` | WARN | `canonical_host`, `suite_path`, `path`, `declared_sha256`, `declared_sha512` (each empty when the `Release` does not declare that hash), `reason`; `upstream_status` (`4xx`, `4xx_index_target`), `architecture` (`arch_not_in_allowlist`), `detail` (`optional_member_integrity`) | An adoption left one of the `Release`'s members out of the snapshot and went on: `4xx` — upstream answered 404 or 410 for a member apt can do without (a `Contents-*` the archive ships compressed only, say); `4xx_index_target` — the same for a `Packages` or `Sources` index (on a flat suite, its root ones): `apt update` fails for that architecture for the snapshot's lifetime, the snapshot answers its requests 404 (`snapshot_index_target_404`), and `adoption.required_architectures` can refuse such a snapshot instead; `arch_not_in_allowlist` — `adoption.architectures` leaves the member's architecture out (never requested); `optional_member_integrity` — a member apt does not need for `apt update` failed its fetch or hash check and `adoption.tolerate_optional_member_failures` is on (the default; an index's failure stays fatal), `detail` saying how; with `adoption.repair_skipped_members` such a member — unless its `Release` declares it by SHA512 only — is fetched again by a later unchanged check. A skipped member is never served from the snapshot. Counted in `acu_adoption_members_skipped_total{reason}`. |
  | `adoption_reconcile_failed` | WARN | `canonical_host`, `suite_path`, `snapshot_id`, `stage` (`decision`: deciding whether an unchanged suite needs a reconcile; `heal`: the reconcile run after an unchanged check; `on_demand`: `POST /reconcile`), `err` | Reconciling a snapshot's declared index files failed — for example a stored anchor that no longer decodes — so nothing was healed this time; it is tried again on a later unchanged check. |
@@ -7586,7 +8266,8 @@ diff --git a/docs/log-fields.md b/docs/log-fields.md
 -| `clock_step_detected` | WARN | `stamp`, `canonical_scheme`, `canonical_host`, `suite_path`, `stored_unixtime`, `now_unixtime` | A stored timestamp is more than 2 s in the future (the wall clock stepped backwards); the gate treated it as old. Rate-limited to one line per minute, except the suite reaper's reports (`stamp=last_requested_at` and `stamp=last_seen_at` from the reaper, and `stamp=wall_clock`), which it bounds itself and logs directly, so a check's report in the same minute cannot hide them. For `stamp=adoption_next_retry_at` the stamp is not treated as old: it is clamped to now + 1 h. For `stamp=last_requested_at` (a suite's client-interest stamp, read when the suite cap looks for an idle suite to evict, by the suite reaper, and by the check of a suite without a snapshot) the suite is not evicted, nor reaped as idle — a future stamp never counts as idle, though a non-canonical or junk row is reaped regardless (see `suite_reaped`); the reaper reports the furthest such stamp of a canonical suite at the first run that reaps after a start and again only when it changes — and the check counts a stamp up to 7 days ahead as recent interest; further ahead, the suite is dormant until a client asks for it again. For `stamp=last_seen_at` (a signed-seen record's stamp, read once a day by the suite reaper's sweep of records no suite uses; `suite_path` is the record's repository path, the furthest — of records with the same stamp, the first by scheme, host and path — reported at the first sweep after a start — a day after it — and when it changes; "in the future" is measured against the time of the sweep itself, so the records the run's own reaps moved up minutes earlier are no step) the record counts as seen now — it is never swept — and its stamp is left as it is: it ages out only once the clock has passed it (rewriting it to the stepped-back now would lose signed history once the clock is corrected). For `stamp=wall_clock` (the suite reaper; no suite fields) the wall clock moved more than an hour further than the monotonic clock between two of the reaper's runs — a forward step without a restart, as when a virtual machine or a laptop resumes; `stored_unixtime` is where the wall clock should be, `now_unixtime` where it is — and the reaper deletes nothing, no suite and no record, for an hour, and leaves the step out of the records' age for as long as it runs, so the record sweep never deletes a record early because of it; this one is not rate-limited and not counted in `acu_clock_steps_detected_total`. `acu_clock_steps_detected_total` counts detections, not distinct clock steps or distinct stamps: the same future stamp is detected again every time it is read — every check for a future `last_check_at` or `last_success_at` (the scheduler reads a future `last_success_at` without reporting it), every check of a suite without a snapshot for a future `last_requested_at`, and every creation attempt within eight rows of the global cap for the future `last_requested_at` its eviction scan re-reads (the line stays rate-limited) — so alert on its rate, not its value. |
 -| `legacy_snapshot_quarantined` | WARN | `reason` (`legacy_plaintext`, `malformed_envelope`, `unsigned_declarations`, `unparseable`, `anchor_missing`, `anchor_oversized`, `anchor_corrupt`, `unexpected_form`), `snapshot_id`, `canonical_host`, `suite_path`, `anchor_form`, `was_current` | The startup trust audit could not prove a pre-upgrade snapshot signed and clean; it no longer serves or vouches, and its suite is served unadopted until it re-adopts. |
 +| `clock_step_detected` | WARN | `stamp`, `canonical_scheme`, `canonical_host`, `suite_path`, `stored_unixtime`, `now_unixtime` | A stored timestamp is more than 2 s in the future (the wall clock stepped backwards); the gate treated it as old. Rate-limited to one line per minute, except the suite reaper's reports (`stamp=last_requested_at` and `stamp=last_seen_at` from the reaper, and `stamp=wall_clock`), which it bounds itself and logs directly, so a check's report in the same minute cannot hide them. For `stamp=adoption_next_retry_at` the stamp is not treated as old: it is clamped to now + 1 h. For `stamp=last_requested_at` (a suite's client-interest stamp, read when the suite cap looks for an idle suite to evict, by the suite reaper, and by the check of a suite without a snapshot) the suite is not evicted, nor reaped as idle — a future stamp never counts as idle, though a non-canonical or junk row is reaped regardless (see `suite_reaped`); the reaper reports the furthest such stamp of a canonical suite at the first run that reaps after a start and again only when it changes — and the check counts a stamp up to 7 days ahead as recent interest; further ahead, the suite is dormant until a client asks for it again. For `stamp=last_seen_at` (a signed-seen record's stamp, read once a day by the suite reaper's sweep of records no suite uses; `suite_path` is the record's repository path, the furthest — of records with the same stamp, the first by scheme, host and path — reported at the first sweep after a start — a day after it — and when it changes; "in the future" is measured against the time of the sweep itself, so the records the run's own reaps moved up minutes earlier are no step) the record counts as seen now — it is never swept — and its stamp is left as it is: it ages out only once the clock has passed it (rewriting it to the stepped-back now would lose signed history once the clock is corrected). For `stamp=wall_clock` (the suite reaper; no suite fields) the wall clock moved more than an hour further than the monotonic clock between two of the reaper's runs — a forward step without a restart, as when a virtual machine or a laptop resumes; `stored_unixtime` is where the wall clock should be, `now_unixtime` where it is — and the reaper deletes nothing, no suite and no record, for an hour, and leaves the step out of the records' age for as long as it runs, so the record sweep never deletes a record early because of it; this one is not rate-limited, and is counted in `acu_clock_steps_detected_total` once per detected step. `acu_clock_steps_detected_total` counts detections, not distinct clock steps or distinct stamps: the same future stamp is detected again every time it is read — every check for a future `last_check_at`, every check the cooldown lets through for a future `last_success_at` (a client's check the cooldown turns away does not report it, nor does the scheduler, which reads it as old), every check of a suite without a snapshot for a future `last_requested_at`, and every creation attempt within eight rows of the global cap for the future `last_requested_at` its eviction scan re-reads (the line stays rate-limited) — so alert on its rate, not its value. |
-+| `legacy_snapshot_quarantined` | WARN | `reason` (`legacy_plaintext`, `malformed_envelope`, `unsigned_declarations`, `unparseable`, `anchor_missing`, `anchor_oversized`, `anchor_corrupt`, `unexpected_form`), `snapshot_id`, `canonical_host`, `suite_path`, `anchor_form`, `was_current`, `anchor_rows_deleted` | The startup trust audit could not prove a pre-upgrade snapshot signed and clean; it no longer serves or vouches, and its suite is served unadopted until it re-adopts. For `anchor_corrupt` — the stored `InRelease`'s bytes no longer hash to its recorded SHA-256 — the same transaction also deletes every cached `url_path` row that holds that blob, under any scheme or host (`anchor_rows_deleted` counts them; 0 for every other reason), so the next client request fetches a fresh copy from upstream instead of being served bytes apt rejects; the blob itself is left to GC. `anchor_oversized` (an anchor over the audit's 8 MiB read, not proven bad) keeps its rows, as does `anchor_missing` (no bytes to serve: the next request fetches anyway). A pool file that cannot be read is no evidence: the snapshot is deferred (`legacy_trust_audit_deferred`). |
++| `legacy_snapshot_quarantined` | WARN | `reason` (`legacy_plaintext`, `malformed_envelope`, `unsigned_declarations`, `unparseable`, `anchor_missing`, `anchor_oversized`, `anchor_corrupt`, `unexpected_form`), `snapshot_id`, `canonical_host`, `suite_path`, `anchor_form`, `was_current`, `anchor_rows_deleted` | The startup trust audit could not prove a pre-upgrade snapshot signed and clean; it no longer serves or vouches, and its suite is served unadopted until it re-adopts. For `anchor_corrupt` — the stored `InRelease`'s bytes no longer hash to its recorded SHA-256 — the same transaction also deletes every cached `url_path` row that holds that blob, under any scheme or host (`anchor_rows_deleted` counts them; 0 for every other reason), and the audit removes the corrupt pool file itself (before the batch commits), so the next client request fetches a fresh copy from upstream instead of being served bytes apt rejects — also when upstream still serves the same `InRelease`, since the miss path keeps an existing pool file of the same hash (a failed removal: `legacy_anchor_discard_failed`). `anchor_oversized` (an anchor over the audit's 8 MiB read, not proven bad) keeps its rows, as does `anchor_missing` (no bytes to serve: the next request fetches anyway). A pool file that cannot be read is no evidence: the snapshot is deferred (`legacy_trust_audit_deferred`). |
++| `legacy_anchor_discard_failed` | ERROR | `snapshot_id`, `canonical_host`, `suite_path`, `blob_hash`, `err` | The startup trust audit could not remove the pool file of an `anchor_corrupt` snapshot; the quarantine went ahead and its `url_path` rows were deleted, so a client request refetches the `InRelease` — but if upstream still serves the same file, the fetch keeps the rotted pool file of that hash and serves it. Delete `pool/<first two characters of blob_hash>/<blob_hash>` under the cache directory once the cause (permissions, a read-only mount) is fixed; an eager re-adoption of the suite, with adoption enabled once a client asks, also evicts it (`pool_corruption_during_adoption`). |
  | `legacy_trust_audit_deferred` | ERROR | `snapshot_id`, `canonical_host`, `suite_path`, `err`, `stack` (present only for a recovered panic) | A pre-upgrade snapshot's pool file could not be read (not "missing"), or auditing it panicked (`err` carries the panic value); the snapshot is left as it was and retried at the next start. |
  | `legacy_trust_audit_progress` | INFO | `audited`, `quarantined`, `deferred` | One batch of up to 100 queued snapshots was audited and committed; the fields are running totals across this start's batches. Logged on the first start after an upgrade, and on later starts while deferred snapshots remain queued or after an interrupted audit. |
  | `legacy_trust_audit_completed` | INFO | `audited`, `signed`, `quarantined`, `deferred`, `anchor_markers`, `duration` | The startup trust audit finished (every start; `audited` is 0 once the upgrade queue has drained). |
@@ -7596,13 +8277,13 @@ diff --git a/docs/log-fields.md b/docs/log-fields.md
  | `adoption_abandoned_at_shutdown` | INFO | `canonical_host`, `suite_path`, `form`, `err` | An adoption was abandoned at shutdown — waiting in the flip barrier (or about to skip it) when the daemon closed the barrier at the signal, or in any step before its commit once the daemon's lifetime context ended: nothing was committed or recorded, the change is adopted after the restart. Not a failure: no `adoption_run_failed`, not counted in `acu_adoption_total` or `acu_adoption_duration_seconds`, not shown in the admin page's recent adoptions. |
  | `displaced_snapshot_lookup_failed` | WARN | `err`, `canonical_host`, `path` | Retained by-hash could not read the suite's displaced snapshots; the request is answered 404, as before spec C8. |
  | `snapshot_adopted_at_lookup_failed` | WARN | `err`, `snapshot_id` | A snapshot `InRelease`/`Release`/`Release.gpg` could not read its snapshot's `adopted_at` (spec C8 `Last-Modified`), so this response carries the pool file's mtime instead and its `Last-Modified` may not grow with the last flip. Not logged when the request had already ended. |
-@@ -364,13 +371,17 @@
+@@ -365,13 +374,17 @@
  | `suite_evicted` | INFO | `canonical_host`, `suite_path` (the evicted suite), `for_host`, `for_suite` | At or above the global cap, a suite with no adopted snapshot that had not been requested for 24 hours was evicted for a new one; its signed-seen records survive, moved up to the time of the eviction (as for `suite_reaped`). Above the cap (after `freshness.max_suites` was lowered, or after an upgrade) the new suite is still refused (`suite_seed_rejected`) until the table is back under the cap. |
  | `suite_caps_exceeded` | WARN | `suites`, `max_suites`, `hosts_at_cap`, `per_host_cap`, `fullest_host`, `fullest_host_suites` | At start, the suite table holds more than `freshness.max_suites` suites (a lowered `max_suites`, or an upgraded cache), or a host holds a tenth of it or more: new suites — for a host at its cap, that host's — are refused. Above the total cap each refused attempt still evicts one suite idle for 24 hours, so the table shrinks back; a host at its cap evicts nothing for its own new suites; its suites go when the suite reaper removes those not requested for `gc.suite_idle_ttl`, or when total-cap eviction for any host's new suite picks one of its idle suites. Not logged for a table at exactly the total cap: that is normal operation for a full cache, where a new suite evicts an idle one (no adopted snapshot, not requested for 24 hours) and is refused only when none qualifies (`suite_seed_rejected`). Logged once per start. |
  | `suite_cap_usage_read_failed` | WARN | `err` | The startup check behind `suite_caps_exceeded` could not count the suites; the caps apply either way. |
 -| `suite_reaped` | INFO | `canonical_scheme`, `canonical_host`, `suite_path`, `reason` (`idle`, `non_canonical`, `junk`), `metadata_rows`, `settled` (present, `true`, only for a settled reap) | The suite reaper (spec C9; hourly, from an hour after the start; a run tries at most 250 `non_canonical` and `junk` suites, first, and at most 25 `idle` ones) deleted a suite: its metadata `url_path` rows (`metadata_rows`, in batches of 1,000, the anchors last), then, in one transaction that re-checks that the suite was not adopted — nor, for `idle`, asked for — since the run listed it, its snapshots (retired: snapshot GC deletes them) and its row. `idle`: no client asked for it in `gc.suite_idle_ttl`; `non_canonical`: a row an earlier release created for a path this version no longer tracks (`metadata_rows` is 0: such a path's cached files are left to `gc.url_path_ttl`); `junk`: a suite without a snapshot whose cached anchor files (`InRelease`, `Release`, `Release.gpg`) all fail their content check — an HTML page, say; a plain `Release` cached as `InRelease` passes — each fetched at least a day ago, whatever its adoption record says — for a flat suite the cache has never seen signed, its cached root `Packages*` and `Sources*` files are judged with its anchor files, and it is junk only when it has at least one such file and each fails its check (an HTML page cached as `Packages.gz`, say); a flat suite seen signed is judged by its anchor files alone. Its signed-seen records survive, moved up to the time of the reap (a later stamp is kept): every suite-row delete — a reap, a cap eviction, a forget that leaves the records — does so, so a record's year (`signed_seen_markers_swept`) counts from the end of its path's tracking; and a suite with an adopted signed snapshot (`inline` or `detached`, not retired) gets its path's record under its own scheme before its snapshots are retired — created if missing, as for a snapshot the upgrade's trust audit could not read yet — so that history survives too. `settled=true`: the final transaction committed but the writer call reported an error, and a fresh read found the row gone — it is a reap all the same. Counted in `acu_suites_reaped_total{reason}`, settled reaps included. |
 -| `admin_forget_requested` | INFO | `scheme`, `canonical_host`, `suite_path` | `POST /forget` accepted a request (logged by `internal/admin`): it passed the guard (`X-ACU-Admin: 1`, `Sec-Fetch-Site` and, without `htpasswd_file`, the `Host` check), the 8 KiB body limit and the parameter checks, and the forget starts. A request refused with 400, 403 or 413 is not logged. `scheme` is the suite's canonical scheme (the other lines about a suite name it `canonical_scheme`). The outcome follows: `suite_forgotten`, `admin_forget_failed`, no line for a busy or unknown suite (409), or, after a panic while the suite is held, `freshness_check_panicked` with `where=forget` (a panic before the hold leaves only net/http's ERROR line). |
-+| `suite_reaped` | INFO | `canonical_scheme`, `canonical_host`, `suite_path`, `reason` (`idle`, `non_canonical`, `junk`), `metadata_rows`, `last_requested_unixtime` (`idle` only, when the suite has one: the client-interest stamp the cutoff judged), `evidence` (`junk` only: the paths of the cached files judged, space-separated, in the order judged), `settled` (present, `true`, only for a settled reap) | The suite reaper (spec C9; hourly, from an hour after the start; a run tries at most 250 `non_canonical` and `junk` suites, first, and at most 25 `idle` ones) deleted a suite: its metadata `url_path` rows (`metadata_rows`, in batches of 1,000, the anchors last), then, in one transaction that re-checks that the suite was not adopted — nor, for `idle`, asked for — since the run listed it, its snapshots (retired: snapshot GC deletes them) and its row. `idle`: no client asked for it in `gc.suite_idle_ttl`; `non_canonical`: a row an earlier release created for a path this version no longer tracks (`metadata_rows` is 0: such a path's cached files are left to `gc.url_path_ttl`); `junk`: a suite without a snapshot whose cached anchor files (`InRelease`, `Release`, `Release.gpg`) all fail their content check — an HTML page, say; a plain `Release` cached as `InRelease` passes — each fetched at least a day ago, whatever its adoption record says — for a flat suite the cache has never seen signed, its cached root `Packages*` and `Sources*` files are judged with its anchor files, and it is junk only when it has at least one such file and each fails its check (an HTML page cached as `Packages.gz`, say); a flat suite seen signed is judged by its anchor files alone. Its signed-seen records survive, moved up to the time of the reap (a later stamp is kept): every suite-row delete — a reap, a cap eviction, a forget that leaves the records — does so, so a record's year (`signed_seen_markers_swept`) counts from the end of its path's tracking; and a suite with an adopted signed snapshot (`inline` or `detached`, not retired) gets its path's record under its own scheme before its snapshots are retired — created if missing, as for a snapshot the upgrade's trust audit could not read yet — so that history survives too. `settled=true`: the final transaction committed but the writer call reported an error, and a fresh read found the row gone — it is a reap all the same. Counted in `acu_suites_reaped_total{reason}`, settled reaps included. |
++| `suite_reaped` | INFO | `canonical_scheme`, `canonical_host`, `suite_path`, `reason` (`idle`, `non_canonical`, `junk`), `metadata_rows`, `last_requested_unixtime` (`idle` only, when the suite has one: the client-interest stamp the cutoff judged), `evidence` (`junk` only: the paths of the cached files judged, a list in the order judged — a JSON array, `[a b]` in the text format), `settled` (present, `true`, only for a settled reap) | The suite reaper (spec C9; hourly, from an hour after the start; a run tries at most 250 `non_canonical` and `junk` suites, first, and at most 25 `idle` ones) deleted a suite: its metadata `url_path` rows (`metadata_rows`, in batches of 1,000, the anchors last), then, in one transaction that re-checks that the suite was not adopted — nor, for `idle`, asked for — since the run listed it, its snapshots (retired: snapshot GC deletes them) and its row. `idle`: no client asked for it in `gc.suite_idle_ttl`; `non_canonical`: a row an earlier release created for a path this version no longer tracks (`metadata_rows` is 0: such a path's cached files are left to `gc.url_path_ttl`); `junk`: a suite without a snapshot whose cached anchor files (`InRelease`, `Release`, `Release.gpg`) all fail their content check — an HTML page, say; a plain `Release` cached as `InRelease` passes — each fetched at least a day ago, whatever its adoption record says — for a flat suite the cache has never seen signed, its cached root `Packages*` and `Sources*` files are judged with its anchor files, and it is junk only when it has at least one such file and each fails its check (an HTML page cached as `Packages.gz`, say); a flat suite seen signed is judged by its anchor files alone. Its signed-seen records survive, moved up to the time of the reap (a later stamp is kept): every suite-row delete — a reap, a cap eviction, a forget that leaves the records — does so, so a record's year (`signed_seen_markers_swept`) counts from the end of its path's tracking; and a suite with an adopted signed snapshot (`inline` or `detached`, not retired) gets its path's record under its own scheme before its snapshots are retired — created if missing, as for a snapshot the upgrade's trust audit could not read yet — so that history survives too. `settled=true`: the final transaction committed but the writer call reported an error, and a fresh read found the row gone — it is a reap all the same. Counted in `acu_suites_reaped_total{reason}`, settled reaps included. |
 +| `admin_forget_requested` | INFO | `canonical_scheme`, `canonical_host`, `suite_path` | `POST /forget` accepted a request (logged by `internal/admin`): it passed the guard (`X-ACU-Admin: 1`, `Sec-Fetch-Site` and, without `htpasswd_file`, the `Host` check), the 8 KiB body limit and the parameter checks, and the forget starts. A request refused with 400, 403 or 413 is not logged. The outcome follows: `suite_forgotten`, `admin_forget_failed`, `suite_not_forgotten` (DEBUG) for a busy or unknown suite (409), or, after a panic while the suite is held, `freshness_check_panicked` with `where=forget` (a panic before the hold leaves only net/http's ERROR line). |
  | `suite_forgotten` | INFO | `canonical_scheme`, `canonical_host`, `suite_path`, `metadata_rows`, `markers_deleted`, `anchor_rows`; `settled` (present, `true`, only for a settled forget, whose line carries `metadata_rows` but not `markers_deleted` or `anchor_rows`) | `POST /forget` deleted a suite as the reaper would, regardless of idleness, and — only when no other suite of the repository path, under either scheme or as its `/.` twin, has a row — `markers_deleted` signed-seen records of the path and `anchor_rows` cached `InRelease`, `Release` and `Release.gpg` of the path and its twin under either scheme. Its request is logged first as `admin_forget_requested`. `settled=true`: the final transaction committed but the writer call reported an error, and a fresh read found the row gone — a forget all the same (the records and cached anchors deleted as above when no other suite of the path has a row; how many is not known); the request is then answered 500 with WARN `admin_forget_failed`, or 503 with that line at DEBUG when the admin listener's shutdown cut it short. |
 -| `admin_forget_failed` | WARN | `err`, `scheme`, `canonical_host`, `suite_path` | `POST /forget` failed on a database error, or its work took longer than 5 minutes, and answered 500. Metadata batches deleted before the error stay deleted (the anchors go last); the request can be repeated (409 then means the suite is gone after all, or busy). A forget whose final delete committed before the error is logged `suite_forgotten` with `settled=true` just before this line when a fresh read then finds the row gone (a read that fails, or lands before a commit still in flight, finds it present: then no such line). Logged at DEBUG instead, and answered 503, when the admin listener began shutting down while the forget ran: shutdown cuts it short. |
@@ -7613,26 +8294,27 @@ diff --git a/docs/log-fields.md b/docs/log-fields.md
 +| `suite_reaper_run_complete` | INFO | `tried`, `reaped`, `markers_swept`, `deferred`, `duration_ms` | A suite reaper run completed (hourly, from an hour after the start): `tried` suites held and judged within the run's budgets, `reaped` of them deleted (each with its `suite_reaped` line), `markers_swept` signed-seen records the daily sweep deleted (0 when no sweep was due), `deferred` `true` when a detected forward step of the wall clock held the run back — no reap, no sweep (see `clock_step_detected` with `stamp=wall_clock`). It sets `acu_suite_reaper_last_run_unixtime`. A run whose listing failed (`suite_reaper_list_suites_failed`) or that a shutdown cut short logs neither, so an alert on the gauge's age catches a reaper that stopped completing runs. Logged with `gc.suite_idle_ttl = 0s` too (nothing is reaped then; the daily sweep still runs). |
  | `suite_reaper_list_suites_failed`, `suite_reaper_read_suite_row_failed`, `suite_reaper_delete_metadata_failed`, `suite_reaper_reap_failed`, `suite_reaper_list_unadopted_anchors_failed`, `suite_reaper_list_unadopted_flat_indexes_failed`, `suite_reaper_junk_anchor_reads_failed`, `suite_reaper_read_signed_evidence_failed`, `suite_reaper_marker_sweep_failed` | WARN | `err`; `canonical_scheme`, `canonical_host` and `suite_path` for a suite's step; `metadata_rows` (for `suite_reaper_delete_metadata_failed`: rows deleted before the error); `count`, `canonical_scheme`, `canonical_host` and `path` for the junk anchor reads (how many anchor or flat index reads failed in the run's junk scan — a failed read is not remembered, so one unreadable pool file that N suites share counts once for each of them whose scan reaches it, up to N times — and the first: its suite's scheme and host and the file's path); `count`, `canonical_scheme`, `canonical_host` and `suite_path` for the signed-evidence reads (how many flat suites' reads failed in the run's junk scan, and the first); `swept` (records deleted before the error) | A step of a suite reaper run failed. A failed listing ends the run: nothing is reaped and nothing swept (a due record sweep runs at the next run) — except the flat indexes' (read only in a run that holds a flat suite without a snapshot), which leaves every flat suite without a snapshot unjudged as junk for the run; a failed read of whether a flat suite was seen signed (read only for one its anchor files and its index files judge differently) leaves that suite unjudged for the run; any other failed step leaves the rest of the run to go on: a suite whose step failed — a database error, or its work cut short after 5 minutes — keeps its row and is retried at the next run (the metadata batches deleted before the error stay deleted, the anchors last); a pool file that exists but does not read keeps its suite (a missing one is not logged); the junk scan runs again at the next run, the record sweep the next day. A step that fails because the daemon is stopping is logged at DEBUG instead. |
  | `suite_reaper_suite_busy` | DEBUG | `canonical_scheme`, `canonical_host`, `suite_path` | A suite the reaper would reap was held — by a check, an adoption, a repair or reconcile, or another deleter (cap eviction, `POST /forget`) — or deleted meanwhile; it is tried again at the next run if it still qualifies, and counts toward the run's budget for its kind (25 `idle` suites; 250 `non_canonical` and `junk` ones). |
-+| `gc_panicked` | ERROR | `where` (`tick`: a periodic GC tick; `pool_scan_worker`: one file of the startup pool scan; `pool_scan_producer`: the pool scan's directory walk), `panic`, `stack` (first occurrence per `where` per process only) | A panic in garbage collection was recovered (logged by `internal/gc`; a bug, please report it). A tick's panic ends that tick — its `gc_run_complete` line and last-run summary are not written — and the next tick comes as scheduled; a worker's ends that file's check, which the next start's scan repeats, and the worker goes on to the next file; the walk's ends the walk, and the scan finishes the files already queued. |
++| `gc_panicked` | ERROR | `where` (`tick`: a periodic GC tick; `startup`: the startup pass; `pool_scan_worker`: one file of the startup pool scan; `pool_scan_producer`: the pool scan's directory walk), `panic`, `stack` (first occurrence per `where` per process only) | A panic in garbage collection was recovered (logged by `internal/gc`; a bug, please report it). A tick's panic ends that tick — its `gc_run_complete` line and last-run summary are not written, so `acu_gc_last_run_unixtime` ages — moves the pass rotation past the pass that panicked, so the passes after it still run, and the next tick comes as scheduled; the startup pass's ends the startup pass, which main logs (`gc startup pass failed`) before it serves; a worker's ends that file's check, which the next start's scan repeats, and the worker goes on to the next file; the walk's ends the walk, and the scan finishes the files already queued. |
  | `handler_goroutine_panicked` | ERROR | `where` (`touch`, `seed_rejections`), `canonical_scheme`, `canonical_host` and `path` (`touch` only), `panic`, `stack` (first occurrence per `where` per process only) | A panic in one of the handler's background goroutines — the touch goroutine, or the cap-rejection cache's sweep timer — was recovered (a bug, please report it). |
  | net/http's own lines: `http: panic serving …`, `http: TLS handshake error from …` and the like | ERROR on the admin listener; WARN on the proxy listeners | none: `msg` is net/http's text — for a panic, `http: panic serving <client address>: <panic>` followed by the stack | The Go HTTP server's own diagnostics, logged through the daemon's structured log at the level each listener sets (left to itself, net/http would write them through Go's standard log package, which the daemon also sends to its log, but at INFO). On the admin listener every such line is ERROR, above all a handler panic net/http recovered: after a `POST /forget` panic, which is logged first as `freshness_check_panicked` with `where=forget`, the request ends without an answer and gets no `admin_request` line. On the proxy listeners (plain and TLS) they are WARN, a TLS handshake error included. |
  | `suite_onboarding_failed` | WARN | `err`, `canonical_host`, `suite_path` | A cache hit on an untracked suite's anchor could not create its row (including the 5 s bound it shares with the backstop that may follow, and a shutdown that cut it short); the anchor is served and the next hit retries. |
-@@ -379,8 +390,10 @@
+@@ -380,8 +393,11 @@
  | `suite_cached_anchor_read_failed` | WARN | `err`, `canonical_host`, `suite_path`, `path` | Creating a suite's row, the handler could not read one of the suite's cached signed anchors (its `url_path` row or its pool file; an absent row is not logged). The row is created anyway, and the anchor is read again and marked right after the write, before the response — also when the client left, or the request is answered from a new snapshot, while it waited for a flip (`suite_signed_seen_backstop_read_failed` if that fails too). Between the write and that mark the suite is tracked with the anchor unmarked; if the mark fails, it stays so until the startup pass at the next start. |
  | `suite_signed_seen_backstop_read_failed` | WARN | `err`, `canonical_host`, `suite_path`, `path` | After creating a suite's row, the handler's second read of a cached signed anchor (see `suite_cached_anchor_read_failed`; also run when the anchor changed during the creation) failed — its `url_path` row (within the backstop's 5 s bound, which covers its database steps; after onboarding the bound is shared with the creation, and on a miss it ends at most 25 s after the request arrived) or its pool file (a local read of a few KiB, not bounded); an absent row is not logged. The response is served; the anchor stays unmarked until the startup pass marks it at the next start. |
  | `snapshot_member_blob_missing` | WARN | `canonical_host`, `path`, `snapshot_id`, `blob_hash`, `snapshot_displaced` (present for a displaced snapshot's member) | A snapshot member's pool file is gone: a current member is re-fetched and checked against its declared hash; a displaced one (retained by-hash) answers 404. |
 +| `snapshot_index_target_404` | WARN | `canonical_host`, `suite_path`, `path`, `architecture`, `snapshot_id` | A client asked an adopted suite for a `Packages` or `Sources` index its current snapshot does not hold (adoption skipped it — `adoption_member_skipped` with `4xx_index_target` — or its `Release` does not list it), and was answered 404 from the snapshot: `apt update` fails for it until a snapshot holds the file. `architecture` is the index's: from its `binary-<arch>/` directory, `source` for a `Sources` index — and for a flat suite, whose root `Packages` have no architecture directory, `all` for a `Packages*` and `source` for a `Sources*`. Counted in `acu_serve_snapshot_index_target_404_total{architecture}`, whose label buckets anything but a known architecture into `other` (the log line keeps the raw path). |
  | `pool_corruption_during_adoption` | WARN | a member that declares a SHA256: `canonical_host`, `suite_path`, `path`, `declared_sha256`, `actual_sha256`; a member the Release declares by SHA512 only: `canonical_host`, `suite_path`, `path`, `declared_sha512`, `derived_sha256` (the SHA-256 of the fetched bytes, verified against `declared_sha512`), `actual_sha256`; an anchor or index the adoption stores from memory: `hash`, `actual_sha256`, `context` (`writeBlobBytes`) | An adoption was about to reuse a pool file whose bytes no longer hash to its name (corrupted at rest). The file is evicted and replaced by freshly verified bytes; it is never bound to the snapshot, and the `.deb` hashes it declares never vouch. A SHA512-only member is fetched at every adoption, and an existing pool file under its derived SHA-256 is re-hashed before it is kept. Counted by `acu_pool_corruption_during_adoption_total`. |
  | `package_coverage_incomplete` | INFO | `canonical_host`, `suite_path`, `snapshot_id`, `reason`; `directories` (`unsupported_variants`), `no_sha256_stanzas` (`no_sha256`), `skipped_rows` (`all_binary_stanzas_malformed`) | A signed snapshot's package coverage could not be proven complete (SPEC3 §7.5.4), so strict mode (`integrity.refuse_unvouched_debs`) stays off for its host. `reason`: `non_dists_layout` (the suite path is neither `dists/`-shaped nor a flat repository's: no path the cache tracks since flat repositories are adopted), `no_packages_members` (its Release lists no `Packages` index; for a flat suite, no root one), `unsupported_variants` (a directory with a `Packages` index has no variant that was fetched and parsed; `directories` names them), `no_sha256` (spec C5: a `Packages` stanza with a `Filename` but no `SHA256`, for example one that declares only `SHA512` or `MD5sum`; it vouches nothing, and `no_sha256_stanzas` counts the distinct paths), `all_binary_stanzas_malformed` (every binary stanza lacks `Package`, `Architecture` or `Version`). A reconcile that heals `Packages` indexes recomputes the rows for them and may log it too; a reconcile never changes a snapshot's coverage. |
-+| `source_paths_skipped` | WARN | `canonical_scheme`, `canonical_host`, `suite_path`, `snapshot_id`, `member_path` (the `Sources` file), `count`, `first` | A `Sources` index named source files whose path the cache does not accept — a `Directory`, or a file in it, with a `%`, `?` or `#`, a `.`, `..` or empty segment, or a leading `/` (a file name with a `/`, a backslash or a NUL byte, or a malformed hash, is dropped as malformed and not counted) — so those files get no hash row in the snapshot (spec C5: `Sources` paths keep the member-path rule): `count` paths, `first` the first of them. The adoption goes on; such a file is served as any unvouched file is. One line per `Sources` file that skipped any. |
++| `source_paths_skipped` | INFO | `canonical_scheme`, `canonical_host`, `suite_path`, `snapshot_id`, `member_path` (the `Sources` file), `count`, `first` | A `Sources` index named source files whose path the cache does not accept — a `Directory`, or a file in it, with a `%`, `?` or `#`, a `.`, `..` or empty segment, or a leading `/` (a file name of `.` or `..`, or with a `/`, a backslash or a NUL byte, or a malformed hash, is dropped as malformed and not counted) — so those files get no hash row in the snapshot (spec C5: `Sources` paths keep the member-path rule): `count` paths, `first` the first of them. The adoption goes on; such a file is served as any unvouched file is. One line per `Sources` file that skipped any, at every adoption: INFO, since the operator cannot act on it. |
++| `adoption_repair_declarations_unavailable` | DEBUG | `canonical_host`, `suite_path`, `snapshot_id`, `err` | A repair of skipped members could not re-read the declarations of the snapshot's `Release` (its stored anchor), so it checks each member against its skip record's SHA-256 alone and writes no SHA512 alias (spec C5); a reconcile reports an unreadable anchor at WARN (`adoption_reconcile_failed`). |
  | `package_hash_conflict` | ERROR | `canonical_host`, `path`, `declared` (one entry per declaring row — `declared_sha256`, `snapshot_id`, `suite_path`: a flat suite and its `./` twin, or two channels a suffix fallback ties, appear by name); `row_blob_hash` on a cache hit; `fetched` (`false` before a download, `true` after it, then with `observed_sha256`) on a miss | Two or more current signed snapshots of the host declare different SHA-256s for the requested path (spec C6 step 3), so the request is refused — 502 with `Retry-After: 60`, request outcome `package_hash_conflict` — rather than answered with one of them. A flat suite's twins disagree this way, under both, between their adoptions of a `Packages` whose `.deb` upstream rewrote in place (see *Flat repositories* in configuration.md). |
  | `package_hash lookup failed` | WARN | `err`, `canonical_host`, `path` | On a `.deb` cache hit the vouching hashes (`package_hash`) could not be read: the cached file is served without the hash check, and strict mode (`integrity.refuse_unvouched_debs`) fails open for it, so a database fault does not refuse every package. A request whose client left is answered 503 (`client_canceled`) instead, never served, and logs nothing here. |
  | `strict-mode coverage lookup failed` | WARN | `err`, `canonical_host` | Strict mode could not read its host's current snapshots and their coverage: it fails open for the request (the `.deb` is served or fetched as if strict mode were off). A request whose client left is answered 503 (`client_canceled`) on the hit path and logs nothing here. |
 ````
 
-- [ ] **Step 3: `docs/admin-ui-spec.md`**
+- [ ] **Step 4: `docs/admin-ui-spec.md`**
 
-§4.5 gains `anchorless` (PG-14, the G carry-forward; additive), the *Last requested* column under `last_requested_unixtime` (F-14), and the Adoption column's two new texts (`refreshed without a Release`; B-63's `checks failing ×k · next scheduled check in …`, design note 6); new §4.6: `gc.retired_reaped` (the F carry-forward), `recent_adoptions[].scheme` (F-19), and the duration sentence (C-36); §5.9's example and the per-section copy note (D-50: the page now renders the spec's copy).
+§4.5 gains `anchorless` (PG-14, the G carry-forward; additive; its one-check exception, review M-11), the *Last requested* column under `last_requested_unixtime` (F-14), and the Adoption column's two new texts (`refreshed without a Release`; B-63's `checks failing ×k · backoff ends in …` / `backoff over`, the count alone for a dormant or record-paced suite: design note 6, reviews M-3 and sweep M-5); new §4.6: `gc.retired_reaped` (the F carry-forward), `recent_adoptions[].scheme` (F-19), and the duration sentence (C-36); §5.9's example and the per-section copy note (D-50: the page now renders the spec's copy).
 
 ````diff
 diff --git a/docs/admin-ui-spec.md b/docs/admin-ui-spec.md
@@ -7644,7 +8326,7 @@ diff --git a/docs/admin-ui-spec.md b/docs/admin-ui-spec.md
  | `anchor_form` | string | The current snapshot's anchor form — `inline`, `detached` or `unsigned` (a `Release` no signature covers: it vouches no `.deb`); empty when the suite has no current snapshot. |
 -| `last_requested_unixtime` | int64 or `null` | When a client last showed interest in the suite (spec C3): written when the suite's row is created, then by coalesced touches — at most one write per suite per hour — from serves of its anchors (`InRelease`, `Release`, `Release.gpg`; status below 400, 304 and HEAD included), of its flat indexes, and of `.deb`s its current snapshot vouched for. A `dists/` suite's index requests (`main/binary-amd64/Packages.gz`) never move it. It decides cap eviction: at the `freshness.max_suites` cap, a suite with no current snapshot whose stamp is 24 hours old or more can be evicted for a new one (`suite_evicted`). |
 -| `check_fail_count` | int64 | Consecutive failed checks since the last answered check: ended unknown (transport error, deadline, unexpected status), or found nothing they may adopt (a suite without a snapshot whose upstream has neither `InRelease` nor `Release`, which also records `anchor_absent`; a signature the check found but could not record as seen), or — a flat repository without a `Release` (phase G) — refreshed its cached index files with no content answer (an HTML page for each, 401, 403). An unsigned `Release` while `adoption.adopt_unsigned` is off is the refusal `unsigned_disabled`, not a failed check, and so is a flat repository without a `Release` while the knob is off. Drives the scheduler's healthy → never-checked → failing ordering and its 2 min → 1 h backoff. Resets to 0 on every answered check, an absent current anchor (`anchor_absent`) included. |
-+| `anchorless` | boolean | `true` for a flat repository without a snapshot whose last answered check refreshed its cached index files without a `Release` (spec C4 Dispatch 4; phase H1) — with adoption enabled, no current snapshot, a last success, no failure or refusal record and no pending change, the marks every other answered check of such a suite leaves; `false` otherwise, and always while adoption is disabled. It tells such a repository from a dormant, never-adopted suite, which also has no snapshot and no record. The Adoption cell reads `refreshed without a Release`. |
++| `anchorless` | boolean | `true` for a flat repository without a snapshot whose last answered check refreshed its cached index files without a `Release` (spec C4 Dispatch 4; phase H1) — with adoption enabled, no current snapshot, a last success, no failure or refusal record and no pending change, the marks every other answered check of such a suite leaves; `false` otherwise, and always while adoption is disabled. One exception lasts one check: a flat suite whose row was created while adoption was disabled has a last success already, so it reads `true` from the moment adoption is enabled until its first check. It tells such a repository from a dormant, never-adopted suite, which also has no snapshot and no record. The Adoption cell reads `refreshed without a Release`. |
 +| `last_requested_unixtime` | int64 or `null` | When a client last showed interest in the suite (spec C3): written when the suite's row is created, then by coalesced touches — at most one write per suite per hour — from serves of its anchors (`InRelease`, `Release`, `Release.gpg`; status below 400, 304 and HEAD included), of its flat indexes, and of `.deb`s its current snapshot vouched for. A `dists/` suite's index requests (`main/binary-amd64/Packages.gz`) never move it. It decides cap eviction: at the `freshness.max_suites` cap, a suite with no current snapshot whose stamp is 24 hours old or more can be evicted for a new one (`suite_evicted`), and reaping: a suite no client asks for in `gc.suite_idle_ttl` is reaped (`suite_reaped`). The Suites table's *Last requested* column shows it (phase H1). |
 +| `check_fail_count` | int64 | Consecutive failed checks since the last answered check: ended unknown (transport error, deadline, unexpected status), or found nothing they may adopt (a suite without a snapshot whose upstream has neither `InRelease` nor `Release`, which also records `anchor_absent`; a signature the check found but could not record as seen), or — a flat repository without a `Release` (phase G) — refreshed its cached index files with no content answer (an HTML page for each, 401, 403). An unsigned `Release` while `adoption.adopt_unsigned` is off is the refusal `unsigned_disabled`, not a failed check, and so is a flat repository without a `Release` while the knob is off. Drives the scheduler's healthy → never-checked → failing ordering and its 2 min → 1 h backoff. Resets to 0 on every answered check, an absent current anchor (`anchor_absent`) included. While above 0 the Adoption cell says so (below). |
  | `adoption_fail_reason` | string or `null` | The current failure or refusal reason; `null` when no record exists. |
@@ -7659,7 +8341,7 @@ diff --git a/docs/admin-ui-spec.md b/docs/admin-ui-spec.md
  
  **Adoption column.** The Suites table's "Adoption" column renders the
  record above as one line, via the server-side `adoptionStatus` helper:
-@@ -370,9 +371,18 @@
+@@ -370,9 +371,23 @@
  `"refused: upstream_older · retry due"` for a refusal, and
  `"refused: upstream_older · since 1d 1h · retry due"` for a refusal whose
  streak began more than 24 h ago. Empty when the suite has no failure or
@@ -7669,18 +8351,23 @@ diff --git a/docs/admin-ui-spec.md b/docs/admin-ui-spec.md
  ` (adoption disabled)`: the record was stored while adoption was enabled
 -and is inert now.
 +and is inert now. A suite whose checks keep failing (`check_fail_count`
-+above 0) adds `"checks failing ×3 · next scheduled check in 12m"` — after
-+the record's text and ` · ` when there is one: the count, and when the
++above 0) adds `"checks failing ×3 · backoff ends in 12m"` — after the
++record's text and ` · ` when there is one: the count, and when the
 +scheduler's backoff (2 min doubling to 1 h, from `last_check_unixtime`)
-+next makes it due, or `now` once that time has passed (phase H1). It says
-+*scheduled*: a client's request may trigger a check sooner, after the
-+`cooldown`. A suite waiting for an adoption slot is not shown as such
-+(that queue is the scheduler's, in memory). The JSON carries the parts as
++ends, or `"backoff over"` once it has (phase H1). That is the earliest
++the scheduler may check the suite: a client's request may trigger a
++check sooner, after the `cooldown`, and a suite whose last success is
++recent is checked later. A suite the scheduler does not queue on its
++backoff shows the count alone: with adoption enabled, a never-adopted
++suite no client asked for within 7 days (dormant), and an adopted suite
++its `anchor_absent` or `unsigned_disabled` record paces (the record's
++own text shows its retry). A suite waiting for an adoption slot is not
++shown as such (that queue is the scheduler's, in memory). The JSON carries the parts as
 +they are (`check_fail_count`, `last_check_unixtime`), not this text.
  
  **Unsigned and absent-anchor refusals (phase E).** `unsigned_unconfirmed`
  is an unsigned repository waiting for its second observation
-@@ -429,6 +439,19 @@
+@@ -429,6 +444,19 @@
  refreshes metadata, so the lag is truthful but expected. The SUITES vital
  is `stale` (§9.1). The JSON keeps every field as stored.
  
@@ -7700,7 +8387,7 @@ diff --git a/docs/admin-ui-spec.md b/docs/admin-ui-spec.md
  ---
  
  ## 5. Component contracts
-@@ -826,15 +849,16 @@
+@@ -826,15 +854,16 @@
  ```html
  <div class="empty empty--{stale|crit}" role="status">
    <span class="empty__eyebrow">NO SUITES TRACKED YET</span>
@@ -7722,7 +8409,7 @@ diff --git a/docs/admin-ui-spec.md b/docs/admin-ui-spec.md
  |------------------|--------------------------|-------------------------------------------------------------------------------------------------------|
 ````
 
-- [ ] **Step 4: `packaging/config/config.toml.default` (C-37)**
+- [ ] **Step 5: `packaging/config/config.toml.default` (C-37)**
 
 Comments only: `max_duration` never cuts the flip barrier short; `keep_displaced` also bounds retained by-hash.
 
@@ -7755,9 +8442,9 @@ diff --git a/packaging/config/config.toml.default b/packaging/config/config.toml
  # than max(upstream.total_timeout * upstream.max_retries, 30m).
 ````
 
-- [ ] **Step 5: The spec, revision 12**
+- [ ] **Step 6: The spec, revision 12**
 
-The revision entry; C3's detached-only sentence (D-52); C5's `Sources` paths (GD-2); C7's new fields and texts; C9's reaper signal and fields (F-13, F-17, F-18), sub-job B's audit-queued predicate (R-H1) and GC's recovered panics (F-21), `/forget`'s 409 line and 400 (F-5, F-15); C10's wait order (E-58); C11's new events, fields and gauge, and the 43 renames (R-H3, R-H6); §6.1's `anchor_corrupt` delete in the quarantine's transaction (R-H2) and the kept-row sentence; §9's H row split into H1–H3; §10 item 12 (GD-5, decided for 1.1.0: keep, R-H5).
+The revision entry; C3's detached-only sentence (D-52); C5's `Sources` paths, logged at INFO (GD-2, review M-8); C7's new fields and texts (B-63's wording: reviews M-3, sweep M-5); C9's reaper signal and fields (F-13, F-17, F-18), sub-job B's audit-queued predicate (R-H1) and GC's recovered panics, the startup pass's and the rotation's included (F-21, reviews I-1, M-1), `/forget`'s 409 line and 400 (F-5, F-15); C10's wait order (E-58); C11's new events, fields and gauge, and the 43 renames (R-H3, R-H6); §6.1's `anchor_corrupt` delete in the quarantine's transaction (R-H2), the pool file's removal before the commit (review C-1) and the kept-row sentence; §9's H row split into H1–H3; §10 item 12 (GD-5, decided for 1.1.0 by ruling R-H5, for the maintainer's confirmation: review sweep M-10).
 
 ````diff
 diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/docs/superpowers/specs/2026-09-27-flat-repositories-design.md
@@ -7767,7 +8454,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  # Flat repositories, eager adoption, and suite lifecycle — design
  
 -- **Date:** 2026-09-27 (revision 11, 2026-10-24: the maintainer's G-1 decision — `POST /reconcile` takes `/forget`'s guard, and without `htpasswd_file` both refuse a `Host` that is not an IP address, `localhost` or `admin.listen`'s host name; the read-only endpoints keep no `Host` check; revision 10, 2026-10-20/21/23: phase G plan rulings — a `Packages` file with no SHA256 stanza parses and adopts with incomplete coverage (`no_sha256`), and a body with no stanza naming a `Filename` still fails its parse (R-G1); every writer of a `url_path` row's `last_fetched_at` stamps it after the pool file is final, so the first adoption's `adopted_at` floor stays above the `max(pool mtime, last_fetched_at)` `Last-Modified` of url_path-served metadata, and blob mtimes are not folded into that floor (R-G3); the anchorless gate is signed evidence — the cached signed-anchor re-mark, then never-downgrade's rule — not every sniff-passing anchor row (phase G deviation 1); a plain `Contents-*` that changed is deleted, not kept, in the anchorless refresh (phase G deviation 2); the anchorless body cap is 64 MiB; a replaced row's `last_fetched_at` is `MAX(now, previous + 1)`; `flat_host_root_unsupported` is a WARN, one line a minute for the process with a `suppressed` count; a Filename made only of `.` segments is refused; `suites[].flat`; after the phase G plan reviews (rulings PG-1–PG-18): with `adopt_unsigned` off, a suite the anchorless gate admits is refused as an unsigned candidate is — the record `unsigned_disabled`, a successful check logged `changed_deferred` with form `anchorless`, paced by its record, no index request and no delete (its probes still run) — so a Release-less flat repository is served as first cached; the gate runs before the knob (PG-1, PG-10, PG-17); a Debian pool artifact (`.deb`, `.udeb`, `.ddeb`, `.dsc`, `.buildinfo`, `.changes`, `.diff.gz`, or a name with `_` and a `.tar.` component) is never metadata, so strict mode vouches and refuses an `icons-foo_1.0_all.deb` like any `.deb` (PG-2, PG-16); the sniff counter is `acu_anchorless_sniff_rejected_total{host}`, renamed from C4's first `anchorless_sniff_rejected` (PG-5); a flat suite whose base has no signed evidence is judged junk on its cached anchor rows and root `Packages*`/`Sources*` rows together — junk only when it has at least one such row and every one is junk evidence — while a flat suite with signed evidence, like every `dists/` suite, is judged by its anchors alone; the signed-evidence read is lazy, per candidate, a read error gives no verdict for the run, and the index rows are read only in a run that has an unadopted flat suite (R-G2 as amended by PG-7, R-G5); at most two anchorless bodies are in memory at once for the process (PG-8); an anchorless check is answered — a success that clears the record and the pending change — when an index request got a content answer (a 304, a 200 stored or matching the cached bytes, a 404 or 410) or when the suite has no index row to ask for, and is a failed check otherwise: a sniff-rejected 200, a changed plain `Contents-*`, a 401 or a 403 is no content answer (design review M-7, PG-12, PG-15); the refresh asks `Packages*`, then `Sources*`, then `Contents-*` (M-3), stores only the changed validators of a 200 with the cached bytes, a plain `Contents-*`'s too (M-1), deletes a row only while it holds the blob the refresh read (M-4), and logs its over-cap WARN at most once a minute for the process with a `suppressed` count (M-6); a replaced row's `last_fetched_at` can lead the clock as `adopted_at` can (M-8); the package-hash lookups join the suite's `suite_freshness` row by its key (M-2); C11's constants name the body cap, the two body slots and the two one-a-minute WARNs (M-10); the residuals of C3, C4 and C6 — constraints across a host's tenants, the twins' conflict window, an upstream that answers 403 for a missing key, an empty plain `Packages` — are documented, with no twin tiebreak (PG-13); after the phase G task reviews (rulings PG-19–PG-24): a flat suite active only through a client-created root index row, with no cached anchor row to model its probes on, probes its `InRelease` and `Release` at sibling URLs of that row's stored `upstream_url`, so a non-default port survives (PG-20); the anchorless refresh deletes a cached `InRelease` or `Release` only while it holds the blob read before the probe tree ran, so a client's fetch during the probe is kept (PG-24); a delete that fails is no answer — its 404s and 410s stop counting, so a check they alone answered fails (PG-24); a read error of the refresh's index rows is a local fault, logged with nothing written and no backoff (PG-24); an unchanged plain `Contents-*` answers the check without a sniff, so a captive portal's page cached as one answers it during the outage — a documented residual (PG-24); `flat` is the admin `suites[]` field, not a new log field (PG-23); `flat_host_root_unsupported` is logged only for a host the allowlist admits; a `Packages` stanza's Filename without a SHA256 is counted for `no_sha256`, never validated, and becomes no row, path or log value; after the phase G final review (rulings PG-28–PG-40): the anchorless refresh also deletes a cached `InRelease` or `Release` whose probe answered 401 or 403 when an index request of the same check got a content answer — S3's and CloudFront's answer for a missing key — while 404 and 410 delete it whatever the indexes answered (PG-28); a 200 over the 64 MiB cap drops its row for the miss path, no content answer, and its WARN names the file, replacing C4's first rule, which kept the row, and the fetcher fails a body whose `Content-Length` exceeds the cap without reading it (PG-29), and that WARN is logged only once the delete commits (PG-39); the suffix fallback stops at a dot-cleaned path longer than 5,121 bytes and skips a split whose base is longer than a suite path or whose name is longer than a Filename, which no row can match (PG-30); it runs only while the cache holds a flat `package_hash` row — a flag primed when the cache opens, whose failed read fails the start, set before any transaction that inserts such a row commits and never cleared while it runs (PG-31, PG-36); a never-adopted flat suite's metadata rows are read once, with its anchor rows, before the host slot and the probe tree, for Dispatch 3 and the refresh, so a read fault is a local fault before any request, and a shutdown during that read is no fault (PG-32, amending PG-24; PG-35); `package_hash_conflict` names each row's suite path (PG-33); the anchorless check line counts the rows it replaced and deleted (`rows_replaced`, `rows_deleted`), a failed check's error leads with the decisive reason and names the other after `; also `, and phase G's new WARNs carry `canonical_scheme` (PG-33, PG-37; the pre-G emitter of `freshness: read anchor rows failed` gains it in phase H: PG-34); the PG-1 clause above says no index request (its probes still run); C5 records that `ParseSources` keeps `validateMemberPath` (PG-21); the limits C2 and C6 call documented, and an adopted unsigned flat suite that stops publishing its `Release`, are documented in *Flat repositories* (PG-33, PG-38); revision 9, 2026-10-20: phase F plan rulings — the reaper and `POST /forget` delete a suite row only through phase D's compare-and-delete, holding the suite through the `SuiteGuard`, so one delete path remains (R-F1); `Gate.Purge` keeps a live entry (R-F2); the reaper also reaps legacy junk rows (R-F3); the orphan-marker sweep reads a future `last_seen_at` as now, and a marker is an orphan only when neither its base nor its `/.` twin has a row under either scheme, the rule `/forget`'s marker deletion follows too (R-F5); after the phase F plan reviews (rulings PF-1–PF-9), task reviews (rulings PF-10, PF-11) and the final review (rulings PF-12–PF-15): the sweep never rewrites a stamp (PF-1, phase F deviation 3); `/forget` deletes the cached anchors of the base and its twin under both schemes with the markers (PF-2); junk is a cached anchor that fails its sniff, an `InRelease` passing the `Release` sniff (a plain-text Release) excepted, whatever the suite's record, fetched at least 24 h ago (PF-3); the junk scan runs every run and the candidates reaped regardless of idleness go first (PF-4); with `adopt_unsigned` off an established unsigned suite keeps its coherent snapshot — R-F4's retirement into the ordinary cache is dropped (PF-5); the `/forget` guard stops a cross-site form or fetch, not DNS rebinding, and Host-header validation joins G-1 (PF-6); `/forget`'s answers say what happened and the status page shows each suite's scheme (PF-7); a forward step of the wall clock defers reaping and the sweep by the uptime floor, a suite's held work is bounded at 5 minutes, a reap stamps its base's markers, reaps are counted by reason (PF-8); every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to `MAX(last_seen_at, now)` in its transaction, so an orphan's year counts from the end of its path's tracking (PF-10, widening PF-8's reap stamp); a hand edit that adds one field to one log line touches that function, not the whole file, for the deferred-minor rule (PF-11); the marker sweep runs once a day; `0s` disables reaping, not the reaper's other duties; the idle cutoff is strict and a NULL or future stamp is never idle; `/forget` takes an optional `scheme`, runs to completion on a context a client cannot cancel, and answers 400, 403 and 500 besides 202 and 409; sub-job C deletes one retired snapshot per transaction without a grace; a re-adoption's `adopted_at` stays above every snapshot of its suite, retired ones included; the 90-day simulation runs the reaper every 6 h and restarts every fifth day, and a four-day simulation runs the production cadence (phase F deviation 2); after the phase F task reviews: a non-canonical suite key deletes no metadata; the sweep judges a future marker against a fresh clock read while its cutoff stays the run's, and the reaper's two clock-step reports are logged directly, outside the one-line-a-minute limit; a panic under a suite's hold is recovered for that suite alone, and a delete whose writer call failed after its commit is a reap; `/forget` refuses a `host` holding a scheme (400), and a shutdown of the admin listener cuts it short (503); after the phase F final review: before it retires a suite's snapshots, every suite-row delete turns never-downgrade's snapshot clause into a marker — when the suite has an adopted, non-retired inline or detached snapshot it upserts its base's marker under the suite's scheme, the one marker a delete creates (PF-12); a forward step the reaper detects never ages a marker (the sweep's cutoff takes off every step detected since the reaper started), and the first sweep is due a day after the reaper starts, so a start with the clock ahead has a day to be corrected (PF-13); the classes reaped regardless of idleness have their own budget of 250 a run, tried first, beside the 25 idle suites (PF-14); the startup GC pass runs no sub-job C (PF-15); a reaped suite's packages lose the version retention its snapshot gave them; a `/forget` panic is logged with its suite (`where=forget`), and a forget whose writer call failed after its commit is logged (`suite_forgotten`, `settled=true`) when a fresh read finds the row gone; revision 8, 2026-10-19: phase E plan rulings — before an unsigned commit the adopter re-marks the suite's cached signed anchors and refuses when it cannot; a refusal inside the commit is a refusal state with its own sentinel and the barrier outcome `refused`; one check tail, and an unexpected success status is a failed check; absent answers reset `check_fail_count`; `anchor_absent` is recorded at the first absent observation, and a future `adoption_fail_first_at` never confirms an unsigned transition; the probe tree's content-key gate, the confirmation details, the interest and client-created-row rules, a 304 only to a conditional request, SHA512 verification before the pool; strict mode waits for signed adoptions only; the scheduler bound's admission order; after the phase E plan reviews (rulings PE-1–PE-8): a probe that finds a signature marks the suite's base, and the re-mark also reads the `/.` twin's rows; never-downgrade reads the markers of both schemes and also refuses while an adopted, non-retired signed snapshot of the base exists; a deferred never-adopted suite and an adopted `anchor_absent` suite are paced by their record; a never-adopted suite whose tree finds no anchor also records `anchor_absent`, and so does a detached suite whose changed `Release` has no signature, unless a failed lateral attempt's record holds, which keeps its reason and paces the suite the same way; a cross-form request records no validators; the interest window is symmetric; the unsigned content key is domain-separated; the unsigned member cap is applied before a slot is taken; strict mode's wait, and the miss path's backstop, end at most 25 s after the request started; the probe bound counts client checks and lost offers; after the phase E task reviews (rulings PE-9–PE-11): the long-run retry simulation names no day count; a suite whose anchor answered absent behind a failed attempt's record is paced by that record; a detached suite's lateral `InRelease` is held only by its own last failure (an in-memory memo) or by the record of its own content, so the detached form's failures never postpone it and a new `InRelease` is attempted at the first check that sees it; a `Packages` stanza without a SHA256 makes coverage incomplete (`no_sha256`) and counts toward the stanza cap; a hit-path client that left during the strict wait is answered `client_canceled`; revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
-+- **Date:** 2026-09-27 (revision 12, 2026-10-24: phase H1, the sweep — snapshot GC sub-job B never deletes, nor ranks, a snapshot still queued for §6.1's audit (R-H1); an `anchor_corrupt` quarantine deletes, in its own transaction, the `url_path` rows that hold the corrupt `InRelease` blob (`anchor_rows_deleted`), while `anchor_oversized` and `anchor_missing` keep theirs (R-H2, the maintainer's decision of 2026-10-24); the 43 prose log messages this branch added are snake_case events, and only main's released prose messages may stay prose (R-H3, R-H6); C3's detached-only suite is untracked only when first seen (deferred minor D-52); C5's skipped `Sources` paths are logged (`source_paths_skipped`, GD-2); C7's status page gains `anchorless`, failing checks with the next scheduled check, *Last requested*, `gc.retired_reaped` and the adoption ring's scheme; C9's reaper logs each completed run (`suite_reaper_run_complete`) and sets `acu_suite_reaper_last_run_unixtime`, `suite_reaped` carries `last_requested_unixtime` and `evidence`, the forward-step report counts in `acu_clock_steps_detected_total`, `/forget`'s 409 is logged at DEBUG (`suite_not_forgotten`) and a body that is not a form is 400, and GC recovers its goroutines' panics (`gc_panicked`); C10's strict wait re-runs at once when nothing is in flight, before the waiter cap; C11 lists the new events, fields and gauge; §9's H row names H1–H3; §10 records GD-5, decided for 1.1.0: keep (R-H5); revision 11, 2026-10-24: the maintainer's G-1 decision — `POST /reconcile` takes `/forget`'s guard, and without `htpasswd_file` both refuse a `Host` that is not an IP address, `localhost` or `admin.listen`'s host name; the read-only endpoints keep no `Host` check; revision 10, 2026-10-20/21/23: phase G plan rulings — a `Packages` file with no SHA256 stanza parses and adopts with incomplete coverage (`no_sha256`), and a body with no stanza naming a `Filename` still fails its parse (R-G1); every writer of a `url_path` row's `last_fetched_at` stamps it after the pool file is final, so the first adoption's `adopted_at` floor stays above the `max(pool mtime, last_fetched_at)` `Last-Modified` of url_path-served metadata, and blob mtimes are not folded into that floor (R-G3); the anchorless gate is signed evidence — the cached signed-anchor re-mark, then never-downgrade's rule — not every sniff-passing anchor row (phase G deviation 1); a plain `Contents-*` that changed is deleted, not kept, in the anchorless refresh (phase G deviation 2); the anchorless body cap is 64 MiB; a replaced row's `last_fetched_at` is `MAX(now, previous + 1)`; `flat_host_root_unsupported` is a WARN, one line a minute for the process with a `suppressed` count; a Filename made only of `.` segments is refused; `suites[].flat`; after the phase G plan reviews (rulings PG-1–PG-18): with `adopt_unsigned` off, a suite the anchorless gate admits is refused as an unsigned candidate is — the record `unsigned_disabled`, a successful check logged `changed_deferred` with form `anchorless`, paced by its record, no index request and no delete (its probes still run) — so a Release-less flat repository is served as first cached; the gate runs before the knob (PG-1, PG-10, PG-17); a Debian pool artifact (`.deb`, `.udeb`, `.ddeb`, `.dsc`, `.buildinfo`, `.changes`, `.diff.gz`, or a name with `_` and a `.tar.` component) is never metadata, so strict mode vouches and refuses an `icons-foo_1.0_all.deb` like any `.deb` (PG-2, PG-16); the sniff counter is `acu_anchorless_sniff_rejected_total{host}`, renamed from C4's first `anchorless_sniff_rejected` (PG-5); a flat suite whose base has no signed evidence is judged junk on its cached anchor rows and root `Packages*`/`Sources*` rows together — junk only when it has at least one such row and every one is junk evidence — while a flat suite with signed evidence, like every `dists/` suite, is judged by its anchors alone; the signed-evidence read is lazy, per candidate, a read error gives no verdict for the run, and the index rows are read only in a run that has an unadopted flat suite (R-G2 as amended by PG-7, R-G5); at most two anchorless bodies are in memory at once for the process (PG-8); an anchorless check is answered — a success that clears the record and the pending change — when an index request got a content answer (a 304, a 200 stored or matching the cached bytes, a 404 or 410) or when the suite has no index row to ask for, and is a failed check otherwise: a sniff-rejected 200, a changed plain `Contents-*`, a 401 or a 403 is no content answer (design review M-7, PG-12, PG-15); the refresh asks `Packages*`, then `Sources*`, then `Contents-*` (M-3), stores only the changed validators of a 200 with the cached bytes, a plain `Contents-*`'s too (M-1), deletes a row only while it holds the blob the refresh read (M-4), and logs its over-cap WARN at most once a minute for the process with a `suppressed` count (M-6); a replaced row's `last_fetched_at` can lead the clock as `adopted_at` can (M-8); the package-hash lookups join the suite's `suite_freshness` row by its key (M-2); C11's constants name the body cap, the two body slots and the two one-a-minute WARNs (M-10); the residuals of C3, C4 and C6 — constraints across a host's tenants, the twins' conflict window, an upstream that answers 403 for a missing key, an empty plain `Packages` — are documented, with no twin tiebreak (PG-13); after the phase G task reviews (rulings PG-19–PG-24): a flat suite active only through a client-created root index row, with no cached anchor row to model its probes on, probes its `InRelease` and `Release` at sibling URLs of that row's stored `upstream_url`, so a non-default port survives (PG-20); the anchorless refresh deletes a cached `InRelease` or `Release` only while it holds the blob read before the probe tree ran, so a client's fetch during the probe is kept (PG-24); a delete that fails is no answer — its 404s and 410s stop counting, so a check they alone answered fails (PG-24); a read error of the refresh's index rows is a local fault, logged with nothing written and no backoff (PG-24); an unchanged plain `Contents-*` answers the check without a sniff, so a captive portal's page cached as one answers it during the outage — a documented residual (PG-24); `flat` is the admin `suites[]` field, not a new log field (PG-23); `flat_host_root_unsupported` is logged only for a host the allowlist admits; a `Packages` stanza's Filename without a SHA256 is counted for `no_sha256`, never validated, and becomes no row, path or log value; after the phase G final review (rulings PG-28–PG-40): the anchorless refresh also deletes a cached `InRelease` or `Release` whose probe answered 401 or 403 when an index request of the same check got a content answer — S3's and CloudFront's answer for a missing key — while 404 and 410 delete it whatever the indexes answered (PG-28); a 200 over the 64 MiB cap drops its row for the miss path, no content answer, and its WARN names the file, replacing C4's first rule, which kept the row, and the fetcher fails a body whose `Content-Length` exceeds the cap without reading it (PG-29), and that WARN is logged only once the delete commits (PG-39); the suffix fallback stops at a dot-cleaned path longer than 5,121 bytes and skips a split whose base is longer than a suite path or whose name is longer than a Filename, which no row can match (PG-30); it runs only while the cache holds a flat `package_hash` row — a flag primed when the cache opens, whose failed read fails the start, set before any transaction that inserts such a row commits and never cleared while it runs (PG-31, PG-36); a never-adopted flat suite's metadata rows are read once, with its anchor rows, before the host slot and the probe tree, for Dispatch 3 and the refresh, so a read fault is a local fault before any request, and a shutdown during that read is no fault (PG-32, amending PG-24; PG-35); `package_hash_conflict` names each row's suite path (PG-33); the anchorless check line counts the rows it replaced and deleted (`rows_replaced`, `rows_deleted`), a failed check's error leads with the decisive reason and names the other after `; also `, and phase G's new WARNs carry `canonical_scheme` (PG-33, PG-37; the pre-G emitter of `freshness: read anchor rows failed` gains it in phase H: PG-34); the PG-1 clause above says no index request (its probes still run); C5 records that `ParseSources` keeps `validateMemberPath` (PG-21); the limits C2 and C6 call documented, and an adopted unsigned flat suite that stops publishing its `Release`, are documented in *Flat repositories* (PG-33, PG-38); revision 9, 2026-10-20: phase F plan rulings — the reaper and `POST /forget` delete a suite row only through phase D's compare-and-delete, holding the suite through the `SuiteGuard`, so one delete path remains (R-F1); `Gate.Purge` keeps a live entry (R-F2); the reaper also reaps legacy junk rows (R-F3); the orphan-marker sweep reads a future `last_seen_at` as now, and a marker is an orphan only when neither its base nor its `/.` twin has a row under either scheme, the rule `/forget`'s marker deletion follows too (R-F5); after the phase F plan reviews (rulings PF-1–PF-9), task reviews (rulings PF-10, PF-11) and the final review (rulings PF-12–PF-15): the sweep never rewrites a stamp (PF-1, phase F deviation 3); `/forget` deletes the cached anchors of the base and its twin under both schemes with the markers (PF-2); junk is a cached anchor that fails its sniff, an `InRelease` passing the `Release` sniff (a plain-text Release) excepted, whatever the suite's record, fetched at least 24 h ago (PF-3); the junk scan runs every run and the candidates reaped regardless of idleness go first (PF-4); with `adopt_unsigned` off an established unsigned suite keeps its coherent snapshot — R-F4's retirement into the ordinary cache is dropped (PF-5); the `/forget` guard stops a cross-site form or fetch, not DNS rebinding, and Host-header validation joins G-1 (PF-6); `/forget`'s answers say what happened and the status page shows each suite's scheme (PF-7); a forward step of the wall clock defers reaping and the sweep by the uptime floor, a suite's held work is bounded at 5 minutes, a reap stamps its base's markers, reaps are counted by reason (PF-8); every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to `MAX(last_seen_at, now)` in its transaction, so an orphan's year counts from the end of its path's tracking (PF-10, widening PF-8's reap stamp); a hand edit that adds one field to one log line touches that function, not the whole file, for the deferred-minor rule (PF-11); the marker sweep runs once a day; `0s` disables reaping, not the reaper's other duties; the idle cutoff is strict and a NULL or future stamp is never idle; `/forget` takes an optional `scheme`, runs to completion on a context a client cannot cancel, and answers 400, 403 and 500 besides 202 and 409; sub-job C deletes one retired snapshot per transaction without a grace; a re-adoption's `adopted_at` stays above every snapshot of its suite, retired ones included; the 90-day simulation runs the reaper every 6 h and restarts every fifth day, and a four-day simulation runs the production cadence (phase F deviation 2); after the phase F task reviews: a non-canonical suite key deletes no metadata; the sweep judges a future marker against a fresh clock read while its cutoff stays the run's, and the reaper's two clock-step reports are logged directly, outside the one-line-a-minute limit; a panic under a suite's hold is recovered for that suite alone, and a delete whose writer call failed after its commit is a reap; `/forget` refuses a `host` holding a scheme (400), and a shutdown of the admin listener cuts it short (503); after the phase F final review: before it retires a suite's snapshots, every suite-row delete turns never-downgrade's snapshot clause into a marker — when the suite has an adopted, non-retired inline or detached snapshot it upserts its base's marker under the suite's scheme, the one marker a delete creates (PF-12); a forward step the reaper detects never ages a marker (the sweep's cutoff takes off every step detected since the reaper started), and the first sweep is due a day after the reaper starts, so a start with the clock ahead has a day to be corrected (PF-13); the classes reaped regardless of idleness have their own budget of 250 a run, tried first, beside the 25 idle suites (PF-14); the startup GC pass runs no sub-job C (PF-15); a reaped suite's packages lose the version retention its snapshot gave them; a `/forget` panic is logged with its suite (`where=forget`), and a forget whose writer call failed after its commit is logged (`suite_forgotten`, `settled=true`) when a fresh read finds the row gone; revision 8, 2026-10-19: phase E plan rulings — before an unsigned commit the adopter re-marks the suite's cached signed anchors and refuses when it cannot; a refusal inside the commit is a refusal state with its own sentinel and the barrier outcome `refused`; one check tail, and an unexpected success status is a failed check; absent answers reset `check_fail_count`; `anchor_absent` is recorded at the first absent observation, and a future `adoption_fail_first_at` never confirms an unsigned transition; the probe tree's content-key gate, the confirmation details, the interest and client-created-row rules, a 304 only to a conditional request, SHA512 verification before the pool; strict mode waits for signed adoptions only; the scheduler bound's admission order; after the phase E plan reviews (rulings PE-1–PE-8): a probe that finds a signature marks the suite's base, and the re-mark also reads the `/.` twin's rows; never-downgrade reads the markers of both schemes and also refuses while an adopted, non-retired signed snapshot of the base exists; a deferred never-adopted suite and an adopted `anchor_absent` suite are paced by their record; a never-adopted suite whose tree finds no anchor also records `anchor_absent`, and so does a detached suite whose changed `Release` has no signature, unless a failed lateral attempt's record holds, which keeps its reason and paces the suite the same way; a cross-form request records no validators; the interest window is symmetric; the unsigned content key is domain-separated; the unsigned member cap is applied before a slot is taken; strict mode's wait, and the miss path's backstop, end at most 25 s after the request started; the probe bound counts client checks and lost offers; after the phase E task reviews (rulings PE-9–PE-11): the long-run retry simulation names no day count; a suite whose anchor answered absent behind a failed attempt's record is paced by that record; a detached suite's lateral `InRelease` is held only by its own last failure (an in-memory memo) or by the record of its own content, so the detached form's failures never postpone it and a new `InRelease` is attempted at the first check that sees it; a `Packages` stanza without a SHA256 makes coverage incomplete (`no_sha256`) and counts toward the stanza cap; a hit-path client that left during the strict wait is answered `client_canceled`; revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
++- **Date:** 2026-09-27 (revision 12, 2026-10-24: phase H1, the sweep — snapshot GC sub-job B never deletes, nor ranks, a snapshot still queued for §6.1's audit (R-H1); an `anchor_corrupt` quarantine deletes, in its own transaction, the `url_path` rows that hold the corrupt `InRelease` blob (`anchor_rows_deleted`), while `anchor_oversized` and `anchor_missing` keep theirs (R-H2, the maintainer's decision of 2026-10-24); the 43 prose log messages this branch added are snake_case events, and only main's released prose messages may stay prose (R-H3, R-H6); after the plan's design reviews, the audit also removes the corrupt pool file (review C-1: the miss path keeps an existing pool file of the same hash, so an upstream still serving the same `InRelease` was refetched onto the rotted file; `legacy_anchor_discard_failed`), GC's startup pass returns a panic as an error and a panicking pass moves the rotation past itself, and `source_paths_skipped` is INFO; C3's detached-only suite is untracked only when first seen (deferred minor D-52); C5's skipped `Sources` paths are logged (`source_paths_skipped`, GD-2); C7's status page gains `anchorless`, failing checks with the end of their backoff, *Last requested*, `gc.retired_reaped` and the adoption ring's scheme; C9's reaper logs each completed run (`suite_reaper_run_complete`) and sets `acu_suite_reaper_last_run_unixtime`, `suite_reaped` carries `last_requested_unixtime` and `evidence`, the forward-step report counts in `acu_clock_steps_detected_total`, `/forget`'s 409 is logged at DEBUG (`suite_not_forgotten`) and a body that is not a form is 400, and GC recovers its goroutines' panics (`gc_panicked`); C10's strict wait re-runs at once when nothing is in flight, before the waiter cap; C11 lists the new events, fields and gauge; §9's H row names H1–H3; §10 records GD-5, decided for 1.1.0 by ruling R-H5 for the maintainer's confirmation: keep; revision 11, 2026-10-24: the maintainer's G-1 decision — `POST /reconcile` takes `/forget`'s guard, and without `htpasswd_file` both refuse a `Host` that is not an IP address, `localhost` or `admin.listen`'s host name; the read-only endpoints keep no `Host` check; revision 10, 2026-10-20/21/23: phase G plan rulings — a `Packages` file with no SHA256 stanza parses and adopts with incomplete coverage (`no_sha256`), and a body with no stanza naming a `Filename` still fails its parse (R-G1); every writer of a `url_path` row's `last_fetched_at` stamps it after the pool file is final, so the first adoption's `adopted_at` floor stays above the `max(pool mtime, last_fetched_at)` `Last-Modified` of url_path-served metadata, and blob mtimes are not folded into that floor (R-G3); the anchorless gate is signed evidence — the cached signed-anchor re-mark, then never-downgrade's rule — not every sniff-passing anchor row (phase G deviation 1); a plain `Contents-*` that changed is deleted, not kept, in the anchorless refresh (phase G deviation 2); the anchorless body cap is 64 MiB; a replaced row's `last_fetched_at` is `MAX(now, previous + 1)`; `flat_host_root_unsupported` is a WARN, one line a minute for the process with a `suppressed` count; a Filename made only of `.` segments is refused; `suites[].flat`; after the phase G plan reviews (rulings PG-1–PG-18): with `adopt_unsigned` off, a suite the anchorless gate admits is refused as an unsigned candidate is — the record `unsigned_disabled`, a successful check logged `changed_deferred` with form `anchorless`, paced by its record, no index request and no delete (its probes still run) — so a Release-less flat repository is served as first cached; the gate runs before the knob (PG-1, PG-10, PG-17); a Debian pool artifact (`.deb`, `.udeb`, `.ddeb`, `.dsc`, `.buildinfo`, `.changes`, `.diff.gz`, or a name with `_` and a `.tar.` component) is never metadata, so strict mode vouches and refuses an `icons-foo_1.0_all.deb` like any `.deb` (PG-2, PG-16); the sniff counter is `acu_anchorless_sniff_rejected_total{host}`, renamed from C4's first `anchorless_sniff_rejected` (PG-5); a flat suite whose base has no signed evidence is judged junk on its cached anchor rows and root `Packages*`/`Sources*` rows together — junk only when it has at least one such row and every one is junk evidence — while a flat suite with signed evidence, like every `dists/` suite, is judged by its anchors alone; the signed-evidence read is lazy, per candidate, a read error gives no verdict for the run, and the index rows are read only in a run that has an unadopted flat suite (R-G2 as amended by PG-7, R-G5); at most two anchorless bodies are in memory at once for the process (PG-8); an anchorless check is answered — a success that clears the record and the pending change — when an index request got a content answer (a 304, a 200 stored or matching the cached bytes, a 404 or 410) or when the suite has no index row to ask for, and is a failed check otherwise: a sniff-rejected 200, a changed plain `Contents-*`, a 401 or a 403 is no content answer (design review M-7, PG-12, PG-15); the refresh asks `Packages*`, then `Sources*`, then `Contents-*` (M-3), stores only the changed validators of a 200 with the cached bytes, a plain `Contents-*`'s too (M-1), deletes a row only while it holds the blob the refresh read (M-4), and logs its over-cap WARN at most once a minute for the process with a `suppressed` count (M-6); a replaced row's `last_fetched_at` can lead the clock as `adopted_at` can (M-8); the package-hash lookups join the suite's `suite_freshness` row by its key (M-2); C11's constants name the body cap, the two body slots and the two one-a-minute WARNs (M-10); the residuals of C3, C4 and C6 — constraints across a host's tenants, the twins' conflict window, an upstream that answers 403 for a missing key, an empty plain `Packages` — are documented, with no twin tiebreak (PG-13); after the phase G task reviews (rulings PG-19–PG-24): a flat suite active only through a client-created root index row, with no cached anchor row to model its probes on, probes its `InRelease` and `Release` at sibling URLs of that row's stored `upstream_url`, so a non-default port survives (PG-20); the anchorless refresh deletes a cached `InRelease` or `Release` only while it holds the blob read before the probe tree ran, so a client's fetch during the probe is kept (PG-24); a delete that fails is no answer — its 404s and 410s stop counting, so a check they alone answered fails (PG-24); a read error of the refresh's index rows is a local fault, logged with nothing written and no backoff (PG-24); an unchanged plain `Contents-*` answers the check without a sniff, so a captive portal's page cached as one answers it during the outage — a documented residual (PG-24); `flat` is the admin `suites[]` field, not a new log field (PG-23); `flat_host_root_unsupported` is logged only for a host the allowlist admits; a `Packages` stanza's Filename without a SHA256 is counted for `no_sha256`, never validated, and becomes no row, path or log value; after the phase G final review (rulings PG-28–PG-40): the anchorless refresh also deletes a cached `InRelease` or `Release` whose probe answered 401 or 403 when an index request of the same check got a content answer — S3's and CloudFront's answer for a missing key — while 404 and 410 delete it whatever the indexes answered (PG-28); a 200 over the 64 MiB cap drops its row for the miss path, no content answer, and its WARN names the file, replacing C4's first rule, which kept the row, and the fetcher fails a body whose `Content-Length` exceeds the cap without reading it (PG-29), and that WARN is logged only once the delete commits (PG-39); the suffix fallback stops at a dot-cleaned path longer than 5,121 bytes and skips a split whose base is longer than a suite path or whose name is longer than a Filename, which no row can match (PG-30); it runs only while the cache holds a flat `package_hash` row — a flag primed when the cache opens, whose failed read fails the start, set before any transaction that inserts such a row commits and never cleared while it runs (PG-31, PG-36); a never-adopted flat suite's metadata rows are read once, with its anchor rows, before the host slot and the probe tree, for Dispatch 3 and the refresh, so a read fault is a local fault before any request, and a shutdown during that read is no fault (PG-32, amending PG-24; PG-35); `package_hash_conflict` names each row's suite path (PG-33); the anchorless check line counts the rows it replaced and deleted (`rows_replaced`, `rows_deleted`), a failed check's error leads with the decisive reason and names the other after `; also `, and phase G's new WARNs carry `canonical_scheme` (PG-33, PG-37; the pre-G emitter of `freshness: read anchor rows failed` gains it in phase H: PG-34); the PG-1 clause above says no index request (its probes still run); C5 records that `ParseSources` keeps `validateMemberPath` (PG-21); the limits C2 and C6 call documented, and an adopted unsigned flat suite that stops publishing its `Release`, are documented in *Flat repositories* (PG-33, PG-38); revision 9, 2026-10-20: phase F plan rulings — the reaper and `POST /forget` delete a suite row only through phase D's compare-and-delete, holding the suite through the `SuiteGuard`, so one delete path remains (R-F1); `Gate.Purge` keeps a live entry (R-F2); the reaper also reaps legacy junk rows (R-F3); the orphan-marker sweep reads a future `last_seen_at` as now, and a marker is an orphan only when neither its base nor its `/.` twin has a row under either scheme, the rule `/forget`'s marker deletion follows too (R-F5); after the phase F plan reviews (rulings PF-1–PF-9), task reviews (rulings PF-10, PF-11) and the final review (rulings PF-12–PF-15): the sweep never rewrites a stamp (PF-1, phase F deviation 3); `/forget` deletes the cached anchors of the base and its twin under both schemes with the markers (PF-2); junk is a cached anchor that fails its sniff, an `InRelease` passing the `Release` sniff (a plain-text Release) excepted, whatever the suite's record, fetched at least 24 h ago (PF-3); the junk scan runs every run and the candidates reaped regardless of idleness go first (PF-4); with `adopt_unsigned` off an established unsigned suite keeps its coherent snapshot — R-F4's retirement into the ordinary cache is dropped (PF-5); the `/forget` guard stops a cross-site form or fetch, not DNS rebinding, and Host-header validation joins G-1 (PF-6); `/forget`'s answers say what happened and the status page shows each suite's scheme (PF-7); a forward step of the wall clock defers reaping and the sweep by the uptime floor, a suite's held work is bounded at 5 minutes, a reap stamps its base's markers, reaps are counted by reason (PF-8); every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to `MAX(last_seen_at, now)` in its transaction, so an orphan's year counts from the end of its path's tracking (PF-10, widening PF-8's reap stamp); a hand edit that adds one field to one log line touches that function, not the whole file, for the deferred-minor rule (PF-11); the marker sweep runs once a day; `0s` disables reaping, not the reaper's other duties; the idle cutoff is strict and a NULL or future stamp is never idle; `/forget` takes an optional `scheme`, runs to completion on a context a client cannot cancel, and answers 400, 403 and 500 besides 202 and 409; sub-job C deletes one retired snapshot per transaction without a grace; a re-adoption's `adopted_at` stays above every snapshot of its suite, retired ones included; the 90-day simulation runs the reaper every 6 h and restarts every fifth day, and a four-day simulation runs the production cadence (phase F deviation 2); after the phase F task reviews: a non-canonical suite key deletes no metadata; the sweep judges a future marker against a fresh clock read while its cutoff stays the run's, and the reaper's two clock-step reports are logged directly, outside the one-line-a-minute limit; a panic under a suite's hold is recovered for that suite alone, and a delete whose writer call failed after its commit is a reap; `/forget` refuses a `host` holding a scheme (400), and a shutdown of the admin listener cuts it short (503); after the phase F final review: before it retires a suite's snapshots, every suite-row delete turns never-downgrade's snapshot clause into a marker — when the suite has an adopted, non-retired inline or detached snapshot it upserts its base's marker under the suite's scheme, the one marker a delete creates (PF-12); a forward step the reaper detects never ages a marker (the sweep's cutoff takes off every step detected since the reaper started), and the first sweep is due a day after the reaper starts, so a start with the clock ahead has a day to be corrected (PF-13); the classes reaped regardless of idleness have their own budget of 250 a run, tried first, beside the 25 idle suites (PF-14); the startup GC pass runs no sub-job C (PF-15); a reaped suite's packages lose the version retention its snapshot gave them; a `/forget` panic is logged with its suite (`where=forget`), and a forget whose writer call failed after its commit is logged (`suite_forgotten`, `settled=true`) when a fresh read finds the row gone; revision 8, 2026-10-19: phase E plan rulings — before an unsigned commit the adopter re-marks the suite's cached signed anchors and refuses when it cannot; a refusal inside the commit is a refusal state with its own sentinel and the barrier outcome `refused`; one check tail, and an unexpected success status is a failed check; absent answers reset `check_fail_count`; `anchor_absent` is recorded at the first absent observation, and a future `adoption_fail_first_at` never confirms an unsigned transition; the probe tree's content-key gate, the confirmation details, the interest and client-created-row rules, a 304 only to a conditional request, SHA512 verification before the pool; strict mode waits for signed adoptions only; the scheduler bound's admission order; after the phase E plan reviews (rulings PE-1–PE-8): a probe that finds a signature marks the suite's base, and the re-mark also reads the `/.` twin's rows; never-downgrade reads the markers of both schemes and also refuses while an adopted, non-retired signed snapshot of the base exists; a deferred never-adopted suite and an adopted `anchor_absent` suite are paced by their record; a never-adopted suite whose tree finds no anchor also records `anchor_absent`, and so does a detached suite whose changed `Release` has no signature, unless a failed lateral attempt's record holds, which keeps its reason and paces the suite the same way; a cross-form request records no validators; the interest window is symmetric; the unsigned content key is domain-separated; the unsigned member cap is applied before a slot is taken; strict mode's wait, and the miss path's backstop, end at most 25 s after the request started; the probe bound counts client checks and lost offers; after the phase E task reviews (rulings PE-9–PE-11): the long-run retry simulation names no day count; a suite whose anchor answered absent behind a failed attempt's record is paced by that record; a detached suite's lateral `InRelease` is held only by its own last failure (an in-memory memo) or by the record of its own content, so the detached form's failures never postpone it and a new `InRelease` is attempted at the first check that sees it; a `Packages` stanza without a SHA256 makes coverage incomplete (`no_sha256`) and counts toward the stanza cap; a hit-path client that left during the strict wait is answered `client_canceled`; revision 7, 2026-10-18: phase D plan rulings — adoption accepts exactly apt's first `InRelease` line, and a marker line with trailing blanks decodes; a binary `Release.gpg` passes its sniff only with a signature version (3–6) where its packet header puts the body; suite paths over 1024 bytes are not tracked; cap eviction holds the evictee's mutex through the checker, tries at most eight candidates, evicts at most one suite per creation attempt at or above the global cap (an attempt above it is still refused) and deletes through the compare-and-delete the reaper reuses, and a startup WARN names a table over its caps; the rejection cache holds at most 4,096 suites; `suite_seed_rejected` is rate-limited to one line a minute; the C3 metric names; the hit-path invariant covers tracked suites, and every row creation marks the suite's cached signed anchors in its own transaction; with no adopter a refresh miss re-stamps its row as before; the T1 on a creating miss lands with phase E; an attempt a shutdown ends before the barrier is abandoned like one in it; revision 6, 2026-10-18: phase C plan rulings — the C8 barrier keeps the adoption's global slot and does not honour `adoption.max_duration` but ends on shutdown (the daemon closes it at the signal), so the admission bound's *A* includes it; a hold that held no request starts no cross-suite quiet period; `flip_quiet_period` is `0s` or `1s` to `15s`; every C8 residual has its own counter; the hold-token residual and the five-suite DoD corrected (four hold, the fifth commits unheld); retained by-hash serves SHA512 aliases from phase C; exact C2 predicate and C3 `Release.gpg` sniff wording; after phase C's final review: once cross-suite quiet holds, a hold commits at 15 s (20 s less a 5 s commit margin) instead of answering its waiters from the old snapshot at 20 s — its late readers are a counted residual — and snapshot anchors carry `adopted_at` alone as `Last-Modified`; revision 5, 2026-10-17: slot-driven admission in C4 — a suite that finds no slot waits and is re-checked when one is released; the admission bound — after the phase B plan review; revision 4, 2026-10-05/11: legacy trust audit, signed-seen ordering, fail-closed inline verification, flip hold token, fair scheduler — after the 2026-10-05 plan review, a follow-up review, and a three-lens review of grounding, alternatives and residual risk; 2026-10-17: PR #8 parity notes in C10, §7 and §9)
  - **Status:** draft for maintainer review
  - **Branch:** `feature/flat-repos` (from `main` @ 536a1ab)
  - **Origin:** reimplementation of the problem reported in PR #8 ("Refresh flat
@@ -7793,13 +8480,13 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 +A `Sources` path `validateMemberPath` refuses — every file of a stanza
 +whose `Directory` fails it, and each file whose own path does — gets no
 +row, as before; it is no longer silent: `ParseSources` counts such paths
-+and keeps the first, and the adoption logs WARN `source_paths_skipped`
++and keeps the first, and the adoption logs INFO `source_paths_skipped`
 +once per `Sources` file that skipped any (phase H1, deferred minor GD-2).
 +
  A stanza's Filename without a SHA256 is counted for `no_sha256`, not
  validated: it becomes no row, no path and no log value (phase G, the Task 3
  review).
-@@ -1269,7 +1277,15 @@
+@@ -1269,7 +1277,16 @@
  
  **Visibility.** Admin `suites[]` gains `anchor_form`, `flat`,
  `last_requested_unixtime`, and the record ("adoption failing 3d 2h ·
@@ -7808,15 +8495,16 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 +adds `anchorless` — a flat suite refreshed without a `Release`, derived
 +from persisted state alone: a flat suite, adoption enabled, no current snapshot, a last
 +success, no record, no pending change (C4 Dispatch 4) — shown as
-+"refreshed without a Release"; "checks failing ×k · next scheduled check
-+in …" while `check_fail_count` > 0 (the scheduler's backoff from
-+`last_check_at`; "scheduled", since a client's check may come sooner); a
++"refreshed without a Release"; "checks failing ×k · backoff ends in …"
++while `check_fail_count` > 0 (the scheduler's backoff from `last_check_at`:
++the earliest it may check; the count alone for a dormant never-adopted
++suite and one its record paces, which the backoff does not schedule); a
 +*Last requested* column; `gc.retired_reaped`; and the adoption ring's
 +`scheme`, shown as `scheme://host`. "Lagging" is
  computed from the first-seen `inrelease_change_seen_at` against `now`. Gauge
  `acu_adoption_failing_suites`; INFO `adoption_deferred` on state transitions;
  WARN `adoption_failing_persistently` at streak counts 3, 6, 12, …; the
-@@ -1566,7 +1582,14 @@
+@@ -1566,7 +1583,14 @@
  a restart, uncorrected for a day, still ages markers by it, and a daemon
  restarted at least once a day (before its first sweep comes due) never
  sweeps (orphan markers are small rows: the safe side). Reaps are
@@ -7832,7 +8520,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  once-logger sets start over when a new key finds 10,000 entries.
  Snapshot GC gains sub-job C,
  in the periodic ticks only — the startup pass, which runs before the
-@@ -1582,7 +1605,14 @@
+@@ -1582,7 +1606,16 @@
  members and `package_hash` rows in bounded chunks (10,000 rows per writer
  transaction), then the header row; it needs no grace, since a retired
  snapshot is never a candidate again (the collision lookup ignores it and
@@ -7844,11 +8532,13 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 +never-downgrade reads until the audit decides it (ruling R-H1, phase H1;
 +the predicate sits before the ranking, so a queued snapshot takes no
 +place). GC recovers a panic per periodic tick and per pool-scan job —
-+ERROR `gc_panicked` — and goes on (phase H1).
++ERROR `gc_panicked` — and goes on; a tick's panic moves the pass rotation
++past the pass that panicked, and the startup pass returns its panic as an
++error, which the daemon logs before it serves (phase H1).
  
  **Migration backfill** of `last_requested_at`: the newest client
  `last_requested_at` of the suite's anchor `url_path` rows, else migration time
-@@ -1613,9 +1643,12 @@
+@@ -1613,9 +1646,12 @@
  suites (no existence oracle; the body says what to check: the status
  page, which now shows each suite's scheme, shows `scheme://host` in its
  Host cell — the scheme goes in `scheme`, default `https`, the rest in
@@ -7864,7 +8554,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  when the admin listener's shutdown cut it short (each metadata batch and
  the final delete are their own transactions, so a forget cut short is
  safe to repeat). A final delete that committed although its writer call
-@@ -1667,7 +1700,10 @@
+@@ -1667,7 +1703,10 @@
  again, a client that left during the wait gets no retry, and the refusal
  is logged once per fetch, by the singleflight leader (design review O1).
  At most 64 waiters per host, each waiting request counting (coalesced
@@ -7876,13 +8566,13 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  
  Documented consequences: a client fetching N unvouched packages one
  after another during a long adoption waits up to 15 s for each (M-11); an
-@@ -1701,10 +1737,23 @@
+@@ -1701,10 +1740,23 @@
  `handler_goroutine_panicked`, `adoption_panicked`, `clock_step_detected`,
  `flat_host_root_unsupported`, `legacy_snapshot_quarantined`,
  `legacy_trust_audit_progress`, `legacy_trust_audit_deferred`,
 -`legacy_trust_audit_completed`; new fields `anchor_form`,
 +`legacy_trust_audit_completed`; phase H1's `suite_reaper_run_complete`,
-+`suite_not_forgotten` (DEBUG), `gc_panicked`,
++`suite_not_forgotten` (DEBUG), `gc_panicked`, `legacy_anchor_discard_failed`,
 +`reconcile_snapshot_read_failed` and `source_paths_skipped`, and the 43
 +lines this branch added with prose messages, renamed to snake_case event
 +names, each keeping its level and fields (`suite_onboarding_failed`,
@@ -7902,7 +8592,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  the admin `suites[]` field, C7, not a log field: every suite line's
  `suite_path` shows the layout; phase G ruling PG-23). New metrics include
  the unlabelled
-@@ -1717,14 +1766,16 @@
+@@ -1717,14 +1769,16 @@
  `acu_strict_adoption_waits_total{host}`, and phase F's unlabelled counter
  `acu_gc_retired_reaped_total` and `acu_suites_reaped_total{reason}` (three
  values: `idle`, `non_canonical`, `junk`), and phase G's
@@ -7921,7 +8611,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  
  | Key | Default | Rule |
  |---|---|---|
-@@ -1902,8 +1953,18 @@
+@@ -1902,8 +1956,26 @@
  - **Quarantine** (`cache.ApplyLegacyAuditDecisions`, in its batch's writer transaction):
    if the snapshot is a suite's current snapshot, clear `current_snapshot_id`
    and that suite's validators and run the Step-8 refcount decrement for it;
@@ -7929,12 +8619,20 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 -  snapshot, host, suite, `was_current`); counter
 +  set `retired_at`; dequeue. For `anchor_corrupt` the same transaction also
 +  deletes every `url_path` row whose `blob_hash` is the snapshot's stored
-+  `InRelease` hash — under any scheme or host, through the writer, the
-+  blob itself left to GC — so the next client request fetches a fresh copy
-+  from upstream instead of being served bytes apt rejects (the maintainer's
-+  decision of 2026-10-24, ruling R-H2, phase H1). In the transaction, not
-+  after it: the dequeue commits with the delete, so a crash between them
-+  cannot dequeue the snapshot with its corrupt rows still served.
++  `InRelease` hash — under any scheme or host, through the writer — so
++  the next client request fetches a fresh copy from upstream instead of
++  being served bytes apt rejects (the maintainer's decision of 2026-10-24,
++  ruling R-H2, phase H1). In the transaction, not after it: the dequeue
++  commits with the delete, so a crash between them cannot dequeue the
++  snapshot with its corrupt rows still served. The audit also removes the
++  corrupt pool file (`DiscardFinalizedBlob`, the integrity scanner's
++  remedy), on its own goroutine before the batch commits, never on the
++  writer: the miss path keeps an existing pool file of the same hash, so
++  an upstream still serving the same `InRelease` would otherwise be
++  fetched onto, and served from, the rotted file (phase H1, review C-1). A
++  commit lost after the removal re-audits the snapshot as `anchor_missing`
++  at the next start; a failed removal is logged (ERROR
++  `legacy_anchor_discard_failed`) and the quarantine goes ahead.
 +  `anchor_oversized` (over the 8 MiB read, not proven bad) and
 +  `anchor_missing` (nothing to serve) keep their rows, and a read error is
 +  still no evidence. WARN `legacy_snapshot_quarantined` (reason,
@@ -7942,7 +8640,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
    `acu_legacy_snapshots_quarantined_total`. A quarantined snapshot never
    serves, never vouches or counts for strict mode (both read current
    snapshots only), is excluded from retained by-hash (non-retired only), can
-@@ -1926,7 +1987,7 @@
+@@ -1926,7 +1998,7 @@
  and duration.
  
  A quarantined suite falls back to Phase 1 serving (its `url_path` anchor row
@@ -7951,7 +8649,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  observes anchor bytes different from the cached ones (phases A–D) or by
  eager first adoption (phase E). For an R-1 quarantine that is the first
  post-upgrade check: the cached anchor holds the tampered envelope, which a
-@@ -2159,7 +2220,7 @@
+@@ -2159,7 +2231,7 @@
  | **E. Eager adoption and anchor forms** | C4 probe tree, classification, form transitions, `anchor_absent`, eager first adoption with interest window, T1-on-seed; C5 unsigned form with safeguards; SHA512 merge, shared verify helper, aliases (served from displaced snapshots by phase C's retained by-hash); C10 in-flight wait. | Production-shaped fixture: active never-adopted suites adopt once, dormant ones make zero requests; classification table; never-downgrade at both points, including the in-transaction recheck race; a §6.1-quarantined plain-text suite adopts unsigned without a downgrade refusal; unsigned never changes posture; nvidia-shaped fixture adopts; SHA512 by-hash served; in-flight wait on hit and miss paths. |
  | **F. Suite reaping** | C9 retirement, reaper (own ticker), batched metadata deletion, sub-job C, memory purge, marker TTL, `POST /forget`. | 90-day simulation at `gc.interval = 24h` with restarts; return-before-GC and `/forget` re-adoption tests; forward-step self-heal; never-downgrade after reap; `/forget` CSRF test; twins untouched. |
  | **G. Flat repositories** | C2 flat grammar; flat IndexTargets (layout-aware, adoption and handler sides); `validateFilename`; C6 materialisation, fallback, coverage; anchorless refresh; flat root-index touch; flat pdiff arch labels. | PR #8's evidence: a miss on `/…/deb/InRelease` and on `/…/deb/./InRelease` creates one suite row each and fires T1 under it, a hit fires T1 again, and `/…/deb/Packages_1.0_all.deb`, host-root `/InRelease` and `/…/deb//InRelease` create none (no check fires for either path on `main`); `/core:/stable:/v1.34/deb/InRelease` → suite `/core:/stable:/v1.34/deb`; every real Filename shape adopts and vouches; flat `Packages` failure fatal; strict matrix; anchorless refresh tests; flat legacy onboarding on a v6 fixture (an untrusted flat suite makes ≤ 1 attempt per backoff step); reaping `/repo` leaves `/repo/.` intact; PR #8's remaining tests ported with the expected results in the plan overview's "PR #8 parity" section. |
@@ -7960,7 +8658,7 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  
  ## 10. Out of scope / follow-ups
  
-@@ -2194,6 +2255,17 @@
+@@ -2194,6 +2266,17 @@
      `Host: 127.0.0.1` (phase F, ruling PF-6, had left it open).
  11. First contact costs two upstream GETs of the anchor (the miss and the
      eager probe).
@@ -7970,9 +8668,9 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
 +    `POST /forget` turns it into a Release-less suite the anchorless
 +    refresh serves (C4 Dispatch 1–2, documented in *Flat repositories*).
 +    Whether such a suite should drop its snapshot and refresh anchorless
-+    once its `Release` has stayed absent was decided for 1.1.0: keep;
-+    revisit if seen in the field (phase H1, ruling R-H5, deferred minor
-+    GD-5): it is rare, the kept snapshot keeps serving cached content when
++    once its `Release` has stayed absent was decided for 1.1.0 by a
++    controller ruling, for the maintainer's confirmation: keep; revisit if
++    seen in the field (phase H1, ruling R-H5, deferred minor GD-5): it is rare, the kept snapshot keeps serving cached content when
 +    an upstream dies outright, where a drop would turn that into 404s, and
 +    a drop is a new state transition with trust and serving consequences.
  
@@ -7980,9 +8678,9 @@ diff --git a/docs/superpowers/specs/2026-09-27-flat-repositories-design.md b/doc
  
 ````
 
-- [ ] **Step 6: The overview**
+- [ ] **Step 7: The overview**
 
-The spec reference becomes revision 12 (revision 11 left it at 10); the deferred-minors constraint says where the IDs resolve now (design note 16); the phase table's H row becomes H1 (in progress; it becomes "done (commit …)" after the final review, as phase G's did), H2 and H3; the Cross-phase interfaces gain H1's names; each Carry-forwards **H:** item H1 closes is marked done and each H3 item says so (the e2e item is left for H2's plan, which marks it), and the (D) item moves there from "PR #8 parity" (D-55); the open decision on corrupt anchors is decided and done (R-H2), and GD-5 is recorded as decided for 1.1.0 (R-H5); the H1 interface line names the 43 renames and the guard, and the two cross-phase lines that quote a message as current name its event (the carry-forward items keep the old names they list).
+The spec reference becomes revision 12 (revision 11 left it at 10); the deferred-minors constraint says where the IDs resolve now — H1's disposition table, the phase plans, and the deleted files through git (design note 16, review sweep M-9) — and drops "or the maintainer's" (review sweep M-1); the phase table's H row becomes H1 (in progress; it becomes "done (commit …)" after the final review, as phase G's did), H2 and H3, whose row names the strict-mode docs; the Cross-phase interfaces gain H1's names; each Carry-forwards **H:** item H1 closes is marked done and each H3 item says so — the two "PR #8 parity" H: items too (the e2e item is left for H2's plan, which marks it) — and the (D) item moves there from "PR #8 parity" (D-55), so the (E) item says "with phase D's (above)"; the block heading becomes "Decisions (spec-level; none open)": the decision on corrupt anchors is decided and done (R-H2), and GD-5 is recorded as decided for 1.1.0 by ruling R-H5, for the maintainer's confirmation (review sweep M-8, M-10); the H1 interface line names the 43 renames, `legacy_anchor_discard_failed` and the guards, and the two cross-phase lines that quote a message as current name its event (the carry-forward items keep the old names they list).
 
 ````diff
 diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md b/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md
@@ -8002,7 +8700,7 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md 
  - An I/O fault is never evidence: code that removes trust (audit, quarantine, reaping) acts on "file does not exist" or on content it read and checked, and on any other read error defers (leaves the item queued, changes nothing, logs ERROR). Refusing to start is reserved for faults that would misjudge everything (database errors, a missing or empty pool).
  - **Release boundary (maintainer decision, 2026-10-17):** phases A–H ship together, with other changes, in the 1.1.0 release candidate. Nothing from this branch is released earlier, so no phase needs to be independently releasable; each phase still ends green (tests, lint, gofmt) so the branch stays bisectable. The phase order is unchanged.
 -- Deferred review minors are listed per phase: `2026-09-28-flat-repositories-A-deferred.md` (IDs A-1…A-57), `2026-09-28-flat-repositories-B-deferred.md` (IDs B-1…B-68), `2026-09-28-flat-repositories-C-deferred.md` (IDs C-1…C-40), `2026-09-28-flat-repositories-D-deferred.md` (IDs D-1…D-60), `2026-09-28-flat-repositories-E-deferred.md` (IDs E-1…E-77), `2026-09-28-flat-repositories-F-deferred.md` (IDs F-1…F-26) and `2026-09-28-flat-repositories-G-deferred.md` (IDs GD-1…GD-6; `GD`, not `G`, so they never collide with spec §10's `G-1`: phase G ruling PG-25). Each later phase plan includes the items, from all seven files, in files it touches (an item tagged with a phase letter is owned by that phase); phase H sweeps the rest and deletes the seven files. Phase H takes F-24 (a pre-existing never-downgrade gap with `gc.keep_displaced = 0`) early.
-+- Deferred review minors are listed per phase: `2026-09-28-flat-repositories-A-deferred.md` (IDs A-1…A-57), `2026-09-28-flat-repositories-B-deferred.md` (IDs B-1…B-68), `2026-09-28-flat-repositories-C-deferred.md` (IDs C-1…C-40), `2026-09-28-flat-repositories-D-deferred.md` (IDs D-1…D-60), `2026-09-28-flat-repositories-E-deferred.md` (IDs E-1…E-77), `2026-09-28-flat-repositories-F-deferred.md` (IDs F-1…F-26) and `2026-09-28-flat-repositories-G-deferred.md` (IDs GD-1…GD-6; `GD`, not `G`, so they never collide with spec §10's `G-1`: phase G ruling PG-25). Each later phase plan includes the items, from all seven files, in files it touches (an item tagged with a phase letter is owned by that phase); phase H sweeps the rest and deletes the seven files. Phase H takes F-24 (a pre-existing never-downgrade gap with `gc.keep_displaced = 0`) early. *Done in phase H1:* every item has a disposition in `2026-09-28-flat-repositories-H1-sweep.md` (fixed, already done, declined with its reason, or the maintainer's), and the seven files are deleted; a code comment that cites an item by ID resolves through the phase plan that took it and git history (H1 design note 16).
++- Deferred review minors are listed per phase: `2026-09-28-flat-repositories-A-deferred.md` (IDs A-1…A-57), `2026-09-28-flat-repositories-B-deferred.md` (IDs B-1…B-68), `2026-09-28-flat-repositories-C-deferred.md` (IDs C-1…C-40), `2026-09-28-flat-repositories-D-deferred.md` (IDs D-1…D-60), `2026-09-28-flat-repositories-E-deferred.md` (IDs E-1…E-77), `2026-09-28-flat-repositories-F-deferred.md` (IDs F-1…F-26) and `2026-09-28-flat-repositories-G-deferred.md` (IDs GD-1…GD-6; `GD`, not `G`, so they never collide with spec §10's `G-1`: phase G ruling PG-25). Each later phase plan includes the items, from all seven files, in files it touches (an item tagged with a phase letter is owned by that phase); phase H sweeps the rest and deletes the seven files. Phase H takes F-24 (a pre-existing never-downgrade gap with `gc.keep_displaced = 0`) early. *Done in phase H1:* every item has a disposition in `2026-09-28-flat-repositories-H1-sweep.md` (fixed, already done, or declined with its reason), and the seven files are deleted; a code comment that cites an item by ID resolves through H1's disposition table (the 136 swept there), the phase plan that took it (the rest), and the deleted files themselves: `git log --diff-filter=D -- 'docs/superpowers/plans/*-deferred.md'` names the commit, and `git show <commit>^:<path>` prints a file (H1 design note 16).
  - Every phase-A task must stay justified by PR #8 (its core problem or one of its four limitations), a named maintainer decision, or a confirmed defect; the review-findings table below records the mapping for the 2026-10-05 changes.
  - Commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
  - Credit: the flat-repository problem was reported and first analysed by Venkat (@venkatamutyala) in PR #8, and this work is based on that PR. They are credited in `Contributors.md` (added 2026-10-17, after phase A); every phase keeps that credit and its PR #8 reference.
@@ -8013,7 +8711,7 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md 
 -| H. End to end and docs | `…-H-e2e-docs.md` | §7 e2e, §8 | all | to write after G |
 +| H1. The sweep | `…-H1-sweep.md` | every deferred minor of A–G; §6.1 (R-H2) and C9 sub-job B (R-H1); C11 names (R-H3, R-H6); the docs of its own changes | A–G | in progress (plan written 2026-10-24) |
 +| H2. End to end | `…-H2-e2e.md` | §7 e2e | H1 | planned |
-+| H3. Docs and release | to write | §8 (README), release notes, the live-upstream smoke, final full-diff review | H1, H2 | to write after H2 |
++| H3. Docs and release | to write | §8 (README), release notes, the strict-mode docs (`docs/configuration.md`), the live-upstream smoke, final full-diff review | H1, H2 | to write after H2 |
  
  ## Cross-phase interfaces (names later phases rely on)
  
@@ -8027,7 +8725,7 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md 
  - F: `cache.ReapIdleSuite`, admin `POST /forget`. Non-canonical legacy suite rows (`!aptpath.IsCanonicalSuitePath`) are reaped regardless of idleness (spec C9); the plan review found none in production. The reaper's refcount release reuses `decrementSnapshotRefcountsTx`; snapshot GC sub-job C also deletes the snapshots phase A's audit retired, and sub-job B's `keep_displaced` ranking excludes retired rows so they never take retention slots. The reaper sweeps a signed-seen marker only when no suite row exists for its base or `/.` twin and it is older than 365 days. F's DoD includes a signed snapshot adopted under the phase-A binary, reaped by the F binary, then returning: never-downgrade still refuses unsigned adoption (markers outlive reaping). As built: `cache.ReapIdleSuite(ctx, SuiteKey, wantCurrent *int64, cutoff int64) (deleted, gone bool, err error)` (a failed submit settled by a fresh read, and a settled reap logged `suite_reaped` with `settled=true` and counted; every suite-row delete — cap eviction, a reap, a forget — moves the base's markers up to `MAX(last_seen_at, now)`, ruling PF-10, and, before it retires the suite's snapshots, upserts its base's marker under the suite's scheme when the suite has an adopted, non-retired inline or detached snapshot: unexported `markSnapshotHistoryTx`, with never-downgrade's snapshot clause shared as `signedHistorySnapshotSQL`, the one marker a delete creates, ruling PF-12), `cache.ForgetSuite(ctx, SuiteKey, wantCurrent *int64) (ForgetResult{Deleted, Gone, MarkersDeleted, AnchorRowsDeleted, KeptBy}, error)` (with the markers it deletes the cached anchors of the base and its `/.` twin under both schemes, ruling PF-2), `cache.DeleteSuiteMetadata(ctx, SuiteKey) (int, error)` (spec C9 step 1; a key `aptpath.IsCanonicalSuitePath` refuses deletes nothing), `cache.ReapRegardless` (`deleteSuiteTx`'s cutoff for a delete regardless of idleness), `cache.ListUnadoptedSuiteAnchors` (`SuiteAnchorRow`), `cache.SweepOrphanMarkers(ctx, now, cutoff int64) (MarkerSweep{Swept, Furthest}, error)` (it never rewrites a stamp, ruling PF-1; the reaper passes a fresh `now` for `Furthest` and, for the cutoff, the run's clock less the forward steps it detected and 365 days, ruling PF-13), `(*cache.Cache).RunRetiredSnapshotGCChunk(ctx, maxRows int) (reaped int, more bool, err error)` (sub-job C), `(*cache.URLPath).LastUse() int64` (the stamp's one Go definition), `(*cache.Cache).HasSuiteRow` (renamed from `SuiteExists`); cap eviction moved to `internal/cache/suite_evict.go` and `deleteSuiteTx`, the one production `DELETE FROM suite_freshness`, to `suite_reap.go` beside two of its three callers, `ReapIdleSuite` and `ForgetSuite` (cap eviction's `createSuiteTx` stays in `suite_rows.go`; ruling R-F1). `cache.RetireSuiteSnapshots` was dropped with R-F4's knob-off retirement (ruling PF-5): phase E's PE-12 carry-forward is resolved by PF-5 — with `adoption.adopt_unsigned = false` an established unsigned suite keeps its coherent snapshot, refused `unsigned_disabled`, until the knob is back on or the suite is forgotten or reaped (forgotten or reaped with the knob still off, it is then a never-adopted suite), and the docs say plainly that the cache then does not keep unsigned repositories fresh (the maintainer confirmed it, 2026-10-20). `freshness.Reaper`, `NewReaper(ReaperConfig{Cache, Checker, IdleTTL, Logger})`, `(*Reaper).Run(ctx)` (started by `main` beside `Checker.Run`; at most 250 candidates reaped regardless of idleness first, then at most 25 idle ones in the same run — `regardlessReapsPerRun`, `reapsPerRun`, `runBudgets`, ruling PF-14 —, the junk scan every run, the marker sweep daily, the first a day after `Run` starts, a forward step of the wall clock deferring reaping and the sweep by the uptime floor and taken off the sweep's cutoff for the life of the process — `stepAhead`, ruling PF-13 —, a suite's held work bounded at 5 minutes, a panic under a suite's hold recovered for that suite alone; started through `main`'s `runReaper` seam) and `(*Reaper).Forget(ctx, scheme, host, suitePath) (cache.ForgetResult, error)` (a panic under its hold logged `freshness_check_panicked` with `where=forget`, released as the cache then answers, then re-panicked to net/http, whose `http: panic serving` line the admin server's `ErrorLog` routes through slog at ERROR; a forget whose writer call failed after its commit logged `suite_forgotten` with `settled=true`); `admin.Config.Forgetter` (`admin.Forgetter`; a forget in flight is cut short by the admin listener's `Shutdown` and answered 503, and a `host` holding `://` is refused with 400), `requireMutationGuard`, and the status JSON's additive `suites[].scheme` (the HTML Host cell shows `scheme://host`; ruling PF-7); `config.GCConfig.SuiteIdleTTL` (`gc.suite_idle_ttl`); `gc.LastRunSummary.RetiredReaped`, `acu_gc_retired_reaped_total` and `acu_suites_reaped_total{reason}`; the startup GC pass runs no sub-job C, the periodic ticks do (`gc.phaseStartup`, `runSnapshotPass`; ruling PF-15); `flipgate.(*Gate).Purge` keeps a live entry (ruling R-F2). Events `suite_reaped`, `suite_forgotten` (`anchor_rows`, `settled`), `admin_forget_requested`, `signed_seen_markers_swept`; `freshness_check_panicked` gains `where=reaper` (naming the suite when it struck under a suite's hold) and `where=forget`, and `clock_step_detected` the stamps `last_seen_at` and `wall_clock`; the reaper's clock-step reports are logged outside the checker's one-line-a-minute limit; the reaper's busy line, held-step WARNs and junk-read WARN, and every `freshness_check_panicked` and `adoption_panicked` line, and the handler's `handler_goroutine_panicked` `where=touch` line, carry `canonical_scheme`; the startup line gains `gc_suite_idle_ttl` and `adoption_adopt_unsigned`. Rulings R-F1–R-F5 and PF-1–PF-15 and deviations 1 (withdrawn: it concerned the dropped retirement), 2 (the coarser 90-day simulation, a four-day one at the production cadence beside it) and 3 (the sweep never rewrites a future stamp) are in the phase F plan and spec revision 9.
 -- G: `aptpath.IsFlatSuitePath`, `aptpath.FlatBase`, `aptpath.DotClean`, `freshness.validateFilename`, and the admin `suites[].flat` field (phase B plan, deviation 3). Legacy flat onboarding also writes signed-seen markers for sniff-passing cached flat anchors (the startup pass only covers suites that already have rows), and the `/.` twin variant of E's in-transaction recheck test runs here. **PR #8 evidence in G's DoD:** `TestServeHTTP_FlatRepositoryFreshness` (a miss on `/…/deb/InRelease` and on `/…/deb/./InRelease` creates one suite row each and fires T1 under it; a later hit fires T1 again; `/…/deb/Packages_1.0_all.deb`, host-root `/InRelease` and `/…/deb//InRelease` create none), the pkgs.k8s.io shape `/core:/stable:/v1.34/deb/InRelease` → `/core:/stable:/v1.34/deb`, flat `Packages` failure fatal, and the mixed-host strict matrix. G also ports the rest of PR #8's tests (see "PR #8 parity" below). As built: `aptpath.IsFlatSuitePath`, `FlatBase`, `DotClean` and `IsFlatHostRootPath` (the flat grammar in `aptpath.SuitePath`), `aptpath.IsAnchorlessIndex` and `SniffAnchorlessIndex`; `cache.PackageHash.FlatFilename` (written by `CommitAdoption` and reconcile), `DeclaredHashesForPath`'s suffix fallback over `idx_package_hash_flat_filename` (at most 32 segments, the longest ancestor-or-self base), `cache.ListSuiteMetadataRows`, `RefreshURLPathBlob`, `DeleteURLPathRows` and `ListUnadoptedFlatIndexRows`; `freshness.validateFilename`, the layout-aware `isIndexTarget`, `indexTargetGroup`, `archFromFilteredPath`, `missingRequestableIndexGroups` and `missingRequestableMembers` (each takes the suite path), `flatIndexClientCreated` (Dispatch 3's flat index row, found among the metadata rows `checkFirst` reads once before the probe tree: ruling PG-32), `(*Adopter).anchorlessEligible` and `(*Checker).anchorlessRefresh` (Dispatch 3–4; results `anchorless_refreshed`/`anchorless_unchanged`, form `anchorless`; `acu_anchorless_sniff_rejected_total{host}`), the reaper's flat index junk evidence — a flat suite with no signed evidence is judged on its anchor and root index rows together, a flat suite with signed evidence on its anchors alone (ruling R-G2 as amended by PG-7: `(*Reaper).suiteJunk`, the signed-evidence read lazy, per candidate) — with the index rows read only when a run has an unadopted flat suite (`hasUnadoptedFlatSuite`); with `adoption.adopt_unsigned` off, a suite the anchorless gate admits is refused `unsigned_disabled`, a success logged `changed_deferred` with form `anchorless` (`(*Checker).anchorlessDisabled`, ruling PG-1); at most two anchorless bodies in memory for the process (`anchorlessBodySlots`, ruling PG-8), and an anchorless check that asks for files is a success only with a content answer (design review M-7); `proxy.IsMetadata` never classifies a Debian pool artifact as metadata (`isPoolArtifact` in `internal/proxy/classify.go`, ruling PG-2); the handler's layout-aware `isIndexTargetPath` and `indexTargetArch`, `flat_host_root_unsupported` (one WARN a minute, only for a host the allowlist admits) and `urlPathModTime` (`Last-Modified = max(pool mtime, last_fetched_at)` at url_path metadata serves); the admin `suites[].flat`. From the fix round after the task reviews: `observability.LogLimiter` (`Allow(now, every time.Duration) (ok bool, suppressed int)`; its zero value is ready, and the interval is each call site's constant), the one copy of the one-line-a-minute limiter, used by `suite_seed_rejected`, `flat_host_root_unsupported` and the anchorless over-cap WARN (ruling PG-22); `aptpath.FlatIndexNames()`, the 14 root `Packages*`/`Sources*` names and the one list `cache.ListSuiteMetadataRows` and `ListUnadoptedFlatIndexRows` probe by; `flatIndexClientCreated` returns the client-created index row, and a flat suite active only through it, with no cached anchor row, probes its `InRelease` and `Release` at sibling URLs of that row's stored `upstream_url` (ruling PG-20); `(*Checker).cachedAnchors` returns the anchor rows, read before the probe tree, and the anchorless refresh deletes a cached `InRelease` or `Release` only while it holds the blob read then (`anchorURLMap` gives `anchorURLsFor` their URLs); a failed `DeleteURLPathRows` is no answer — its 404s and 410s stop counting, so a check they alone answered fails — and a failed read of a flat suite's metadata rows — once, before the host slot and the probe tree — is a local fault (WARN `freshness: read anchor rows failed`, no request, nothing written, no backoff) (rulings PG-24, PG-32); the reaper's `unadoptedFlat`, the one predicate its index-read gate and its per-suite test share. From the final fix wave: the anchorless refresh deletes a cached `InRelease` or `Release` whose probe answered 401 or 403 beside an index request's content answer in the same check (ruling PG-28); an index whose 200 is over the cap is dropped for the miss path (`anchorlessDropped`; its WARN, renamed `freshness: anchorless index over its size cap, dropped for the miss path`, names the file) and `fetch.Conditional` fails a body whose `Content-Length` exceeds its cap without reading it (ruling PG-29); `aptpath.MaxFilenameBytes` (4,096: `validateFilename`'s cap and the fallback's name bound), `maxFallbackPathBytes` and the bounded, substring-built `flatSplits` (ruling PG-30); `Cache.flatRows`, primed at `Open` by `flatRowsExistSQL` (a failed read fails `Open`: ruling PG-36) and set by `noteFlatRows` before `CommitAdoption` or `InsertReconciledMembers` submits a flat row, so `DeclaredHashesForPath` skips the fallback while it is false (ruling PG-31); `anchorlessRefresh` takes the metadata rows `checkFirst` read (ruling PG-32); `anchorlessFailure` (the failed check's decisive reason first, the other after `; also `); `rows_replaced`/`rows_deleted` on the anchorless check line (`checkEnd`); `suite_path` in `package_hash_conflict`'s `declared` entries (`declaredAttrs`, ruling PG-33); `canonical_scheme` on phase G's new WARNs; the tests-only `Checker.anchorlessStoredHook`. Rulings R-G1–R-G5 (R-G2 as amended by PG-7) and PG-1–PG-40 (PG-19–PG-24 on the task reviews; PG-25–PG-27 the fix round's deferred IDs, its one skip and the spec revision; PG-28–PG-33 the final review's; PG-34–PG-40 its fix waves') and deviations 1 (the anchorless gate reads signed evidence) and 2 (a changed plain `Contents-*` is deleted) are in the phase G plan, and the behaviour they settle in spec revision 10; the items phase G leaves are in `…-G-deferred.md` (GD-1–GD-6).
 +- G: `aptpath.IsFlatSuitePath`, `aptpath.FlatBase`, `aptpath.DotClean`, `freshness.validateFilename`, and the admin `suites[].flat` field (phase B plan, deviation 3). Legacy flat onboarding also writes signed-seen markers for sniff-passing cached flat anchors (the startup pass only covers suites that already have rows), and the `/.` twin variant of E's in-transaction recheck test runs here. **PR #8 evidence in G's DoD:** `TestServeHTTP_FlatRepositoryFreshness` (a miss on `/…/deb/InRelease` and on `/…/deb/./InRelease` creates one suite row each and fires T1 under it; a later hit fires T1 again; `/…/deb/Packages_1.0_all.deb`, host-root `/InRelease` and `/…/deb//InRelease` create none), the pkgs.k8s.io shape `/core:/stable:/v1.34/deb/InRelease` → `/core:/stable:/v1.34/deb`, flat `Packages` failure fatal, and the mixed-host strict matrix. G also ports the rest of PR #8's tests (see "PR #8 parity" below). As built: `aptpath.IsFlatSuitePath`, `FlatBase`, `DotClean` and `IsFlatHostRootPath` (the flat grammar in `aptpath.SuitePath`), `aptpath.IsAnchorlessIndex` and `SniffAnchorlessIndex`; `cache.PackageHash.FlatFilename` (written by `CommitAdoption` and reconcile), `DeclaredHashesForPath`'s suffix fallback over `idx_package_hash_flat_filename` (at most 32 segments, the longest ancestor-or-self base), `cache.ListSuiteMetadataRows`, `RefreshURLPathBlob`, `DeleteURLPathRows` and `ListUnadoptedFlatIndexRows`; `freshness.validateFilename`, the layout-aware `isIndexTarget`, `indexTargetGroup`, `archFromFilteredPath`, `missingRequestableIndexGroups` and `missingRequestableMembers` (each takes the suite path), `flatIndexClientCreated` (Dispatch 3's flat index row, found among the metadata rows `checkFirst` reads once before the probe tree: ruling PG-32), `(*Adopter).anchorlessEligible` and `(*Checker).anchorlessRefresh` (Dispatch 3–4; results `anchorless_refreshed`/`anchorless_unchanged`, form `anchorless`; `acu_anchorless_sniff_rejected_total{host}`), the reaper's flat index junk evidence — a flat suite with no signed evidence is judged on its anchor and root index rows together, a flat suite with signed evidence on its anchors alone (ruling R-G2 as amended by PG-7: `(*Reaper).suiteJunk`, the signed-evidence read lazy, per candidate) — with the index rows read only when a run has an unadopted flat suite (`hasUnadoptedFlatSuite`); with `adoption.adopt_unsigned` off, a suite the anchorless gate admits is refused `unsigned_disabled`, a success logged `changed_deferred` with form `anchorless` (`(*Checker).anchorlessDisabled`, ruling PG-1); at most two anchorless bodies in memory for the process (`anchorlessBodySlots`, ruling PG-8), and an anchorless check that asks for files is a success only with a content answer (design review M-7); `proxy.IsMetadata` never classifies a Debian pool artifact as metadata (`isPoolArtifact` in `internal/proxy/classify.go`, ruling PG-2); the handler's layout-aware `isIndexTargetPath` and `indexTargetArch`, `flat_host_root_unsupported` (one WARN a minute, only for a host the allowlist admits) and `urlPathModTime` (`Last-Modified = max(pool mtime, last_fetched_at)` at url_path metadata serves); the admin `suites[].flat`. From the fix round after the task reviews: `observability.LogLimiter` (`Allow(now, every time.Duration) (ok bool, suppressed int)`; its zero value is ready, and the interval is each call site's constant), the one copy of the one-line-a-minute limiter, used by `suite_seed_rejected`, `flat_host_root_unsupported` and the anchorless over-cap WARN (ruling PG-22); `aptpath.FlatIndexNames()`, the 14 root `Packages*`/`Sources*` names and the one list `cache.ListSuiteMetadataRows` and `ListUnadoptedFlatIndexRows` probe by; `flatIndexClientCreated` returns the client-created index row, and a flat suite active only through it, with no cached anchor row, probes its `InRelease` and `Release` at sibling URLs of that row's stored `upstream_url` (ruling PG-20); `(*Checker).cachedAnchors` returns the anchor rows, read before the probe tree, and the anchorless refresh deletes a cached `InRelease` or `Release` only while it holds the blob read then (`anchorURLMap` gives `anchorURLsFor` their URLs); a failed `DeleteURLPathRows` is no answer — its 404s and 410s stop counting, so a check they alone answered fails — and a failed read of a flat suite's metadata rows — once, before the host slot and the probe tree — is a local fault (WARN `freshness_read_anchor_rows_failed`, no request, nothing written, no backoff) (rulings PG-24, PG-32); the reaper's `unadoptedFlat`, the one predicate its index-read gate and its per-suite test share. From the final fix wave: the anchorless refresh deletes a cached `InRelease` or `Release` whose probe answered 401 or 403 beside an index request's content answer in the same check (ruling PG-28); an index whose 200 is over the cap is dropped for the miss path (`anchorlessDropped`; its WARN, now `freshness_anchorless_index_over_cap`, names the file) and `fetch.Conditional` fails a body whose `Content-Length` exceeds its cap without reading it (ruling PG-29); `aptpath.MaxFilenameBytes` (4,096: `validateFilename`'s cap and the fallback's name bound), `maxFallbackPathBytes` and the bounded, substring-built `flatSplits` (ruling PG-30); `Cache.flatRows`, primed at `Open` by `flatRowsExistSQL` (a failed read fails `Open`: ruling PG-36) and set by `noteFlatRows` before `CommitAdoption` or `InsertReconciledMembers` submits a flat row, so `DeclaredHashesForPath` skips the fallback while it is false (ruling PG-31); `anchorlessRefresh` takes the metadata rows `checkFirst` read (ruling PG-32); `anchorlessFailure` (the failed check's decisive reason first, the other after `; also `); `rows_replaced`/`rows_deleted` on the anchorless check line (`checkEnd`); `suite_path` in `package_hash_conflict`'s `declared` entries (`declaredAttrs`, ruling PG-33); `canonical_scheme` on phase G's new WARNs; the tests-only `Checker.anchorlessStoredHook`. Rulings R-G1–R-G5 (R-G2 as amended by PG-7) and PG-1–PG-40 (PG-19–PG-24 on the task reviews; PG-25–PG-27 the fix round's deferred IDs, its one skip and the spec revision; PG-28–PG-33 the final review's; PG-34–PG-40 its fix waves') and deviations 1 (the anchorless gate reads signed evidence) and 2 (a changed plain `Contents-*` is deleted) are in the phase G plan, and the behaviour they settle in spec revision 10; the items phase G leaves are in `…-G-deferred.md` (GD-1–GD-6).
-+- H1: the admin JSON's `suites[].anchorless`, `recent_adoptions[].scheme` and `gc.retired_reaped`; `cache.LegacyAuditDecision.DropAnchorRows` and `cache.LegacyAuditEffect` (R-H2); the events `suite_reaper_run_complete`, `suite_not_forgotten`, `gc_panicked`, `reconcile_snapshot_read_failed`, `source_paths_skipped` and the 43 snake_case names of rulings R-H3 and R-H6, and the guard test that keeps every new log message snake_case (`internal/observability/event_names_test.go`); the gauge `acu_suite_reaper_last_run_unixtime`; `freshness.CheckBackoff` and `admin.Config.CheckBackoff`; `simtest.Unavailable`.
++- H1: the admin JSON's `suites[].anchorless`, `recent_adoptions[].scheme` and `gc.retired_reaped`; `cache.LegacyAuditDecision.DropAnchorRows` and `cache.LegacyAuditEffect` (R-H2); the events `suite_reaper_run_complete`, `suite_not_forgotten`, `gc_panicked`, `reconcile_snapshot_read_failed`, `source_paths_skipped`, `legacy_anchor_discard_failed` and the 43 snake_case names of rulings R-H3 and R-H6, and the guard tests that keep every new log message snake_case and documented (`internal/observability/event_names_test.go`, `event_docs_test.go`); the gauge `acu_suite_reaper_last_run_unixtime`; `freshness.CheckBackoff` and `admin.Config.CheckBackoff`; `simtest.Unavailable`.
  - H: PR #8's end-to-end table in `e2e/flat`: one signed flat repository configured as `deb <uri>/ /` on one client and `deb <uri> ./` on another; both report 2.0 within one cooldown of the v2 publish, and with the upstream stopped two fresh clients install 2.0 from the snapshots. H also runs the live-upstream smoke and documents the strict-mode consequences listed under "PR #8 parity" below.
  
  ## Carry-forwards (from phase A and B reviews)
@@ -8042,7 +8740,7 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md 
 -- *(F)* The 1.1.0 release notes tell offline and archive caches — and any install that relied on `gc.enabled = false` to keep everything — to set `gc.suite_idle_ttl = "0s"` before upgrading: the suite reaper runs whatever `gc.enabled` says and, from an hour after the first start, deletes the suites no client asked for in `gc.suite_idle_ttl` (720 h by default, counted from the last request before the upgrade, so a long-idle suite goes at once), with their cached index files (`docs/configuration.md`, *Upgrading an existing cache* and *Suite reaping*, says so; the Task 11 review).
 -- *(F)* The prose WARN names phase F adds — the seven `suite reaper: …` lines and `admin: forget failed` (documented as they are) — may become snake_case in H's documentation sweep, with phase D's and E's.
 +- *(D)* The three prose WARN names `suite onboarding failed`, `suite signed-seen mark failed` and `suite cap usage read failed` (documented as they are) may become snake_case in H's documentation sweep. (Moved here from "PR #8 parity" by H1: deferred minor D-55.) *Done in H1 (Task 3, ruling R-H3).*
-+- *(E)* The prose WARN names phase E adds — `freshness: read anchor rows failed`, `freshness: read current snapshot failed`, `adoption: served anchor read failed; the flip barrier runs` and `adoption: signed-anchor re-mark failed` (documented as they are) — may become snake_case in H's documentation sweep, with phase D's (listed under "PR #8 parity"). *Done in H1 (Task 3, ruling R-H3).*
++- *(E)* The prose WARN names phase E adds — `freshness: read anchor rows failed`, `freshness: read current snapshot failed`, `adoption: served anchor read failed; the flip barrier runs` and `adoption: signed-anchor re-mark failed` (documented as they are) — may become snake_case in H's documentation sweep, with phase D's (above). *Done in H1 (Task 3, ruling R-H3).*
 +- *(E)* `README.md` (spec §8): unsigned and SHA512-only repositories, eager first adoption and the `adopt_unsigned` threat notes, beside the flat forms H documents. *H3's.*
 +- *(F)* `README.md` (spec §8, "GC and `/forget`"): suite reaping and `POST /forget` beside *Recovering a degraded repository*, and `/forget` in the sentence that names the admin interface's `POST /reconcile`; `docs/configuration.md` documents both (*Suite reaping* under `[gc]`, *Forgetting a suite* under `[admin]`). *H3's.*
 +- *(F)* The admin status page and JSON show no reaping: `gc.LastRunSummary.RetiredReaped` (spec C11) is not copied into the admin GC section, which copies its fields one by one (`internal/admin/status.go`); add `retired_reaped` beside `displaced_reaped` in the JSON, the GC panel and `docs/admin-ui-spec.md` (phase F plan, design note 15). *Done in H1 (Task 4; `docs/admin-ui-spec.md` §4.6, Task 18).*
@@ -8061,25 +8759,30 @@ diff --git a/docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md 
 +- *(G)* `docs/log-fields.md` has never documented the adoption event `adoption_member_skipped`, to which phase G (E-9) added `declared_sha512`, nor `snapshot_index_target_404`, whose architecture label phase G made layout-aware (`all`, `source` for a flat suite): document both in H's observability sweep (phase G Task 16 review, Minor 8). *Done in H1 (Task 18), with `admin_reconcile_requested`.*
 +- *(G-1)* The 1.1.0 release notes say that `POST /reconcile` now needs the header `X-ACU-Admin: 1`, as `POST /forget` does, so a script that calls it must add it, and that without `admin.htpasswd_file` both endpoints refuse (403) a `Host` that is not an IP address, `localhost` or `admin.listen`'s host name, a guard against DNS rebinding: an operator behind a reverse proxy that forwards the client's `Host` sets `htpasswd_file` or has the proxy send `Host: 127.0.0.1` (the maintainer's decision, 2026-10-24). *H3's.*
  
- **Open decision (spec-level, for the maintainer):**
+-**Open decision (spec-level, for the maintainer):**
++**Decisions (spec-level; none open):**
  
 -- An `anchor_corrupt` or `anchor_oversized` quarantine leaves the known-corrupt `url_path` anchor in Phase-1 serving, and the checker sees "unchanged". This is pre-existing behaviour for any bit-rotted metadata blob. Decide in a later phase whether the audit should also invalidate that `url_path` row.
-+- *Decided for 1.1.0 (phase H1, ruling R-H5): keep the behaviour; revisit if seen in the field.* An adopted unsigned flat suite whose upstream stops publishing its `Release` keeps its coherent snapshot — "refused: anchor_absent" on the status page, `adoption_refused_persistently` in the log — until `POST /forget` turns it into a Release-less suite (*Flat repositories*). It is rare in the field; the kept snapshot keeps serving cached content when an upstream dies outright, where an automatic drop would turn that into 404s; a drop would add a state transition with trust and serving consequences late in the release (deferred minor GD-5; spec §10 item 12).
++- *Decided for 1.1.0 by ruling R-H5 (phase H1), for the maintainer's confirmation: keep the behaviour; revisit if seen in the field.* An adopted unsigned flat suite whose upstream stops publishing its `Release` keeps its coherent snapshot — "refused: anchor_absent" on the status page, `adoption_refused_persistently` in the log — until `POST /forget` turns it into a Release-less suite (*Flat repositories*). It is rare in the field; the kept snapshot keeps serving cached content when an upstream dies outright, where an automatic drop would turn that into 404s; a drop would add a state transition with trust and serving consequences late in the release (deferred minor GD-5; spec §10 item 12).
 +- *Decided by the maintainer, 2026-10-24, and done in H1 (Task 2, ruling R-H2):* an `anchor_corrupt` quarantine deletes, in its own transaction, the `url_path` rows that hold the corrupt `InRelease` blob, so clients fetch a fresh copy; `anchor_oversized` (not proven bad) keeps them (spec §6.1, revision 12). The entry as it stood: an `anchor_corrupt` or `anchor_oversized` quarantine leaves the known-corrupt `url_path` anchor in Phase-1 serving, and the checker sees "unchanged". This is pre-existing behaviour for any bit-rotted metadata blob. Decide in a later phase whether the audit should also invalidate that `url_path` row.
  - *Decided by the maintainer, 2026-10-24, and done before phase H:* Host-header validation of the admin listener's mutating endpoints (spec §10 G-1; phase F ruling PF-6). `POST /reconcile` takes `/forget`'s guard (`requireMutationGuard`: `X-ACU-Admin: 1` and `Sec-Fetch-Site`), and without `htpasswd_file` both refuse a `Host` that is not an IP address, `localhost` or `admin.listen`'s host name; the read-only endpoints keep no `Host` check. H's release notes carry it (above).
  
  ## PR #8 parity (gap analysis, 2026-10-17)
-@@ -159,7 +164,6 @@
+@@ -157,9 +162,8 @@
  
- - **Live-upstream smoke (manual, before the release that ships G; not CI).** PR #8's author verified against live pkgs.k8s.io (v1.32–v1.37, `kubectl` 1.34.11 installed through the cache); our e2e uses fixtures only. With adoption enabled and `integrity.refuse_unvouched_debs = true`, front live pkgs.k8s.io (two minors, one client per source form), NVIDIA CUDA, libnvidia-container, pkg.jenkins.io and download.sublimetext.com. For each: `adoption_success` logged; `apt-get update` output clean under the e2e grep; one package installs; zero `unvouched_deb_refused`. Record the results in the release notes.
- - **Docs (`docs/configuration.md`, strict mode):** a flat snapshot with incomplete coverage turns strict mode off for its whole host, as an incomplete `dists/` snapshot does; on a strict host, the first install from a newly added flat suite can be refused while its first adoption is queued; strict mode now refuses undeclared `.deb`s on flat-only hosts.
+ **H:**
+ 
+-- **Live-upstream smoke (manual, before the release that ships G; not CI).** PR #8's author verified against live pkgs.k8s.io (v1.32–v1.37, `kubectl` 1.34.11 installed through the cache); our e2e uses fixtures only. With adoption enabled and `integrity.refuse_unvouched_debs = true`, front live pkgs.k8s.io (two minors, one client per source form), NVIDIA CUDA, libnvidia-container, pkg.jenkins.io and download.sublimetext.com. For each: `adoption_success` logged; `apt-get update` output clean under the e2e grep; one package installs; zero `unvouched_deb_refused`. Record the results in the release notes.
+-- **Docs (`docs/configuration.md`, strict mode):** a flat snapshot with incomplete coverage turns strict mode off for its whole host, as an incomplete `dists/` snapshot does; on a strict host, the first install from a newly added flat suite can be refused while its first adoption is queued; strict mode now refuses undeclared `.deb`s on flat-only hosts.
 -- *(D)* The three prose WARN names `suite onboarding failed`, `suite signed-seen mark failed` and `suite cap usage read failed` (documented as they are) may become snake_case in H's documentation sweep.
++- **Live-upstream smoke (manual, before the release that ships G; not CI).** PR #8's author verified against live pkgs.k8s.io (v1.32–v1.37, `kubectl` 1.34.11 installed through the cache); our e2e uses fixtures only. With adoption enabled and `integrity.refuse_unvouched_debs = true`, front live pkgs.k8s.io (two minors, one client per source form), NVIDIA CUDA, libnvidia-container, pkg.jenkins.io and download.sublimetext.com. For each: `adoption_success` logged; `apt-get update` output clean under the e2e grep; one package installs; zero `unvouched_deb_refused`. Record the results in the release notes. *H3's.*
++- **Docs (`docs/configuration.md`, strict mode):** a flat snapshot with incomplete coverage turns strict mode off for its whole host, as an incomplete `dists/` snapshot does; on a strict host, the first install from a newly added flat suite can be refused while its first adoption is queued; strict mode now refuses undeclared `.deb`s on flat-only hosts. *H3's.*
  
  ## Review findings 2026-10-05 → where they are addressed
  
 ````
 
-- [ ] **Step 7: Two comments that name a deferred file**
+- [ ] **Step 8: Two comments that name a deferred file**
 
 Design note 16 keeps the comments that cite an item by ID; these two point at a file this task deletes and say something it no longer holds.
 
@@ -8113,16 +8816,19 @@ new:
 	// new failure mode for a rare idle slot. The wait
 ```
 
-- [ ] **Step 8: Delete the seven deferred files**
+- [ ] **Step 9: Delete the seven deferred files**
 
 ```bash
 git rm docs/superpowers/plans/2026-09-28-flat-repositories-A-deferred.md docs/superpowers/plans/2026-09-28-flat-repositories-B-deferred.md docs/superpowers/plans/2026-09-28-flat-repositories-C-deferred.md docs/superpowers/plans/2026-09-28-flat-repositories-D-deferred.md docs/superpowers/plans/2026-09-28-flat-repositories-E-deferred.md docs/superpowers/plans/2026-09-28-flat-repositories-F-deferred.md docs/superpowers/plans/2026-09-28-flat-repositories-G-deferred.md
 ```
 
-- [ ] **Step 9: Verify**
+- [ ] **Step 10: Verify**
+
+Run: `go test -count=1 ./internal/observability/`
+Expected: `ok` — the docs test and Task 3's two guards (`TestEveryEventIsDocumented` subsumes the review's per-event grep: every event the plan added has its row).
 
 Run: `go test -count=1 ./internal/config/ ./cmd/...`
-Expected: both `ok` (the conffile still parses and validates: Step 4 changed comments only).
+Expected: both `ok` (the conffile still parses and validates: Step 5 changed comments only).
 
 Run: `go build ./... && go vet ./internal/freshness/ ./internal/handler/`
 Expected: no output.
@@ -8133,31 +8839,42 @@ Expected: `0`, and no grep output (the phase plans keep their historical referen
 Run: `git diff --check`
 Expected: no output.
 
+Mutation checks (one at a time, each reverted):
+
+| Mutant | Fails |
+|---|---|
+| `legacy_anchor_discard_failed`'s row loses its first cell's name (its mention in `legacy_snapshot_quarantined`'s row stays) | `event_docs_test.go:117: internal/freshness/legacy_audit.go:124: event legacy_anchor_discard_failed has no row in docs/log-fields.md; add one` |
+| One of `main`'s listed events given a row (`admin_disabled` beside `legacy_trust_audit_deferred`) | `event_docs_test.go:119: admin_disabled has a docs/log-fields.md row now: remove it from mainEventsWithoutARow` |
+| A stale entry in `mainEventsWithoutARow` (the test file: its lines shift down by one) | `event_docs_test.go:125: no_such_event is no longer logged: remove it from mainEventsWithoutARow` |
+
 Run Task 17's Steps 2–4 again.
 Expected: as there: every package `ok`, `0 issues.`, the five drift files. Replay: 21 packages `ok`, `0 issues.`, the five drift files.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
-gofmt -l internal/handler/wallclock_stamps_test.go internal/freshness/anchorless.go
-git add docs/configuration.md docs/log-fields.md docs/admin-ui-spec.md packaging/config/config.toml.default docs/superpowers/specs/2026-09-27-flat-repositories-design.md docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md internal/handler/wallclock_stamps_test.go internal/freshness/anchorless.go
+gofmt -l internal/handler/wallclock_stamps_test.go internal/freshness/anchorless.go internal/observability/event_docs_test.go
+git add internal/observability/event_docs_test.go docs/configuration.md docs/log-fields.md docs/admin-ui-spec.md packaging/config/config.toml.default docs/superpowers/specs/2026-09-27-flat-repositories-design.md docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md internal/handler/wallclock_stamps_test.go internal/freshness/anchorless.go
 git commit -m "$(cat <<'EOF'
 Document phase H1; spec revision 12; overview; delete the deferred files
 
 log-fields, configuration, the admin UI spec and the conffile document
-H1's changes: the corrupt-anchor rows the audit deletes (R-H2), the
-audit-queued snapshots sub-job B keeps (R-H1), the reaper's run line and
-gauge, the new events and fields, the status page's new fields and
-texts, /forget's 400 and 409 line, and the log-fields gaps
+H1's changes: the corrupt-anchor rows and pool file the audit removes
+(R-H2), the audit-queued snapshots sub-job B keeps (R-H1), the reaper's
+run line and gauge, the new events and fields, the status page's new
+fields and texts, /forget's 400 and 409 line, and the log-fields gaps
 (adoption_member_skipped, snapshot_index_target_404,
-admin_reconcile_requested). Spec revision 12 records them; the overview
-marks H1's carry-forwards and decisions; every deferred minor has its
+admin_reconcile_requested, adoption_repair_declarations_unavailable). A
+guard test requires a log-fields row for every snake_case event, main's
+87 without one listed. Spec revision 12 records them; the overview marks
+H1's carry-forwards and decisions; every deferred minor has its
 disposition in the H1 plan, so the seven deferred files are deleted
-(C-36, C-37, D-52, D-55, E-24; GD-5 decided: keep, R-H5).
+(C-36, C-37, D-52, D-55, E-24; GD-5 decided for the maintainer's
+confirmation: keep, R-H5).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
 )"
 ```
 
-The `gofmt -l` prints nothing; `git rm` in Step 8 staged the deletions.
+The `gofmt -l` prints nothing; `git rm` in Step 9 staged the deletions.
