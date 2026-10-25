@@ -54,12 +54,14 @@ func (r *Reaper) Forget(ctx context.Context, scheme, host, suitePath string) (ca
 	key := cache.SuiteKey{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath}
 	switch _, err := r.cache.GetSuiteFreshness(ctx, scheme, host, suitePath); {
 	case errors.Is(err, cache.ErrNotFound):
+		r.notForgotten(key, "no_suite")
 		return cache.ForgetResult{}, nil
 	case err != nil:
 		return cache.ForgetResult{}, fmt.Errorf("forget: read suite row: %w", err)
 	}
 	release, ok := r.checker.HoldSuite(key)
 	if !ok {
+		r.notForgotten(key, "busy")
 		return cache.ForgetResult{}, nil
 	}
 	gone := false
@@ -81,6 +83,7 @@ func (r *Reaper) Forget(ctx context.Context, scheme, host, suitePath string) (ca
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
 		gone = true
+		r.notForgotten(key, "no_suite")
 		return cache.ForgetResult{}, nil
 	case err != nil:
 		return cache.ForgetResult{}, fmt.Errorf("forget: read suite row: %w", err)
@@ -108,6 +111,11 @@ func (r *Reaper) Forget(ctx context.Context, scheme, host, suitePath string) (ca
 		return cache.ForgetResult{}, fmt.Errorf("forget: %w", err)
 	}
 	if !res.Deleted {
+		reason := "changed"
+		if res.Gone {
+			reason = "no_suite"
+		}
+		r.notForgotten(key, reason)
 		return res, nil
 	}
 	r.logger.Info("suite_forgotten",
@@ -119,4 +127,16 @@ func (r *Reaper) Forget(ctx context.Context, scheme, host, suitePath string) (ca
 		"anchor_rows", res.AnchorRowsDeleted,
 	)
 	return res, nil
+}
+
+// notForgotten logs DEBUG suite_not_forgotten with why Forget deleted
+// nothing (deferred minor F-15): no_suite (no row, before the hold or
+// under it), busy (the hold was refused) or changed (the final
+// compare-and-delete found the row changed: no writer of the current
+// snapshot runs under the hold, so this is the defensive case). POST
+// /forget answers 409 for all of them alike — no existence oracle (spec
+// C9) — and an operator who turns DEBUG on can tell them apart here.
+func (r *Reaper) notForgotten(key cache.SuiteKey, reason string) {
+	r.logger.Debug("suite_not_forgotten", "canonical_scheme", key.CanonicalScheme, "canonical_host", key.CanonicalHost,
+		"suite_path", key.SuitePath, "reason", reason)
 }

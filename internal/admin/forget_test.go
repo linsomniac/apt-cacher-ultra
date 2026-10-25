@@ -273,8 +273,10 @@ func TestEndpoint_Forget_LogsAcceptedRequestsAndFailures(t *testing.T) {
 				return
 			}
 			_, scheme, _, _ := tc.stub.snapshot()
-			if len(req) != 1 || req[0]["level"] != "INFO" || req[0]["scheme"] != scheme || req[0]["canonical_host"] != "h" ||
-				req[0]["suite_path"] != "/s" {
+			// Deferred minor F-16: canonical_scheme, as on every other line
+			// about a suite, and no scheme key.
+			if len(req) != 1 || req[0]["level"] != "INFO" || req[0]["canonical_scheme"] != scheme || req[0]["scheme"] != nil ||
+				req[0]["canonical_host"] != "h" || req[0]["suite_path"] != "/s" {
 				t.Fatalf("admin_forget_requested lines %v; want one at INFO for %s h /s", req, scheme)
 			}
 			failed := records(&buf, "admin_forget_failed")
@@ -285,7 +287,7 @@ func TestEndpoint_Forget_LogsAcceptedRequestsAndFailures(t *testing.T) {
 				return
 			}
 			if len(failed) != 1 || failed[0]["level"] != "WARN" || failed[0]["err"] != "disk I/O error" ||
-				failed[0]["canonical_host"] != "h" || failed[0]["suite_path"] != "/s" {
+				failed[0]["canonical_scheme"] != scheme || failed[0]["canonical_host"] != "h" || failed[0]["suite_path"] != "/s" {
 				t.Fatalf("admin_forget_failed lines %v; want one at WARN with the error", failed)
 			}
 		})
@@ -435,5 +437,55 @@ func TestStatus_SuitesShowTheirScheme(t *testing.T) {
 		if !strings.Contains(string(html), cell) {
 			t.Errorf("HTML lacks the Host cell %s", cell)
 		}
+	}
+}
+
+// Deferred minor F-16 on the shutdown path (execution review G-6): the
+// DEBUG admin_forget_failed line a shutdown leaves names the scheme
+// canonical_scheme, as the WARN does, and carries no scheme key.
+// TestEndpoint_Forget_ShutdownCutsItShort pins only the line's level,
+// TestEndpoint_Forget_LogsAcceptedRequestsAndFailures only the WARN's
+// fields.
+func TestEndpoint_Forget_ShutdownLineNamesTheCanonicalScheme(t *testing.T) {
+	stub := newBlockingForgetter()
+	var buf lockedBuffer
+	s, base, cleanup := startAdminServer(t, withForgetter(stub),
+		withLogger(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+	defer cleanup()
+	defer stub.unblock()
+	answered := make(chan error, 1)
+	go func() {
+		req, err := http.NewRequest(http.MethodPost, base+"/forget", strings.NewReader("scheme=http&host=h&suite=/s"))
+		if err != nil {
+			answered <- err
+			return
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("X-ACU-Admin", "1")
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		answered <- err
+	}()
+	<-stub.entered
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if err := <-answered; err != nil {
+		t.Fatalf("the forget request: %v", err)
+	}
+	var lines []map[string]any
+	for _, line := range strings.Split(buf.String(), "\n") {
+		var m map[string]any
+		if line != "" && json.Unmarshal([]byte(line), &m) == nil && m["msg"] == "admin_forget_failed" {
+			lines = append(lines, m)
+		}
+	}
+	if len(lines) != 1 || lines[0]["level"] != "DEBUG" || lines[0]["canonical_scheme"] != "http" || lines[0]["scheme"] != nil ||
+		lines[0]["canonical_host"] != "h" || lines[0]["suite_path"] != "/s" {
+		t.Fatalf("admin_forget_failed lines %v; want one DEBUG line with canonical_scheme http and no scheme key", lines)
 	}
 }

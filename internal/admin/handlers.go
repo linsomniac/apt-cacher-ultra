@@ -552,7 +552,8 @@ func (s *Server) logRefresherFailure(metricName string, err error, dur time.Dura
 //   - 202 Accepted: reconcile triggered asynchronously.
 //   - 409 Conflict: not triggered (busy, suite unknown, no current snapshot,
 //     or no free adoption slot).
-//   - 400 Bad Request: host or suite missing.
+//   - 400 Bad Request: host or suite missing, or a body that is not a
+//     valid form (deferred minor F-5).
 //   - 403 Forbidden: refused by requireMutationGuard; the body says which
 //     rule refused it.
 //   - 413 Request Entity Too Large: body exceeds 8 KiB.
@@ -571,27 +572,23 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.cfg.Reconciler == nil {
-		http.Error(w, "reconcile not available\n", http.StatusNotImplemented)
+		http.Error(w, "reconcile not available", http.StatusNotImplemented)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "request body too large\n", http.StatusRequestEntityTooLarge)
+	f, ok := parseSuiteForm(w, r)
+	if !ok {
 		return
 	}
-	host := strings.TrimSpace(r.FormValue("host"))
-	suite := strings.TrimSpace(r.FormValue("suite"))
-	scheme := strings.TrimSpace(r.FormValue("scheme"))
-	if scheme == "" {
-		scheme = "https"
-	}
-	if host == "" || suite == "" {
-		http.Error(w, "host and suite are required\n", http.StatusBadRequest)
+	if f.host == "" || f.suite == "" {
+		http.Error(w, "host and suite are required", http.StatusBadRequest)
 		return
 	}
-	s.logger.Info("admin_reconcile_requested", "scheme", scheme, "canonical_host", host, "suite_path", suite)
-	if !s.cfg.Reconciler.Reconcile(r.Context(), scheme, host, suite) {
-		http.Error(w, "reconcile not triggered (busy, unknown, no current snapshot, or no free adoption slot)\n", http.StatusConflict)
+	// scheme stays beside canonical_scheme: this line is on main with
+	// scheme, and log filters may use it (deferred minor F-16).
+	s.logger.Info("admin_reconcile_requested", "scheme", f.scheme, "canonical_scheme", f.scheme, "canonical_host", f.host,
+		"suite_path", f.suite)
+	if !s.cfg.Reconciler.Reconcile(r.Context(), f.scheme, f.host, f.suite) {
+		http.Error(w, "reconcile not triggered (busy, unknown, no current snapshot, or no free adoption slot)", http.StatusConflict)
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
@@ -628,9 +625,10 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 // or https, default https). Returns:
 //   - 202 Accepted: the suite is forgotten; the body names it, the markers
 //     deleted and the rows that kept them (ruling PF-7).
-//   - 400 Bad Request: host or suite missing, another scheme, or a host
+//   - 400 Bad Request: host or suite missing, another scheme, a host
 //     holding a scheme (scheme://host, as the status page's Host cell shows
-//     it: the scheme goes in scheme).
+//     it: the scheme goes in scheme), or a body that is not a valid form
+//     (deferred minor F-5).
 //   - 403 Forbidden: X-ACU-Admin: 1 is missing, Sec-Fetch-Site is present
 //     and neither same-origin nor none (a browser's cross-site or
 //     same-site request), or, without htpasswd_file, the Host is another
@@ -648,53 +646,83 @@ func (s *Server) handleForget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.cfg.Forgetter == nil {
-		http.Error(w, "forget not available\n", http.StatusNotImplemented)
+		http.Error(w, "forget not available", http.StatusNotImplemented)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "request body too large\n", http.StatusRequestEntityTooLarge)
+	f, ok := parseSuiteForm(w, r)
+	if !ok {
 		return
 	}
-	host := strings.TrimSpace(r.FormValue("host"))
-	suite := strings.TrimSpace(r.FormValue("suite"))
-	scheme := strings.TrimSpace(r.FormValue("scheme"))
-	if scheme == "" {
-		scheme = "https"
-	}
+	scheme, host, suite := f.scheme, f.host, f.suite
 	if host == "" || suite == "" || (scheme != "http" && scheme != "https") {
-		http.Error(w, "host and suite are required; scheme is http or https\n", http.StatusBadRequest)
+		http.Error(w, "host and suite are required; scheme is http or https", http.StatusBadRequest)
 		return
 	}
 	if strings.Contains(host, "://") {
 		// The status page's Host cell shows scheme://host; copied whole
 		// into host it matches no row (the Task 10 review's minor 4).
-		http.Error(w, "host is the host name alone: pass the scheme in scheme (http or https) and the host without it\n",
+		http.Error(w, "host is the host name alone: pass the scheme in scheme (http or https) and the host without it",
 			http.StatusBadRequest)
 		return
 	}
-	s.logger.Info("admin_forget_requested", "scheme", scheme, "canonical_host", host, "suite_path", suite)
+	s.logger.Info("admin_forget_requested", "canonical_scheme", scheme, "canonical_host", host, "suite_path", suite)
 	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
 	defer cancel()
 	defer context.AfterFunc(s.stopping, cancel)()
 	res, err := s.cfg.Forgetter.Forget(ctx, scheme, host, suite)
 	switch {
 	case err != nil && s.stopping.Err() != nil:
-		s.logger.Debug("admin_forget_failed", "err", err, "scheme", scheme, "canonical_host", host, "suite_path", suite)
-		http.Error(w, "shutting down; retry once the daemon is back\n", http.StatusServiceUnavailable)
+		s.logger.Debug("admin_forget_failed", "err", err, "canonical_scheme", scheme, "canonical_host", host, "suite_path", suite)
+		http.Error(w, "shutting down; retry once the daemon is back", http.StatusServiceUnavailable)
 		return
 	case err != nil:
-		s.logger.Warn("admin_forget_failed", "err", err, "scheme", scheme, "canonical_host", host, "suite_path", suite)
-		http.Error(w, "forget failed\n", http.StatusInternalServerError)
+		s.logger.Warn("admin_forget_failed", "err", err, "canonical_scheme", scheme, "canonical_host", host, "suite_path", suite)
+		http.Error(w, "forget failed", http.StatusInternalServerError)
 		return
 	case !res.Deleted:
 		http.Error(w, "not forgotten: busy (try again) or no such suite (the status page's Host cell shows "+
 			"scheme://host: pass its scheme as scheme, default https, and the rest as host; suite as its Suite path "+
-			"column shows it)\n", http.StatusConflict)
+			"column shows it)", http.StatusConflict)
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
 	_, _ = io.WriteString(w, forgottenText(scheme, host, suite, res))
+}
+
+// suiteForm is the form both mutating endpoints take.
+type suiteForm struct {
+	scheme, host, suite string
+}
+
+// parseSuiteForm reads the form body of POST /reconcile and POST /forget
+// (deferred minor F-4: one parser for both): at most 8 KiB — more is 413
+// "request body too large" — and a body ParseForm cannot parse (a stray
+// "%", say) is 400 "malformed form body" (deferred minor F-5); host,
+// suite and scheme are trimmed, and an empty scheme is https. When it
+// reports false it has answered.
+//
+// AIDEV-NOTE: http.Error appends the newline: messages carry none, so
+// every error body ends in exactly one (deferred minor F-6). Call it only
+// after requireMutationGuard (review M-10 of the H1 plan): it reads and
+// limits the body, and a 400 or 413 before the guard would answer an
+// unauthenticated cross-origin request with more than the guard's 403.
+func parseSuiteForm(w http.ResponseWriter, r *http.Request) (suiteForm, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	if err := r.ParseForm(); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "malformed form body", http.StatusBadRequest)
+		}
+		return suiteForm{}, false
+	}
+	f := suiteForm{scheme: strings.TrimSpace(r.FormValue("scheme")), host: strings.TrimSpace(r.FormValue("host")),
+		suite: strings.TrimSpace(r.FormValue("suite"))}
+	if f.scheme == "" {
+		f.scheme = "https"
+	}
+	return f, true
 }
 
 // forgottenText is POST /forget's 202 body (ruling PF-7): what was
@@ -745,20 +773,20 @@ func forgottenText(scheme, host, suite string, res cache.ForgetResult) string {
 // read them.
 func (s *Server) requireMutationGuard(w http.ResponseWriter, r *http.Request) bool {
 	if r.Header.Get("X-ACU-Admin") != "1" {
-		http.Error(w, "this endpoint requires the header X-ACU-Admin: 1\n", http.StatusForbidden)
+		http.Error(w, "this endpoint requires the header X-ACU-Admin: 1", http.StatusForbidden)
 		return false
 	}
 	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
 		// Any other origin: a same-site request is refused too (the Task 10
 		// re-review's out-of-scope 1: "cross-site" named only part of it).
-		http.Error(w, "requests from another origin are refused: Sec-Fetch-Site must be same-origin or none\n",
+		http.Error(w, "requests from another origin are refused: Sec-Fetch-Site must be same-origin or none",
 			http.StatusForbidden)
 		return false
 	}
 	if s.auth == nil && !s.hostNamesListener(r.Host) {
 		http.Error(w, "without admin.htpasswd_file this endpoint accepts only an IP address, localhost or "+
 			"admin.listen's host name as the Host (a guard against DNS rebinding): connect by address, "+
-			"or set admin.htpasswd_file\n", http.StatusForbidden)
+			"or set admin.htpasswd_file", http.StatusForbidden)
 		return false
 	}
 	return true

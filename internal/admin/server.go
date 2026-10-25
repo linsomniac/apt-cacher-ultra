@@ -393,7 +393,9 @@ func (s *Server) buildHandler() http.Handler {
 		if r.Method == http.MethodOptions {
 			if _, profile := profiles[r.URL.Path]; profile {
 				w.Header().Set("Allow", "GET, OPTIONS")
-			} else if r.URL.Path == "/forget" {
+			} else if r.URL.Path == "/forget" || r.URL.Path == "/reconcile" {
+				// The mutating endpoints (deferred minor F-6: /reconcile
+				// answered the read-only set).
 				w.Header().Set("Allow", "POST, OPTIONS")
 			} else {
 				w.Header().Set("Allow", allowMethods)
