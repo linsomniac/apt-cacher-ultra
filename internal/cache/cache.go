@@ -12,7 +12,6 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 	_ "modernc.org/sqlite"
@@ -25,10 +24,6 @@ var ErrClosed = errors.New("cache: closed")
 // caller blocks (or hits ctx.Done). Apt traffic is bursty but each write
 // is small, so a few hundred slots is plenty without burning memory.
 const writeBufferSize = 256
-
-// connMaxIdleTime is how long a spare read connection may sit unused
-// before the pool closes it.
-const connMaxIdleTime = 5 * time.Minute
 
 // minIdleConns is the floor of maxIdleConns.
 const minIdleConns = 16
@@ -202,15 +197,17 @@ func openDB(path string) (*sql.DB, error) {
 	// a 3.5 MB database. The idle cap only keeps connections a burst already
 	// opened, so it does not raise the peak connection count, but it keeps
 	// their memory after the burst: up to about 4 MB each with a warm page
-	// cache (32 measured at +122 MB RSS). It is less in practice, since a
-	// connection drops its cache at its next read after a write, but one
-	// left idle keeps its pages until connMaxIdleTime closes it, once the
-	// server is quiet. Do not add a tight SetMaxOpenConns: it trades the
-	// churn for readers waiting on a connection. The writer's and the
+	// cache (32 measured at +122 MB RSS), so at most about cap x 4 MB (64 MB
+	// at the floor). It is less in practice, since a connection drops its
+	// cache at its next read after a write. There is deliberately no
+	// SetConnMaxIdleTime or SetConnMaxLifetime (the maintainer's decision,
+	// 2026-10-24): a 5-minute idle timeout made every quiet gap reopen each
+	// connection, doubling the 90-day simulation under -race, to free memory
+	// the cap already bounds. Do not add a tight SetMaxOpenConns: it trades
+	// the churn for readers waiting on a connection. The writer's and the
 	// revision observer's pinned connections are in use, not idle, so they
 	// do not count against the cap.
 	db.SetMaxIdleConns(maxIdleConns())
-	db.SetConnMaxIdleTime(connMaxIdleTime)
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping sqlite %q: %w", path, err)
