@@ -259,6 +259,25 @@ func (c *Cache) RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGrac
 	// out the same way, before the window function (spec C9): they never
 	// take one of a suite's keep_displaced slots, and sub-job C
 	// (RunRetiredSnapshotGCChunk) deletes them.
+	//
+	// AIDEV-NOTE: ruling R-H1 (deferred minor F-24). A snapshot still
+	// queued in legacy_trust_audit — one the audit deferred after an I/O
+	// fault — is ranked out too and never deleted here: never-downgrade
+	// counts it as signed history (refuseUnsignedDowngrade's displaced
+	// clause), the audit left its base unmarked, and only the audit can
+	// judge it. Deleted, it was the base's only signed history gone, and an
+	// unsigned candidate was admitted (with keep_displaced = 0); the next
+	// audit would only Drop it. Kept, it waits for the verdict: Keep marks
+	// the base, a quarantine retires it, and B or C then deletes it.
+	// Never PF-12's marker instead: the audit may still find it plain text,
+	// which must get no marker (spec §6.1). Cost (review M-9 of the H1
+	// plan): a snapshot the audit defers at every start (a pool file that
+	// keeps failing to read, or a classifier panic) keeps its members,
+	// package rows and blobs for the life of its suite; the remedy is the
+	// ERROR legacy_trust_audit_deferred at every start — fix the pool, or
+	// POST /forget the suite. The one deliberate marker for such a
+	// snapshot is PF-12's: a reap, eviction or forget of its suite marks
+	// its base (markSnapshotHistoryTx) before retiring it.
 	const selectSQL = `
 SELECT snapshot_id, reap_class FROM (
   SELECT snapshot_id, 'orphan' AS reap_class FROM suite_snapshot
@@ -282,6 +301,7 @@ SELECT snapshot_id, reap_class FROM (
        AND snapshot_id NOT IN (SELECT current_snapshot_id
                                  FROM suite_freshness
                                 WHERE current_snapshot_id IS NOT NULL)
+       AND snapshot_id NOT IN (SELECT snapshot_id FROM legacy_trust_audit)
   ) WHERE rn > ?
 )
 LIMIT ?`
