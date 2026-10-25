@@ -283,7 +283,7 @@ func TestAnchorAbsent_AnchorRowReadFailure(t *testing.T) {
 			warns := logRecords(t, &logs, "freshness_read_anchor_rows_failed")
 			ended := logRecords(t, &logs, "freshness_check_ended_by_shutdown")
 			if shutdown {
-				if len(warns) != 0 || len(ended) != 1 || ended[0]["step"] != "read the anchor rows" {
+				if len(warns) != 0 || len(ended) != 1 || ended[0]["step"] != "read the anchor rows" || ended[0]["canonical_scheme"] != "http" {
 					t.Fatalf("WARNs %v, shutdown lines %v; want no WARN and one DEBUG for the read", warns, ended)
 				}
 				return
@@ -293,5 +293,43 @@ func TestAnchorAbsent_AnchorRowReadFailure(t *testing.T) {
 				t.Fatalf("WARN records %v, want one naming the scheme, the suite and the error", warns)
 			}
 		})
+	}
+}
+
+// snapReadCancelCache cancels the caller's context at GetSuiteSnapshot and
+// fails the read with its error: an admin client that hung up mid-request.
+type snapReadCancelCache struct {
+	Cache
+	cancel func()
+}
+
+func (c *snapReadCancelCache) GetSuiteSnapshot(ctx context.Context, id int64) (*cache.SuiteSnapshot, error) {
+	c.cancel()
+	return nil, fmt.Errorf("injected snapshot read failure (id %d): %w", id, ctx.Err())
+}
+
+// Task 8 review M-2: Reconcile reads the snapshot under the admin
+// request's context, so a read a client hang-up cut short is DEBUG, not
+// WARN (ruling PG-35, the E-13 class), and still counts unsigned.
+func TestReconcile_ASnapshotReadCutShortByTheRequestIsDebug(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adopt()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var logs lockedBuffer
+	chk, err := New(Config{Cache: &snapReadCancelCache{Cache: r.cache, cancel: cancel}, Fetcher: r.up,
+		HostLimiter: hostsem.New(8), Adopter: r.adopter,
+		Logger: slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})), now: r.clock.now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := mustAcquire(t, chk.admission, "other", true)
+	defer held.release()
+	if chk.Reconcile(ctx, "http", rigHost, rigSuite) {
+		t.Fatal("a reconcile whose snapshot read was cut short took the reserved slot")
+	}
+	recs := logRecords(t, &logs, "reconcile_snapshot_read_failed")
+	if len(recs) != 1 || recs[0]["level"] != "DEBUG" || recs[0]["canonical_scheme"] != "http" || recs[0]["suite_path"] != rigSuite {
+		t.Fatalf("records %v, want one DEBUG naming the suite and no WARN", recs)
 	}
 }

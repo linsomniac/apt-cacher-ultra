@@ -1279,10 +1279,16 @@ func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string)
 	}
 	// The reserved-slot rule (spec C4): only a signed current snapshot may
 	// take the last free slot; a snapshot that cannot be read counts as
-	// unsigned (fail-closed), logged (deferred minor E-31).
+	// unsigned (fail-closed), logged (deferred minor E-31). ctx is the
+	// admin request's: a read a client hang-up cut short is DEBUG, not
+	// WARN (ruling PG-35, the E-13 class; Task 8 review M-2).
 	signed := false
 	if snap, err := c.cache.GetSuiteSnapshot(ctx, snapID); err != nil {
-		c.logger.Warn("reconcile_snapshot_read_failed",
+		level := slog.LevelWarn
+		if ctx.Err() != nil {
+			level = slog.LevelDebug
+		}
+		c.logger.Log(ctx, level, "reconcile_snapshot_read_failed",
 			"err", err, "snapshot_id", snapID,
 			"canonical_scheme", scheme, "canonical_host", host, "suite_path", suitePath)
 	} else {

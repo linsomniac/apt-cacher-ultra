@@ -420,7 +420,7 @@ func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
 		}
 	}
 	stale := s.LastSuccessAt == nil || *s.LastSuccessAt <= now.Add(-c.refresh).Unix() ||
-		*s.LastSuccessAt > future // infinitely old; checkLocked reports it once (B-38)
+		*s.LastSuccessAt > future // infinitely old; each check that runs reports it (B-38, E-37)
 	retryDue := c.adopter != nil && s.AdoptionFailCount > 0 && s.AdoptionNextRetryAt != nil && *s.AdoptionNextRetryAt <= nowU
 	if !stale && !retryDue && !c.pendingChange(s) {
 		return false

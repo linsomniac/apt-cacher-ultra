@@ -340,7 +340,7 @@ func (c *Checker) endedByShutdown(ctx context.Context, suite SuiteRef, step stri
 		return false
 	}
 	c.logger.Debug("freshness_check_ended_by_shutdown", "step", step, "err", err,
-		"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath)
+		"canonical_scheme", suite.CanonicalScheme, "canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath)
 	return true
 }
 
