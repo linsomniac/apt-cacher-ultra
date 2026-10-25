@@ -396,6 +396,18 @@ LIMIT ?`
 // with its four indexes. Re-measure before raising it.
 const retiredChunkRows = 10_000
 
+// effectiveChunkRows is the rows one sub-job C transaction deletes for a
+// requested maxRows: retiredChunkRows for 0 or less — what the snapshot
+// pass asks for — and maxRows otherwise (deferred minor F-2: the default
+// is pinned here without a 10,001-row fixture, which takes some 5 s under
+// -race; the gc package pins that the pass asks for 0).
+func effectiveChunkRows(maxRows int) int {
+	if maxRows <= 0 {
+		return retiredChunkRows
+	}
+	return maxRows
+}
+
 // RunRetiredSnapshotGCChunk is one writer transaction of snapshot-GC
 // sub-job C (spec C9): it takes the oldest retired snapshot, deletes up to
 // maxRows of its rows — snapshot_member, then snapshot_skipped_member,
@@ -417,9 +429,7 @@ const retiredChunkRows = 10_000
 // later tick). Chunking bounds the writer's hold on a large suite (tens of
 // thousands of package_hash rows).
 func (c *Cache) RunRetiredSnapshotGCChunk(ctx context.Context, maxRows int) (reaped int, more bool, err error) {
-	if maxRows <= 0 {
-		maxRows = retiredChunkRows
-	}
+	maxRows = effectiveChunkRows(maxRows)
 	// The op writes gotReaped/gotMore, never the named results: on a
 	// ctx/close path submitWrite returns before the op ends (see
 	// InsertCandidateSnapshot).

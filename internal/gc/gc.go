@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -109,6 +110,10 @@ type Config struct {
 // scan + one-shot GC pass) blocking before listeners come up.
 type GC struct {
 	cfg Config
+
+	// store is cfg.Cache behind gcStore (the snapshot pass and the pool
+	// scan); tests replace it.
+	store gcStore
 
 	// nextPass preserves progress through URL-path → snapshot → blob work.
 	// Even the final batch of a pass can exceed the shared tick deadline;
@@ -222,7 +227,7 @@ func New(cfg Config) (*GC, error) {
 		return nil, errors.New("gc: Logger is required")
 	}
 	if !cfg.Enabled {
-		return &GC{cfg: cfg}, nil
+		return &GC{cfg: cfg, store: cfg.Cache}, nil
 	}
 	if cfg.Interval <= 0 {
 		return nil, fmt.Errorf("gc: Interval must be > 0, got %s", cfg.Interval)
@@ -248,7 +253,7 @@ func New(cfg Config) (*GC, error) {
 	if cfg.HeartbeatStaleGrace <= 0 {
 		return nil, fmt.Errorf("gc: HeartbeatStaleGrace must be > 0, got %s", cfg.HeartbeatStaleGrace)
 	}
-	return &GC{cfg: cfg}, nil
+	return &GC{cfg: cfg, store: cfg.Cache}, nil
 }
 
 // StartupPass runs the SPEC4 §4.2 step 5 (pool/ orphan scan) and step
@@ -265,7 +270,18 @@ func New(cfg Config) (*GC, error) {
 // files (not files just created by the same-tick blob GC pass).
 //
 // When Enabled = false, returns nil immediately.
-func (g *GC) StartupPass(ctx context.Context) error {
+//
+// A panic is recovered and returned as an error (gc_panicked,
+// where=startup), which main logs before it serves: this pass runs on
+// main's goroutine before any listener, and a panic that persisted data
+// triggers would otherwise recur at every start (review I-1 of the H1
+// plan). A panic in its passes moves the rotation past the pass in
+// progress, as a periodic tick's does, so the first periodic tick does not
+// begin with the pass that panicked (re-review m-4).
+func (g *GC) StartupPass(ctx context.Context) (err error) {
+	passesDone := true // a panic before runTick leaves the rotation as it is
+	defer g.skipPanickedPass(&passesDone)
+	defer g.recoverPanicInto("startup", &err)
 	if !g.cfg.Enabled {
 		return nil
 	}
@@ -279,7 +295,9 @@ func (g *GC) StartupPass(ctx context.Context) error {
 
 	// Step 6: one-shot GC pass — without snapshot-GC sub-job C, which the
 	// periodic ticks run, normally the first (ruling PF-15: runSnapshotPass).
+	passesDone = false
 	tick, err := g.runTick(ctx, phaseStartup)
+	passesDone = true
 	if err != nil {
 		return fmt.Errorf("gc startup: tick: %w", err)
 	}
@@ -368,73 +386,166 @@ func (g *GC) Run(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			start := time.Now()
-			tick, err := g.runTick(ctx, "periodic")
-			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-				g.cfg.Logger.Warn("gc_tick_failed", "err", err)
-			}
-			duration := time.Since(start)
-			endUnix := wallclock.Unix()
-			g.cfg.Logger.Info("gc_run_complete",
-				"phase", "periodic",
-				"blobs_reaped", tick.blobsReaped,
-				"bytes_reclaimed", tick.bytesReclaimed,
-				"orphan_candidates_reaped", tick.orphanCandidatesReaped,
-				"displaced_reaped", tick.displacedReaped,
-				"retired_reaped", tick.retiredReaped,
-				"url_path_rows_reaped", tick.urlPathRowsReaped,
-				"url_path_rows_scanned", tick.urlPath.scanned,
-				"url_path_rows_stamped", tick.urlPath.stamped,
-				"url_path_rows_cleared", tick.urlPath.cleared,
-				"url_path_duration_ms", tick.urlPathDuration.Milliseconds(),
-				"snapshot_duration_ms", tick.snapshotDuration.Milliseconds(),
-				"blob_duration_ms", tick.blobDuration.Milliseconds(),
-				"pool_orphans_repaired", 0,
-				"pool_orphan_bytes_repaired", int64(0),
-				"pool_unlink_errors", tick.poolUnlinkErrors,
-				"deadline_reached", tick.deadlineReached,
-				"duration_ms", duration.Milliseconds(),
-			)
-			emitGCMetrics(
-				"periodic",
-				duration.Seconds(),
-				endUnix,
-				tick.blobsReaped,
-				tick.bytesReclaimed,
-				tick.orphanCandidatesReaped,
-				tick.displacedReaped,
-				tick.retiredReaped,
-				tick.urlPathRowsReaped,
-				0,
-				0,
-				tick.poolUnlinkErrors,
-				tick.deadlineReached,
-			)
-			emitGCPassMetrics("periodic", tick)
-			g.recordLastRun(LastRunSummary{
-				Phase:                   "periodic",
-				AtUnixTime:              endUnix,
-				DurationSeconds:         duration.Seconds(),
-				BlobsReaped:             tick.blobsReaped,
-				BytesReclaimed:          tick.bytesReclaimed,
-				OrphanCandidatesReaped:  tick.orphanCandidatesReaped,
-				DisplacedReaped:         tick.displacedReaped,
-				RetiredReaped:           tick.retiredReaped,
-				URLPathRowsReaped:       tick.urlPathRowsReaped,
-				URLPathRowsScanned:      tick.urlPath.scanned,
-				URLPathRowsStamped:      tick.urlPath.stamped,
-				URLPathRowsCleared:      tick.urlPath.cleared,
-				URLPathDurationSeconds:  tick.urlPathDuration.Seconds(),
-				SnapshotDurationSeconds: tick.snapshotDuration.Seconds(),
-				BlobDurationSeconds:     tick.blobDuration.Seconds(),
-				PoolOrphansRepaired:     0,
-				PoolOrphanBytesRepaired: 0,
-				PoolUnlinkErrors:        tick.poolUnlinkErrors,
-				DeadlineReached:         tick.deadlineReached,
-			})
+			g.periodicTick(ctx)
 			t.Reset(g.cfg.Interval)
 		}
 	}
+}
+
+// periodicTick is one periodic tick: the passes (runTick), its
+// gc_run_complete line, metrics and last-run summary. A panic is
+// recovered here — logged gc_panicked, where=tick — and the next tick
+// comes as scheduled (deferred minor F-21: sub-job C runs in this
+// goroutine since phase F). The line, the metrics and the last-run
+// summary stay inside the recovered function, so a tick that panicked
+// leaves acu_gc_last_run_unixtime as it was: its age is the alert. A
+// panic in a pass moves the rotation past that pass (skipPanickedPass).
+func (g *GC) periodicTick(ctx context.Context) {
+	passesDone := false
+	defer g.skipPanickedPass(&passesDone)
+	defer g.recoverPanic("tick")
+	start := time.Now()
+	tick, err := g.runTick(ctx, "periodic")
+	passesDone = true
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		g.cfg.Logger.Warn("gc_tick_failed", "err", err)
+	}
+	duration := time.Since(start)
+	endUnix := wallclock.Unix()
+	g.cfg.Logger.Info("gc_run_complete",
+		"phase", "periodic",
+		"blobs_reaped", tick.blobsReaped,
+		"bytes_reclaimed", tick.bytesReclaimed,
+		"orphan_candidates_reaped", tick.orphanCandidatesReaped,
+		"displaced_reaped", tick.displacedReaped,
+		"retired_reaped", tick.retiredReaped,
+		"url_path_rows_reaped", tick.urlPathRowsReaped,
+		"url_path_rows_scanned", tick.urlPath.scanned,
+		"url_path_rows_stamped", tick.urlPath.stamped,
+		"url_path_rows_cleared", tick.urlPath.cleared,
+		"url_path_duration_ms", tick.urlPathDuration.Milliseconds(),
+		"snapshot_duration_ms", tick.snapshotDuration.Milliseconds(),
+		"blob_duration_ms", tick.blobDuration.Milliseconds(),
+		"pool_orphans_repaired", 0,
+		"pool_orphan_bytes_repaired", int64(0),
+		"pool_unlink_errors", tick.poolUnlinkErrors,
+		"deadline_reached", tick.deadlineReached,
+		"duration_ms", duration.Milliseconds(),
+	)
+	emitGCMetrics(
+		"periodic",
+		duration.Seconds(),
+		endUnix,
+		tick.blobsReaped,
+		tick.bytesReclaimed,
+		tick.orphanCandidatesReaped,
+		tick.displacedReaped,
+		tick.retiredReaped,
+		tick.urlPathRowsReaped,
+		0,
+		0,
+		tick.poolUnlinkErrors,
+		tick.deadlineReached,
+	)
+	emitGCPassMetrics("periodic", tick)
+	g.recordLastRun(LastRunSummary{
+		Phase:                   "periodic",
+		AtUnixTime:              endUnix,
+		DurationSeconds:         duration.Seconds(),
+		BlobsReaped:             tick.blobsReaped,
+		BytesReclaimed:          tick.bytesReclaimed,
+		OrphanCandidatesReaped:  tick.orphanCandidatesReaped,
+		DisplacedReaped:         tick.displacedReaped,
+		RetiredReaped:           tick.retiredReaped,
+		URLPathRowsReaped:       tick.urlPathRowsReaped,
+		URLPathRowsScanned:      tick.urlPath.scanned,
+		URLPathRowsStamped:      tick.urlPath.stamped,
+		URLPathRowsCleared:      tick.urlPath.cleared,
+		URLPathDurationSeconds:  tick.urlPathDuration.Seconds(),
+		SnapshotDurationSeconds: tick.snapshotDuration.Seconds(),
+		BlobDurationSeconds:     tick.blobDuration.Seconds(),
+		PoolOrphansRepaired:     0,
+		PoolOrphanBytesRepaired: 0,
+		PoolUnlinkErrors:        tick.poolUnlinkErrors,
+		DeadlineReached:         tick.deadlineReached,
+	})
+}
+
+// gcStore is what the snapshot pass and the pool scan call on the cache
+// (design note 18 of the H1 plan): a seam, so tests reach sub-job C's
+// deadline and chunk size without a 10,000-row fixture (deferred minors
+// F-1, F-2) and make a tick or a pool-scan job panic (F-21). New sets it
+// to Config.Cache; the url_path and blob passes keep Config.Cache.
+type gcStore interface {
+	RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGraceSeconds int64, keepDisplaced int) (cache.SnapshotGCBatchResult, error)
+	RunRetiredSnapshotGCChunk(ctx context.Context, maxRows int) (reaped int, more bool, err error)
+	HashKnown(ctx context.Context, hash string) (bool, error)
+}
+
+// skipPanickedPass is deferred by periodicTick before its recoverPanic,
+// so it runs after it: when the passes did not finish (a recovered panic),
+// it moves the rotation past the pass in progress — g.nextPass, which
+// runTick advances only when a pass completes — so a pass that panics on
+// every tick cannot starve the passes after it: the blob pass keeps
+// reclaiming disk while a sub-job's bug waits for its fix (review M-1 of
+// the H1 plan).
+func (g *GC) skipPanickedPass(passesDone *bool) {
+	if *passesDone {
+		return
+	}
+	switch g.nextPass {
+	case urlPathPass:
+		g.nextPass = snapshotPass
+	case snapshotPass:
+		g.nextPass = blobPass
+	default:
+		g.nextPass = urlPathPass
+	}
+}
+
+// gcPanicStacks holds the wheres whose gc_panicked line carried a stack.
+var gcPanicStacks sync.Map
+
+// recoverPanic is deferred by each unit of work of GC's goroutines — a
+// periodic tick, a pool-scan job, the pool-scan producer: it logs a
+// recovered panic as ERROR gc_panicked (where, panic, and the stack the
+// first time per where for the process) and lets its goroutine go on
+// (deferred minor F-21; the overview's rule for internal/gc).
+//
+// AIDEV-NOTE: recover works only because this method IS the deferred
+// function (defer g.recoverPanic(where)); a wrapping closure would make
+// recover return nil and the panic would kill the daemon. A logger that
+// panics in turn is contained too: that panic is dropped.
+func (g *GC) recoverPanic(where string) {
+	v := recover()
+	if v == nil {
+		return
+	}
+	g.logGCPanic(where, v)
+}
+
+// recoverPanicInto is recoverPanic for a function that returns an error
+// (StartupPass): it also sets *err, so the caller sees the panic as a
+// failure. Like recoverPanic it works only as the deferred function itself
+// (defer g.recoverPanicInto(where, &err)).
+func (g *GC) recoverPanicInto(where string, err *error) {
+	v := recover()
+	if v == nil {
+		return
+	}
+	*err = fmt.Errorf("gc %s: panicked: %v", where, v)
+	g.logGCPanic(where, v)
+}
+
+// logGCPanic logs a recovered panic as ERROR gc_panicked; a logger that
+// panics in turn is contained: that panic is dropped.
+func (g *GC) logGCPanic(where string, v any) {
+	defer func() { _ = recover() }()
+	attrs := []any{"where", where, "panic", fmt.Sprint(v)}
+	if _, seen := gcPanicStacks.LoadOrStore(where, true); !seen {
+		attrs = append(attrs, "stack", string(debug.Stack()))
+	}
+	g.cfg.Logger.Error("gc_panicked", attrs...)
 }
 
 // tickResult bundles one tick's per-pass outcomes for the
@@ -507,8 +618,8 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 		start := time.Now()
 		snap, snapDeadline, err := g.runSnapshotPass(ctx, deadline, phase)
 		res.snapshotDuration = time.Since(start)
-		res.orphanCandidatesReaped += snap.OrphanReaped
-		res.displacedReaped += snap.DisplacedReaped
+		res.orphanCandidatesReaped += snap.batch.OrphanReaped
+		res.displacedReaped += snap.batch.DisplacedReaped
 		res.retiredReaped += snap.retired
 		if snapDeadline {
 			res.deadlineReached = true

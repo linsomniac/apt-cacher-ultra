@@ -9,8 +9,12 @@ import (
 )
 
 // snapshotPassResult counts one snapshot pass's reaps by class.
+//
+// AIDEV-NOTE: batch is a named field, never embedded (deferred minor
+// F-3): embedded, SnapshotGCBatchResult's Total() was promoted and
+// silently left out retired.
 type snapshotPassResult struct {
-	cache.SnapshotGCBatchResult
+	batch cache.SnapshotGCBatchResult
 	// retired counts the retired snapshots sub-job C deleted (spec C9).
 	retired int
 }
@@ -80,7 +84,7 @@ func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase stri
 			return acc, true, nil
 		}
 
-		batch, err := g.cfg.Cache.RunSnapshotGCBatch(ctx,
+		batch, err := g.store.RunSnapshotGCBatch(ctx,
 			g.cfg.SnapshotBatchSize,
 			staleGraceSeconds,
 			g.cfg.KeepDisplaced,
@@ -89,8 +93,8 @@ func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase stri
 			return acc, false, fmt.Errorf("snapshot gc batch: %w", err)
 		}
 		batchesRun++
-		acc.OrphanReaped += batch.OrphanReaped
-		acc.DisplacedReaped += batch.DisplacedReaped
+		acc.batch.OrphanReaped += batch.OrphanReaped
+		acc.batch.DisplacedReaped += batch.DisplacedReaped
 
 		if batch.Total() == 0 {
 			break // A ∪ B drained
@@ -107,7 +111,9 @@ func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase stri
 		if expired() {
 			return acc, true, nil
 		}
-		reaped, more, err := g.cfg.Cache.RunRetiredSnapshotGCChunk(ctx, 0)
+		// 0: the cache's own chunk (retiredChunkRows, 10,000 rows a
+		// transaction), never a larger number (deferred minor F-2).
+		reaped, more, err := g.store.RunRetiredSnapshotGCChunk(ctx, 0)
 		if err != nil {
 			return acc, false, fmt.Errorf("retired snapshot gc chunk: %w", err)
 		}
