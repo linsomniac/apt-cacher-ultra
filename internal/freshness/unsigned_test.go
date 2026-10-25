@@ -418,7 +418,7 @@ func TestRunUnsigned_FailedRemarkRefuses(t *testing.T) {
 			if r.current() != 0 {
 				t.Fatal("committed although the re-mark failed")
 			}
-			if recs := r.records("adoption: signed-anchor re-mark failed"); len(recs) != 1 || recs[0]["level"] != level || !nonEmptyString(recs[0]["err"]) {
+			if recs := r.records("adoption_signed_anchor_remark_failed"); len(recs) != 1 || recs[0]["level"] != level || !nonEmptyString(recs[0]["err"]) {
 				t.Fatalf("re-mark fault records %v, want one at %s with the error", recs, level) // deferred minor E-17
 			}
 		})
@@ -680,7 +680,7 @@ func TestRunUnsigned_RemarkReadErrorRefuses(t *testing.T) {
 	if r.current() != 0 {
 		t.Fatal("committed although the re-mark could not read the cached anchors")
 	}
-	if recs := r.records("adoption: signed-anchor re-mark failed"); len(recs) != 1 || recs[0]["level"] != "WARN" || !nonEmptyString(recs[0]["err"]) {
+	if recs := r.records("adoption_signed_anchor_remark_failed"); len(recs) != 1 || recs[0]["level"] != "WARN" || !nonEmptyString(recs[0]["err"]) {
 		t.Fatalf("re-mark fault records %v, want one at WARN with the error", recs) // deferred minor E-17
 	}
 }

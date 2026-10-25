@@ -232,7 +232,7 @@ func TestEndpoint_Forget(t *testing.T) {
 // The Task 10 review's minor 5: an accepted request — past the guard, the
 // body cap and the parameter checks — is logged as INFO
 // admin_forget_requested with its scheme, host and suite, and a database
-// failure as WARN admin: forget failed with the error; a refused request
+// failure as WARN admin_forget_failed with the error; a refused request
 // (403, 400) logs neither.
 func TestEndpoint_Forget_LogsAcceptedRequestsAndFailures(t *testing.T) {
 	admin := []string{"X-ACU-Admin", "1"}
@@ -277,16 +277,16 @@ func TestEndpoint_Forget_LogsAcceptedRequestsAndFailures(t *testing.T) {
 				req[0]["suite_path"] != "/s" {
 				t.Fatalf("admin_forget_requested lines %v; want one at INFO for %s h /s", req, scheme)
 			}
-			failed := records(&buf, "admin: forget failed")
+			failed := records(&buf, "admin_forget_failed")
 			if !tc.failed {
 				if len(failed) != 0 {
-					t.Fatalf("admin: forget failed lines %v; want none", failed)
+					t.Fatalf("admin_forget_failed lines %v; want none", failed)
 				}
 				return
 			}
 			if len(failed) != 1 || failed[0]["level"] != "WARN" || failed[0]["err"] != "disk I/O error" ||
 				failed[0]["canonical_host"] != "h" || failed[0]["suite_path"] != "/s" {
-				t.Fatalf("admin: forget failed lines %v; want one at WARN with the error", failed)
+				t.Fatalf("admin_forget_failed lines %v; want one at WARN with the error", failed)
 			}
 		})
 	}
@@ -387,12 +387,12 @@ func TestEndpoint_Forget_ShutdownCutsItShort(t *testing.T) {
 	var failed []string
 	for _, line := range strings.Split(buf.String(), "\n") {
 		var m map[string]any
-		if line != "" && json.Unmarshal([]byte(line), &m) == nil && m["msg"] == "admin: forget failed" {
+		if line != "" && json.Unmarshal([]byte(line), &m) == nil && m["msg"] == "admin_forget_failed" {
 			failed = append(failed, m["level"].(string))
 		}
 	}
 	if len(failed) != 1 || failed[0] != "DEBUG" {
-		t.Fatalf("admin: forget failed lines at levels %v; want one at DEBUG", failed)
+		t.Fatalf("admin_forget_failed lines at levels %v; want one at DEBUG", failed)
 	}
 }
 

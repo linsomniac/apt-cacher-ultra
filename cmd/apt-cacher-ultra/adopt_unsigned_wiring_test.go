@@ -51,7 +51,7 @@ func TestWarnSuiteCaps_ZeroCapAndReadFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	warnSuiteCaps(context.Background(), c, 100, slog.New(slog.NewJSONHandler(&logs, nil)))
-	if !strings.Contains(logs.String(), `"level":"WARN","msg":"suite cap usage read failed"`) {
+	if !strings.Contains(logs.String(), `"level":"WARN","msg":"suite_cap_usage_read_failed"`) {
 		t.Fatalf("a failed cap read was not a WARN:\n%s", logs.String())
 	}
 }

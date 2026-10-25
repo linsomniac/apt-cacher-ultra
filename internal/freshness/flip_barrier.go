@@ -122,7 +122,7 @@ func (a *Adopter) servedAnchorUnchanged(ctx context.Context, suite SuiteRef, p *
 	defer cancel()
 	row, err := a.cache.LookupURL(rctx, suite.CanonicalScheme, suite.CanonicalHost, path)
 	if err != nil && !errors.Is(err, cache.ErrNotFound) {
-		a.logger.Warn("adoption: served anchor read failed; the flip barrier runs",
+		a.logger.Warn("adoption_served_anchor_read_failed",
 			"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "path", path, "err", err)
 	}
 	return err == nil && row.BlobHash != nil && *row.BlobHash == want

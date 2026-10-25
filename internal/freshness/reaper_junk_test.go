@@ -131,7 +131,7 @@ func TestReaper_ReapsLegacyJunkKeepsTransientSoft404(t *testing.T) {
 	if d := reapedTotal(t, "junk") - junk0; d != 5 {
 		t.Fatalf(`acu_suites_reaped_total{reason="junk"} rose by %v, want 5`, d)
 	}
-	if ev := r.events("suite reaper: junk anchor reads failed"); len(ev) != 0 {
+	if ev := r.events("suite_reaper_junk_anchor_reads_failed"); len(ev) != 0 {
 		t.Fatalf("read failure lines = %v, want none: a missing pool file is no read failure (the Task 7 review's minor 2)", ev)
 	}
 }
@@ -393,7 +393,7 @@ func TestReaper_JunkReadFailuresLogOncePerScan(t *testing.T) {
 	if !r.exists("/r/dists/a") || !r.exists("/r/dists/b") {
 		t.Fatal("an unreadable anchor was taken for junk evidence")
 	}
-	ev := r.events("suite reaper: junk anchor reads failed")
+	ev := r.events("suite_reaper_junk_anchor_reads_failed")
 	if len(ev) != 1 || ev[0]["count"] != float64(2) {
 		t.Fatalf("read failure lines = %v, want one with count 2", ev)
 	}

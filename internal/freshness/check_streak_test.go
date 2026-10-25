@@ -405,7 +405,7 @@ func TestCheck_CancelledCallerIsNotAFailedCheckBothForms(t *testing.T) {
 			c, _ := formChecker(t, form, 0, cancellingUpstream{cancel: cancel},
 				slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 			c.Check(ctx, "http", "h", "/r/dists/x")
-			if out := logs.String(); !strings.Contains(out, "freshness: check cancelled") || strings.Contains(out, "freshness check failed") {
+			if out := logs.String(); !strings.Contains(out, "freshness_check_cancelled") || strings.Contains(out, "freshness check failed") {
 				t.Fatalf("cancelled check not abandoned as such; logs:\n%s", out)
 			}
 		})

@@ -228,7 +228,7 @@ func TestCheck_RepairObeysTheGlobalSlot(t *testing.T) {
 	}
 	deferred := false
 	for _, line := range strings.Split(logs.String(), "\n") {
-		if strings.Contains(line, `"msg":"freshness: repair deferred, no adoption slot"`) &&
+		if strings.Contains(line, `"msg":"freshness_repair_deferred_no_adoption_slot"`) &&
 			strings.Contains(line, `"canonical_host":"b.example"`) {
 			deferred = true
 		}
@@ -343,7 +343,7 @@ func TestCheck_HealthySuiteAsksForNoRepairSlot(t *testing.T) {
 	held := mustAcquire(t, r.checker.admission, rigHost, true)
 	defer held.release()
 	r.check() // 304: unchanged
-	if strings.Contains(r.logs.String(), "repair deferred, no adoption slot") {
+	if strings.Contains(r.logs.String(), "freshness_repair_deferred_no_adoption_slot") {
 		t.Fatal("a healthy suite asked for a repair slot")
 	}
 	if _, ok := r.adopter.reconciledSnapshots.Load(*r.row().CurrentSnapshotID); !ok {

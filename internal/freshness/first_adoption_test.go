@@ -749,7 +749,7 @@ func TestCheckFirst_ShutdownAtTheMarkerWriteIsQuiet(t *testing.T) {
 	if row := r.row(); row.CheckFailCount != 0 || row.LastCheckAt != nil || row.CurrentSnapshotID != nil {
 		t.Fatalf("row %+v, want nothing written", row)
 	}
-	ev := r.events("freshness: check ended by shutdown")
+	ev := r.events("freshness_check_ended_by_shutdown")
 	if len(ev) != 1 || ev[0]["level"] != "DEBUG" || ev[0]["step"] != "mark the signature seen" {
 		t.Fatalf("shutdown lines %v, want one DEBUG line naming the marker write", ev)
 	}
@@ -996,7 +996,7 @@ func TestCheckFirst_AnchorRowReadErrorWritesNothing(t *testing.T) {
 	ctx := context.Background()
 	chk.Check(ctx, "http", rigHost, rigSuite)
 	chk.WaitForAdoptions()
-	warns := logRecords(t, &logs, "freshness: read anchor rows failed")
+	warns := logRecords(t, &logs, "freshness_read_anchor_rows_failed")
 	if len(warns) != 1 || warns[0]["level"] != "WARN" || warns[0]["suite_path"] != rigSuite ||
 		!strings.Contains(fmt.Sprint(warns[0]["err"]), "injected url_path read failure") {
 		t.Fatalf("WARN records %v, want one naming the suite and the read error", warns)

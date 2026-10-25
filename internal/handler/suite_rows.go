@@ -321,7 +321,7 @@ func (h *Handler) cachedAnchors(ctx context.Context, key cache.SuiteKey, except 
 		row, signed, err := h.readCachedAnchor(ctx, key, p)
 		switch {
 		case err != nil:
-			h.logger.Warn("suite cached anchor read failed",
+			h.logger.Warn("suite_cached_anchor_read_failed",
 				"err", err, "canonical_host", key.CanonicalHost, "suite_path", key.SuitePath, "path", p)
 		case row != nil && row.BlobHash != nil:
 			a.BlobHash, a.SeenAt, a.Signed = *row.BlobHash, row.LastUse(), signed
@@ -391,7 +391,7 @@ func (h *Handler) markCachedSignedAnchors(ctx context.Context, key cache.SuiteKe
 		}
 		row, signed, err := h.readCachedAnchor(ctx, key, p)
 		if err != nil {
-			h.logger.Warn("suite signed-seen backstop read failed",
+			h.logger.Warn("suite_signed_seen_backstop_read_failed",
 				"err", err, "canonical_host", key.CanonicalHost, "suite_path", key.SuitePath, "path", p)
 			continue
 		}
@@ -413,7 +413,7 @@ func (h *Handler) markCachedSignedAnchors(ctx context.Context, key cache.SuiteKe
 		return
 	}
 	if err := h.cache.MarkSignedSeenBatch(ctx, marks); err != nil {
-		h.logger.Warn("suite signed-seen mark failed",
+		h.logger.Warn("suite_signed_seen_mark_failed",
 			"err", err, "canonical_host", key.CanonicalHost, "suite_path", key.SuitePath)
 	}
 }
@@ -501,7 +501,7 @@ func (h *Handler) runOnboard(req *proxy.Request, sr *suiteReq, deadline time.Tim
 	if err != nil {
 		// Untracked suites need no marker: serving on is safe, and the next
 		// hit tries again.
-		h.logger.Warn("suite onboarding failed",
+		h.logger.Warn("suite_onboarding_failed",
 			"err", err, "canonical_host", req.CanonicalHost, "suite_path", req.SuitePath)
 		return sfResult{err: err}
 	}
@@ -534,7 +534,7 @@ func (h *Handler) touchAsync(req *proxy.Request, touchURL bool, suites []cache.S
 	}
 	for _, k := range suites {
 		if err := h.cache.TouchSuite(ctx, k); err != nil {
-			h.logger.Debug("suite touch failed", "err", err, "canonical_host", k.CanonicalHost, "suite_path", k.SuitePath)
+			h.logger.Debug("suite_touch_failed", "err", err, "canonical_host", k.CanonicalHost, "suite_path", k.SuitePath)
 		}
 	}
 }

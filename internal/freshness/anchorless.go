@@ -55,8 +55,8 @@ const maxAnchorlessIndexBytes = 64 << 20
 // conditional GET takes one of Checker.anchorlessBodies' slots.
 const anchorlessBodySlots = 2
 
-// anchorlessOverCapWarnEvery rate-limits the WARN "freshness: anchorless
-// index over its size cap, dropped for the miss path": at most one line per
+// anchorlessOverCapWarnEvery rate-limits the WARN
+// freshness_anchorless_index_over_cap: at most one line per
 // minute process-wide, with
 // the count of the lines it suppressed (design review M-6; the handler's
 // flat_host_root_unsupported does the same). The limiter is
@@ -239,7 +239,7 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 		requests++
 		a, err := c.refreshAnchorlessRow(ctx, fetchCtx, suite, strings.TrimPrefix(row.Path, suitePath+"/"), row)
 		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
-			c.logger.Debug("freshness: check cancelled", "canonical_host", host, "suite_path", suitePath)
+			c.logger.Debug("freshness_check_cancelled", "canonical_host", host, "suite_path", suitePath)
 			return
 		}
 		switch a {
@@ -291,7 +291,7 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 			if c.endedByShutdown(ctx, suite, "delete anchorless rows", err) {
 				return
 			}
-			c.logger.Warn("freshness: delete anchorless rows failed",
+			c.logger.Warn("freshness_delete_anchorless_rows_failed",
 				"err", err, "canonical_scheme", suite.CanonicalScheme, "canonical_host", host, "suite_path", suitePath)
 			// Task 10 review M4: a failed delete is no answer. The one
 			// transaction deleted nothing, so its 404s and 410s stop
@@ -364,7 +364,7 @@ func (c *Checker) noteAnchorlessOverCap(suite SuiteRef, path string) {
 	if !ok {
 		return
 	}
-	c.logger.Warn("freshness: anchorless index over its size cap, dropped for the miss path",
+	c.logger.Warn("freshness_anchorless_index_over_cap",
 		"canonical_scheme", suite.CanonicalScheme, "canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "path", path,
 		"max_bytes", maxAnchorlessIndexBytes, "suppressed", suppressed)
 }
@@ -459,7 +459,7 @@ func (c *Checker) refreshAnchorlessRow(ctx, fetchCtx context.Context, suite Suit
 		return anchorlessDropped, fmt.Errorf("%s: changed, with no sniff to judge it: dropped for the miss path", name)
 	case sniffable && !pass:
 		anchorlessSniffRejectedTotal.Inc(suite.CanonicalHost)
-		c.logger.Debug("freshness: anchorless index failed its sniff, kept",
+		c.logger.Debug("freshness_anchorless_index_sniff_failed_kept",
 			"canonical_host", suite.CanonicalHost, "path", row.Path)
 		return anchorlessUnknown, fmt.Errorf("%s: the 200's body failed its sniff", name)
 	case hash == old:

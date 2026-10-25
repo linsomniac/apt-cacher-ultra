@@ -731,7 +731,7 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
 	}
 	l, ok := c.admission.tryAcquire(rp.suite.CanonicalHost, rp.signed)
 	if !ok {
-		c.logger.Debug("freshness: repair deferred, no adoption slot",
+		c.logger.Debug("freshness_repair_deferred_no_adoption_slot",
 			"canonical_host", rp.suite.CanonicalHost, "suite_path", rp.suite.SuitePath)
 		repairDeferredTotal.Inc(rp.suite.CanonicalHost)
 		out.repair = nil
@@ -958,7 +958,7 @@ func (c *Checker) bumpFailedCheck(ctx context.Context, scheme, host, suitePath s
 	case errors.Is(err, cache.ErrNotFound):
 		return // the row is gone: nothing to bump (UPDATE-only, spec C3)
 	case err != nil:
-		c.logger.Warn("freshness: read suite row after a panic failed",
+		c.logger.Warn("freshness_read_suite_row_after_panic_failed",
 			"err", err, "canonical_host", host, "suite_path", suitePath)
 		return
 	}
@@ -966,7 +966,7 @@ func (c *Checker) bumpFailedCheck(ctx context.Context, scheme, host, suitePath s
 	cur.LastCheckAt = &now
 	cur.CheckFailCount++
 	if err := c.cache.UpdateSuiteFreshness(ctx, *cur); err != nil {
-		c.logger.Warn("freshness: persist failure bump after a panic failed",
+		c.logger.Warn("freshness_persist_failure_bump_after_panic_failed",
 			"err", err, "canonical_host", host, "suite_path", suitePath)
 	}
 }
@@ -1192,7 +1192,7 @@ func (c *Checker) applyClamp(ctx context.Context, cur *cache.SuiteFreshness, g r
 	}
 	c.clockStep("adoption_next_retry_at", cur.CanonicalScheme, cur.CanonicalHost, cur.SuitePath, *cur.AdoptionNextRetryAt, now)
 	if err := c.cache.SetAdoptionNextRetry(ctx, cur.CanonicalScheme, cur.CanonicalHost, cur.SuitePath, g.clampTo); err != nil {
-		c.logger.Warn("freshness: clamp adoption retry failed",
+		c.logger.Warn("freshness_clamp_adoption_retry_failed",
 			"err", err, "canonical_host", cur.CanonicalHost, "suite_path", cur.SuitePath)
 	}
 	clamped := g.clampTo

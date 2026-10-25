@@ -610,7 +610,7 @@ Unsigned adoption has five safeguards:
    finds (one cached over the other scheme during the commit's flip
    barrier, for a suite refused at `freshness.max_suites`, is found only
    by the next attempt); if it cannot read them, the adoption is refused
-   as well (logged as `adoption: signed-anchor re-mark failed`): that
+   as well (logged as `adoption_signed_anchor_remark_failed`): that
    refusal means the cache could not rule out a signature.
 4. At most 1,000 files declared in the `Release`'s SHA256 and SHA512
    lists, each path counted once (files listed only under MD5Sum or SHA1
@@ -1077,7 +1077,7 @@ curl -sS --fail-with-body -X POST http://127.0.0.1:6789/forget -H 'X-ACU-Admin: 
 #   without htpasswd_file, a host name other than localhost or listen's (use the address)
 # 409 = busy (being checked or adopted: try again) or no such suite (check the
 #   scheme, which defaults to https, and the host and suite the status page shows)
-# 500 = a database error (logged as WARN admin: forget failed); repeat it:
+# 500 = a database error (logged as WARN admin_forget_failed); repeat it:
 #   409 then means it was forgotten after all (or is busy)
 # 503 = the daemon began shutting down while the forget ran; repeat it once it is back
 ```

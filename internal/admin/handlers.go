@@ -612,7 +612,7 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 // (freshness.suiteHoldTimeout); left running at SIGTERM it would hold the
 // admin listener's Shutdown, which main runs first and alone, and eat the
 // proxy listeners' drain budget. So Shutdown cancels it (s.stopping), and
-// a forget cut short so logs admin: forget failed at DEBUG — no failure
+// a forget cut short so logs admin_forget_failed at DEBUG — no failure
 // (design review M-3) — and answers 503. Cutting it short is data-safe,
 // as a failed reap is: each metadata batch is its own writer transaction,
 // the anchors last, and the final delete (ForgetSuite) one transaction, so
@@ -680,11 +680,11 @@ func (s *Server) handleForget(w http.ResponseWriter, r *http.Request) {
 	res, err := s.cfg.Forgetter.Forget(ctx, scheme, host, suite)
 	switch {
 	case err != nil && s.stopping.Err() != nil:
-		s.logger.Debug("admin: forget failed", "err", err, "scheme", scheme, "canonical_host", host, "suite_path", suite)
+		s.logger.Debug("admin_forget_failed", "err", err, "scheme", scheme, "canonical_host", host, "suite_path", suite)
 		http.Error(w, "shutting down; retry once the daemon is back\n", http.StatusServiceUnavailable)
 		return
 	case err != nil:
-		s.logger.Warn("admin: forget failed", "err", err, "scheme", scheme, "canonical_host", host, "suite_path", suite)
+		s.logger.Warn("admin_forget_failed", "err", err, "scheme", scheme, "canonical_host", host, "suite_path", suite)
 		http.Error(w, "forget failed\n", http.StatusInternalServerError)
 		return
 	case !res.Deleted:

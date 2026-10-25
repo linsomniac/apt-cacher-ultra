@@ -229,7 +229,7 @@ func TestCheck_AnchorlessAnswersByStatus(t *testing.T) {
 			if failed := tc.result == "failed"; failed != (row.CheckFailCount == 1) || failed != (row.LastSuccessAt == nil) {
 				t.Fatalf("suite row = %+v; want failed = %v", row, failed)
 			}
-			if got := strings.Count(r.logs.String(), "anchorless index over its size cap"); got != map[bool]int{true: 1}[tc.failLog] {
+			if got := strings.Count(r.logs.String(), "freshness_anchorless_index_over_cap"); got != map[bool]int{true: 1}[tc.failLog] {
 				t.Fatalf("%d size-cap WARN lines, want %d", got, map[bool]int{true: 1}[tc.failLog])
 			}
 		})
@@ -883,7 +883,7 @@ func TestCheck_AnchorlessOverCapWarnIsRateLimited(t *testing.T) {
 }
 
 // overCapMsg is the over-cap WARN's message.
-const overCapMsg = "freshness: anchorless index over its size cap, dropped for the miss path"
+const overCapMsg = "freshness_anchorless_index_over_cap"
 
 // Ruling PG-29 (the final review's concurrency lens I-1): an anchorless
 // index whose 200 is over the 64 MiB cap is dropped for the miss path —
@@ -1314,7 +1314,7 @@ BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END`); err != nil {
 			if got := r.lastResult(); got != tc.result {
 				t.Fatalf("result %q, want %s", got, tc.result)
 			}
-			if recs := logRecords(t, r.logs, "freshness: delete anchorless rows failed"); len(recs) != 1 ||
+			if recs := logRecords(t, r.logs, "freshness_delete_anchorless_rows_failed"); len(recs) != 1 ||
 				recs[0]["level"] != "WARN" || recs[0]["canonical_scheme"] != "http" || recs[0]["suite_path"] != "/fury" {
 				t.Fatalf("delete failure lines %v, want one WARN naming http /fury", recs)
 			}
@@ -1378,7 +1378,7 @@ func TestCheck_AnchorlessIndexReadFaultIsALocalFault(t *testing.T) {
 		r.check() // five triggers within one cooldown: T1s of five client index hits
 		r.clock.advance(5 * time.Second)
 	}
-	warns := logRecords(t, r.logs, "freshness: read anchor rows failed")
+	warns := logRecords(t, r.logs, "freshness_read_anchor_rows_failed")
 	for _, m := range warns {
 		if m["level"] != "WARN" || m["suite_path"] != "/fury" || m["canonical_scheme"] != "http" {
 			t.Fatalf("read failure line %v, want a WARN naming http /fury", m)

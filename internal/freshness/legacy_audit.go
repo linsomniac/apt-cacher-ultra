@@ -378,7 +378,7 @@ func markFromCachedSignedAnchors(ctx context.Context, c *cache.Cache, logger *sl
 		if err != nil {
 			// Pool file gone or unreadable: no evidence either way
 			// (deferred minor A-49: said at DEBUG, not silently).
-			logger.Debug("legacy trust audit: cached anchor skipped",
+			logger.Debug("legacy_trust_audit_cached_anchor_skipped",
 				"canonical_host", a.CanonicalHost, "path", a.Path, "err", err)
 			continue
 		}

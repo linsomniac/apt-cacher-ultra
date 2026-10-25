@@ -503,8 +503,8 @@ func TestServeHTTP_UnreadableFetchedSuiteFile(t *testing.T) {
 		t.Fatalf("Release: the url_path row was not stored (%v)", err)
 	}
 	want := []string{"/r/dists/s/InRelease /r/dists/s", "/r/dists/t/Release /r/dists/t"}
-	if got := r.warnPaths("suite file head read failed"); !slices.Equal(got, want) {
-		t.Fatalf("suite file head read failed for %q, want %q", got, want)
+	if got := r.warnPaths("suite_file_head_read_failed"); !slices.Equal(got, want) {
+		t.Fatalf("suite_file_head_read_failed for %q, want %q", got, want)
 	}
 }
 
@@ -545,12 +545,12 @@ func TestServeHTTP_UnreadableCachedAnchorMakesTheCreationUnproven(t *testing.T) 
 		t.Fatal("h: marked from a Release.gpg nobody could read")
 	}
 	want := []string{"/r/dists/g/Release.gpg /r/dists/g", "/r/dists/h/Release.gpg /r/dists/h"}
-	if got := r.warnPaths("suite cached anchor read failed"); !slices.Equal(got, want) {
-		t.Fatalf("suite cached anchor read failed for %q, want %q", got, want)
+	if got := r.warnPaths("suite_cached_anchor_read_failed"); !slices.Equal(got, want) {
+		t.Fatalf("suite_cached_anchor_read_failed for %q, want %q", got, want)
 	}
 	want = []string{"/r/dists/h/Release.gpg /r/dists/h"} // no line for the absent InRelease rows
-	if got := r.warnPaths("suite signed-seen backstop read failed"); !slices.Equal(got, want) {
-		t.Fatalf("suite signed-seen backstop read failed for %q, want %q", got, want)
+	if got := r.warnPaths("suite_signed_seen_backstop_read_failed"); !slices.Equal(got, want) {
+		t.Fatalf("suite_signed_seen_backstop_read_failed for %q, want %q", got, want)
 	}
 }
 
@@ -745,7 +745,7 @@ func TestNew_WiresTheRejectionSweepsPanicReport(t *testing.T) {
 }
 
 // Final review, tests Minor 1 (Task 9 minor 2): a backstop whose mark
-// fails is logged WARN suite signed-seen mark failed — the operator's
+// fails is logged WARN suite_signed_seen_mark_failed — the operator's
 // only sign that a tracked suite's signed anchor waits for the startup
 // pass — and the response is served.
 func TestServeHTTP_BackstopMarkFailureIsAWarning(t *testing.T) {
@@ -764,9 +764,9 @@ BEGIN SELECT RAISE(ABORT, 'injected marker failure'); END`); err != nil {
 	if rec := r.get("/r/dists/g/Release"); rec.Code != http.StatusOK || r.suite("/r/dists/g") == nil {
 		t.Fatalf("Release miss = %d; want 200 and the row created", rec.Code)
 	}
-	recs := logRecords(r.logs, "suite signed-seen mark failed", slog.LevelDebug)
+	recs := logRecords(r.logs, "suite_signed_seen_mark_failed", slog.LevelDebug)
 	if len(recs) != 1 || recs[0]["level"] != "WARN" || recs[0]["err"] == nil || recs[0]["suite_path"] != "/r/dists/g" {
-		t.Fatalf("suite signed-seen mark failed records = %v; want one WARN with err and suite_path", recs)
+		t.Fatalf("suite_signed_seen_mark_failed records = %v; want one WARN with err and suite_path", recs)
 	}
 }
 
@@ -1156,7 +1156,7 @@ func TestServeHTTP_BackstopIsBoundedBeforeTheBody(t *testing.T) {
 				}
 				// Both anchor reads (InRelease, Release.gpg) fail on the ended
 				// context and are logged; the base stays unmarked.
-				if n := len(logRecords(logs, "suite signed-seen backstop read failed", slog.LevelWarn)); n != 2 || s.marked(suite) {
+				if n := len(logRecords(logs, "suite_signed_seen_backstop_read_failed", slog.LevelWarn)); n != 2 || s.marked(suite) {
 					t.Fatalf("hit=%v: %d backstop read failures logged, marked %v; want 2 and unmarked", hit, n, s.marked(suite))
 				}
 			})

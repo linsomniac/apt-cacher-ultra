@@ -413,7 +413,7 @@ func serveListeners(
 	// setting no longer affects verification (spec C5 rev 4): it only
 	// admits an empty keyring at startup (see buildAdopter).
 	if !cfg.Adoption.RequireSignature {
-		logger.Warn("adoption.require_signature = false: an empty keyring is allowed at startup; plain-text or malformed InRelease files are never adopted as signed metadata, and with an empty keyring signed suites cannot adopt until keys are installed or adoption.accept_any_signer is set")
+		logger.Warn("adoption_require_signature_disabled")
 	}
 
 	// SPEC2 §5.1: accept_any_signer = true is a loud relaxation —
@@ -1129,7 +1129,7 @@ func warnSuiteCaps(ctx context.Context, c *cache.Cache, maxSuites int, logger *s
 	perHost := maxSuites / 10
 	u, err := c.SuiteCapUsage(ctx, perHost)
 	if err != nil {
-		logger.Warn("suite cap usage read failed", "err", err)
+		logger.Warn("suite_cap_usage_read_failed", "err", err)
 		return
 	}
 	if u.Total <= maxSuites && u.HostsAtCap == 0 {
@@ -1238,7 +1238,7 @@ func waitAdoptionDrain(wait func(), notice time.Duration, logger *slog.Logger) {
 		defer close(done)
 		defer func() {
 			if r := recover(); r != nil {
-				logger.Error("shutdown wait panicked", "panic", r, "stack", string(debug.Stack()))
+				logger.Error("shutdown_wait_panicked", "panic", r, "stack", string(debug.Stack()))
 			}
 		}()
 		wait()

@@ -388,8 +388,8 @@ func TestServeHTTP_OnboardingTimeoutServesUntracked(t *testing.T) {
 		if ok, err := s.c.HasSuiteRow(context.Background(), key); err != nil || ok {
 			t.Fatalf("a timed-out onboarding tracked the suite (%v, %v)", ok, err)
 		}
-		if n := len(logRecords(logs, "suite onboarding failed", slog.LevelWarn)); n != 1 {
-			t.Fatalf("%d suite onboarding failed records, want 1", n)
+		if n := len(logRecords(logs, "suite_onboarding_failed", slog.LevelWarn)); n != 1 {
+			t.Fatalf("%d suite_onboarding_failed records, want 1", n)
 		}
 		s.h.cachedAnchorsHook = nil
 		get()

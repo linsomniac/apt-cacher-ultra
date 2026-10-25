@@ -480,7 +480,7 @@ func TestReaper_SkipsABusySuiteAndRetriesNextRun(t *testing.T) {
 	}
 	// The busy line names the scheme too (the Task 6 review's minor 4:
 	// both schemes' copies of a suite can be tracked).
-	if ev := r.events("suite reaper: suite busy, retried next run"); len(ev) != 1 || ev[0]["canonical_scheme"] != "http" ||
+	if ev := r.events("suite_reaper_suite_busy"); len(ev) != 1 || ev[0]["canonical_scheme"] != "http" ||
 		ev[0]["suite_path"] != "/r/dists/busy" {
 		t.Fatalf("busy lines = %v, want one naming http and /r/dists/busy", ev)
 	}
@@ -642,7 +642,7 @@ func TestReaper_AHoldTimeoutIsAWarnedFailureAndTheNextRunReaps(t *testing.T) {
 		if !r.exists("/r/dists/a") {
 			t.Fatal("a suite whose hold timed out was reaped: the held steps did not run on the bounded context")
 		}
-		ev := r.events("suite reaper: read suite row failed")
+		ev := r.events("suite_reaper_read_suite_row_failed")
 		if len(ev) != 1 || ev[0]["level"] != "WARN" || ev[0]["canonical_scheme"] != "http" || ev[0]["suite_path"] != "/r/dists/a" {
 			t.Fatalf("read failures = %v, want one at WARN naming http and /r/dists/a", ev)
 		}
@@ -824,7 +824,7 @@ func TestReaper_ASettledReapIsAReap(t *testing.T) {
 	if len(ev) != 1 || ev[0]["settled"] != true || ev[0]["reason"] != "idle" || ev[0]["suite_path"] != "/r/dists/a" {
 		t.Fatalf("suite_reaped lines = %v, want one for /r/dists/a with settled=true", ev)
 	}
-	if fails := r.events("suite reaper: reap failed"); len(fails) != 0 {
+	if fails := r.events("suite_reaper_reap_failed"); len(fails) != 0 {
 		t.Fatalf("reap failures = %v, want none: the reap committed", fails)
 	}
 	if d := reapedTotal(t, "idle") - idle0; d != 1 {
@@ -847,7 +847,7 @@ func TestReaper_AShutdownMidRunIsNoFailure(t *testing.T) {
 	if !r.exists("/r/dists/a") {
 		t.Fatal("the cancelled run reaped the suite")
 	}
-	if ev := r.events("suite reaper: read suite row failed"); len(ev) != 1 || ev[0]["level"] != "DEBUG" {
+	if ev := r.events("suite_reaper_read_suite_row_failed"); len(ev) != 1 || ev[0]["level"] != "DEBUG" {
 		t.Fatalf("read failures = %v, want one at DEBUG", ev)
 	}
 }

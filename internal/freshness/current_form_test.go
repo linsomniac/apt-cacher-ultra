@@ -1727,7 +1727,7 @@ func TestCheck_AnchorFoundAgainFailsOnASnapshotReadError(t *testing.T) {
 	chk.Check(ctx, "http", rigHost, rigSuite)
 	chk.WaitForAdoptions()
 	fc.fail.Store(false)
-	warns := logRecords(t, &logs, "freshness: read current snapshot failed")
+	warns := logRecords(t, &logs, "freshness_read_current_snapshot_failed")
 	if len(warns) != 1 || warns[0]["level"] != "WARN" || warns[0]["snapshot_id"] != float64(snap.SnapshotID) {
 		t.Fatalf("WARN records %v, want one naming snapshot %d", warns, snap.SnapshotID)
 	}

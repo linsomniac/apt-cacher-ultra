@@ -161,7 +161,7 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 	if c.adopter != nil {
 		if gate := c.retryGateFor(cur, now); pacedByRefusal(gate) || c.pacedAbsentAnswer(suiteKey(scheme, host, suitePath), gate) {
 			c.applyClamp(ctx, cur, gate, now)
-			c.logger.Debug("freshness: refused suite paced until its retry",
+			c.logger.Debug("freshness_refused_suite_paced_until_retry",
 				"canonical_host", host, "suite_path", suitePath, "reason", gate.reason)
 			return
 		}
@@ -241,7 +241,7 @@ func (c *Checker) finishCheck(ctx context.Context, out *checkOutcome, cur *cache
 	}
 	if e.clearRecord {
 		if err := c.cache.ClearAdoptionFailure(ctx, suite.CanonicalScheme, host, suitePath); err != nil {
-			c.logger.Warn("freshness: clear adoption failure failed",
+			c.logger.Warn("freshness_clear_adoption_failure_failed",
 				"err", err, "canonical_host", host, "suite_path", suitePath)
 		}
 	}
@@ -322,7 +322,7 @@ func (c *Checker) failCheck(ctx context.Context, out *checkOutcome, cur *cache.S
 // caller's context ended (shutdown), and then logs it at DEBUG: it says
 // nothing about upstream, so the check returns without writing — no
 // failCheck, no WARN, no failed-check count — as a cancelled GET does
-// (t.end.cancelled(), "freshness: check cancelled").
+// (t.end.cancelled(), "freshness_check_cancelled").
 //
 // AIDEV-NOTE: final fix wave FW-3 (d) (final concurrency review M-1): the
 // local steps between the probes and the tail — the checker's marker
@@ -336,7 +336,7 @@ func (c *Checker) endedByShutdown(ctx context.Context, suite SuiteRef, step stri
 	if ctx.Err() == nil {
 		return false
 	}
-	c.logger.Debug("freshness: check ended by shutdown", "step", step, "err", err,
+	c.logger.Debug("freshness_check_ended_by_shutdown", "step", step, "err", err,
 		"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath)
 	return true
 }
@@ -437,7 +437,7 @@ func (c *Checker) baseline(ctx context.Context, cur *cache.SuiteFreshness, suite
 		hash = *row.BlobHash
 	}
 	if hash == "" {
-		c.logger.Debug("freshness: no baseline anchor hash, skipping",
+		c.logger.Debug("freshness_check_skipped_no_baseline_anchor_hash",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"anchor", name,
@@ -586,7 +586,7 @@ func (c *Checker) checkInline(ctx, fetchCtx context.Context, out *checkOutcome, 
 		if errors.Is(err, context.Canceled) {
 			// A cancelled caller (shutdown) is not evidence about upstream;
 			// the check deadline (DeadlineExceeded) is, and counts below.
-			c.logger.Debug("freshness: check cancelled", "canonical_host", host, "suite_path", suitePath)
+			c.logger.Debug("freshness_check_cancelled", "canonical_host", host, "suite_path", suitePath)
 			return nil, nil, false
 		}
 		// 404 with no current snapshot AND a Release url_path row →
@@ -776,7 +776,7 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 		if errors.Is(err, context.Canceled) {
 			// A cancelled caller (shutdown) is not evidence about upstream;
 			// the check deadline (DeadlineExceeded) is, and counts below.
-			c.logger.Debug("freshness: check cancelled", "canonical_host", host, "suite_path", suitePath)
+			c.logger.Debug("freshness_check_cancelled", "canonical_host", host, "suite_path", suitePath)
 			return nil, nil
 		}
 		c.failCheck(ctx, out, cur, suite, nowUnix, "detached", err)

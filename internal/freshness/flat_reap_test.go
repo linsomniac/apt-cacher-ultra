@@ -109,7 +109,7 @@ func TestReaper_ReapsAJunkAnchorlessFlatSuite(t *testing.T) {
 			t.Errorf("%s: %v; want the reaped suite's row deleted, not served as a hit", p, err)
 		}
 	}
-	if ev := r.events("suite reaper: junk anchor reads failed"); len(ev) != 0 {
+	if ev := r.events("suite_reaper_junk_anchor_reads_failed"); len(ev) != 0 {
 		t.Fatalf("read failure lines = %v, want none", ev)
 	}
 }
@@ -270,7 +270,7 @@ func TestReaper_AFailedFlatIndexReadJudgesNoFlatSuite(t *testing.T) {
 		return nil, errors.New("disk I/O error")
 	}
 	r.reaper.runOnce(context.Background())
-	if ev := r.events("suite reaper: list unadopted flat indexes failed"); len(ev) != 1 {
+	if ev := r.events("suite_reaper_list_unadopted_flat_indexes_failed"); len(ev) != 1 {
 		t.Fatalf("%d flat index read failure lines, want 1", len(ev))
 	}
 	for _, s := range []string{"/junk", "/junk-everything"} {
@@ -298,7 +298,7 @@ func TestReaper_AFailedSignedEvidenceReadJudgesNothing(t *testing.T) {
 	r.cacheAnchor("/r/dists/junk", "InRelease", softPage, old)
 	r.reaper.signedEvidence = func(context.Context, string, string) error { return errors.New("disk I/O error") }
 	r.reaper.runOnce(context.Background())
-	ev := r.events("suite reaper: read signed evidence failed")
+	ev := r.events("suite_reaper_read_signed_evidence_failed")
 	if len(ev) != 1 || ev[0]["count"] != float64(2) {
 		t.Fatalf("signed evidence failure lines = %v, want one counting 2", ev)
 	}

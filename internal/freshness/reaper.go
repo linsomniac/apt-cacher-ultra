@@ -236,7 +236,7 @@ type reapCandidate struct {
 func (r *Reaper) runOnce(ctx context.Context) {
 	rows, err := r.cache.ListSuitesWithAdoption(ctx)
 	if err != nil {
-		r.warn(ctx, "suite reaper: list suites failed", "err", err)
+		r.warn(ctx, "suite_reaper_list_suites_failed", "err", err)
 		return
 	}
 	now := r.checker.now()
@@ -302,7 +302,7 @@ func (r *Reaper) sweepMarkers(ctx context.Context, now, fresh time.Time) {
 		r.logger.Info("signed_seen_markers_swept", "count", res.Swept)
 	}
 	if err != nil {
-		r.warn(ctx, "suite reaper: marker sweep failed", "err", err, "swept", res.Swept)
+		r.warn(ctx, "suite_reaper_marker_sweep_failed", "err", err, "swept", res.Swept)
 	}
 }
 
@@ -495,7 +495,7 @@ func runBudgets(cands []reapCandidate) []reapCandidate {
 func (r *Reaper) reapSuite(ctx context.Context, c reapCandidate) (reaped bool) {
 	release, ok := r.checker.HoldSuite(c.key)
 	if !ok {
-		r.logger.Debug("suite reaper: suite busy, retried next run", "canonical_scheme", c.key.CanonicalScheme,
+		r.logger.Debug("suite_reaper_suite_busy", "canonical_scheme", c.key.CanonicalScheme,
 			"canonical_host", c.key.CanonicalHost, "suite_path", c.key.SuitePath)
 		return false
 	}
@@ -544,9 +544,9 @@ func (r *Reaper) reapSuite(ctx context.Context, c reapCandidate) (reaped bool) {
 
 // The reaper's held steps, as their failure lines name them.
 const (
-	stepReadRow        = "suite reaper: read suite row failed"
-	stepDeleteMetadata = "suite reaper: delete metadata failed"
-	stepReap           = "suite reaper: reap failed"
+	stepReadRow        = "suite_reaper_read_suite_row_failed"
+	stepDeleteMetadata = "suite_reaper_delete_metadata_failed"
+	stepReap           = "suite_reaper_reap_failed"
 )
 
 // heldReap is what reapHeld did under a suite's hold.
@@ -697,7 +697,7 @@ func sameSnapshot(a, b *int64) bool {
 func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdoption, have []reapCandidate, now time.Time) []reapCandidate {
 	anchors, err := r.cache.ListUnadoptedSuiteAnchors(ctx)
 	if err != nil {
-		r.warn(ctx, "suite reaper: list unadopted anchors failed", "err", err)
+		r.warn(ctx, "suite_reaper_list_unadopted_anchors_failed", "err", err)
 		return nil
 	}
 	bySuite := map[cache.SuiteKey][]cache.SuiteAnchorRow{}
@@ -718,7 +718,7 @@ func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdopt
 	if hasUnadoptedFlatSuite(rows) {
 		indexes, err := r.flatIndexRows(ctx)
 		if err != nil {
-			r.warn(ctx, "suite reaper: list unadopted flat indexes failed", "err", err)
+			r.warn(ctx, "suite_reaper_list_unadopted_flat_indexes_failed", "err", err)
 			indexesRead = false
 		}
 		for _, a := range indexes {
@@ -765,11 +765,11 @@ func (r *Reaper) junkCandidates(ctx context.Context, rows []cache.SuiteWithAdopt
 	}
 	r.sniffs = next
 	if fails.n > 0 {
-		r.warn(ctx, "suite reaper: junk anchor reads failed", "count", fails.n, "err", fails.first,
+		r.warn(ctx, "suite_reaper_junk_anchor_reads_failed", "count", fails.n, "err", fails.first,
 			"canonical_scheme", fails.scheme, "canonical_host", fails.host, "path", fails.path)
 	}
 	if evidenceFails > 0 {
-		r.warn(ctx, "suite reaper: read signed evidence failed", "count", evidenceFails, "err", evidenceErr,
+		r.warn(ctx, "suite_reaper_read_signed_evidence_failed", "count", evidenceFails, "err", evidenceErr,
 			"canonical_scheme", evidenceKey.CanonicalScheme, "canonical_host", evidenceKey.CanonicalHost,
 			"suite_path", evidenceKey.SuitePath)
 	}

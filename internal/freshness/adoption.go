@@ -1069,7 +1069,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// those rules.
 	prior, err := a.priorSnapshot(ctx, suite)
 	if err != nil {
-		a.logger.Warn("adoption: read prior snapshot failed",
+		a.logger.Warn("adoption_read_prior_snapshot_failed",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"err", err,
@@ -1763,7 +1763,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			if errors.Is(err, errRemarkPoolRead) {
 				level = slog.LevelError
 			}
-			a.logger.Log(ctx, level, "adoption: signed-anchor re-mark failed",
+			a.logger.Log(ctx, level, "adoption_signed_anchor_remark_failed",
 				"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "err", err)
 			return fmt.Errorf("%w: the cached signed anchors could not be re-marked: %w",
 				ErrAdoptionUnsignedDowngradeRefused, err)

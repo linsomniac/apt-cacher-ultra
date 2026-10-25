@@ -154,7 +154,7 @@ func (c *Checker) anchorAbsent(ctx, fetchCtx context.Context, out *checkOutcome,
 	if runTree {
 		rows, _, err := c.cachedAnchors(ctx, suite)
 		if err != nil {
-			c.logger.Warn("freshness: read anchor rows failed",
+			c.logger.Warn("freshness_read_anchor_rows_failed",
 				"err", err, "canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath)
 		}
 		t := c.runProbeTree(fetchCtx, suite, c.anchorURLsFor(suite, anchorURLMap(rows)))
@@ -205,7 +205,7 @@ func (c *Checker) anchorFoundAgain(ctx context.Context, out *checkOutcome, cur *
 		if c.endedByShutdown(ctx, suite, "read current snapshot", err) {
 			return nil
 		}
-		c.logger.Warn("freshness: read current snapshot failed",
+		c.logger.Warn("freshness_read_current_snapshot_failed",
 			"err", err,
 			"snapshot_id", *cur.CurrentSnapshotID,
 			"canonical_host", suite.CanonicalHost,
@@ -476,7 +476,7 @@ func (c *Checker) checkUnsigned(ctx, fetchCtx context.Context, out *checkOutcome
 	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			c.logger.Debug("freshness: check cancelled", "canonical_host", host, "suite_path", suitePath)
+			c.logger.Debug("freshness_check_cancelled", "canonical_host", host, "suite_path", suitePath)
 			return nil, nil
 		}
 		c.failCheck(ctx, out, cur, suite, nowUnix, "unsigned", err)

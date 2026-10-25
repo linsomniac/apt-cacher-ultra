@@ -259,7 +259,7 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 		c.clockStep("last_requested_at", suite.CanonicalScheme, host, suitePath, *cur.LastRequestedAt, now)
 	}
 	if !ok {
-		c.logger.Debug("freshness: never-adopted suite without recent interest, dormant",
+		c.logger.Debug("freshness_never_adopted_suite_dormant_no_recent_interest",
 			"canonical_host", host, "suite_path", suitePath)
 		return nil
 	}
@@ -286,13 +286,13 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 	}
 	if err != nil {
 		if !c.endedByShutdown(ctx, suite, "read the anchor rows", err) {
-			c.logger.Warn("freshness: read anchor rows failed",
+			c.logger.Warn("freshness_read_anchor_rows_failed",
 				"err", err, "canonical_scheme", suite.CanonicalScheme, "canonical_host", host, "suite_path", suitePath)
 		}
 		return nil
 	}
 	if !clientCreated {
-		c.logger.Debug("freshness: never-adopted suite without a client-created anchor or flat index row, dormant",
+		c.logger.Debug("freshness_never_adopted_suite_dormant_no_client_created_row",
 			"canonical_host", host, "suite_path", suitePath)
 		return nil
 	}
@@ -300,7 +300,7 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 	gate := c.retryGateFor(cur, now)
 	c.applyClamp(ctx, cur, gate, now)
 	if !offered && c.pacedFirst(cur, gate, now) {
-		c.logger.Debug("freshness: deferred never-adopted suite paced until its retry or the next refresh check",
+		c.logger.Debug("freshness_deferred_never_adopted_suite_paced_until_retry",
 			"canonical_host", host, "suite_path", suitePath, "reason", gate.reason)
 		return nil
 	}
@@ -328,7 +328,7 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 	t := c.runProbeTree(fetchCtx, suite, urls)
 	switch {
 	case t.end != nil && t.end.cancelled():
-		c.logger.Debug("freshness: check cancelled", "canonical_host", host, "suite_path", suitePath)
+		c.logger.Debug("freshness_check_cancelled", "canonical_host", host, "suite_path", suitePath)
 		return nil
 	case t.end != nil:
 		c.failCheck(ctx, out, cur, suite, nowUnix, "probe", fmt.Errorf("%s: %w", t.endName, t.end.err))

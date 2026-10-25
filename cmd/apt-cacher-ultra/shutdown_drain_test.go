@@ -40,7 +40,7 @@ func TestWaitAdoptionDrain_LogsAPanicWithItsStack(t *testing.T) {
 	logs := &syncLogBuffer{}
 	waitAdoptionDrain(func() { panic("drain bug") }, time.Hour, slog.New(slog.NewJSONHandler(logs, nil)))
 	out := logs.String()
-	if !strings.Contains(out, `"msg":"shutdown wait panicked"`) || !strings.Contains(out, `"panic":"drain bug"`) ||
+	if !strings.Contains(out, `"msg":"shutdown_wait_panicked"`) || !strings.Contains(out, `"panic":"drain bug"`) ||
 		!strings.Contains(out, `"stack":"goroutine`) {
 		t.Fatalf("panic log = %s; want the panic and its stack", out)
 	}

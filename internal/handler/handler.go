@@ -927,7 +927,7 @@ func (h *Handler) tryDisplacedByHash(w http.ResponseWriter, r *http.Request, req
 	rows, err := h.cache.DisplacedSnapshotMembers(r.Context(), req.CanonicalScheme, req.CanonicalHost,
 		req.SuitePath, memberPath, currentID, h.keepDisplaced+1)
 	if err != nil {
-		h.logger.Warn("displaced snapshot lookup failed",
+		h.logger.Warn("displaced_snapshot_lookup_failed",
 			"err", err,
 			"canonical_host", req.CanonicalHost,
 			"path", req.Path,
@@ -1272,7 +1272,7 @@ func (h *Handler) anchorModTime(ctx context.Context, snapshotID int64) time.Time
 		return time.Unix(*snap.AdoptedAt, 0)
 	}
 	if ctx.Err() == nil {
-		h.logger.Warn("snapshot adopted_at lookup failed",
+		h.logger.Warn("snapshot_adopted_at_lookup_failed",
 			"err", err,
 			"snapshot_id", snapshotID,
 		)
@@ -2207,7 +2207,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 		fetched.Suite = sr.key
 		head, herr := readHead(h.cache.BlobPath(hash), file.HeadBytes())
 		if herr != nil {
-			h.logger.Warn("suite file head read failed",
+			h.logger.Warn("suite_file_head_read_failed",
 				"err", herr, "canonical_host", req.CanonicalHost, "suite_path", req.SuitePath, "path", req.Path)
 			if file.Marks() {
 				// A local disk fault, labelled like every other one

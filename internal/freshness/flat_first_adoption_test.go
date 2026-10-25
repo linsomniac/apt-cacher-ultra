@@ -101,12 +101,12 @@ func TestCheck_AFailedFlatIndexReadIsALocalFault(t *testing.T) {
 			continue
 		}
 		switch m["msg"] {
-		case "freshness: read anchor rows failed":
+		case "freshness_read_anchor_rows_failed":
 			if m["level"] != "WARN" || m["suite_path"] != "/fury" {
 				t.Fatalf("read failure line %v, want a WARN naming /fury", m)
 			}
 			warns++
-		case "freshness: never-adopted suite without a client-created anchor or flat index row, dormant":
+		case "freshness_never_adopted_suite_dormant_no_client_created_row":
 			t.Fatalf("the read fault was taken for dormancy: %v", m)
 		}
 	}
