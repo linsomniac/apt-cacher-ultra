@@ -34,12 +34,14 @@ func TestReaper_ForgetSaysWhyItForgotNothing(t *testing.T) {
 	if res, err := r.reaper.Forget(ctx, "http", "h", "/r/dists/gone"); res.Deleted || err != nil {
 		t.Fatalf("gone under the hold: %+v, %v", res, err)
 	}
-	want := map[string]string{"/r/dists/none": "no_suite", "/r/dists/busy": "busy", "/r/dists/gone": "no_suite"}
+	want := map[string]string{"/r/dists/none": notForgottenNoSuite, "/r/dists/busy": notForgottenBusy,
+		"/r/dists/gone": notForgottenNoSuite}
 	lines := r.events("suite_not_forgotten")
 	for _, m := range lines {
+		path, _ := m["suite_path"].(string)
 		if m["level"] != "DEBUG" || m["canonical_scheme"] != "http" || m["canonical_host"] != "h" ||
-			m["reason"] != want[m["suite_path"].(string)] {
-			t.Errorf("line %v, want DEBUG with the reason %q", m, want[m["suite_path"].(string)])
+			m["reason"] != want[path] {
+			t.Errorf("line %v, want DEBUG with the reason %q", m, want[path])
 		}
 	}
 	if len(lines) != 3 {

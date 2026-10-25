@@ -72,9 +72,12 @@ func TestMutatingEndpoints_BodiesEndInOneNewlineAndOptionsNamePost(t *testing.T)
 		withForgetter(&stubForgetter{})) // a zero result: not deleted, 409
 	defer cleanup()
 	for _, path := range []string{"/reconcile", "/forget"} {
-		_, body := postForm(t, base+path, nil) // no X-ACU-Admin: the guard's 403
+		status, body := postForm(t, base+path, nil) // no X-ACU-Admin: the guard's 403
+		if status != http.StatusForbidden {
+			t.Fatalf("%s without X-ACU-Admin: %d, want 403", path, status)
+		}
 		checkBody(path+" 403", body)
-		status, body := postAdminBody(t, base+path, "host=h")
+		status, body = postAdminBody(t, base+path, "host=h")
 		if status != http.StatusBadRequest {
 			t.Fatalf("%s without suite: %d, want 400", path, status)
 		}

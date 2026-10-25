@@ -244,7 +244,7 @@ func TestMutatingEndpoints_HostCheckOffWithHtpasswd(t *testing.T) {
 
 // The guard runs first: a refused request learns nothing about the
 // endpoint, neither that its Forgetter or Reconciler is unwired (501) nor
-// how its body parses (413).
+// how its body parses (400 or 413).
 func TestMutatingEndpoints_GuardRunsFirst(t *testing.T) {
 	const noHeader = "this endpoint requires the header X-ACU-Admin: 1"
 	for _, ep := range guardedEndpoints {
