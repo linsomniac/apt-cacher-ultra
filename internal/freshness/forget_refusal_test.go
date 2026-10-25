@@ -34,8 +34,9 @@ func TestReaper_ForgetSaysWhyItForgotNothing(t *testing.T) {
 	if res, err := r.reaper.Forget(ctx, "http", "h", "/r/dists/gone"); res.Deleted || err != nil {
 		t.Fatalf("gone under the hold: %+v, %v", res, err)
 	}
-	want := map[string]string{"/r/dists/none": notForgottenNoSuite, "/r/dists/busy": notForgottenBusy,
-		"/r/dists/gone": notForgottenNoSuite}
+	// The literals, not the constants: the reasons are a log contract
+	// (docs/log-fields.md), and the test pins what goes on the wire.
+	want := map[string]string{"/r/dists/none": "no_suite", "/r/dists/busy": "busy", "/r/dists/gone": "no_suite"}
 	lines := r.events("suite_not_forgotten")
 	for _, m := range lines {
 		path, _ := m["suite_path"].(string)
