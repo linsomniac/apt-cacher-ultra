@@ -53,6 +53,10 @@ Both reviews (`planH2-review/design.md`, `exec.md`) found no Critical issue and 
 | exec n-4: the debug recipe works once per container | adopted | Task 11 |
 | controller: actionlint by `go run` was blocked | adopted: a pinned image, `rhysd/actionlint:1.7.12`, run with `--network none` | Task 10 |
 
+### Re-check against H1 revision 2 (30c9638), 2026-10-25
+
+No H2 assertion, config key, status-JSON path or metric depends on anything H1 renames, removes or changes: H1's 43 renames (the six renamed DEBUG events among them) touch none of the events this harness reads (`request`, `freshness_check` — matched as a whole `msg=` value, so H1's `freshness_check_cancelled` and the like never match it — `adoption_success`, `adoption_refused`, `adoption_flip_barrier`, `unvouched_deb_refused`, `package_hash_conflict`) or their fields; H1 only adds status fields and changes config comments; `shutdown wait panicked` becomes `shutdown_wait_panicked`, which `whole_run`'s `[a-z_]*panicked` alternative matches. One addition: H1's `TestEveryEventIsDocumented` parses every non-test Go file under `cmd/` and `internal/` whatever its build tag, so `e2ehooks.go`'s `e2e_commit_delay_enabled` needs a `docs/log-fields.md` row, which Task 1 now adds (without it H1's guard prints `cmd/apt-cacher-ultra/e2ehooks.go:41: event e2e_commit_delay_enabled has no row in docs/log-fields.md; add one`; checked with H1's two guard files on this plan's tree, and silent with the row); it is snake_case, so `TestLogMessagesAreSnakeCase` needs no list entry. H2's two overview edits (Task 11) still apply after H1's Task 18 overview diff (applied in a scratch copy: each old text occurs once).
+
 ## Global Constraints
 
 Everything in the overview's Global Constraints that touches this plan applies. In particular:
@@ -60,7 +64,7 @@ Everything in the overview's Global Constraints that touches this plan applies. 
 - **Fixtures only.** No scenario reaches a live repository. The test container's only upstream is its own nginx; the daemon's `upstream.allowed_host_regex` admits `signed.test` and `plain.test` alone. CI's network use is the base images (Docker Hub: `golang:1.25-bookworm`, `debian:bookworm-slim`, the client image; locally also `rhysd/actionlint` for the workflow check), the distribution mirrors the image build installs from (`deb.debian.org`, `archive.debian.org`, `archive.ubuntu.com`) and the Go module proxy the build stage's `go mod download` uses, as e2e/deb's job already does (design note 13).
 - **Spec values kept** (ruling R-H2-2): the unsigned confirmation gap `max(cooldown, 5m)` = 5 minutes (1 hour after a 401/403 on a signature file), the 45 s commit delay, the flip hold's 20 s bound below apt's 30 s timeout, `flip_quiet_period` inside its `1s`–`15s` range, the six client images.
 - **No production change.** The only Go change is the `e2ehooks` seam (Task 1), compiled only with `-tags e2ehooks`; a release build (`make build`, `make deb`, nfpm, e2e/deb) contains its no-op twin and reads no `ACU_E2E_*` variable (`TestBuildAdopter_ReleaseBinaryIgnoresTheE2ECommitDelay`, and CI's grep of the release binary, Task 10).
-- **Assert on stable names.** Log assertions use only snake_case events (`request`, `freshness_check`, `adoption_success`, `adoption_refused`, `adoption_flip_barrier`, `unvouched_deb_refused`, `e2e_commit_delay_enabled`, `*_panicked`, `package_hash_conflict`) and fields, the admin status JSON (`suites[]`, `process.started_unixtime`: a locked contract) and `/metrics`. No assertion reads a prose message except `whole_run`'s panic catch-all (net/http's `http: panic serving …`, `shutdown wait panicked`), so H1's snake_case renames (its ruling R-H3) cannot break this harness, which runs after H1.
+- **Assert on stable names.** Log assertions use only snake_case events (`request`, `freshness_check`, `adoption_success`, `adoption_refused`, `adoption_flip_barrier`, `unvouched_deb_refused`, `e2e_commit_delay_enabled`, `*_panicked`, `package_hash_conflict`) and fields, the admin status JSON (`suites[]`, `process.started_unixtime`: a locked contract) and `/metrics`. No assertion reads a prose message except `whole_run`'s panic catch-all (net/http's `http: panic serving …`; `shutdown wait panicked`, which H1 renames `shutdown_wait_panicked`: both forms match), so H1's snake_case renames (its rulings R-H3 and R-H6) cannot break this harness, which runs after H1. The event H2's Go code adds has a `docs/log-fields.md` row (Task 1), as H1's `TestEveryEventIsDocumented` requires.
 - **No assertion is weakened to pass** (the controller's rule): a check that flakes gets a wider bound with its reason, never removed.
 - After the Go change (Task 1): `go test -race ./...` and `golangci-lint run ./...` are clean, `golangci-lint run --build-tags e2ehooks ./cmd/...` too, and `gofmt -l .` lists only the five known drift files (`cmd/apt-cacher-ultra/ca_print.go`, `internal/cache/cache_test.go`, `internal/cache/gc_urlpath_test.go`, `internal/freshness/hot_prefetch_test.go`, `internal/proxy/connect_stats.go`). Never run `gofmt -w` on those five.
 - Every shell file in `e2e/flat/` is bash with `set -euo pipefail` (`lib.sh` is sourced by `test.sh`, which sets it), and `shellcheck -x e2e/flat/*.sh` (run from the repo root) prints nothing once Task 8 lands; Tasks 3–7's lint steps state exactly what it prints until then (functions and variables a later task uses). No `grep -q` ends a pipe (design note 18). No bare `sleep` stands in for a condition (ruling R-H2-5); the sleeps that remain pace a poll or a client loop (`poll`'s one second, `until_candidates`' cooldown, the commit-delay loop's 3 s).
@@ -126,7 +130,7 @@ The failure modes this harness could hide, most likely first, each pinned in the
 
 | Area | Files | Task |
 |---|---|---|
-| The commit-delay seam | `cmd/apt-cacher-ultra/e2ehooks.go`, `e2ehooks_off.go`, `e2ehooks_test.go`, `e2ehooks_off_test.go` (new); `cmd/apt-cacher-ultra/main.go` (`buildAdopter`'s one call) | 1 |
+| The commit-delay seam | `cmd/apt-cacher-ultra/e2ehooks.go`, `e2ehooks_off.go`, `e2ehooks_test.go`, `e2ehooks_off_test.go` (new); `cmd/apt-cacher-ultra/main.go` (`buildAdopter`'s one call); `docs/log-fields.md` (the `e2e_commit_delay_enabled` row) | 1 |
 | Fixtures and the image | `e2e/flat/build-fixtures.sh`, `e2e/flat/nginx.conf`, `e2e/flat/Dockerfile` (new); `.dockerignore` | 2 |
 | The harness and first contact | `e2e/flat/lib.sh`, `e2e/flat/test.sh`, `e2e/flat/run.sh` (new); `Makefile` (`e2e-flat`) | 3 |
 | PR #8's table, the older `Date`, the restart | `e2e/flat/test.sh` | 4 |
@@ -165,7 +169,7 @@ Spec §7: "A commit-delay hook of 45 s asserts no client timeouts". The adopter 
 **Files:**
 - Create: `cmd/apt-cacher-ultra/e2ehooks.go`, `cmd/apt-cacher-ultra/e2ehooks_off.go`
 - Create (tests): `cmd/apt-cacher-ultra/e2ehooks_test.go`, `cmd/apt-cacher-ultra/e2ehooks_off_test.go`
-- Modify: `cmd/apt-cacher-ultra/main.go` (`buildAdopter`, after `freshness.NewAdopter`)
+- Modify: `cmd/apt-cacher-ultra/main.go` (`buildAdopter`, after `freshness.NewAdopter`), `docs/log-fields.md` (the event's row: H1's `TestEveryEventIsDocumented` reads every non-test Go file, build tag or not)
 
 **Interfaces:**
 - Consumes: `(*freshness.Adopter).SetCommitDelayForTest(d time.Duration)` (`internal/freshness/adoption.go`); the test helpers `withKeyringDirs`, `newAdoptionEnabledCfg`, `newAdoptionWiringDeps` (`cmd/apt-cacher-ultra/adoption_wiring_test.go`).
@@ -365,6 +369,12 @@ new:
 	}
 ```
 
+In `docs/log-fields.md`'s *Operational events* table, immediately before the row that begins `` | `apt-cacher-ultra starting` | INFO | ``, add:
+
+```
+| `e2e_commit_delay_enabled` | WARN | `commit_delay` (a Go duration, `45s`), `detail` | Logged once at start, and only by a test binary built with `-tags e2ehooks` (e2e/flat's image, `cmd/apt-cacher-ultra/e2ehooks.go`) when `ACU_E2E_COMMIT_DELAY` is set: every adoption commit then waits `commit_delay` first, inside the flip barrier. A release binary has no such seam, never reads the variable and never logs this line. |
+```
+
 - [ ] **Step 4: Run the tests to verify they pass, in both builds**
 
 Run: `go test -count=1 -tags e2ehooks -run 'E2ECommitDelay|ReleaseBinaryIgnores' -v ./cmd/apt-cacher-ultra/`
@@ -378,16 +388,19 @@ Expected: `--- PASS: TestBuildAdopter_ReleaseBinaryIgnoresTheE2ECommitDelay` (su
 Remove the `applyE2EHooks` call from `buildAdopter` (keep both new files) and run the tagged command of Step 4.
 Expected: `--- FAIL: TestBuildAdopter_E2ECommitDelayFromTheEnvironment` and `--- FAIL: TestBuildAdopter_E2ECommitDelayRejectsABadValue` (the planning replay's two failing lines). Restore the call.
 
+Then delete the `e2e_commit_delay_enabled` row from `docs/log-fields.md` and run `go test -count=1 -run TestEveryEventIsDocumented ./internal/observability/` (H1's guard).
+Expected: `event_docs_test.go:117: cmd/apt-cacher-ultra/e2ehooks.go:41: event e2e_commit_delay_enabled has no row in docs/log-fields.md; add one`. Restore the row.
+
 - [ ] **Step 6: Full verification**
 
 Run: `gofmt -l . && go vet ./... && go vet -tags e2ehooks ./cmd/apt-cacher-ultra/ && golangci-lint run ./... && golangci-lint run --build-tags e2ehooks ./cmd/... && go test -race -count=1 -timeout 30m ./...`
-Expected: `gofmt -l` lists only the five drift files; vet prints nothing; both lint runs print `0 issues.`; every package `ok`.
+Expected: `gofmt -l` lists only the five drift files; vet prints nothing; both lint runs print `0 issues.`; every package `ok` (`internal/observability` included: H1's `TestEveryEventIsDocumented` and `TestLogMessagesAreSnakeCase` pass with the new row).
 
 - [ ] **Step 7: Commit**
 
 ```bash
 gofmt -l cmd/apt-cacher-ultra/e2ehooks.go cmd/apt-cacher-ultra/e2ehooks_off.go cmd/apt-cacher-ultra/e2ehooks_test.go cmd/apt-cacher-ultra/e2ehooks_off_test.go cmd/apt-cacher-ultra/main.go
-git add cmd/apt-cacher-ultra/e2ehooks.go cmd/apt-cacher-ultra/e2ehooks_off.go cmd/apt-cacher-ultra/e2ehooks_test.go cmd/apt-cacher-ultra/e2ehooks_off_test.go cmd/apt-cacher-ultra/main.go
+git add cmd/apt-cacher-ultra/e2ehooks.go cmd/apt-cacher-ultra/e2ehooks_off.go cmd/apt-cacher-ultra/e2ehooks_test.go cmd/apt-cacher-ultra/e2ehooks_off_test.go cmd/apt-cacher-ultra/main.go docs/log-fields.md
 git commit -F - <<'EOF'
 e2e: a commit-delay seam for the e2ehooks test binary
 
@@ -3073,6 +3086,9 @@ a republished index reaches a client within one `periodic_refresh`, and an upstr
 
 Run: `grep -c 'e2e-flat' Makefile && grep -n 'Done in phase H2' docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md && git diff --check`
 Expected: `2` (the `.PHONY` line and the target); one overview line; `git diff --check` prints nothing.
+
+Run: `go test -count=1 -run 'TestEveryEventIsDocumented|TestLogMessagesAreSnakeCase' ./internal/observability/`
+Expected: `ok` (H1's guards: Task 1's `e2e_commit_delay_enabled` row still stands; this task adds no event).
 
 Read `e2e/flat/README.md` against `test.sh`: every scenario in the run list has a row, in order, and every variable `run.sh` reads is in the table.
 
