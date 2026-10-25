@@ -543,6 +543,12 @@ func (r *Reaper) reapSuite(ctx context.Context, c reapCandidate) (reaped bool) {
 }
 
 // The reaper's held steps, as their failure lines name them.
+//
+// AIDEV-NOTE: each step is a log event name — reapSuite logs h.step as its
+// failure line's message. A new step must be a snake_case event constant,
+// listed in fieldMessages in internal/observability/event_names_test.go
+// (whose guard fails any other value assigned to h.step), with a
+// docs/log-fields.md row (the suite reaper's shared one).
 const (
 	stepReadRow        = "suite_reaper_read_suite_row_failed"
 	stepDeleteMetadata = "suite_reaper_delete_metadata_failed"

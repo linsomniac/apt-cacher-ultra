@@ -352,8 +352,8 @@ func anchorlessFailure(requests, answeredDeletes int, reqErr, deleteErr error) e
 	return fmt.Errorf("%w: %w; also %w", errAnchorlessUnknown, first, also)
 }
 
-// noteAnchorlessOverCap logs WARN "freshness: anchorless index over its
-// size cap, dropped for the miss path" for path, an index row of suite
+// noteAnchorlessOverCap logs WARN freshness_anchorless_index_over_cap
+// for path, an index row of suite
 // whose 200 was over maxAnchorlessIndexBytes (ruling PG-29), once the
 // delete that dropped it committed (ruling PG-39), at most once per
 // anchorlessOverCapWarnEvery process-wide, with the count of the lines it

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -170,7 +171,9 @@ var logSinks = map[string]int{
 
 // fieldMessages are the message arguments that are neither a literal, a
 // constant nor a forwarding helper's parameter, each with the constants
-// its value comes from.
+// its value comes from. The list is checked against the code: every value
+// the field is assigned in its file must be one of them (or a snake_case
+// literal), so a new step fails until it is listed here.
 var fieldMessages = map[string][]string{
 	"internal/freshness/reaper.go h.step": {"stepReadRow", "stepDeleteMetadata", "stepReap"},
 }
@@ -193,8 +196,16 @@ func parseTree(t *testing.T) []goFile {
 	var files []goFile
 	for _, dir := range []string{"internal", "cmd"} {
 		err := filepath.WalkDir(filepath.Join(root, dir), func(p string, d fs.DirEntry, err error) error {
-			if err != nil || d.IsDir() || !strings.HasSuffix(p, ".go") || strings.HasSuffix(p, "event_names_test.go") {
+			if err != nil || d.IsDir() || !strings.HasSuffix(p, ".go") {
 				return err
+			}
+			rel, err := filepath.Rel(root, p)
+			if err != nil {
+				return err
+			}
+			rel = filepath.ToSlash(rel)
+			if rel == "internal/observability/event_names_test.go" {
+				return nil
 			}
 			src, err := os.ReadFile(p)
 			if err != nil {
@@ -204,11 +215,7 @@ func parseTree(t *testing.T) []goFile {
 			if err != nil {
 				return err
 			}
-			rel, err := filepath.Rel(root, p)
-			if err != nil {
-				return err
-			}
-			files = append(files, goFile{rel: filepath.ToSlash(rel), src: string(src), file: f})
+			files = append(files, goFile{rel: rel, src: string(src), file: f})
 			return nil
 		})
 		if err != nil {
@@ -222,9 +229,10 @@ func parseTree(t *testing.T) []goFile {
 // and cmd/, test files aside) with the first place it is logged: the
 // message argument of each logSinks call, when it is a string literal or
 // a string constant of its package; the constants fieldMessages lists for
-// a field. Any other message argument is reported (t.Errorf) unless it is
-// a parameter of a forwarding helper logSinks lists, whose own callers
-// are checked.
+// a field, and any snake_case literal the field's file assigns to it. Any
+// other message argument is reported (t.Errorf) unless it is a parameter
+// of a forwarding helper logSinks lists, whose own callers are checked; so
+// is any other value assigned to a fieldMessages field.
 func logMessages(t *testing.T) map[string]string {
 	t.Helper()
 	files := parseTree(t)
@@ -280,7 +288,7 @@ func logMessages(t *testing.T) map[string]string {
 				return true
 			}
 			var name string
-			switch fn := call.Fun.(type) {
+			switch fn := ast.Unparen(call.Fun).(type) {
 			case *ast.SelectorExpr:
 				if pkg, ok := fn.X.(*ast.Ident); ok && pkg.Name == "http" {
 					return true // http.Error writes a response body
@@ -332,37 +340,80 @@ func logMessages(t *testing.T) map[string]string {
 			return true
 		})
 	}
+	// A field's values come from the code, not the list: every value its
+	// file assigns to the field must be a constant fieldMessages lists for
+	// it, or a snake_case literal, itself a message.
+	for key, names := range fieldMessages {
+		rel, expr, _ := strings.Cut(key, " ")
+		field := expr[strings.LastIndex(expr, ".")+1:]
+		for _, f := range files {
+			if f.rel != rel {
+				continue
+			}
+			for _, v := range fieldValues(f.file, field) {
+				where := f.rel + ":" + strconv.Itoa(guardFset.Position(v.Pos()).Line)
+				if id, ok := v.(*ast.Ident); ok && slices.Contains(names, id.Name) {
+					continue
+				}
+				if lit, ok := v.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+					if s, _ := strconv.Unquote(lit.Value); snakeCase.MatchString(s) {
+						add(where, s)
+						continue
+					}
+				}
+				t.Errorf("%s: %s is assigned %s, which fieldMessages does not list; "+
+					"make it a snake_case event constant and add it there (internal/observability/event_names_test.go)",
+					where, expr, types.ExprString(v))
+			}
+		}
+	}
 	return msgs
+}
+
+// fieldValues returns the values file assigns to a field named field: the
+// right side of each assignment to a selector of that name (h.step, h.err =
+// stepReap, err), and the value of each composite-literal key of that name.
+func fieldValues(file *ast.File, field string) []ast.Expr {
+	var values []ast.Expr
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch s := n.(type) {
+		case *ast.AssignStmt:
+			for i, lhs := range s.Lhs {
+				if sel, ok := lhs.(*ast.SelectorExpr); ok && sel.Sel.Name == field {
+					if len(s.Rhs) == len(s.Lhs) {
+						values = append(values, s.Rhs[i])
+					} else {
+						values = append(values, s.Rhs[0]) // h.step, h.err = f(): no listed constant
+					}
+				}
+			}
+		case *ast.KeyValueExpr:
+			if key, ok := s.Key.(*ast.Ident); ok && key.Name == field {
+				values = append(values, s.Value)
+			}
+		}
+		return true
+	})
+	return values
 }
 
 // Rulings R-H3 and R-H6 (phase H1): the 43 messages are snake_case. No Go
 // file under internal/ or cmd/ — tests included — carries an old prose
-// message; each new name is a string literal of production code (the
-// reaper's step names are constants, so a literal, not only a call
-// argument, counts); and docs/log-fields.md gives each one a row.
+// message; each new name is a log message of production code (as
+// logMessages reads them, the reaper's step constants included); and
+// docs/log-fields.md gives each one a row.
 func TestSweptEventNames(t *testing.T) {
-	literals := map[string]bool{}
 	for _, f := range parseTree(t) {
 		for _, e := range sweptEvents {
 			if strings.Contains(f.src, e.old) {
-				t.Errorf("%s still says %q", f.rel, e.old)
+				t.Errorf("%s still says %q; rename it to %s", f.rel, e.old, e.event)
 			}
 		}
-		if strings.HasSuffix(f.rel, "_test.go") {
-			continue
-		}
-		ast.Inspect(f.file, func(n ast.Node) bool {
-			if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING {
-				if s, err := strconv.Unquote(lit.Value); err == nil {
-					literals[s] = true
-				}
-			}
-			return true
-		})
 	}
+	msgs := logMessages(t)
 	documented := documentedEvents(t)
 	for _, e := range sweptEvents {
-		if !literals[e.event] {
+		if _, ok := msgs[e.event]; !ok {
 			t.Errorf("no production code emits %s (was %q)", e.event, e.old)
 		}
 		if !documented[e.event] {
@@ -470,7 +521,8 @@ func hasSink(name string) bool {
 // directly; this pins that, so the guard's reading stays complete. Without
 // type information it judges by shape: a Debug/Info/Warn/Error/…Context/
 // Log/LogAttrs selector on a receiver whose expression names a logger, used
-// as a value — assigned, passed, returned or stored — rather than called.
+// as a value — assigned, passed, returned, sent or stored, parenthesized or
+// not — rather than called.
 func TestLogMethodsAreOnlyCalledDirectly(t *testing.T) {
 	methods := map[string]bool{"Debug": true, "Info": true, "Warn": true, "Error": true, "DebugContext": true,
 		"InfoContext": true, "WarnContext": true, "ErrorContext": true, "Log": true, "LogAttrs": true}
@@ -490,18 +542,27 @@ func TestLogMethodsAreOnlyCalledDirectly(t *testing.T) {
 				!strings.Contains(strings.ToLower(types.ExprString(sel.X)), "log") {
 				return true
 			}
+			// The parent that uses it, past any parentheses: (logger.Info)("…")
+			// is a call, x := (logger.Info) a value.
+			use, i := ast.Node(n), len(stack)-2
+			for ; i > 0; i-- {
+				if _, ok := stack[i].(*ast.ParenExpr); !ok {
+					break
+				}
+				use = stack[i]
+			}
 			valueUse := false
-			switch p := stack[len(stack)-2].(type) {
-			case *ast.AssignStmt, *ast.ReturnStmt, *ast.CompositeLit:
+			switch p := stack[i].(type) {
+			case *ast.AssignStmt, *ast.ReturnStmt, *ast.CompositeLit, *ast.SendStmt:
 				valueUse = true
 			case *ast.KeyValueExpr:
-				valueUse = p.Value == n
+				valueUse = p.Value == use
 			case *ast.ValueSpec:
 				for _, v := range p.Values {
-					valueUse = valueUse || v == n
+					valueUse = valueUse || v == use
 				}
 			case *ast.CallExpr:
-				valueUse = p.Fun != n
+				valueUse = p.Fun != use
 			}
 			if valueUse {
 				t.Errorf("%s:%s: %s taken as a value; call the log method directly so TestLogMessagesAreSnakeCase reads its message",

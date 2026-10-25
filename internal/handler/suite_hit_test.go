@@ -364,9 +364,10 @@ func testOnboardingAtTheGlobalCapEvictsUnderTheGuard(t *testing.T) {
 
 // Design review M8 (final review, tests I-3; Task 9 ruling d overturned:
 // the seam exists): an onboarding whose writer operation outlasts
-// onboardTimeout serves the hit untracked, logs WARN suite onboarding
-// failed, and the next hit onboards. cachedAnchorsHook runs under the
-// onboarding's bounded context, so it stands in for a slow writer.
+// onboardTimeout serves the hit untracked, logs WARN
+// suite_onboarding_failed, and the next hit onboards. cachedAnchorsHook
+// runs under the onboarding's bounded context, so it stands in for a slow
+// writer.
 func TestServeHTTP_OnboardingTimeoutServesUntracked(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		logs := &syncLog{}
