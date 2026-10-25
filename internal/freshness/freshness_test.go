@@ -37,7 +37,7 @@ type fakeCache struct {
 	getErrFn  func() error // consulted after getErr: a non-nil result fails that read
 	putErr    error
 	lookupErr error
-	listHook  func() // called at the top of ListSuites, before the mutex
+	listHook  func() // called at the top of ListSuitesWithAdoption, before the mutex
 
 	putCount atomic.Int64
 	// existsCalls counts HasSuiteRow reads (the I-4 row gate); they fail

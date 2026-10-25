@@ -906,13 +906,14 @@ func unloggedPanic(report func()) {
 // (`defer func() { c.recoverGoroutine(...) }()`) makes recover() return
 // nil and the panic kills the daemon. An adoption panic is recorded as an
 // adoption failure by recoverAdoption, before the mutex is released
-// (spec C5).
+// (spec C5). The report runs under its own boundary (unloggedPanic,
+// deferred minor E-45): a panicking log handler must not escape it.
 func (c *Checker) recoverGoroutine(where string, suite SuiteRef) {
 	r := recover()
 	if r == nil {
 		return
 	}
-	c.reportPanic("adoption_panicked", where, suite, r)
+	unloggedPanic(func() { c.reportPanic("adoption_panicked", where, suite, r) })
 }
 
 // checkLockedSafe runs checkLocked and converts a panic into a FAILED

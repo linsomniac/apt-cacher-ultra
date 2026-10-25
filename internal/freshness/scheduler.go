@@ -18,6 +18,13 @@ import (
 // from spinning on the cache every 15s.
 const minFastTickInterval = 5 * time.Second
 
+// tickInterval is the scheduler's tick for refresh: SPEC §7.4's fast
+// tick, refresh / 4, floored at minFastTickInterval. Run's ticker and the
+// tests that wait for a tick read it here (deferred minor E-56).
+func tickInterval(refresh time.Duration) time.Duration {
+	return max(refresh/4, minFastTickInterval)
+}
+
 // staleSuiteFactor multiplies periodic_refresh to set the "this suite has
 // gone silently stale" threshold for the SPEC §7.4 freshness_stale_suites
 // gauge. A healthy suite refreshes every periodic_refresh; 4× gives ample
@@ -117,7 +124,7 @@ type schedItem struct {
 	key     string
 	waiting bool // parked after a queued result; its re-check bypasses the cooldown
 	signed  bool // for waiting items: the current snapshot is signed (reserved-slot rule)
-	held    bool // waiting, but its last offer found the suite busy or no slot: not offered until unhold
+	held    bool // waiting, but its last offer found the suite busy, or no slot and no release since its dispatch (B-45): not offered until unhold
 	// pendingChange: queued with a change pending and no failure record
 	// (Checker.pendingChange), typically a client check that found no slot;
 	// its check bypasses the cooldown, so the tick parks it (spec C4).
@@ -170,9 +177,11 @@ type schedQueues struct {
 	order  []string // round-robin ring of hosts
 	next   int      // index in order of the host whose turn is next
 	queued map[string]struct{}
-	// pending holds the keys of class-queued suites a later tick found
-	// with a pending change (deferred minor B-66): pop sets the item's
-	// pendingChange from it.
+	// pending holds the keys of queued suites a later tick found with a
+	// pending change (deferred minor B-66). enqueue marks every duplicate,
+	// waiting and in-flight ones too; pop moves a class-queued suite's mark
+	// to its item (pendingChange), and done drops whatever mark is left
+	// when the suite's turn ends, so a mark never reaches a later turn.
 	pending map[string]struct{}
 	waitSeq uint64 // the last waitSeq handed out
 }
@@ -191,7 +200,8 @@ func (q *schedQueues) enqueue(s cache.SuiteFreshness, pendingChange bool) bool {
 		// A suite queued earlier as merely stale that a client check
 		// has since left with a pending change keeps its place but
 		// bypasses the cooldown when its turn comes (B-66). A waiting or
-		// in-flight suite ignores the mark (pop and done drop it).
+		// in-flight suite ignores the mark; done drops it when the
+		// suite's turn ends.
 		if pendingChange {
 			q.pending[key] = struct{}{}
 		}
@@ -254,11 +264,13 @@ func (q *schedQueues) refreshSigned(signed map[string]bool) {
 }
 
 // finish files a finished check (spec C4 slot-driven re-offer): a queued
-// result parks the suite to wait for a slot — keeping its place, held
-// until the next wake or tick, if it was already waiting (a lost offer);
-// an offer that found the suite busy (another goroutine holds its mutex)
-// parks it held too — re-offering at once would spin while the mutex is
-// held; any other result ends the suite's turn.
+// result parks the suite to wait for a slot — keeping its place if it was
+// already waiting (a lost offer), held until the next wake or tick unless
+// a slot was released after the offer was dispatched (gen, the admission
+// generation now, differs from the item's: B-45), which parks it unheld,
+// offered at once; an offer that found the suite busy (another goroutine
+// holds its mutex) parks it held too — re-offering at once would spin
+// while the mutex is held; any other result ends the suite's turn.
 func (q *schedQueues) finish(d checkDone, gen uint64) {
 	switch {
 	case isQueuedResult(d.report.result):
@@ -508,10 +520,7 @@ func (c *Checker) Run(ctx context.Context) {
 	if c.refresh <= 0 {
 		return
 	}
-	interval := c.refresh / 4
-	if interval < minFastTickInterval {
-		interval = minFastTickInterval
-	}
+	interval := tickInterval(c.refresh)
 	work := make(chan schedItem)
 	done := make(chan checkDone, checkWorkers)
 	var wg sync.WaitGroup
@@ -588,7 +597,7 @@ func (c *Checker) Run(ctx context.Context) {
 func (c *Checker) safeReschedule(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
-			c.reportPanic("freshness_check_panicked", "reschedule", SuiteRef{}, r)
+			unloggedPanic(func() { c.reportPanic("freshness_check_panicked", "reschedule", SuiteRef{}, r) })
 		}
 	}()
 	c.rescheduleFailingAdoptions(ctx)
@@ -622,14 +631,7 @@ func (c *Checker) checkWorker(ctx context.Context, work <-chan schedItem, done c
 			return
 		case item := <-work:
 			rep := checkReport{result: "failed"}
-			func() {
-				defer func() {
-					if recover() != nil {
-						freshnessUnloggedPanics.Inc()
-					}
-				}()
-				rep = c.checkRecovered(ctx, item)
-			}()
+			unloggedPanic(func() { rep = c.checkRecovered(ctx, item) })
 			done <- checkDone{item: item, report: rep}
 		}
 	}
@@ -640,7 +642,7 @@ func (c *Checker) checkWorker(ctx context.Context, work <-chan schedItem, done c
 func (c *Checker) safeTick(ctx context.Context, q *schedQueues) {
 	defer func() {
 		if r := recover(); r != nil {
-			c.reportPanic("freshness_check_panicked", "scheduler", SuiteRef{}, r)
+			unloggedPanic(func() { c.reportPanic("freshness_check_panicked", "scheduler", SuiteRef{}, r) })
 		}
 	}()
 	c.tick(ctx, q)

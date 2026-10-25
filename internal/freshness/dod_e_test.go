@@ -143,7 +143,7 @@ func TestDoD_ActiveSuitesAdoptOnceDormantSuitesStaySilent(t *testing.T) {
 				t.Fatalf("%v: %d verifications, want exactly one adoption", s, n)
 			}
 		}
-		const tick = 15 * time.Minute / 4 // the scheduler's tick: periodic_refresh / 4
+		tick := tickInterval(15 * time.Minute) // the scheduler's own tick (deferred minor E-56)
 		if at := ver.attempts(returning); at[0].Sub(touched) > tick+checkDeadline {
 			t.Fatalf("returning %v: adopted %v after its touch, want within one scheduler tick (%v) and its check",
 				returning, at[0].Sub(touched), tick)

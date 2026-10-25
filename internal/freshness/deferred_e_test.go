@@ -130,7 +130,7 @@ func TestAdoptionPanicWithABrokenLoggerIsContained(t *testing.T) {
 }
 
 // Deferred minor B-20: a shutdown that cuts a failure record's write short
-// is not a WARN.
+// is not a WARN: it is logged once, at DEBUG (deferred minor E-43).
 func TestAdoptionFailureRecordCutByShutdownIsNotAWarning(t *testing.T) {
 	r := newRetryRig(t, 0)
 	bad := r.release("bad", 0)
@@ -138,10 +138,9 @@ func TestAdoptionFailureRecordCutByShutdownIsNotAWarning(t *testing.T) {
 	r.up.set(bad)
 	r.checker.recordHook = r.cancelLifetime // shutdown begins right before the write
 	r.check()
-	for _, rec := range r.events("adoption_failure_record_failed") {
-		if rec["level"] == "WARN" {
-			t.Fatalf("a record cut short by shutdown logged WARN: %v", rec)
-		}
+	recs := r.events("adoption_failure_record_failed")
+	if len(recs) != 1 || recs[0]["level"] != "DEBUG" {
+		t.Fatalf("adoption_failure_record_failed lines %v; want one at DEBUG for the write shutdown cut short", recs)
 	}
 	if r.row().AdoptionFailCount != 0 {
 		t.Fatal("a record was written after shutdown began")

@@ -208,10 +208,13 @@ func (c *Checker) recoverAdoption(req *adoptionRequest, start time.Time) {
 	if r == nil {
 		return
 	}
-	// The reporting runs under its own boundary (B-18): a panic there must
-	// neither escape nor skip the record below.
+	// The report, then the counters and the ring event, each run under
+	// their own boundary (B-18, deferred minor E-42; review M-2 of the H1
+	// plan): a panicking log handler must not skip the counters, and
+	// neither may escape the adoption goroutine or skip the record below,
+	// which recovers its own panics.
+	unloggedPanic(func() { c.reportPanic("adoption_panicked", "adoption", req.suite, r) })
 	unloggedPanic(func() {
-		c.reportPanic("adoption_panicked", "adoption", req.suite, r)
 		d := time.Since(start)
 		host := req.suite.CanonicalHost
 		adoptionTotal.Inc("panicked", host)
