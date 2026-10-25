@@ -162,6 +162,9 @@ func TestRun_RecoversATickPanicAndRunsTheNextTick(t *testing.T) {
 		if len(ev) != 1 || ev[0]["level"] != "ERROR" || ev[0]["where"] != "tick" || ev[0]["panic"] != "snapshot batch bug" {
 			t.Fatalf("gc_panicked lines %v, want one at ERROR, where=tick", ev)
 		}
+		if stack, _ := ev[0]["stack"].(string); !strings.Contains(stack, "(*fakeStore).RunSnapshotGCBatch") {
+			t.Fatalf("gc_panicked stack %q, want the panicking RunSnapshotGCBatch's frame", stack)
+		}
 		if runs := gcEvents(t, buf, "gc_run_complete"); len(runs) != 2 {
 			t.Fatalf("%d gc_run_complete lines, want 2 (the ticks after the panic)", len(runs))
 		}
@@ -189,8 +192,17 @@ func TestPeriodicTick_APanickingPassDoesNotStarveTheNext(t *testing.T) {
 		t.Fatalf("%d gc_run_complete lines, want 1 (the blob pass's tick)", len(runs))
 	}
 	g.periodicTick(ctx) // the snapshot pass again
-	if ev := gcEvents(t, buf, "gc_panicked"); len(ev) != 2 {
+	ev := gcEvents(t, buf, "gc_panicked")
+	if len(ev) != 2 {
 		t.Fatalf("%d gc_panicked lines, want 2 (the snapshot pass, twice)", len(ev))
+	}
+	// Design note 11: the stack once per where for the GC — the first
+	// tick's panic carries it, the second's does not.
+	if _, ok := ev[0]["stack"]; !ok {
+		t.Fatal("the first where=tick gc_panicked line has no stack")
+	}
+	if _, ok := ev[1]["stack"]; ok {
+		t.Fatal("the second where=tick gc_panicked line has a stack, want it once per where")
 	}
 }
 
@@ -210,6 +222,11 @@ func TestStartupPass_ReturnsAPanicAsAnError(t *testing.T) {
 	ev := gcEvents(t, buf, "gc_panicked")
 	if len(ev) != 1 || ev[0]["level"] != "ERROR" || ev[0]["where"] != "startup" || ev[0]["panic"] != "snapshot batch bug" {
 		t.Fatalf("gc_panicked lines %v, want one at ERROR, where=startup", ev)
+	}
+	// The first panic per where for this (fresh) GC carries its stack,
+	// which names the function that panicked.
+	if stack, _ := ev[0]["stack"].(string); !strings.Contains(stack, "(*fakeStore).RunSnapshotGCBatch") {
+		t.Fatalf("gc_panicked stack %q, want the panicking RunSnapshotGCBatch's frame", stack)
 	}
 	// Re-review m-4: the rotation moved past the snapshot pass, so the
 	// first periodic tick runs the blob pass, not the pass that panicked.

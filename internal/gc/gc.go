@@ -118,8 +118,10 @@ type GC struct {
 	// nextPass preserves progress through URL-path → snapshot → blob work.
 	// Even the final batch of a pass can exceed the shared tick deadline;
 	// resume at the following pass next tick instead of restarting URL scans
-	// and indefinitely starving snapshot/blob cleanup. Only the GC goroutine
-	// touches this, after the sequential startup pass.
+	// and indefinitely starving snapshot/blob cleanup. A pass that panicked
+	// moves it too, past that pass (skipPanickedPass, review M-1 of the H1
+	// plan). Only the GC goroutine touches this, after the sequential
+	// startup pass.
 	nextPass pass
 
 	// lastRunMu guards lastRun. Writes happen at the end of each
@@ -138,6 +140,14 @@ type GC struct {
 	// only by the tick goroutine (StartupPass runs before Run starts), so
 	// no lock is needed.
 	urlPathCursor struct{ scheme, host, path string }
+
+	// panicStacks holds the wheres whose gc_panicked line carried a stack
+	// (logGCPanic): once per where per process, since main builds one GC.
+	//
+	// AIDEV-NOTE: a field, not a package global (review of H1 Task 7), so
+	// each test's fresh GC logs its first panic's stack and can assert it
+	// without depending on test order.
+	panicStacks sync.Map
 }
 
 type pass uint8
@@ -483,12 +493,13 @@ type gcStore interface {
 }
 
 // skipPanickedPass is deferred by periodicTick before its recoverPanic,
-// so it runs after it: when the passes did not finish (a recovered panic),
-// it moves the rotation past the pass in progress — g.nextPass, which
-// runTick advances only when a pass completes — so a pass that panics on
-// every tick cannot starve the passes after it: the blob pass keeps
-// reclaiming disk while a sub-job's bug waits for its fix (review M-1 of
-// the H1 plan).
+// and by StartupPass before its recoverPanicInto, so it runs after the
+// recover: when the passes did not finish (a recovered panic), it moves
+// the rotation past the pass in progress — g.nextPass, which runTick
+// advances only when a pass completes — so a pass that panics on every
+// tick cannot starve the passes after it: the blob pass keeps reclaiming
+// disk while a sub-job's bug waits for its fix (review M-1 of the H1
+// plan).
 func (g *GC) skipPanickedPass(passesDone *bool) {
 	if *passesDone {
 		return
@@ -503,14 +514,12 @@ func (g *GC) skipPanickedPass(passesDone *bool) {
 	}
 }
 
-// gcPanicStacks holds the wheres whose gc_panicked line carried a stack.
-var gcPanicStacks sync.Map
-
 // recoverPanic is deferred by each unit of work of GC's goroutines — a
 // periodic tick, a pool-scan job, the pool-scan producer: it logs a
 // recovered panic as ERROR gc_panicked (where, panic, and the stack the
-// first time per where for the process) and lets its goroutine go on
-// (deferred minor F-21; the overview's rule for internal/gc).
+// first time per where for this GC, so for the process) and lets its
+// goroutine go on (deferred minor F-21; the overview's rule for
+// internal/gc).
 //
 // AIDEV-NOTE: recover works only because this method IS the deferred
 // function (defer g.recoverPanic(where)); a wrapping closure would make
@@ -542,7 +551,7 @@ func (g *GC) recoverPanicInto(where string, err *error) {
 func (g *GC) logGCPanic(where string, v any) {
 	defer func() { _ = recover() }()
 	attrs := []any{"where", where, "panic", fmt.Sprint(v)}
-	if _, seen := gcPanicStacks.LoadOrStore(where, true); !seen {
+	if _, seen := g.panicStacks.LoadOrStore(where, true); !seen {
 		attrs = append(attrs, "stack", string(debug.Stack()))
 	}
 	g.cfg.Logger.Error("gc_panicked", attrs...)
