@@ -64,7 +64,7 @@ type SourcesParseStats struct {
 // Phase 2's trust-SHA256-only posture refuses MD5/SHA1 fallback even
 // for source artifacts.
 //
-// A stanza is silently skipped when:
+// A stanza, or one of its files, is skipped when:
 //
 //   - it lacks `Package:` or `Directory:`,
 //   - it has no `Checksums-Sha256:` block (per SPEC6_5 §11 H4: source
@@ -82,10 +82,19 @@ type SourcesParseStats struct {
 // stanza's `Directory:`, so any path-separator-bearing filename is
 // either malformed input or an attempt to escape the directory.
 //
+// Only the validateMemberPath case is counted (SourcesParseStats.
+// PathsSkipped); the other skips above, and a malformed entry, are
+// dropped uncounted.
+//
 // Whole-file fatal errors (malformed header line, scanner buffer
-// exhausted, or stanza-cap exceeded) return non-nil err. The caller
-// emits SPEC6_5 §10.2 `source_parse_failed` Warn at the Sources-file
-// granularity.
+// exhausted, or stanza-cap exceeded) return non-nil err, and so does a
+// non-empty file that yields no row: "every path refused by
+// validateMemberPath" when paths reached that check and all failed it
+// (a dpkg-scansources ./pool repository, whose Directory fields start
+// "./"), otherwise "no stanzas with Package + Directory +
+// Checksums-Sha256". Every error return carries the stats counted so
+// far. The caller emits SPEC6_5 §10.2 `source_parse_failed` Warn at the
+// Sources-file granularity.
 //
 // AIDEV-NOTE: callers pass already-decompressed bytes — decompression
 // of Sources.gz / Sources.xz is the fetch layer's job, not parsing.
@@ -197,6 +206,10 @@ func ParseSources(text []byte) ([]SourceRef, SourcesParseStats, error) {
 	}
 	if err := flush(); err != nil {
 		return nil, stats, fmt.Errorf("sources: tail: %w", err)
+	}
+	if len(out) == 0 && stats.PathsSkipped > 0 {
+		// Task 10 review I-1: name the cause, not missing fields.
+		return nil, stats, fmt.Errorf("sources: every path refused by validateMemberPath (%d skipped)", stats.PathsSkipped)
 	}
 	if len(out) == 0 && len(bytes.TrimSpace(text)) > 0 {
 		return nil, stats, errors.New("sources: no stanzas with Package + Directory + Checksums-Sha256")

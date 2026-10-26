@@ -2795,7 +2795,9 @@ type sourcePathDecl struct {
 // source_parsed Debug log; the H11 skips (a path validateMemberPath
 // refuses) are counted and logged once per Sources file at INFO,
 // source_paths_skipped (deferred minor GD-2; INFO, review M-8: it
-// repeats at every adoption and the operator cannot act on it).
+// repeats at every adoption and the operator cannot act on it) — also
+// for a file that then fails to parse, such as one whose every path was
+// refused, which source_parse_failed then names as its cause.
 //
 // Non-/dists/ layouts (where repoRootFromSuitePath returns false)
 // return (nil, 0, nil): source rows are simply not populated. Phase 1
@@ -2840,6 +2842,24 @@ func (a *Adopter) buildSourceHashes(suite SuiteRef, snapshotID int64,
 			continue
 		}
 		refs, stats, err := ParseSources(body)
+		if stats.PathsSkipped > 0 {
+			// Ruling PG-21 keeps validateMemberPath for a Sources file's
+			// paths: one with a "%" or a "." segment gets no source row.
+			//
+			// AIDEV-NOTE: logged before the err check (Task 10 review
+			// I-1): ParseSources fails a file whose every path it refused
+			// (stats come back with the error), and that file, which
+			// lost all its source rows, must still say so.
+			a.logger.Info("source_paths_skipped",
+				"canonical_scheme", suite.CanonicalScheme,
+				"canonical_host", suite.CanonicalHost,
+				"suite_path", suite.SuitePath,
+				"snapshot_id", snapshotID,
+				"member_path", m.Path,
+				"count", stats.PathsSkipped,
+				"first", stats.FirstSkipped,
+			)
+		}
 		if err != nil {
 			a.logger.Warn("source_parse_failed",
 				"suite_path", suite.SuitePath,
@@ -2861,19 +2881,6 @@ func (a *Adopter) buildSourceHashes(suite SuiteRef, snapshotID int64,
 			"stanza_count", stats.StanzaCount,
 			"package_hash_rows", len(refs),
 		)
-		if stats.PathsSkipped > 0 {
-			// Ruling PG-21 keeps validateMemberPath for a Sources file's
-			// paths: one with a "%" or a "." segment gets no source row.
-			a.logger.Info("source_paths_skipped",
-				"canonical_scheme", suite.CanonicalScheme,
-				"canonical_host", suite.CanonicalHost,
-				"suite_path", suite.SuitePath,
-				"snapshot_id", snapshotID,
-				"member_path", m.Path,
-				"count", stats.PathsSkipped,
-				"first", stats.FirstSkipped,
-			)
-		}
 		for _, ref := range refs {
 			fullPath := repoRoot + ref.Path
 			if existing, dup := dedup[fullPath]; dup {
