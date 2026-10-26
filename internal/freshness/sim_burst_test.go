@@ -231,9 +231,11 @@ func (s *startsByURL) Fetch(ctx context.Context, target *fetch.Target, dst fetch
 //     are at most 2 (the scheduler's) + its client checks + its lost offers
 //     (offers another admission took first, counted through offerHook);
 //  4. lost offers in all are at most the admissions in all — each lost
-//     offer coincides with another admission (work-conserving) — and at
-//     least one: hx's, which offerHook counts exactly (its probes are the
-//     tick's, its lost offers' and the winning offer's);
+//     offer but hx's coincides with another admission (work-conserving;
+//     hx's coincides with the test's synthetic lease, which the admission
+//     count leaves out: deferred minor E-41) — and at least one: hx's,
+//     which offerHook counts exactly (its probes are the tick's, its lost
+//     offers' and the winning offer's);
 //  5. goroutines stay bounded.
 func TestSimCapacity_UpgradeBurstSameHost(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {

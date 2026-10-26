@@ -806,3 +806,22 @@ func TestSimCapacity_TheBarrierHoldsTheGlobalSlotWithinItsBound(t *testing.T) {
 		}
 	})
 }
+
+// Deferred minor C-17 (phase C design note 14): without a stop context
+// (Run/RunDetached), a cancelled ctx before the commit is a shutdown — the
+// adoption ends and commits nothing.
+func TestRunRequest_CancelledWithoutAStopContextCommitsNothing(t *testing.T) {
+	r := newRetryRig(t, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	body := r.release("v1", 0)
+	req := &adoptionRequest{suite: SuiteRef{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite},
+		form: adoptionFormInline, bytes: body, key: hashOf(body)}
+	err := r.adopter.runRequest(ctx, req, runHooks{membersDone: cancel})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want the shutdown (context.Canceled)", err)
+	}
+	if r.currentSnapshot() != nil {
+		t.Fatal("an adoption cancelled before its commit committed")
+	}
+}

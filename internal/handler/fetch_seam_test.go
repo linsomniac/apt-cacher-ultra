@@ -18,7 +18,8 @@ import (
 )
 
 // recFetcher is an in-memory upstream that records the URLs it is asked
-// for and answers every request with body.
+// for and answers every request with body — but an …/InRelease target with
+// inRelease, when that is set (deferred minor D-29).
 type recFetcher struct {
 	body      []byte
 	inRelease []byte // when set, served for an …/InRelease target instead of body

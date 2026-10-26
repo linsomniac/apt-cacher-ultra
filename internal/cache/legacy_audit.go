@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 )
@@ -317,7 +316,7 @@ SELECT sf.canonical_scheme, sf.canonical_host, sf.suite_path, u.path, u.blob_has
 		if err := rows.Scan(&a.CanonicalScheme, &a.CanonicalHost, &a.SuitePath, &a.Path, &a.BlobHash, &a.SeenAt); err != nil {
 			return nil, fmt.Errorf("ListTrackedSuiteAnchors: scan: %w", err)
 		}
-		if a.SeenAt > 0 && (strings.HasSuffix(a.Path, "/InRelease") || strings.HasSuffix(a.Path, "/Release.gpg")) {
+		if a.SeenAt > 0 { // the IN above picks InRelease and Release.gpg only (deferred minor A-26)
 			out = append(out, a)
 		}
 	}

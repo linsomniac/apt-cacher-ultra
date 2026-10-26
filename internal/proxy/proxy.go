@@ -169,8 +169,9 @@ func (p *Parser) Parse(requestURI, hostHeader string) (*Request, error) {
 		return nil, fmt.Errorf("%w: %q", ErrInvalidPath, path)
 	}
 
-	// Spec C1: a decoded control byte is never a legitimate apt path
-	// (apt percent-encodes them) and must not reach the cache key.
+	// AIDEV-NOTE: spec C1 — a decoded control byte is never a legitimate
+	// apt path (apt percent-encodes them) and must not reach the cache key
+	// (deferred minor A-10).
 	for i := 0; i < len(path); i++ {
 		if path[i] < 0x20 || path[i] == 0x7f {
 			return nil, fmt.Errorf("%w: control byte in path", ErrInvalidPath)

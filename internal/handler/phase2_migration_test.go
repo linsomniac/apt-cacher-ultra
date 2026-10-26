@@ -454,14 +454,12 @@ func newPhase2MigrationStack(t *testing.T, c *cache.Cache, upstream *url.URL) *p
 	return &phase2ChaosStack{handler: h, checker: checker, adopter: adopter}
 }
 
-// waitForMigrationFlip polls suite_freshness.current_snapshot_id
-// until it's set (any non-NULL value), nudging with InRelease GETs
-// to keep maybeFireFreshness firing in case the per-suite TryLock
-// missed earlier attempts. The migration test starts with
-// CurrentSnapshotID = NULL (never adopted), so any non-NULL value
-// indicates the first adoption has flipped.
-// The first post-migration hit already adopts A (spec C4 eager first
-// adoption), so it waits for the snapshot whose InRelease is want.
+// waitForMigrationFlip polls suite_freshness.current_snapshot_id until
+// the current snapshot's InRelease is want, nudging with InRelease GETs to
+// keep maybeFireFreshness firing in case the per-suite TryLock missed
+// earlier attempts. The first post-migration hit already adopts A (spec C4
+// eager first adoption), so a non-NULL pointer alone proves nothing: it
+// waits for the snapshot whose InRelease is want (deferred minor E-35).
 func waitForMigrationFlip(t *testing.T, stack *phase2ChaosStack, upstreamURL *url.URL, srvURL string, want []byte, timeout time.Duration) error {
 	t.Helper()
 	sum := sha256.Sum256(want)

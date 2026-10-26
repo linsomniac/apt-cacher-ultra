@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
@@ -376,5 +377,46 @@ func TestReconcileMetric_Increments(t *testing.T) {
 	metrics.Default.Render(&buf)
 	if !strings.Contains(buf.String(), "acu_adoption_reconciled_total") {
 		t.Errorf("acu_adoption_reconciled_total not present after a heal:\n%s", buf.String())
+	}
+}
+
+// Deferred minor B-28: a tick's heal parses the snapshot's pinned Release
+// once — the decision's parse is reused.
+func TestCheck_ReconcileOnTheTickParsesTheReleaseOnce(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adopter.repairSkippedMembers = true
+	ctx := context.Background()
+	all := fakePackagesStanzas(map[string]string{"pool/main/c/c/c_1_all.deb": testHex64})
+	const allPath = "main/binary-all/Packages" // a required group (arch all) the snapshot lacks
+	r.members.put("http://h/r/dists/x/"+allPath, all)
+	in := signedRelease("degraded", 0, map[string][]byte{"main/binary-amd64/Packages": r.pkgs, allPath: all})
+	ah, err := r.adopter.writeBlobBytes(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ph, err := r.adopter.writeBlobBytes(ctx, r.pkgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _, err := r.cache.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{CanonicalScheme: "http",
+		CanonicalHost: rigHost, SuitePath: rigSuite, InReleaseHash: &ah})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.cache.CommitAdoption(ctx, id, []cache.SnapshotMember{
+		{SnapshotID: id, Path: "InRelease", BlobHash: ah, DeclaredSHA256: ah},
+		{SnapshotID: id, Path: "main/binary-amd64/Packages", BlobHash: ph, DeclaredSHA256: ph},
+	}, nil, nil, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	var parses atomic.Int32
+	r.adopter.reparseHook = func() { parses.Add(1) }
+	r.up.set(in) // unchanged: the tick decides and heals
+	r.check()
+	if _, err := r.cache.GetSnapshotMember(ctx, id, allPath); err != nil {
+		t.Fatalf("the missing member was not healed: %v", err)
+	}
+	if n := parses.Load(); n != 1 {
+		t.Fatalf("the Release was parsed %d times for one heal, want 1", n)
 	}
 }

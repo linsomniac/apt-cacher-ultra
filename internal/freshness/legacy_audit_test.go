@@ -798,3 +798,38 @@ func TestRunLegacyTrustAudit_MarksFromCachedSignedAnchors(t *testing.T) {
 		}
 	}
 }
+
+// Deferred minor A-47: the audit counts an unsigned snapshot it keeps as
+// audited, not as signed.
+func TestRunLegacyTrustAudit_UnsignedKeepIsNotSigned(t *testing.T) {
+	r := newRetryRig(t, 0)
+	ctx := context.Background()
+	r.adoptUnsigned("u1")
+	id := *r.row().CurrentSnapshotID
+	if err := r.cache.EnqueueLegacyTrustAudit(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	res, err := RunLegacyTrustAudit(ctx, r.cache, discardAuditLogger())
+	if err != nil || res.Audited != 1 || res.Signed != 0 || res.Quarantined != 0 {
+		t.Fatalf("audit = %+v (%v), want 1 audited, 0 signed, 0 quarantined", res, err)
+	}
+}
+
+// Deferred minor C-29: every error RunLegacyTrustAudit returns starts
+// "legacy trust audit:" (main's refusal line relies on it).
+func TestRunLegacyTrustAudit_ErrorsCarryThePrefix(t *testing.T) {
+	r := newRetryRig(t, 0)
+	ctx := context.Background()
+	r.adoptUnsigned("u1")
+	if err := r.cache.EnqueueLegacyTrustAudit(ctx, *r.row().CurrentSnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	prev := legacyAuditAfterBatch
+	t.Cleanup(func() { legacyAuditAfterBatch = prev })
+	boom := errors.New("batch hook failed")
+	legacyAuditAfterBatch = func(int) error { return boom }
+	_, err := RunLegacyTrustAudit(ctx, r.cache, discardAuditLogger())
+	if !errors.Is(err, boom) || !strings.HasPrefix(err.Error(), "legacy trust audit: ") {
+		t.Fatalf("err = %v, want the batch error with the prefix", err)
+	}
+}

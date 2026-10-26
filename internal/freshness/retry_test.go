@@ -3,6 +3,7 @@ package freshness
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"math"
 	"testing"
 	"time"
 )
@@ -56,5 +57,19 @@ func TestJitterDelay(t *testing.T) {
 	}
 	if retryHorizon != 75*time.Minute {
 		t.Fatalf("retryHorizon = %v, want 75m (1h + 25%% jitter)", retryHorizon)
+	}
+}
+
+// Deferred minor B-17: a random value outside [0, 1) or NaN cannot push
+// the delay past ±25 %.
+func TestJitterDelay_ClampsTheRandomValue(t *testing.T) {
+	d := 4 * time.Minute
+	for _, tc := range []struct {
+		u    float64
+		want time.Duration
+	}{{-1, 3 * time.Minute}, {math.NaN(), 3 * time.Minute}, {0, 3 * time.Minute}, {0.5, d}, {1, 5 * time.Minute}, {7, 5 * time.Minute}} {
+		if got := jitterDelay(d, tc.u); got != tc.want {
+			t.Errorf("jitterDelay(%v, %v) = %v, want %v", d, tc.u, got, tc.want)
+		}
 	}
 }

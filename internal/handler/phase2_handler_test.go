@@ -701,7 +701,10 @@ func TestServeHTTP_AdoptedSuiteSnapshotMemberDBError_FailsClosed(t *testing.T) {
 	upstreamCalls := atomic.Int32{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
-		_, _ = w.Write([]byte("attacker bytes"))
+		// An InRelease, so a clearsign envelope like its sibling's (ruling
+		// PD-2; deferred minor D-30) — though never read: the test asserts
+		// no upstream call.
+		_, _ = w.Write(simtest.ClearsignedFixture("attacker bytes"))
 	}))
 	defer srv.Close()
 
@@ -908,8 +911,8 @@ func TestServeHTTP_AdoptedSuiteMissingBlob_StaleNotServed(t *testing.T) {
 	// Seed a stale url_path row for the same path. respondError's
 	// upstream-unreachable path would otherwise serve this; the
 	// recovery responder must not.
-	staleBody := simtest.ClearsignedFixture("stale Phase 1 InRelease")
-	stale := writeBlob(t, h, staleBody)
+	staleAnchor := simtest.ClearsignedFixture("stale Phase 1 InRelease") // not staleBody: that is the package's helper (deferred minor D-28)
+	stale := writeBlob(t, h, staleAnchor)
 	now := nowUnixForTest()
 	if err := h.cache.PutURLPath(context.Background(), cache.URLPath{
 		CanonicalScheme: scheme, CanonicalHost: canonHost,
@@ -930,7 +933,7 @@ func TestServeHTTP_AdoptedSuiteMissingBlob_StaleNotServed(t *testing.T) {
 	if rec.Code != http.StatusBadGateway {
 		t.Errorf("status=%d, want 502 (must not stale-serve url_path during recovery)", rec.Code)
 	}
-	if rec.Body.String() == string(staleBody) {
+	if rec.Body.String() == string(staleAnchor) {
 		t.Errorf("body returned stale Phase 1 bytes: %q", rec.Body.String())
 	}
 	if got := rec.Header().Get("X-Cache"); got == "HIT-STALE" {

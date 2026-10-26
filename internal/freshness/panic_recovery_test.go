@@ -10,11 +10,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 type panickingVerifier struct{}
@@ -390,4 +392,35 @@ func TestReportPanic_LogsStackOncePerKind(t *testing.T) {
 	if n := strings.Count(logs.String(), "adoption_panicked"); n != 2 {
 		t.Fatalf("adoption_panicked lines = %d, want 2", n)
 	}
+}
+
+// Deferred minor A-37: the adopter's heartbeat logs its panic through the
+// package's one helper — adoption_panicked, where=heartbeat, the stack the
+// first time — and the adoption still commits.
+func TestHeartbeatPanicIsLoggedWithItsStackOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		panicStackLogged.Delete("heartbeat")
+		c := simtest.OpenCache(t)
+		members := &simMembers{fakeFetcher: newFakeFetcher(), stalled: map[string]bool{}, delay: map[string]time.Duration{}}
+		pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": testHex64})
+		members.put(rigPkgsURL, pkgs)
+		members.setDelay(rigPkgsURL, 3*time.Second) // the heartbeat ticks while the member arrives
+		logs := &lockedBuffer{}
+		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
+			HostLimiter: hostsem.New(8), HeartbeatInterval: time.Second, Logger: slog.New(slog.NewJSONHandler(logs, nil))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ad.heartbeatHook = func() { panic("heartbeat bug") }
+		ref := SuiteRef{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite}
+		trackSuite(t, c, ref)
+		if err := ad.Run(context.Background(), ref, signedRelease("v1", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs}), "", ""); err != nil {
+			t.Fatalf("the adoption failed after a heartbeat panic: %v", err)
+		}
+		recs := logRecords(t, logs, "adoption_panicked")
+		if len(recs) != 1 || recs[0]["where"] != "heartbeat" || recs[0]["level"] != "ERROR" || recs[0]["stack"] == nil ||
+			recs[0]["suite_path"] != rigSuite {
+			t.Fatalf("adoption_panicked records %v, want one ERROR where=heartbeat with the suite and the stack", recs)
+		}
+	})
 }
