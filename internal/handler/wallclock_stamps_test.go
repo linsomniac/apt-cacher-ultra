@@ -14,7 +14,7 @@ import (
 
 // Deferred minor A-3 (handler half): every stamp the handler persists or
 // reports comes from wallclock, so a test offset moves it; time.Now would
-// not. (The GC's stamps stay listed in the deferred file.)
+// not. (The GC's half: TestGC_StampsFollowTheWallClock, internal/gc.)
 func TestHandler_StampsFollowTheWallClock(t *testing.T) {
 	restore := wallclock.SetOffsetForTest(48 * time.Hour)
 	defer restore()

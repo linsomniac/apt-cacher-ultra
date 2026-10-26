@@ -220,9 +220,10 @@ successful check, as before. Two things differ from earlier releases: a
 plain-text "InRelease" (no clearsign line; apt rejects it too) no longer
 tracks a suite, and neither does a repository that publishes only `Release`
 and `Release.gpg` (for example pkg.jenkins.io). Earlier releases tracked
-such a repository from its first `Release` hit; it is now served as before
-but no longer checked for changes or shown on the status page while
-adoption is disabled.
+such a repository from its first `Release` hit; one first seen after the
+upgrade is now served as before but not tracked — not checked for changes
+or shown on the status page — while adoption is disabled, and one an
+earlier release already tracks stays tracked.
 
 At most `max_suites` suites are tracked and at most `max_suites / 10` per
 host. At the total cap, a new suite makes room by evicting the least
@@ -300,6 +301,14 @@ shows "refused: anchor_absent" on the status page — unless it is a flat
 repository the cache has never seen signed, which is refreshed without a
 `Release` (see *Flat repositories*), or, while `adoption.adopt_unsigned`
 is off, shows "refused: unsigned_disabled" instead.
+
+A first check that ends without an answer the cache can act on — a 5xx or
+a timeout while it probes, `Release.gpg` failing after a 200 `Release`,
+say — is a failed check: the scheduler backs off from it, but it records
+no adoption failure, so a check a client triggers past the `cooldown`
+probes again, a full `Release` download included. Client checks are bound
+by the `cooldown` alone; the lasting case, an unsigned `Release` while
+`adoption.adopt_unsigned` is off, is a refusal, which its record paces.
 
 First adoptions never take the last free adoption slot, which is kept for
 suites that already serve a signed snapshot (see *Capacity and
@@ -687,7 +696,21 @@ clearsigned message — a plain-text file adopted with `require_signature =
 false`, or one carrying declarations outside its signature — or whose pool
 file is missing or corrupt, is quarantined: it stops serving and vouching,
 its suite is served from the ordinary cache, and a `legacy_snapshot_quarantined`
-line names it. A suite quarantined for declarations outside its signature
+line names it. When the stored `InRelease` is corrupt — its bytes no longer
+match the hash recorded for them — the audit also deletes every cached copy
+of it (each `url_path` row that holds that file, under any scheme or host;
+the line's `anchor_rows_deleted` counts them) and removes the corrupt file,
+so the next client update fetches a fresh one from upstream instead of
+being served bytes apt rejects, also when upstream still serves the same
+file (`legacy_anchor_discard_failed` says when the file could not be
+removed; a crash in the instant between the quarantine and the removal
+leaves the file too, with no such line, until a re-adoption replaces it);
+a missing file, or one too large for the audit to read
+(`anchor_oversized`, not proven bad), keeps its rows. A snapshot whose
+pool file cannot be read at all is deferred, not judged: an ERROR
+`legacy_trust_audit_deferred` names it at every start, and it keeps its
+rows and files until the pool is fixed or the suite is forgotten
+(`POST /forget`). A suite quarantined for declarations outside its signature
 adopts again on its first freshness check, because its tampered copy never
 matches a clean upstream; one quarantined because its stored file was lost
 or corrupt waits for the next upstream change, and may have no record that
@@ -819,7 +842,7 @@ served an unvouched package.
 | `snapshot_batch_size` | integer | `10` | Maximum snapshots removed per batch. Snapshot deletion can cascade through many member rows. At least `1`. |
 | `max_tick_duration` | duration | `"5m"` | Budget for startup/periodic GC passes, checked between batches; remaining work resumes later. The startup pass, which runs before the listeners serve, leaves the retired snapshots (of a reaped, evicted or forgotten suite, or one the upgrade's trust audit quarantined) to the periodic passes, normally the first one after the start (see *Suite reaping*); it deletes only a retired one never adopted whose heartbeat went stale, as it does any abandoned adoption candidate. Must be positive. |
 | `blob_grace` | duration | `"5m"` | Grace after a blob's reference count reaches zero before deletion. At least `"1s"`, and greater than twice `heartbeat_interval`. |
-| `keep_displaced` | integer | `3` | Recent displaced snapshots kept per suite for inspection. `0` retains none; must be nonnegative. Does not by itself retain superseded package binaries. Also bounds retained by-hash: a by-hash request the current snapshot lacks is served from the newest `keep_displaced` + 1 displaced snapshots of its suite, and `0` turns that off (see *Flip consistency*). |
+| `keep_displaced` | integer | `3` | Recent displaced snapshots kept per suite for inspection. `0` retains none; must be nonnegative. A displaced snapshot the upgrade's trust audit has not judged yet (one whose pool file it could not read: see *Upgrading an existing cache*) is kept, and takes none of the `keep_displaced` places, until the audit decides it: it may be the suite's only evidence of a signature. Does not by itself retain superseded package binaries. Also bounds retained by-hash: a by-hash request the current snapshot lacks is served from the newest `keep_displaced` + 1 displaced snapshots of its suite, and `0` turns that off (see *Flip consistency*). |
 | `pool_scan_workers` | integer | `4` | Workers for the startup orphan-file scan. At least `1`. |
 | `heartbeat_interval` | duration | `"60s"` | Refresh in-progress adoption liveness and blob protection. Positive and subject to both bounds below. |
 | `url_path_ttl` | duration | `"168h"` | Requests within this window protect cached URL rows. Older or never-requested rows are evaluated against snapshot/version retention and hold grace. `"0s"` disables URL-path expiration; other values must be at least `"1m"`. |
@@ -865,7 +888,16 @@ again at the next run. Reaping a suite deletes its cached index files
 tree — a flat repository's root files, never its `./` twin's — in
 batches of 1,000 files), retires its snapshots and deletes its
 row (INFO `suite_reaped`; `acu_suites_reaped_total{reason}` counts the
-reaps). The reaper deletes no package, but a reaped suite's packages
+reaps). Each run that completes logs INFO `suite_reaper_run_complete` and
+sets the gauge `acu_suite_reaper_last_run_unixtime`, which has no series
+until the first completed run, an hour after the start. To catch a
+reaper that stopped, alert when the gauge has been absent for longer
+than two hours (`absent(acu_suite_reaper_last_run_unixtime)` with a
+Prometheus `for:` longer than that first hour plus one interval; a
+shorter one pages after every restart) or when its age exceeds two hours
+(one interval plus that first hour); an age alert alone never fires for
+a reaper that has not completed a run since its start.
+The reaper deletes no package, but a reaped suite's packages
 lose the version retention its snapshot gave them
 (`retention.max_versions_per_package` counts versions in current
 snapshots only; a package another suite's snapshot lists keeps that
@@ -1071,8 +1103,9 @@ curl -sS --fail-with-body -X POST http://127.0.0.1:6789/forget -H 'X-ACU-Admin: 
     --data-urlencode 'suite=/ubuntu/24.04/prod/dists/noble'
 # 202 Accepted = forgotten (the work is done when the answer comes); the body
 #   names the suite, the signed-path records deleted and the suites that kept them
-# 400 = host or suite missing, a scheme other than http or https, or a host
-#   holding scheme:// (pass the scheme in scheme)
+# 400 = host or suite missing, a scheme other than http or https, a host
+#   holding scheme:// (pass the scheme in scheme), or a body that is not a form
+# 413 = a body over 8 KiB
 # 403 = the header is missing, a browser request from another origin, or,
 #   without htpasswd_file, a host name other than localhost or listen's (use the address)
 # 409 = busy (being checked or adopted: try again) or no such suite (check the
@@ -1090,7 +1123,9 @@ Each accepted request is logged as INFO `admin_forget_requested` (a
 request refused with 400, 403 or 413 is not), and each suite forgotten
 as INFO `suite_forgotten` — with `settled=true` when its final delete
 committed although the request then failed (500, or 503 at shutdown)
-and a fresh read then found the row gone.
+and a fresh read then found the row gone. A 409 is logged at DEBUG as
+`suite_not_forgotten`, whose `reason` says which case it was (`no_suite`,
+`busy`; `changed` should never occur).
 
 ## `[serve]`: stale responses
 

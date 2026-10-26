@@ -350,8 +350,9 @@ next to the Suites table contract in §5.3:
 | `scheme` | string | The suite's canonical scheme, `http` or `https` (phase F, ruling PF-7): a repository can be tracked under both, as two rows with the same `host` and `suite_path`, and `POST /forget` (`docs/configuration.md`, *Forgetting a suite*) takes it, defaulting to `https`. The Suites table's Host column shows it as `scheme://host`. |
 | `flat` | boolean | `true` for a flat repository's suite — a canonical suite path with no `dists` segment, its `./` twin included (spec C2) — and `false` for a `dists/` suite (phase G). The Suites table's Suite path cell shows a neutral `flat` badge after the path. The tag is not selectable (`user-select: none`), so copying the Suite path cell — as `/forget`'s 409 asks — copies the path alone. |
 | `anchor_form` | string | The current snapshot's anchor form — `inline`, `detached` or `unsigned` (a `Release` no signature covers: it vouches no `.deb`); empty when the suite has no current snapshot. |
-| `last_requested_unixtime` | int64 or `null` | When a client last showed interest in the suite (spec C3): written when the suite's row is created, then by coalesced touches — at most one write per suite per hour — from serves of its anchors (`InRelease`, `Release`, `Release.gpg`; status below 400, 304 and HEAD included), of its flat indexes, and of `.deb`s its current snapshot vouched for. A `dists/` suite's index requests (`main/binary-amd64/Packages.gz`) never move it. It decides cap eviction: at the `freshness.max_suites` cap, a suite with no current snapshot whose stamp is 24 hours old or more can be evicted for a new one (`suite_evicted`). |
-| `check_fail_count` | int64 | Consecutive failed checks since the last answered check: ended unknown (transport error, deadline, unexpected status), or found nothing they may adopt (a suite without a snapshot whose upstream has neither `InRelease` nor `Release`, which also records `anchor_absent`; a signature the check found but could not record as seen), or — a flat repository without a `Release` (phase G) — refreshed its cached index files with no content answer (an HTML page for each, 401, 403). An unsigned `Release` while `adoption.adopt_unsigned` is off is the refusal `unsigned_disabled`, not a failed check, and so is a flat repository without a `Release` while the knob is off. Drives the scheduler's healthy → never-checked → failing ordering and its 2 min → 1 h backoff. Resets to 0 on every answered check, an absent current anchor (`anchor_absent`) included. |
+| `anchorless` | boolean | `true` for a flat repository without a snapshot whose last answered check refreshed its cached index files without a `Release` (spec C4 Dispatch 4; phase H1) — with adoption enabled, no current snapshot, a last success, no failure or refusal record and no pending change, the marks every other answered check of such a suite leaves; `false` otherwise, and always while adoption is disabled. One exception lasts one check: a flat suite whose row was created while adoption was disabled has a last success already, so it reads `true` from the moment adoption is enabled until its first check. It tells such a repository from a dormant, never-adopted suite, which also has no snapshot and no record. The Adoption cell reads `refreshed without a Release`. |
+| `last_requested_unixtime` | int64 or `null` | When a client last showed interest in the suite (spec C3): written when the suite's row is created, then by coalesced touches — at most one write per suite per hour — from serves of its anchors (`InRelease`, `Release`, `Release.gpg`; status below 400, 304 and HEAD included), of its flat indexes, and of `.deb`s its current snapshot vouched for. A `dists/` suite's index requests (`main/binary-amd64/Packages.gz`) never move it. It decides cap eviction: at the `freshness.max_suites` cap, a suite with no current snapshot whose stamp is 24 hours old or more can be evicted for a new one (`suite_evicted`), and reaping: a suite no client asks for in `gc.suite_idle_ttl` is reaped (`suite_reaped`). The Suites table's *Last requested* column shows it (phase H1). |
+| `check_fail_count` | int64 | Consecutive failed checks since the last answered check: ended unknown (transport error, deadline, unexpected status), or found nothing they may adopt (a suite without a snapshot whose upstream has neither `InRelease` nor `Release`, which also records `anchor_absent`; a signature the check found but could not record as seen), or — a flat repository without a `Release` (phase G) — refreshed its cached index files with no content answer (an HTML page for each, 401, 403). An unsigned `Release` while `adoption.adopt_unsigned` is off is the refusal `unsigned_disabled`, not a failed check, and so is a flat repository without a `Release` while the knob is off. Drives the scheduler's healthy → never-checked → failing ordering and its 2 min → 1 h backoff. Resets to 0 on every answered check, an absent current anchor (`anchor_absent`) included. While above 0 the Adoption cell says so (below). |
 | `adoption_fail_reason` | string or `null` | The current failure or refusal reason; `null` when no record exists. |
 | `adoption_fail_count` | int64 | Consecutive adoption attempts in the current failure/refusal streak; `0` when no record exists. |
 | `adoption_fail_first_unixtime` | int64 or `null` | When the current streak started; for `unsigned_unconfirmed` and `anchor_absent`, when the current bytes (or absence) were first observed — it restarts on new content while `adoption_fail_count` keeps growing. |
@@ -362,7 +363,7 @@ These are additive to the locked JSON contract (§0.1), the same way
 `keyring[]` was: no existing key changes shape or meaning (`scheme` too:
 the HTML Host cell gains the `scheme://` prefix, the JSON `host` is
 unchanged; `flat` too: the HTML Suite path cell gains its badge, the JSON
-`suite_path` is unchanged).
+`suite_path` is unchanged; `anchorless` too).
 
 **Adoption column.** The Suites table's "Adoption" column renders the
 record above as one line, via the server-side `adoptionStatus` helper:
@@ -370,9 +371,23 @@ record above as one line, via the server-side `adoptionStatus` helper:
 `"refused: upstream_older · retry due"` for a refusal, and
 `"refused: upstream_older · since 1d 1h · retry due"` for a refusal whose
 streak began more than 24 h ago. Empty when the suite has no failure or
-refusal record. While adoption is disabled, the text gains the suffix
+refusal record — or `"refreshed without a Release"` for an `anchorless`
+suite (phase H1). While adoption is disabled, the text gains the suffix
 ` (adoption disabled)`: the record was stored while adoption was enabled
-and is inert now.
+and is inert now. A suite whose checks keep failing (`check_fail_count`
+above 0) adds `"checks failing ×3 · backoff ends in 12m"` — after the
+record's text and ` · ` when there is one: the count, and when the
+scheduler's backoff (2 min doubling to 1 h, from `last_check_unixtime`)
+ends, or `"backoff over"` once it has (phase H1). That is the earliest
+the scheduler may check the suite: a client's request may trigger a
+check sooner, after the `cooldown`, and a suite whose last success is
+recent is checked later. A suite the scheduler does not queue on its
+backoff shows the count alone: with adoption enabled, a never-adopted
+suite no client asked for within 7 days (dormant), and an adopted suite
+its `anchor_absent` or `unsigned_disabled` record paces (the record's
+own text shows its retry). A suite waiting for an adoption slot is not
+shown as such (that queue is the scheduler's, in memory). The JSON carries the parts as
+they are (`check_fail_count`, `last_check_unixtime`), not this text.
 
 **Unsigned and absent-anchor refusals (phase E).** `unsigned_unconfirmed`
 is an unsigned repository waiting for its second observation
@@ -428,6 +443,19 @@ stored record marks no warn and is not counted as FAILING or REFUSED 24H+,
 and a lag keeps its "(lagging …)" text but does not warn: Phase 1 never
 refreshes metadata, so the lag is truthful but expected. The SUITES vital
 is `stale` (§9.1). The JSON keeps every field as stored.
+
+### 4.6 GC and Recent Adoptions fields (phase H1)
+
+Two more fields, additive to the locked JSON contract as §4.5's are:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `gc.retired_reaped` | int | Retired snapshots the last GC run deleted — those of reaped, forgotten and evicted suites, and those the upgrade's trust audit quarantined (spec C9, sub-job C) — beside `displaced_reaped`; the GC panel shows it as *Retired reaped*. Always 0 after the startup run, which leaves them to the periodic runs. |
+| `recent_adoptions[].scheme` | string | The adopted suite's canonical scheme, `http` or `https`; the Recent Adoptions table's Host cell shows `scheme://host`, as the Suites table does. Empty for an event recorded without one. |
+
+A Recent Adoptions row's duration is the attempt's wall-clock time,
+and includes the flip barrier's wait (spec C8: at most 140 s) for an
+adoption that commits behind it, as `acu_adoption_duration_seconds` does.
 
 ---
 
@@ -826,15 +854,16 @@ A two-line block in the panel body, height 96px, centered:
 ```html
 <div class="empty empty--{stale|crit}" role="status">
   <span class="empty__eyebrow">NO SUITES TRACKED YET</span>
-  <p class="empty__body">Adoption begins when a client requests an
-  InRelease through the proxy.</p>
+  <p class="empty__body">A suite is tracked once a client requests its
+  InRelease through the proxy (…).</p>
 </div>
 ```
 
 `.empty` carries the 4px left stripe when state is non-stale (the
 keyring critical-empty case is the principal example).
 
-Per-section copy:
+Per-section copy (the page renders these words; its Suites body was a
+different sentence until phase H1):
 
 | Section          | Eyebrow                  | Body                                                                                                  |
 |------------------|--------------------------|-------------------------------------------------------------------------------------------------------|

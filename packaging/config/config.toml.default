@@ -104,7 +104,9 @@ hot_prefetch_budget   = "5m"
 # Longest an adoption, repair or reconcile may run. An abandoned adoption
 # is retried on the normal schedule, a repair or reconcile on the next
 # unchanged check. This deadline never cuts the final commit short; the
-# commit has its own 5-minute bound.
+# commit has its own 5-minute bound. Nor does it cut the flip barrier
+# short (see flip_quiet_period: at most 140 s), which only a shutdown
+# ends early.
 max_duration          = "30m"
 # How long the cache keeps a suite's snapshot after a client last finished
 # receiving its InRelease/Release before switching to a new snapshot, so
@@ -158,7 +160,10 @@ batch_size          = 100   # blob/URL-row batch bound; >= 1
 snapshot_batch_size = 10    # snapshot deletion batch bound; >= 1
 max_tick_duration   = "5m"  # > 0; tick budget checked between batches
 blob_grace          = "5m"  # >= 1s after a blob's refcount reaches zero
-keep_displaced      = 3     # displaced snapshots kept per suite; >= 0
+# Displaced snapshots kept per suite; >= 0. A by-hash request the current
+# snapshot lacks is served from the newest keep_displaced + 1 of them
+# (retained by-hash); 0 turns that off.
+keep_displaced      = 3
 pool_scan_workers   = 4     # startup orphan-scan parallelism; >= 1
 # Must be > 0, with 2 * heartbeat_interval < blob_grace, and also less
 # than max(upstream.total_timeout * upstream.max_retries, 30m).

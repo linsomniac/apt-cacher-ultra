@@ -415,9 +415,11 @@ func (c *Checker) refreshAnchorlessRow(ctx, fetchCtx context.Context, suite Suit
 	// the deadline. So two slow anchorless requests anywhere can make
 	// other hosts' anchorless checks wait, each holding a host slot idle,
 	// up to their deadlines. No deadlock: a body-slot holder never waits
-	// for a host slot; bounded, and failed checks back off. Follow-up for
-	// phase H (the phase G deferred file): a short bounded wait for a body
-	// slot, or a per-request timeout well under checkDeadline. The wait
+	// for a host slot; bounded, and failed checks back off. A short
+	// bounded wait for a body slot, or a per-request timeout well under
+	// checkDeadline, was declined in phase H1 (deferred minor GD-1): it
+	// would make anchorless checks fail under contention and back off — a
+	// new failure mode for a rare idle slot. The wait
 	// honours fetchCtx (the deadline, a shutdown):
 	// TestCheck_AnchorlessSlotWaitEndsWithTheCheck pins it.
 	select {
