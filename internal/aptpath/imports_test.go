@@ -52,6 +52,11 @@ func TestAptpathImportsOnlyStdlib(t *testing.T) {
 }
 
 // internal/cache must not import internal/proxy; shared path logic lives here.
+//
+// It checks cache's direct imports only (deferred minor A-8): a package
+// cache imports could pull proxy in. `go list -deps ./internal/cache/ |
+// grep internal/proxy` checks the whole set (empty at 6786529, where
+// cache's module imports are aptpath, debversion and wallclock).
 func TestCacheDoesNotImportProxy(t *testing.T) {
 	for file, imps := range nonTestImports(t, filepath.Join("..", "cache")) {
 		for _, p := range imps {

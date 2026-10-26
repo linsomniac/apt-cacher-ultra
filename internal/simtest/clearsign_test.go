@@ -8,6 +8,17 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 )
 
+// Deferred minor D-7: text with a line that begins with "-" panics — its
+// decoded plaintext would differ from it.
+func TestClearsignedFixture_PanicsOnADashLine(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal(`no panic for a line beginning with "-"`)
+		}
+	}()
+	ClearsignedFixture("Origin: x\n- y\n")
+}
+
 // The fixture is what spec C3's sniff and reconcile's decoder take for a
 // clearsigned InRelease, and its plaintext is the text it wraps.
 func TestClearsignedFixture(t *testing.T) {

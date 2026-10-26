@@ -164,6 +164,9 @@ func TestReparseSnapshotRelease_DecodesAptsMarkerLine(t *testing.T) {
 	signed := clearsignForTest(t, genuine)
 	const marker = "-----BEGIN PGP SIGNED MESSAGE-----"
 	blanks := bytes.Replace(signed, []byte(marker+"\n"), []byte(marker+" \t\n"), 1)
+	if bytes.Equal(blanks, signed) { // deferred minor D-26
+		t.Fatal("test premise: the marker line was not rewritten")
+	}
 	id := storeInlineSnapshot(t, env, blanks)
 	got, err := env.adopter.reparseSnapshotRelease(context.Background(), id)
 	if err != nil || len(got) != 1 || got[0].Path != "main/binary-amd64/Packages" {

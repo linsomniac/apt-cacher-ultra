@@ -137,22 +137,25 @@ func TestCommitAdoption_AdoptedAtIsMonotonic(t *testing.T) {
 	}
 }
 
+// putAnchor caches afSuite's anchor file, served (fetched) at fetched
+// (deferred minor C-13: three tests wrote it out).
+func putAnchor(t *testing.T, c *Cache, file string, fetched int64) {
+	t.Helper()
+	h := seedBlob(t, c, "served "+file)
+	if err := c.PutURLPath(context.Background(), URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: afSuite + file,
+		BlobHash: &h, UpstreamURL: "http://h" + afSuite + file, IsMetadata: true, LastFetchedAt: &fetched}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // A first adoption must pass the anchors clients were served from the
 // url_path cache: max(now, the newest anchor last_fetched_at + 1), read
 // before CommitAdoption Step 3c re-seeds those rows with now.
 func TestCommitAdoption_FirstAdoptionPassesTheServedAnchors(t *testing.T) {
 	c := openCache(t)
-	ctx := context.Background()
-	putAnchor := func(file string, fetched int64) {
-		h := seedBlob(t, c, "served "+file)
-		if err := c.PutURLPath(ctx, URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: afSuite + file,
-			BlobHash: &h, UpstreamURL: "http://h" + afSuite + file, IsMetadata: true, LastFetchedAt: &fetched}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	putAnchor("/InRelease", 1_400_000)
-	putAnchor("/Release", 1_500_000)
-	putAnchor("/Release.gpg", 1_600_000)
+	putAnchor(t, c, "/InRelease", 1_400_000)
+	putAnchor(t, c, "/Release", 1_500_000)
+	putAnchor(t, c, "/Release.gpg", 1_600_000)
 	restore := stubNow(t, 1_000_000) // the clock stepped back after those fetches
 	id := commitCandidate(t, c, SnapshotCandidate{}, "first adoption")
 	restore()
@@ -163,12 +166,7 @@ func TestCommitAdoption_FirstAdoptionPassesTheServedAnchors(t *testing.T) {
 
 func TestCommitAdoption_FirstAdoptionKeepsNowPastOlderAnchors(t *testing.T) {
 	c := openCache(t)
-	h := seedBlob(t, c, "served InRelease")
-	fetched := int64(900_000)
-	if err := c.PutURLPath(context.Background(), URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: afSuite + "/InRelease",
-		BlobHash: &h, UpstreamURL: "http://h" + afSuite + "/InRelease", IsMetadata: true, LastFetchedAt: &fetched}); err != nil {
-		t.Fatal(err)
-	}
+	putAnchor(t, c, "/InRelease", 900_000)
 	restore := stubNow(t, 1_000_000)
 	id := commitCandidate(t, c, SnapshotCandidate{}, "first adoption, newer clock")
 	restore()
@@ -183,12 +181,7 @@ func TestCommitAdoption_FirstAdoptionPassesEachServedAnchorFile(t *testing.T) {
 	for _, file := range []string{"/InRelease", "/Release", "/Release.gpg"} {
 		t.Run(file, func(t *testing.T) {
 			c := openCache(t)
-			h := seedBlob(t, c, "served "+file)
-			fetched := int64(1_600_000)
-			if err := c.PutURLPath(context.Background(), URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: afSuite + file,
-				BlobHash: &h, UpstreamURL: "http://h" + afSuite + file, IsMetadata: true, LastFetchedAt: &fetched}); err != nil {
-				t.Fatal(err)
-			}
+			putAnchor(t, c, file, 1_600_000)
 			restore := stubNow(t, 1_000_000)
 			id := commitCandidate(t, c, SnapshotCandidate{}, "first adoption after "+file)
 			restore()

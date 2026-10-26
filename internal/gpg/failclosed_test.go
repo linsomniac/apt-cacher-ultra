@@ -160,6 +160,30 @@ func TestVerifyInline_FollowsAptsFirstLineRule(t *testing.T) {
 	}
 }
 
+// Deferred minor D-6: the accept leg end to end for an envelope whose
+// every line ends in CRLF and whose marker line carries trailing blanks —
+// DecodableClearsign then hands go-crypto an LF marker line before CRLF
+// lines: it verifies, and the handler's sniff accepts it too.
+func TestVerifyInline_AcceptsACRLFEnvelopeWithABlankPaddedMarker(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t, signer), RequireSignature: true, Logger: silentLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	crlf := bytes.ReplaceAll(clearsignWith(t, signer, []byte(fakeReleasePlaintext)), []byte("\n"), []byte("\r\n"))
+	body := bytes.Replace(crlf, []byte(clearsignBeginMarker+"\r\n"), []byte(clearsignBeginMarker+" \t\r\n"), 1)
+	if bytes.Equal(body, crlf) {
+		t.Fatal("test premise: the marker line was not rewritten")
+	}
+	if !aptpath.SniffInRelease(body) {
+		t.Fatal("the handler's sniff refuses a body adoption accepts")
+	}
+	out, err := v.VerifyInline(context.Background(), newSuite(), body)
+	if err != nil || len(out) == 0 {
+		t.Fatalf("VerifyInline = %q, %v; want the signed text", out, err)
+	}
+}
+
 // Deferred minor A-53: the detached path names an empty keyring too.
 func TestVerifyDetached_EmptyKeyringSaysSo(t *testing.T) {
 	signer := newTestEntity(t, "Signer", "signer@example.com")

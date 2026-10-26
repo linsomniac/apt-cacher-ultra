@@ -215,6 +215,29 @@ func TestSetAdoptionNextRetry_OnlyMovesAnExistingRecord(t *testing.T) {
 	assertRecord(t, "moved", getSuite(t, c), f)
 }
 
+// Deferred minor D-10: a record with a count but no reason (a NULL the API
+// never writes) is a failure, so the restart reschedules it: COALESCE makes
+// the NULL an empty string — without it, NULL NOT IN (…) is NULL and the
+// row is skipped.
+func TestRescheduleFailingAdoptions_ReschedulesAReasonlessRecord(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	if err := c.SeedSuiteForTest(ctx, SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/n"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.db.Exec(`UPDATE suite_freshness SET adoption_fail_count = 3, adoption_fail_reason = NULL,
+ adoption_next_retry_at = 9999999999 WHERE suite_path = '/n'`); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := c.RescheduleFailingAdoptions(ctx, 5_000, func() int64 { return 7 }); err != nil || n != 1 {
+		t.Fatalf("RescheduleFailingAdoptions = %d, %v; want 1, nil", n, err)
+	}
+	s, err := c.GetSuiteFreshness(ctx, "http", "h", "/n")
+	if err != nil || s.AdoptionNextRetryAt == nil || *s.AdoptionNextRetryAt != 5_007 {
+		t.Fatalf("next retry = %v (%v), want 5007", s.AdoptionNextRetryAt, err)
+	}
+}
+
 // Spec C7 restart rule: failing rows get one retry each, spread over the
 // refresh interval; refusal states and panic records keep their schedule.
 func TestRescheduleFailingAdoptions_SkipsRefusalsAndPanics(t *testing.T) {

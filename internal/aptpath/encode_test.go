@@ -33,7 +33,7 @@ func TestAptEncodePath_Table(t *testing.T) {
 // BuildUpstreamURL -> url.Parse as the same decoded path, and Go must use
 // our encoding verbatim (EscapedPath == RawPath).
 func TestBuildUpstreamURL_AllBytesRoundTrip(t *testing.T) {
-	for b := 1; b < 256; b++ {
+	for b := 0; b < 256; b++ { // NUL included (deferred minor A-9)
 		if b == '/' {
 			continue
 		}
@@ -107,13 +107,17 @@ func TestBuildUpstreamURL_FixtureDB(t *testing.T) {
 		t.Skip("set ACU_URLPATH_FIXTURE_DB to a cache.db to run")
 	}
 	paths := readURLPaths(t, dbPath)
-	for _, p := range paths {
-		u, err := url.Parse(BuildUpstreamURL("http", "h", p))
-		if err != nil || u.Path != p {
-			t.Errorf("round trip failed for %q: %v", p, err)
+	for _, p := range paths { // deferred minor A-11: each message says what was got
+		raw := BuildUpstreamURL("http", "h", p)
+		u, err := url.Parse(raw)
+		switch {
+		case err != nil:
+			t.Errorf("url.Parse(%q) for path %q: %v", raw, p, err)
+		case u.Path != p:
+			t.Errorf("round trip of %q: got %q (URL %q)", p, u.Path, raw)
 		}
-		if strings.ContainsAny(p, "+~") && !strings.Contains(BuildUpstreamURL("http", "h", p), "%") {
-			t.Errorf("expected apt encoding for %q", p)
+		if strings.ContainsAny(p, "+~") && !strings.Contains(raw, "%") {
+			t.Errorf("path %q: got %q, want apt's percent-encoding", p, raw)
 		}
 	}
 }

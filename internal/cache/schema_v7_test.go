@@ -213,6 +213,8 @@ func auditQueue(t *testing.T, db *sql.DB) []int64 {
 func TestSchemaV7_GoStepFailureRollsBackMigration(t *testing.T) {
 	defer stubNow(t, v7Now)()
 	db := buildV6(t)
+	// migrationGoSteps is package state: never t.Parallel here, nor in any
+	// test that migrates while this one has it swapped (deferred minor A-19).
 	orig := migrationGoSteps[6]
 	migrationGoSteps[6] = func(context.Context, *sql.Tx, int64) error { return errors.New("injected") }
 	defer func() { migrationGoSteps[6] = orig }()
@@ -270,9 +272,13 @@ func TestSchemaV7_TriggerRejectsEmptyFormAndUniqueIndexIsPartial(t *testing.T) {
 	                      VALUES('http','h','/u/dists/s1',?,'bogus',1)`, hB); err == nil {
 		t.Fatal("bogus anchor_form accepted")
 	}
-	// The flat_filename partial index exists.
+	// The flat_filename partial index exists, and is partial (deferred minor A-21).
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_package_hash_flat_filename'`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("flat_filename index missing (%v)", err)
+	}
+	var partial int
+	if err := db.QueryRow(`SELECT partial FROM pragma_index_list('package_hash') WHERE name = 'idx_package_hash_flat_filename'`).Scan(&partial); err != nil || partial != 1 {
+		t.Fatalf("flat_filename index partial = %d (%v), want 1", partial, err)
 	}
 }

@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
 	"testing"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 )
 
 // seedFormSnapshot inserts a suite row and an adopted snapshot of form
@@ -59,16 +62,9 @@ func TestSuiteSnapshot_AnchorHash(t *testing.T) {
 		s := SuiteSnapshot{Form: c.form, SingleAnchorHash: &single, ReleaseHash: &rel, ReleaseGPGHash: &gpg}
 		got := s.AnchorHash(c.name)
 		if (got == nil) != (c.want == nil) || (got != nil && *got != *c.want) {
-			t.Errorf("%s snapshot: AnchorHash(%q) = %v, want %v", c.form, c.name, derefS(got), derefS(c.want))
+			t.Errorf("%s snapshot: AnchorHash(%q) = %v, want %v", c.form, c.name, derefStr(got), derefStr(c.want))
 		}
 	}
-}
-
-func derefS(p *string) string {
-	if p == nil {
-		return "<nil>"
-	}
-	return *p
 }
 
 // Spec C5 / overview E carry-forward: CommitAdoption Step 3c seeds an
@@ -319,37 +315,39 @@ func TestCommitAdoption_RefusesUnsignedForAnySignedHistory(t *testing.T) {
 	}
 }
 
-// Spec C5 / §7: url_path GC's identity guard (d) keeps the anchor of the
-// current snapshot's form — an unsigned suite's <suite>/Release, not the
-// <suite>/InRelease its single-anchor slot would suggest. Guards (b)/(c)
-// cannot decide here: the rows hold other blobs than the snapshot's.
+// Spec C5 / §7: url_path GC's identity guard (d) keeps the anchor files of
+// the current snapshot's form (aptpath.AnchorPaths) — an unsigned suite's
+// <suite>/Release, not the <suite>/InRelease its single-anchor slot would
+// suggest; a detached suite's Release and Release.gpg (deferred minor E-1:
+// the detached arm was unpinned) — and no other. Guards (b)/(c) cannot
+// decide here: the rows hold other blobs than the snapshot's.
 func TestRunURLPathGCBatch_IdentityGuardFollowsTheAnchorForm(t *testing.T) {
 	c := openCache(t)
 	const now = int64(2_000_000_000)
 	defer stubNow(t, now)()
 	anchor := seedBlob(t, c, "the snapshot's anchor")
+	sig := seedBlob(t, c, "the snapshot's signature")
 	old := sql.NullInt64{Int64: now - 30*86400, Valid: true}
-	for _, s := range []struct {
-		suite string
-		form  AnchorForm
-	}{{"/u/dists/unsigned", FormUnsigned}, {"/u/dists/inline", FormInline}} {
-		seedFormSnapshot(t, c, "http", "h", s.suite, s.form, &anchor, nil, nil, false)
-		for _, name := range []string{"/InRelease", "/Release"} {
-			putURLPathRow(t, c, "http", "h", s.suite+name, seedBlob(t, c, "served "+s.suite+name), old, true)
+	forms := []AnchorForm{FormUnsigned, FormInline, FormDetached}
+	names := []string{"InRelease", "Release", "Release.gpg"}
+	for _, form := range forms {
+		suite := "/u/dists/" + string(form)
+		if form == FormDetached {
+			seedFormSnapshot(t, c, "http", "h", suite, form, nil, &anchor, &sig, false)
+		} else {
+			seedFormSnapshot(t, c, "http", "h", suite, form, &anchor, nil, nil, false)
+		}
+		for _, name := range names {
+			putURLPathRow(t, c, "http", "h", suite+"/"+name, seedBlob(t, c, "served "+suite+"/"+name), old, true)
 		}
 	}
 	drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
-	for _, w := range []struct {
-		path string
-		kept bool
-	}{
-		{"/u/dists/unsigned/Release", true},
-		{"/u/dists/unsigned/InRelease", false},
-		{"/u/dists/inline/InRelease", true},
-		{"/u/dists/inline/Release", false},
-	} {
-		if got := urlPathExists(t, c, w.path); got != w.kept {
-			t.Errorf("%s kept = %v, want %v", w.path, got, w.kept)
+	for _, form := range forms {
+		for _, name := range names {
+			path := "/u/dists/" + string(form) + "/" + name
+			if got, want := urlPathExists(t, c, path), slices.Contains(aptpath.AnchorPaths(string(form)), name); got != want {
+				t.Errorf("%s kept = %v, want %v", path, got, want)
+			}
 		}
 	}
 }

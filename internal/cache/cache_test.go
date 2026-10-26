@@ -1634,14 +1634,19 @@ func TestInsertCandidateSnapshot_RejectsDanglingBlobFK(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	dangling := strings.Repeat("0", 64) // valid hex shape but no blob row
-	_, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
+	// Deferred minor D-9: the suite row first, checked, so only the insert
+	// itself can fail below.
+	if err := c.EnsureSuiteForTest(ctx, "http", "archive.ubuntu.com", "/ubuntu/dists/noble"); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "archive.ubuntu.com",
 		SuitePath:       "/ubuntu/dists/noble",
 		InReleaseHash:   &dangling,
 	})
-	if err == nil {
-		t.Fatal("expected FK violation, got nil")
+	if err == nil || !strings.Contains(err.Error(), "FOREIGN KEY") {
+		t.Fatalf("err = %v, want the blob FK violation", err)
 	}
 }
 
@@ -1652,7 +1657,10 @@ func TestInsertCandidateSnapshot_RejectsBothModes(t *testing.T) {
 	rh := seedBlob(t, c, "release")
 	gh := seedBlob(t, c, "release-gpg")
 
-	_, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
+	if err := c.EnsureSuiteForTest(ctx, "http", "x.example", "/p"); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/p",
@@ -1660,21 +1668,24 @@ func TestInsertCandidateSnapshot_RejectsBothModes(t *testing.T) {
 		ReleaseHash:     &rh,
 		ReleaseGPGHash:  &gh,
 	})
-	if err == nil {
-		t.Fatal("expected CHECK violation for both-modes, got nil")
+	if !errors.Is(err, ErrInvalidAnchorForm) {
+		t.Fatalf("err = %v, want ErrInvalidAnchorForm for both modes", err)
 	}
 }
 
 func TestInsertCandidateSnapshot_RejectsAllNull(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
-	_, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
+	if err := c.EnsureSuiteForTest(ctx, "http", "x.example", "/p"); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "x.example",
 		SuitePath:       "/p",
 	})
-	if err == nil {
-		t.Fatal("expected CHECK violation for all-NULL, got nil")
+	if !errors.Is(err, ErrInvalidAnchorForm) {
+		t.Fatalf("err = %v, want ErrInvalidAnchorForm for no anchor", err)
 	}
 }
 

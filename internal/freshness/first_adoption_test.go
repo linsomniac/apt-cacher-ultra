@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -994,6 +995,7 @@ func TestCheckFirst_AnchorRowReadErrorWritesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
+	before := r.row() // the whole row: no column may change (deferred minor F-8)
 	chk.Check(ctx, "http", rigHost, rigSuite)
 	chk.WaitForAdoptions()
 	warns := logRecords(t, &logs, "freshness_read_anchor_rows_failed")
@@ -1001,11 +1003,13 @@ func TestCheckFirst_AnchorRowReadErrorWritesNothing(t *testing.T) {
 		!strings.Contains(fmt.Sprint(warns[0]["err"]), "injected url_path read failure") {
 		t.Fatalf("WARN records %v, want one naming the suite and the read error", warns)
 	}
-	if n := len(r.up.etagsSent(rigAnchorURL)); n != 0 {
-		t.Fatalf("%d upstream requests, want none", n)
+	for _, url := range []string{rigAnchorURL, rigReleaseURL, rigReleaseGPGURL} {
+		if n := len(r.up.etagsSent(url)); n != 0 {
+			t.Fatalf("%d upstream requests to %s, want none", n, url)
+		}
 	}
-	if row := r.row(); row.LastCheckAt != nil || row.CheckFailCount != 0 || row.AdoptionFailCount != 0 {
-		t.Fatalf("the read error wrote the row: %+v", row)
+	if row := r.row(); !reflect.DeepEqual(row, before) {
+		t.Fatalf("the read error wrote the row: %+v, want it unchanged: %+v", row, before)
 	}
 	fc.fail.Store(false)
 	chk.Check(ctx, "http", rigHost, rigSuite)

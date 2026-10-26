@@ -914,9 +914,10 @@ func TestAdoptionFlipQuietPeriod_DefaultAndBounds(t *testing.T) {
 			t.Errorf("flip_quiet_period = %s: got %v (err %v), want %v", ok.value, cfg.Adoption.FlipQuietPeriod.Duration, err, ok.want)
 		}
 	}
-	for _, bad := range []string{"16s", "-1s", "500ms", "999ms"} {
-		if _, err := load("[adoption]\nflip_quiet_period = \"" + bad + "\"\n"); err == nil {
-			t.Errorf("flip_quiet_period = %s accepted, want a validation error", bad)
+	for _, bad := range []string{"16s", "-1s", "500ms", "999ms"} { // each one Validate's, naming the key (deferred minor C-9)
+		_, err := load("[adoption]\nflip_quiet_period = \"" + bad + "\"\n")
+		if err == nil || !strings.Contains(err.Error(), "adoption.flip_quiet_period must be 0s or between 1s and 15s") {
+			t.Errorf("flip_quiet_period = %s: err %v, want the key's bounds", bad, err)
 		}
 	}
 }

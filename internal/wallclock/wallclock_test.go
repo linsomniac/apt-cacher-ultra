@@ -1,6 +1,12 @@
 package wallclock
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -16,6 +22,7 @@ func TestNow_TracksRealTimeWithZeroOffset(t *testing.T) {
 
 func TestSetOffsetForTest_ShiftsAndRestores(t *testing.T) {
 	restore := SetOffsetForTest(-2 * time.Hour)
+	t.Cleanup(restore) // a failing assertion must not leak the offset (deferred minor A-1)
 	shifted := Now()
 	if d := time.Since(shifted); d < 2*time.Hour-time.Minute || d > 2*time.Hour+time.Minute {
 		t.Fatalf("offset not applied: time.Since(Now()) = %v, want ~2h", d)
@@ -27,6 +34,47 @@ func TestSetOffsetForTest_ShiftsAndRestores(t *testing.T) {
 	restore()
 	if d := time.Since(Now()); d > time.Minute || d < -time.Minute {
 		t.Fatalf("offset not restored: %v", d)
+	}
+}
+
+// Deferred minor A-2: production code never steps the wall clock — only
+// tests call SetOffsetForTest.
+func TestSetOffsetForTest_OnlyTestsCallIt(t *testing.T) {
+	for _, dir := range []string{"cmd", "internal"} {
+		err := filepath.WalkDir(filepath.Join("..", "..", dir), func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+			if err != nil {
+				return err
+			}
+			ast.Inspect(f, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				switch fn := call.Fun.(type) {
+				case *ast.SelectorExpr:
+					ok = fn.Sel.Name == "SetOffsetForTest"
+				case *ast.Ident:
+					ok = fn.Name == "SetOffsetForTest"
+				default:
+					ok = false
+				}
+				if ok {
+					t.Errorf("%s calls SetOffsetForTest outside a test", path)
+				}
+				return true
+			})
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

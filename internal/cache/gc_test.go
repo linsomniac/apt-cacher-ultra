@@ -43,7 +43,11 @@ func stubNow(t *testing.T, ts int64) func() {
 	t.Helper()
 	prev := nowUnix
 	nowUnix = func() int64 { return ts }
-	return func() { nowUnix = prev }
+	restore := func() { nowUnix = prev }
+	// A test that fails before its own restore runs leaves no stub behind
+	// (deferred minor C-12); restoring twice is harmless.
+	t.Cleanup(restore)
+	return restore
 }
 
 // ---------------------------------------------------------------------------

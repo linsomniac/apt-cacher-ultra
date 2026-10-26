@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -415,7 +414,7 @@ func TestCreateSuite_ReportsAFutureStampThroughTheChecker(t *testing.T) {
 	_, rc, _ := gatedAdopter(t)
 	logs := &lockedBuffer{}
 	c, err := New(Config{Cache: rc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
-		Logger: slog.New(slog.NewTextHandler(logs, nil))})
+		Logger: slog.New(slog.NewJSONHandler(logs, nil))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -438,11 +437,11 @@ func TestCreateSuite_ReportsAFutureStampThroughTheChecker(t *testing.T) {
 		t.Fatalf("acu_clock_steps_detected_total rose by %v, want 1", got)
 	}
 	// Deferred minor D-24: ReportClockStep passes three strings by
-	// position; each must reach its own field.
-	out := logs.String()
-	if !strings.Contains(out, "clock_step_detected") || !strings.Contains(out, "stamp=last_requested_at") ||
-		!strings.Contains(out, "canonical_scheme=http ") || !strings.Contains(out, "canonical_host=h ") ||
-		!strings.Contains(out, "suite_path=/r/dists/x ") {
-		t.Fatalf("log = %q; want clock_step_detected for http://h/r/dists/x's last_requested_at", out)
+	// position; each must reach its own field — read from the decoded
+	// record, not the text (deferred minor F-9).
+	recs := logRecords(t, logs, "clock_step_detected")
+	if len(recs) != 1 || recs[0]["stamp"] != "last_requested_at" || recs[0]["canonical_scheme"] != "http" ||
+		recs[0]["canonical_host"] != "h" || recs[0]["suite_path"] != "/r/dists/x" {
+		t.Fatalf("clock_step_detected records %v; want one for http://h/r/dists/x's last_requested_at", recs)
 	}
 }

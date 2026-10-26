@@ -27,7 +27,11 @@ func Now() time.Time {
 func Unix() int64 { return Now().Unix() }
 
 // SetOffsetForTest shifts Now by d and returns a function that restores
-// the previous offset. Only tests call it.
+// the previous offset. Only tests call it (TestSetOffsetForTest_OnlyTestsCallIt
+// walks cmd/ and internal/). Restores run in the reverse order of the calls
+// — last in, first out, as deferred calls and t.Cleanup run them — since
+// each restores the offset in force when its call was made (deferred
+// minor A-2).
 func SetOffsetForTest(d time.Duration) (restore func()) {
 	prev := offsetNanos.Swap(int64(d))
 	return func() { offsetNanos.Store(prev) }
