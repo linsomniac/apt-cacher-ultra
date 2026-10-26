@@ -320,3 +320,55 @@ func TestAuditLegacySnapshot_NoAnchorHashAsksForNoDrop(t *testing.T) {
 		t.Fatalf("verdict %+v, err %v; want an anchor_missing quarantine without dropAnchorRows", v, err)
 	}
 }
+
+// cancelOnMessage passes records to Handler and calls cancel when it sees
+// msg: a shutdown signal that lands just as that record is logged.
+type cancelOnMessage struct {
+	slog.Handler
+	msg    string
+	cancel context.CancelFunc
+}
+
+func (h cancelOnMessage) Handle(ctx context.Context, r slog.Record) error {
+	if r.Message == h.msg {
+		h.cancel()
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+// The H1 final fix re-review's minor 3: the audit's context is main's
+// signal context. A signal that lands after a batch commits — here as the
+// quarantine line is logged, between the commit and the queue read — still
+// lets the rotted pool file go: its snapshot is already dequeued, so no
+// later audit would remove it. The audit then stops at its next batch read
+// with the cancellation.
+func TestRunLegacyTrustAudit_ACancelAfterTheCommitStillRemovesTheFile(t *testing.T) {
+	env := newAdoptionTestEnv(t)
+	c := env.cache
+	rotten := adoptLegacy(t, env, "/r/dists/rotten", clearsignForTest(t, realisticRelease()+"Note: rotten\n"), "/r/pool/r_1_amd64.deb")
+	snap, err := c.GetSuiteSnapshot(context.Background(), rotten)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := *snap.SingleAnchorHash
+	rotBlob(t, c, hash)
+	if err := c.ClearSignedSeenForTest(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.EnqueueLegacyTrustAudit(context.Background(), rotten); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	logs := &lockedBuffer{}
+	logger := slog.New(cancelOnMessage{Handler: slog.NewJSONHandler(logs, nil), msg: "legacy_snapshot_quarantined", cancel: cancel})
+	if _, err := RunLegacyTrustAudit(ctx, c, logger); !errors.Is(err, context.Canceled) {
+		t.Fatalf("audit err = %v, want the next batch read's cancellation", err)
+	}
+	if _, err := os.Stat(c.BlobPath(hash)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the rotted pool file: %v, want removed", err)
+	}
+	if recs := logRecords(t, logs, "legacy_anchor_discard_failed"); len(recs) != 0 {
+		t.Errorf("records %v, want none", recs)
+	}
+}

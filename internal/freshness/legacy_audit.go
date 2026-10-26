@@ -169,7 +169,8 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 						// (writeBlobBytes) once a client asks with adoption
 						// enabled; the audit does not revisit it.
 						hash := *decided[i].SingleAnchorHash
-						queued, err := c.LegacyAuditQueueNamesAnchor(ctx, hash)
+						// A shutdown signal (ctx) must not keep a dequeued snapshot's rotted file.
+						queued, err := c.LegacyAuditQueueNamesAnchor(context.WithoutCancel(ctx), hash)
 						if err == nil && !queued {
 							err = legacyDiscardAnchor(c, hash)
 						}

@@ -250,8 +250,9 @@ type reapCandidate struct {
 // OR its age > 3h (docs/log-fields.md's recipe) — an age alert alone
 // never fires for a reaper that has not completed a run since its start.
 // 3 h is reapUptimeFloor + reapInterval plus one more interval of margin:
-// the age peaks near floor + interval after a restart or one failed run,
-// so a threshold at that edge paged or not on the runs' durations and the
+// the age peaks near one interval and the absence after a restart lasts
+// about the floor; one failed run makes either about floor + interval, so
+// a threshold at that edge paged or not on the runs' durations and the
 // scrape timing (Task 18 review M-1; the H1 final review's ops M-1).
 // Retune the recipe if either constant changes. The gauge is not seeded at
 // Run's start on purpose: that would claim a run that did not happen
