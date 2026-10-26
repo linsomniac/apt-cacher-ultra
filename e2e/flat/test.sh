@@ -435,9 +435,27 @@ mirror_mode() {
 }
 
 # A commit slower than the flip barrier's 20 s hold (spec §7): no client
-# times out. The straddle a phase-B expiry allows is a documented residual
-# (spec C8), so this scenario's grep allows its words and nothing else
-# (APT_RESIDUAL).
+# times out. apt resends a request that reached its 30 s timeout and prints
+# nothing when the resend succeeds (apt 2.6.1, even with Acquire::Retries
+# 0), so apt's output cannot show a timeout. Two checks do: each update's
+# length (a held update lasts the hold, 20 s at most, plus apt's own second
+# or two), and the daemon's request lines (none cancelled by its client,
+# none lasting 30 s).
+#
+# Every update runs under the full grep, stricter than spec §7's scoped
+# one: this client cannot reach spec C8's phase-B straddle. It fetched v1's
+# lists before the publish, so every update in the window gets a 304 for
+# the old InRelease and requests no index, and Jitsi's by-hash requests are
+# served from the displaced snapshot. A straddle's words here (Hash Sum
+# mismatch, unexpected size) would be a bug, such as a non-atomic flip of
+# Jitsi's, not the residual.
+#
+# AIDEV-NOTE: this scenario must end well before UNSIGNED_FIRST_CONTACT +
+# 300 s (it ends about 140 s into the run); do not move it later. The 45 s
+# delay applies to every adoption commit, and a stop waits for a commit
+# that has started: /unsigned404's first adoption (300 s after its first
+# contact at the earliest) in flight at the second stop_daemon would
+# outlast that stop's 40 s.
 commit_delay() {
     scenario commit-delay "a 45 s commit: held anchor requests never reach apt's timeout"
     stop_daemon
@@ -447,28 +465,43 @@ commit_delay() {
     client delay "$PROXY" "$SRC_JITSI" "$SRC_K8S" "$SRC_DISTS"
     apt_update delay
     publish jitsi v2
-    local start=$SECONDS mismatches=0
+    local start=$SECONDS t0 took lengths=""
     until log_has "$SCENARIO_MARK" "$(event adoption_success)" "$(suite_kv "$JITSI")"; do
         ((SECONDS - start < 150)) || fail "the delayed jitsi adoption did not commit within 150s"
-        apt_update delay --allow="$APT_RESIDUAL"
-        if grep -q 'Hash Sum mismatch' "$APT_LOG"; then
-            mismatches=$((mismatches + 1))
-        fi
+        t0=$SECONDS
+        apt_update delay
+        took=$((SECONDS - t0))
+        ((took < 28)) || fail "an update took ${took}s: one of its requests reached apt's 30 s timeout"
+        lengths+=" ${took}s"
         sleep 3
     done
-    say "the delayed commit landed $((SECONDS - start))s after the publish; updates with the residual mismatch: $mismatches"
-    log_has "$SCENARIO_MARK" "$(event adoption_flip_barrier)" "$(suite_kv "$JITSI")" "$(kv outcome hold_expired)" ||
-        fail "the jitsi flip did not end hold_expired: $(log_lines "$SCENARIO_MARK" "$(event adoption_flip_barrier)")"
+    say "the delayed commit landed $((SECONDS - start))s after the publish; the updates in the window took:$lengths"
+    local lines
+    if ! log_has "$SCENARIO_MARK" "$(event adoption_flip_barrier)" "$(suite_kv "$JITSI")" "$(kv outcome hold_expired)"; then
+        lines=$(log_lines "$SCENARIO_MARK" "$(event adoption_flip_barrier)")
+        fail "the jitsi flip did not end hold_expired: ${lines:-no adoption_flip_barrier line in this scenario}"
+    fi
+    # The daemon's side of the update lengths: no request was given up by
+    # its client, and none lasted apt's 30 s timeout.
+    lines=$(log_lines "$SCENARIO_MARK" "$(event request)" "$(kv canonical_host signed.test)" \
+        '(^| )(outcome=client_canceled|duration_ms=([3-9][0-9]{4}|[1-9][0-9]{5,}))( |$)')
+    [[ -z $lines ]] || fail "a request was cancelled by its client or lasted 30 s or more: $lines"
     local held max=0 ms
     held=$(log_lines "$SCENARIO_MARK" "$(event request)" "(^| )path=$(re "$JITSI")/(InRelease|Release)( |\$)" \
         'flip_held_ms=' | grep -oE 'flip_held_ms=[0-9]+' | cut -d= -f2 || true)
     [[ -n $held ]] || fail "no jitsi InRelease or Release request waited in the hold"
     for ms in $held; do ((ms > max)) && max=$ms; done
-    ((max <= 20000)) || fail "a request waited ${max} ms in a hold, over 20 s"
+    # A wait is measured once the hold's 20 s timer has fired: 500 ms for
+    # the timer's latency.
+    ((max <= 20000 + 500)) || fail "a request waited ${max} ms in a hold, over 20 s"
     say "held requests: $(wc -w <<< "$held"), longest wait ${max} ms"
     stop_daemon
+    local mark
+    mark=$(log_mark)
     start_daemon
-    # The residual clears with the next update: no error of any kind.
+    ! log_has "$mark" "$(event e2e_commit_delay_enabled)" ||
+        fail "the daemon restarted with the commit delay still enabled"
+    # The first update after the commit fetches v2's InRelease and indexes.
     apt_update delay
     candidates_are delay acu-jitsi=2.0 || fail "the client sees acu-jitsi $(candidate delay acu-jitsi)"
     apt_install delay acu-jitsi=2.0
