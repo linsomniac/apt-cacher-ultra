@@ -132,7 +132,8 @@ stop_daemon() {
 # wait_snapshot COLUMN FILE LIMIT: polls once a second, LIMIT times,
 # until /dists/noble's current snapshot records FILE's SHA-256 in
 # COLUMN (inrelease_hash or release_hash). Sets SNAPSHOT_ID and
-# SNAPSHOT_AFTER (seconds) on success; returns 1 on timeout.
+# SNAPSHOT_AFTER (seconds) on success; on timeout prints a line naming
+# COLUMN, FILE, LIMIT and the last current snapshot seen, and returns 1.
 #
 # AIDEV-NOTE: eager first adoption (flat-repositories spec C4 Dispatch
 # 3) adopts a suite at its first contact, so "some snapshot is current"
@@ -159,6 +160,7 @@ wait_snapshot() {
         fi
         sleep 1
     done
+    echo "wait_snapshot: no current /dists/noble snapshot with $column = sha256($file) = ${want:0:12}.. after $limit polls (last seen: id|$column = ${got:-<none>})"
     return 1
 }
 
@@ -403,7 +405,8 @@ adopted_id="$SNAPSHOT_ID"
 echo "[deb-test] adopted V2 snapshot id=$adopted_id (after ${SNAPSHOT_AFTER}s)"
 
 # 2e: a follow-up GET should now serve via snapshot_member resolution
-# and set the X-Cache-Snapshot response header (SPEC2 §6.1 / §10.1).
+# and set the X-Cache-Snapshot response header (SPEC2 §6.1 / §10.1)
+# to the V2 snapshot's id.
 echo "[deb-test] phase 2: follow-up GET should expose X-Cache-Snapshot"
 hdrs_file=/tmp/inrelease.headers
 status=$(curl -sS -x http://127.0.0.1:3142 \
@@ -425,6 +428,12 @@ if ! grep -qi '^x-cache-snapshot:' "$hdrs_file"; then
 fi
 xcs="$(grep -i '^x-cache-snapshot:' "$hdrs_file" | tr -d '\r')"
 echo "[deb-test] follow-up: $xcs"
+xcs_id="${xcs#*:}"
+xcs_id="${xcs_id//[[:space:]]/}"
+if [[ "$xcs_id" != "$adopted_id" ]]; then
+    echo "FAIL: follow-up X-Cache-Snapshot is '$xcs_id', want $adopted_id (the V2 snapshot)"
+    exit 1
+fi
 
 echo "[deb-test] phase 2 (inline adoption smoke) PASS"
 
@@ -581,7 +590,8 @@ if [[ "$rg_hash" == "<null>" ]]; then
 fi
 echo "[deb-test] phase 3: detached form confirmed (release_hash=${r_hash:0:12}.., release_gpg_hash=${rg_hash:0:12}..)"
 
-# 3f: a follow-up GET should expose X-Cache-Snapshot just like phase 2.
+# 3f: a follow-up GET should expose X-Cache-Snapshot, naming the
+# V2-detached snapshot, just like phase 2.
 echo "[deb-test] phase 3: follow-up GET should expose X-Cache-Snapshot"
 hdrs_file=/tmp/release.headers
 status=$(curl -sS -x http://127.0.0.1:3142 \
@@ -602,6 +612,12 @@ if ! grep -qi '^x-cache-snapshot:' "$hdrs_file"; then
 fi
 xcs="$(grep -i '^x-cache-snapshot:' "$hdrs_file" | tr -d '\r')"
 echo "[deb-test] phase 3 follow-up: $xcs"
+xcs_id="${xcs#*:}"
+xcs_id="${xcs_id//[[:space:]]/}"
+if [[ "$xcs_id" != "$adopted_id" ]]; then
+    echo "FAIL: phase-3 follow-up X-Cache-Snapshot is '$xcs_id', want $adopted_id (the V2-detached snapshot)"
+    exit 1
+fi
 
 echo "[deb-test] phase 3 (detached adoption smoke) PASS"
 
@@ -689,6 +705,11 @@ format = "text"
 EOF
 chmod 0644 /etc/apt-cacher-ultra/config.toml
 
+# The daemon log is appended across phases, and phases 2 and 3 each log
+# a snapshot_id=2 of their own (each wiped the cache, so ids restart at
+# 1): phase 4's log checks read only the lines from here on.
+p4_log_from=$(( $(wc -l < "$daemon_log") + 1 ))
+
 echo "[deb-test] phase 4: restart daemon under Phase 3 config"
 runuser -u apt-cacher-ultra -- \
     /usr/sbin/apt-cacher-ultra --config /etc/apt-cacher-ultra/config.toml \
@@ -774,9 +795,17 @@ if [[ "$status" != "200" ]]; then
     exit 1
 fi
 
+# The bound: this flip follows the hot prefetch, which may run for its
+# whole hot_prefetch_budget (60 s, above), and the flip barrier's quiet
+# period (adoption.flip_quiet_period, 10 s by default, counted from the
+# trigger GET: no client sends an anchor during this wait, so none of
+# the barrier's longer waits applies), plus 20 s for the check, the
+# member fetches and the commit: 90 s. A prefetch that runs out its
+# budget still flips within this bound, so 4d prints its line, with
+# the failed and unattempted counts, rather than a timeout here.
 echo "[deb-test] phase 4: poll for V2 adoption (2nd)"
-if ! wait_snapshot inrelease_hash /fixture-v2/dists/noble/InRelease 60; then
-    echo "FAIL: phase-4 V2 adoption did not flip the suite within 60s (still v1_id=$v1_id)"
+if ! wait_snapshot inrelease_hash /fixture-v2/dists/noble/InRelease 90; then
+    echo "FAIL: phase-4 V2 adoption did not flip the suite within 90s (still v1_id=$v1_id)"
     dump_adoption_state
     exit 1
 fi
@@ -787,37 +816,51 @@ echo "[deb-test] phase 4 V2 adopted snapshot id=$v2_id (after ${SNAPSHOT_AFTER}s
 # for the V2 snapshot with hot_count >= 1, fetched >= 1, failed=0,
 # mismatched=0. This is the "hot pair was warmed" oracle.
 echo "[deb-test] phase 4: assert adoption_hot_prefetch_complete fired for snapshot $v2_id"
-# `|| true`: with no such line the greps fail the pipeline, and set -e
-# would exit before the FAIL below names what is missing.
-hot_line=$(grep "msg=adoption_hot_prefetch_complete" "$daemon_log" \
-    | grep "snapshot_id=$v2_id" | tail -1) || true
+# The line is logged just after the flip wait_snapshot saw, so poll for
+# it briefly. Read only phase 4's lines (p4_log_from), and match the id
+# whole, so snapshot_id=2 cannot match snapshot_id=20.
+hot_line=""
+for _ in $(seq 1 10); do
+    # `|| true`: with no such line the greps fail the pipeline, and
+    # set -e would exit before the FAIL below names what is missing.
+    hot_line=$(tail -n +"$p4_log_from" "$daemon_log" \
+        | grep "msg=adoption_hot_prefetch_complete" \
+        | grep -E "(^| )snapshot_id=${v2_id}( |$)" | tail -1) || true
+    [[ -n "$hot_line" ]] && break
+    sleep 1
+done
 if [[ -z "$hot_line" ]]; then
-    echo "FAIL: no adoption_hot_prefetch_complete log line for snapshot $v2_id"
-    echo "=== relevant log tail ==="
-    grep -E "hot_prefetch|adoption_" "$daemon_log" | tail -30 || true
+    echo "FAIL: no phase-4 adoption_hot_prefetch_complete log line for snapshot $v2_id within 10s of its flip"
+    echo "=== relevant phase-4 log tail ==="
+    tail -n +"$p4_log_from" "$daemon_log" | grep -E "hot_prefetch|adoption_" | tail -30 || true
     exit 1
 fi
 echo "[deb-test] phase 4 hot-prefetch line: $hot_line"
 # Extract numeric fields. slog text format emits `key=value` tokens
 # separated by spaces. Anchor on the bare key= so a longer suffix
-# (e.g. `unattempted=`) doesn't match `attempted=`.
-hot_count=$(printf '%s\n' "$hot_line" | grep -oE '(^| )hot_count=[0-9]+' | tr -dc '0-9')
-fetched=$(printf '%s\n' "$hot_line" | grep -oE '(^| )fetched=[0-9]+' | tr -dc '0-9')
-failed=$(printf '%s\n' "$hot_line" | grep -oE '(^| )failed=[0-9]+' | tr -dc '0-9')
-mismatched=$(printf '%s\n' "$hot_line" | grep -oE '(^| )mismatched=[0-9]+' | tr -dc '0-9')
-if [[ "${hot_count:-0}" -lt 1 ]]; then
+# (e.g. `unattempted=`) doesn't match `attempted=`. A missing field
+# fails by name: none of the four defaults to 0.
+hot_count="" fetched="" failed="" mismatched=""
+for f in hot_count fetched failed mismatched; do
+    if [[ ! "$hot_line" =~ (^|\ )$f=([0-9]+)(\ |$) ]]; then
+        echo "FAIL: phase-4 hot-prefetch line has no $f= field"
+        exit 1
+    fi
+    printf -v "$f" '%s' "${BASH_REMATCH[2]}"
+done
+if [[ "$hot_count" -lt 1 ]]; then
     echo "FAIL: phase-4 hot_count=$hot_count, want >= 1 (Stage 1 should mine the V1 hot pair)"
     exit 1
 fi
-if [[ "${fetched:-0}" -lt 1 ]]; then
+if [[ "$fetched" -lt 1 ]]; then
     echo "FAIL: phase-4 fetched=$fetched, want >= 1 (the V2 path should warm)"
     exit 1
 fi
-if [[ "${failed:-0}" -ne 0 ]]; then
+if [[ "$failed" -ne 0 ]]; then
     echo "FAIL: phase-4 failed=$failed, want 0"
     exit 1
 fi
-if [[ "${mismatched:-0}" -ne 0 ]]; then
+if [[ "$mismatched" -ne 0 ]]; then
     echo "FAIL: phase-4 mismatched=$mismatched, want 0"
     exit 1
 fi
