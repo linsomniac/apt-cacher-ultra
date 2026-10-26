@@ -65,7 +65,7 @@ Each phase: write its detailed plan (`2026-09-28-flat-repositories-<letter>-<nam
 | E. Eager adoption and anchor forms | `…-E-forms.md` | C4 probe tree, C5 unsigned/SHA512, C10 wait | B, D | done (commit 9ab48c4) |
 | F. Suite reaping | `…-F-reaping.md` | C9 | D, E | done (commit dfdbb90) |
 | G. Flat repositories | `…-G-flat.md` | C2 flat, C5 flat IndexTargets/Filenames, C6, C4 anchorless | A–F | done (commit e2d7ada) |
-| H1. The sweep | `…-H1-sweep.md` | every deferred minor of A–G; §6.1 (R-H2) and C9 sub-job B (R-H1); C11 names (R-H3, R-H6); the docs of its own changes | A–G | in progress (plan written 2026-10-24) |
+| H1. The sweep | `…-H1-sweep.md` | every deferred minor of A–G; §6.1 (R-H2) and C9 sub-job B (R-H1); C11 names (R-H3, R-H6); the docs of its own changes | A–G | done (commit d52ad81) |
 | H2. End to end | `…-H2-e2e.md` | §7 e2e | H1 | planned |
 | H3. Docs and release | to write | §8 (README), release notes, the strict-mode docs (`docs/configuration.md`), the live-upstream smoke, final full-diff review; inputs: the *For H3* sections of the H1 and H2 plans, and the carry-forwards below marked *H3's* | H1, H2 | to write after H2 |
 
