@@ -532,7 +532,7 @@ unsigned_first_adoption() {
         return 0
     fi
     scenario unsigned-first-adoption "an unsigned repository adopts after the 5-minute confirmation"
-    local left=$((UNSIGNED_FIRST_CONTACT + UNSIGNED_DEADLINE - SECONDS)) took
+    local left=$((UNSIGNED_FIRST_CONTACT + UNSIGNED_DEADLINE - SECONDS)) took st
     ((left > 0)) || left=1
     if ! poll_quietly "$left" adopted_as plain.test /unsigned404 unsigned; then
         fail "plain.test/unsigned404 did not adopt within ${UNSIGNED_DEADLINE}s of its first contact: $(record_of /unsigned404)"
@@ -549,8 +549,9 @@ unsigned_first_adoption() {
     apt_install main acu-unsigned404=2.0
     # An unsigned snapshot never makes its host strict (spec C10): a .deb
     # no snapshot vouches is still served on plain.test.
-    [[ $("${CURL[@]}" -s -o /dev/null -w '%{http_code}' -x "$PROXY" http://plain.test/goreleaser/acu-goreleaser_2.0_amd64.deb) == 200 ]] ||
-        fail "plain.test refused an unvouched .deb after an unsigned adoption"
+    st=$("${CURL[@]}" -sS -o /dev/null -w '%{http_code}' -x "$PROXY" \
+        http://plain.test/goreleaser/acu-goreleaser_2.0_amd64.deb || true)
+    [[ $st == 200 ]] || fail "an unvouched .deb on plain.test answered $st after an unsigned adoption, want 200"
     # The 403 variant needs an hour between its observations: once a retry
     # of its record has come 5 minutes or more after its first observation
     # — where a 5-minute gap would have confirmed it — it is still
@@ -736,15 +737,58 @@ whole_run() {
     # The 5-minute floor where the unsigned scenario did not run: a run
     # this short must not have adopted plain.test/unsigned404 (it catches a
     # broken floor whenever that suite's first retry came before now).
-    if [[ ${E2E_UNSIGNED_WAIT:-0} != 1 ]] && ((SECONDS - UNSIGNED_FIRST_CONTACT < 300)); then
+    # Whether it did is said, not asserted: an adoption_fail_count of 2 or
+    # more means a retry was refused before now; adoption_fail_reason
+    # unsigned_unconfirmed means the read worked and the suite still waits.
+    local since=$((SECONDS - UNSIGNED_FIRST_CONTACT)) count reason
+    if [[ ${E2E_UNSIGNED_WAIT:-0} == 1 ]]; then
+        say "the 5-minute floor check: not run here (unsigned-first-adoption asserted the floor)"
+    elif ((since < 300)); then
         [[ -z $(suite plain.test /unsigned404 current_snapshot_id) ]] ||
-            fail "plain.test/unsigned404 adopted $((SECONDS - UNSIGNED_FIRST_CONTACT))s after its first contact, before the 5-minute confirmation"
+            fail "plain.test/unsigned404 adopted ${since}s after its first contact, before the 5-minute confirmation"
+        count=$(suite plain.test /unsigned404 adoption_fail_count)
+        reason=$(suite plain.test /unsigned404 adoption_fail_reason)
+        say "the 5-minute floor check: plain.test/unsigned404 unadopted ${since}s after its first contact," \
+            "adoption_fail_count ${count:-none} (2 or more: a retry was refused by now), adoption_fail_reason ${reason:-none}"
+    else
+        say "the 5-minute floor check: skipped, ${since}s after first contact (300 s or more)"
     fi
     local bad
-    bad=$(log_lines 0 '(^| )msg=("[^"]*panic|[a-z_]*panicked( |$))|(^| )msg=package_hash_conflict( |$)')
+    bad=$(panics_in_log)
     [[ -z $bad ]] || fail "panics or conflicts in the daemon log: $bad"
+    # Panics the daemon recovered without logging them are only counted.
+    # The counters start at 0 with each process: these are the process
+    # restart started. A counter never incremented has no sample (metric
+    # reads 0), so each must at least be declared: a renamed one fails
+    # here instead of reading 0.
+    local m n
+    "${CURL[@]}" -fsS -o /clients/main/metrics.txt "$ADMIN/metrics" || fail "the daemon's /metrics did not answer"
+    for m in acu_flip_gate_panics_total acu_freshness_unlogged_panics_total; do
+        grep -q "^# TYPE $m counter\$" /clients/main/metrics.txt || fail "/metrics declares no counter $m"
+        n=$(metric "$m")
+        ((n == 0)) || fail "$m is $n, want 0"
+    done
     kill -0 "$DAEMON_PID" || fail "the daemon is not running"
+    "${CURL[@]}" -fsS -o /dev/null "$ADMIN/healthz" || fail "the daemon does not answer its healthz"
     passed
+}
+
+# panics_in_log: the daemon log's panic and hash-conflict lines: a
+# recovered panic's event (*_panicked, net/http's "http: panic serving
+# …"), package_hash_conflict, and Go's runtime crash text at the start of
+# a line (an unrecovered panic or a fatal error, which reach the log
+# through start_daemon's 2>&1: a crash during a planned stop shows only
+# here, since stop_daemon ignores the exit status).
+panics_in_log() {
+    log_lines 0 '(^| )msg=("[^"]*panic|[a-z_]*panicked( |$))|(^| )msg=package_hash_conflict( |$)|^(panic|fatal error): '
+}
+
+# after_final_stop: the final stop comes after whole_run, so its log is
+# scanned once more.
+after_final_stop() {
+    local bad
+    bad=$(panics_in_log)
+    [[ -z $bad ]] || fail "panics or conflicts in the daemon log after the final stop: $bad"
 }
 
 setup
@@ -761,4 +805,5 @@ restart
 upstream_down
 whole_run
 stop_daemon
+after_final_stop
 say "PASS in ${SECONDS}s: ${TIMINGS[*]}"
