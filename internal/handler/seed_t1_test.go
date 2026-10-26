@@ -299,7 +299,7 @@ func TestServeHTTP_CoalescedCreatingMissFiresT1Once(t *testing.T) {
 	r.h.fetch = slowUpstream{staticUpstream: staticUpstream{r.srv.URL + "/r/dists/s/InRelease": rowInRelease},
 		fetches: &fetches}
 	_, host, port := splitURL(t, r.srv.URL)
-	holdHostSlotsUntilJoined(t, r.h, hostKey(host, port), 0)
+	held := holdHostSlotsUntilJoined(t, r.h, hostKey(host, port), 0)
 	var wg sync.WaitGroup
 	for range 2 {
 		wg.Add(1)
@@ -312,6 +312,14 @@ func TestServeHTTP_CoalescedCreatingMissFiresT1Once(t *testing.T) {
 	}
 	wg.Wait()
 	r.h.activeWG.Wait()
+	// A serialised second miss is a hit: it fetches nothing either, so
+	// only the hold's joined call shows the two coalesced (review M-2).
+	held.mu.Lock()
+	joined := held.call != nil
+	held.mu.Unlock()
+	if !joined {
+		t.Fatal("no singleflight call had a joiner (setup: the two misses must coalesce)")
+	}
 	if fetches.Load() != 1 {
 		t.Fatalf("%d upstream fetches, want 1 (setup: the two misses must coalesce)", fetches.Load())
 	}

@@ -83,7 +83,9 @@ func (s *heldSlots) waitGone(h *Handler) {
 func holdHostSlotsUntilJoined(t *testing.T, h *Handler, host string, delay time.Duration) *heldSlots {
 	t.Helper()
 	var rels []func()
-	for range 4 { // the strict rig's hostsem.New(4)
+	// Every slot, whatever the rig's limit: the first Acquire creates the
+	// host's entry, whose Capacity is that limit (review M-1).
+	for len(rels) == 0 || len(rels) < h.sem.Snapshot()[host].Capacity {
 		rel, err := h.sem.Acquire(context.Background(), host)
 		if err != nil {
 			t.Fatal(err)
@@ -505,8 +507,11 @@ func TestServeHTTP_StrictHitWithNothingInFlightDoesNotWait(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, proxyReq("GET", srvURL, waitDebPath))
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status %d, want the strict-mode refusal", rec.Code)
+	if rec.Code != http.StatusBadGateway || rec.Header().Get("Retry-After") != "60" {
+		t.Fatalf("status %d Retry-After %q, want the strict-mode refusal", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	if a.asks.Load() == 0 {
+		t.Fatal("AdoptionsInFlight was never asked (review M-4)")
 	}
 	if n := a.waits.Load(); n != 0 {
 		t.Fatalf("waited %d times, want 0 (nothing in flight)", n)

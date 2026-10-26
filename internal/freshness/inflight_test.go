@@ -128,6 +128,11 @@ func TestHostAdoptions_NothingInFlightBeatsTheWaiterCap(t *testing.T) {
 	if !h.wait(context.Background(), "a", strictWait) {
 		t.Fatal("a request with nothing in flight was refused for the waiter cap")
 	}
+	// It never became a waiter: a count leaked here would refuse the
+	// host's waits once an adoption runs (review M-3).
+	if n := h.waiters["a"]; n != strictWaitersPerHost {
+		t.Fatalf("waiters = %d after a request with nothing in flight, want %d (unchanged)", n, strictWaitersPerHost)
+	}
 }
 
 // Spec C10: the checker counts a signed adoption in flight from its spawn

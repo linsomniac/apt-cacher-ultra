@@ -94,6 +94,8 @@ func (h *hostAdoptions) inFlight(host string) bool {
 // served the unvouched .deb, which a MITM tunnel's writer (alive while
 // Drain cancels the inner request's context) delivered (review fix round
 // 1, Task 9). The handler also checks the context itself after any wait.
+//
+// AIDEV-NOTE: nothing in flight is decided before the waiter cap (deferred minor E-58).
 func (h *hostAdoptions) wait(ctx context.Context, host string, maxWait time.Duration) bool {
 	h.mu.Lock()
 	if h.n[host] == 0 {
