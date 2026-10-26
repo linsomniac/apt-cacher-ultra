@@ -2,6 +2,7 @@ package simtest
 
 import (
 	"slices"
+	"strconv"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -30,6 +31,53 @@ func TestLedger_CountsStraddlesInsideTheWindowNetOfHolds(t *testing.T) {
 		}
 		if l.Checked() != 2 || !slices.Equal(l.AnchorGens("a"), []string{"1"}) {
 			t.Fatalf("checked %d, a's anchor generations %v; want 2 and [1]", l.Checked(), l.AnchorGens("a"))
+		}
+	})
+}
+
+// Deferred minor C-5: an anchor's own hold does not shorten its index's
+// window. The anchor arrives after a 5 s hold and the client then spends
+// 11 s on a download: its index request goes out 11 s after the anchor
+// arrived — outside the window, not checked (deducting the anchor's own
+// hold would make it 6 s, inside).
+func TestLedger_AnAnchorsOwnHoldIsNotDeducted(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		serve := func(rq Request) (string, time.Duration) {
+			if rq.Anchor {
+				time.Sleep(5 * time.Second)
+				return "1", 5 * time.Second
+			}
+			return "2", 0
+		}
+		l := NewLedger(10 * time.Second)
+		l.RunUpdate(1, []Request{{Suite: "a", Anchor: true}, {Filler: 11 * time.Second}}, serve)
+		if l.Checked() != 0 || len(l.Straddles()) != 0 {
+			t.Fatalf("checked %d, straddles %v; want neither", l.Checked(), l.Straddles())
+		}
+	})
+}
+
+// Deferred minor C-5: AnchorGens, the proof that clients crossed a flip,
+// holds the generations of checked pairs only: updates whose index fell
+// outside the window add none.
+func TestLedger_AnchorGensHoldsCheckedPairsOnly(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		gen := 0
+		serve := func(rq Request) (string, time.Duration) {
+			if rq.Anchor {
+				gen++
+			}
+			return strconv.Itoa(gen), 0
+		}
+		l := NewLedger(10 * time.Second)
+		l.RunUpdate(1, []Request{{Suite: "a", Anchor: true}, {Filler: 11 * time.Second}}, serve)
+		l.RunUpdate(2, []Request{{Suite: "a", Anchor: true}, {Filler: 12 * time.Second}}, serve)
+		if g := l.AnchorGens("a"); len(g) != 0 {
+			t.Fatalf("AnchorGens = %v after updates outside the window, want none", g)
+		}
+		l.RunUpdate(3, []Request{{Suite: "a", Anchor: true}}, serve)
+		if g := l.AnchorGens("a"); !slices.Equal(g, []string{"3"}) {
+			t.Fatalf("AnchorGens = %v, want [3] (the one checked pair)", g)
 		}
 	})
 }

@@ -1274,6 +1274,15 @@ func bothFormsFailing(r *retryRig) (kIn, kDet string) {
 // inside the lateral's window, and at the check after each lateral
 // attempt. (About a quarter more attempts than once per form per window:
 // accepted, no further machinery.)
+//
+// Ruling R-H7 (phase H1): a check every five minutes, not two. The rig's
+// clock is virtual, so the test's time is CPU — about 5 ms a check under
+// -race, 1,440 checks took 7.6-8.0 s — and a synctest bubble would not
+// shorten it. 576 checks keep every assertion with the same seed (48
+// lateral windows, 15 with two detached attempts, none early) and kill the
+// lateral-hold mutants the two-minute cadence killed; an early release
+// shorter than the five-minute cadence is below this test's resolution
+// (review M-4).
 func TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds(t *testing.T) {
 	r := newRetryRig(t, 0)
 	r.adoptDetached()
@@ -1282,8 +1291,8 @@ func TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds(t *testing
 	kIn, kDet := bothFormsFailing(r)
 	lateral, detached, windows, twice, since := 0, 0, 0, 0, 0
 	var lateralRetry int64
-	for m := 0; m < 2*24*60; m += 2 { // two days, a check every two minutes
-		r.clock.advance(2 * time.Minute)
+	for m := 0; m < 2*24*60; m += 5 { // two days, a check every five minutes
+		r.clock.advance(5 * time.Minute)
 		calls := r.ver.calls()
 		r.check()
 		if r.ver.calls() == calls {

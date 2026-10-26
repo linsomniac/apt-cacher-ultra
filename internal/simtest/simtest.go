@@ -110,6 +110,13 @@ func After(d time.Duration, next Behavior) Behavior {
 	}
 }
 
+// Unavailable answers 503 at once: an unknown end that costs no time.
+func Unavailable() Behavior {
+	return func(context.Context, string) (*fetch.ConditionalResult, error) {
+		return nil, &fetch.StatusError{Code: 503}
+	}
+}
+
 // ETag is the validator Serve gives body.
 func ETag(body []byte) string {
 	s := sha256.Sum256(body)

@@ -62,8 +62,10 @@ func (m *gateModel) commitAfter(key string, latency time.Duration) func() error 
 }
 
 // clients starts, every period from offset until until, a client that
-// runs one update of queue.
-func clients(l *simtest.Ledger, serve simtest.ServeFunc, queue []simtest.Request, offset, period time.Duration, until time.Time, wg *sync.WaitGroup) {
+// runs one update of queue. Its clients are numbered from idBase, so groups
+// running at once have disjoint ids and a Straddle's Client names one
+// client (deferred minor C-7).
+func clients(l *simtest.Ledger, serve simtest.ServeFunc, queue []simtest.Request, idBase int, offset, period time.Duration, until time.Time, wg *sync.WaitGroup) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -72,7 +74,7 @@ func clients(l *simtest.Ledger, serve simtest.ServeFunc, queue []simtest.Request
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				l.RunUpdate(i, queue, serve)
+				l.RunUpdate(idBase+i, queue, serve)
 			}()
 			time.Sleep(period)
 		}
@@ -111,8 +113,8 @@ func TestSimFlip_OverlappingHoldTrace(t *testing.T) {
 		var wg sync.WaitGroup
 		t0 := time.Now()
 		until := t0.Add(111 * time.Second)
-		clients(l, fast, []simtest.Request{{Suite: "A", Anchor: true}}, 11*time.Millisecond, 500*time.Millisecond, until, &wg)
-		clients(l, fast, []simtest.Request{{Suite: "B", Anchor: true}}, 261*time.Millisecond, 500*time.Millisecond, until, &wg)
+		clients(l, fast, []simtest.Request{{Suite: "A", Anchor: true}}, 0, 11*time.Millisecond, 500*time.Millisecond, until, &wg)
+		clients(l, fast, []simtest.Request{{Suite: "B", Anchor: true}}, 10000, 261*time.Millisecond, 500*time.Millisecond, until, &wg)
 		wg.Add(1)
 		go func() { // another B reader, on a slow link, still reading when B's hold could start
 			defer wg.Done()
@@ -193,8 +195,8 @@ func TestSimFlip_ClientReleasedFromAnotherHold(t *testing.T) {
 		trace := simtest.NewLedger(testQuiet)
 		var wg sync.WaitGroup
 		t0 := time.Now()
-		clients(l, serve, []simtest.Request{{Suite: "A", Anchor: true}}, 11*time.Millisecond, 500*time.Millisecond, t0.Add(100*time.Second), &wg)
-		clients(l, serve, []simtest.Request{{Suite: "B", Anchor: true}}, 261*time.Millisecond, 500*time.Millisecond, t0.Add(61*time.Second), &wg)
+		clients(l, serve, []simtest.Request{{Suite: "A", Anchor: true}}, 0, 11*time.Millisecond, 500*time.Millisecond, t0.Add(100*time.Second), &wg)
+		clients(l, serve, []simtest.Request{{Suite: "B", Anchor: true}}, 10000, 261*time.Millisecond, 500*time.Millisecond, t0.Add(61*time.Second), &wg)
 		var traceHeld []time.Duration
 		wg.Add(1)
 		go func() {
@@ -254,7 +256,7 @@ func TestSimFlip_SlowReaderCommitsInsideTheHold(t *testing.T) {
 				var wg sync.WaitGroup
 				t0 := time.Now()
 				clients(l, m.serve(map[string]time.Duration{"K": time.Second}), []simtest.Request{{Suite: "K", Anchor: true}},
-					11*time.Millisecond, 500*time.Millisecond, t0.Add(100*time.Second), &wg)
+					0, 11*time.Millisecond, 500*time.Millisecond, t0.Add(100*time.Second), &wg)
 				wg.Add(1)
 				go func() { // starts half a second before the hold
 					defer wg.Done()
@@ -331,7 +333,7 @@ func TestSimFlip_FiveBusySuites(t *testing.T) {
 		t0 := time.Now()
 		until := t0.Add(150 * time.Second)
 		for i, k := range keys {
-			clients(l, serve, []simtest.Request{{Suite: k, Anchor: true}}, time.Duration(13*(i+1))*time.Millisecond, 500*time.Millisecond, until, &wg)
+			clients(l, serve, []simtest.Request{{Suite: k, Anchor: true}}, 10000*i, time.Duration(13*(i+1))*time.Millisecond, 500*time.Millisecond, until, &wg)
 		}
 		outs := make([]<-chan flipOut, len(keys))
 		starts := make([]time.Time, len(keys))

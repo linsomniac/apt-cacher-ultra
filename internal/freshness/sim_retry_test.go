@@ -174,9 +174,9 @@ func TestSimRetry_LongRunDateRulesAndClockSteps(t *testing.T) {
 		bad := s.release("untrusted", t0.Unix())
 		s.ver.reject(hashOf(bad))
 		s.serve(bad)
-		time.Sleep(5 * day)
-		s.touch(t) // a client asks again: the suite stays interesting
-		time.Sleep(5*day + 7*time.Minute)
+		time.Sleep(5*day - 7*time.Minute) // off the tick grid (deferred minor E-53)
+		s.touch(t)                        // a client asks again: the suite stays interesting
+		time.Sleep(5*day + 14*time.Minute)
 		if a := s.ver.calls(); a < 10*15 || a > 10*30 { // deferred minor B-57: a floor too
 			t.Fatalf("untrusted body: %d attempts in 10 days, want 150..300", a)
 		}
@@ -212,6 +212,16 @@ func TestSimRetry_LongRunDateRulesAndClockSteps(t *testing.T) {
 				r.AdoptionFailCount, strOf(r.AdoptionFailReason))
 		}
 
+		// Each clock-step stretch has its own liveness floor (deferred
+		// minor E-50: the run's floor below was carried by the failing
+		// phases): 2 days at one check per refresh is about 18.
+		stretchChecks := func(from int, step string) {
+			t.Helper()
+			if n := len(s.up.Calls(rigAnchorURL)) - from; n < 16 {
+				t.Fatalf("after a %s clock step: %d checks in its 2 days, want >= 16", step, n)
+			}
+		}
+		from := len(s.up.Calls(rigAnchorURL))
 		restore := wallclock.SetOffsetForTest(-2 * time.Hour)
 		time.Sleep(2*day + 13*time.Minute)
 		v3 := s.release("v3", wallclock.Now().Unix())
@@ -220,8 +230,10 @@ func TestSimRetry_LongRunDateRulesAndClockSteps(t *testing.T) {
 		if s.current(t) != hashOf(v3) {
 			t.Fatal("after a backward clock step, new content was not adopted")
 		}
+		stretchChecks(from, "backward")
 		restore()
 
+		from = len(s.up.Calls(rigAnchorURL))
 		restore = wallclock.SetOffsetForTest(30 * day)
 		time.Sleep(2*day + 17*time.Minute)
 		v4 := s.release("v4", wallclock.Now().Unix())
@@ -230,6 +242,7 @@ func TestSimRetry_LongRunDateRulesAndClockSteps(t *testing.T) {
 		if s.current(t) != hashOf(v4) {
 			t.Fatal("after a forward clock step, new content was not adopted")
 		}
+		stretchChecks(from, "forward")
 		restore()
 		s.stop()
 		days := int(time.Since(t0) / day)
@@ -339,6 +352,14 @@ func TestSimRetry_ClockStepsWithAnActiveRecord(t *testing.T) {
 		time.Sleep(tick + time.Minute)
 		if s.ver.calls() == before {
 			t.Fatal("after a forward step, the overdue retry did not come at the next tick")
+		}
+		// Deferred minor E-52: the forward leg checks a future date too.
+		ahead = s.release("ahead-of-the-forward-stepped-clock", wallclock.Now().Add(time.Hour).Unix())
+		s.serve(ahead)
+		time.Sleep(refresh + tick + time.Minute)
+		if s.current(t) == hashOf(ahead) || strOf(s.row(t).AdoptionFailReason) != "release_date_in_future" {
+			t.Fatalf("after a forward step, content dated an hour ahead: current %q reason %q, want refused as release_date_in_future",
+				s.current(t), strOf(s.row(t).AdoptionFailReason))
 		}
 		good = s.release("good-after-the-forward-step", wallclock.Now().Unix())
 		s.serve(good)

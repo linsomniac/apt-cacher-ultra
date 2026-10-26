@@ -68,7 +68,10 @@ func NewLedger(window time.Duration) *Ledger {
 	return &Ledger{window: window, gens: map[string]map[string]bool{}}
 }
 
-// RunUpdate runs one update for client, starting from queue.
+// RunUpdate runs one update for client, starting from queue. It blocks
+// for the whole update — in real time outside a synctest bubble — and is
+// safe for concurrent use: simulations run many clients' updates at once
+// (deferred minor C-8).
 func (l *Ledger) RunUpdate(client int, queue []Request, serve ServeFunc) {
 	type arrival struct {
 		gen  string
@@ -129,8 +132,9 @@ func (l *Ledger) Checked() int {
 	return l.checked
 }
 
-// AnchorGens returns, sorted, the anchor generations of suite's checked
-// pairs: two or more prove its clients crossed a flip.
+// AnchorGens returns, sorted as strings ("10" before "9"), the anchor
+// generations of suite's checked pairs: two or more prove its clients
+// crossed a flip (deferred minor C-8).
 func (l *Ledger) AnchorGens(suite string) []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()

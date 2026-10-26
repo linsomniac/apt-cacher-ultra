@@ -356,6 +356,12 @@ func TestDoD_NinetyDaysOfReapingWithRestarts(t *testing.T) {
 			if day == 31 && b.exists(t, returning) {
 				t.Fatalf("day %d: %s not reaped", day, returning)
 			}
+			// A daily sample mid-boot, not only right after a restart: a
+			// goroutine that piles up during a boot and exits at its stop
+			// shows here (deferred minor F-10).
+			if n := sampleGoroutines(base); n > base {
+				t.Fatalf("day %d, 09:00, mid-boot: %d goroutines, the first boot had %d", day, n, base)
+			}
 			for s, l := range last {
 				switch day {
 				case l + 30:
@@ -455,11 +461,14 @@ func TestDoD_NinetyDaysOfReapingWithRestarts(t *testing.T) {
 // deadline falls 29 minutes before a restart, after the last run of the
 // boot before, is reaped at the next boot's floor, never at its start; a
 // suite whose anchor row url_path GC deleted before its deadline (by the
-// 48 h boot's startup pass, 6 hours before it: the four days are shorter
-// than the 168 h TTL, so the row is seeded already past it) is still
-// reaped, its marker kept; a suite in daily use is never reaped; after
-// every restart the goroutines are back at the first boot's count, and no
-// panic was recovered.
+// 48 h boot's startup pass, 90 minutes before it: the four days are
+// shorter than the 168 h TTL, so the row is seeded already past it) is
+// still reaped, its marker kept — at 50 h, the boot's second hourly run,
+// where a 2-, 3- or 6-hourly reaper would reap it at 51, 52 or 55 h
+// (deferred minor F-11: a deadline of 54 h was reaped at 55 h by all
+// four); a suite in daily use is never reaped; after every restart the
+// goroutines are back at the first boot's count, and no panic was
+// recovered.
 func TestDoD_ProductionCadenceAcrossTwelveHourlyRestarts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()
@@ -488,9 +497,10 @@ func TestDoD_ProductionCadenceAcrossTwelveHourlyRestarts(t *testing.T) {
 		// and the restart at 35 h 59 m; without the uptime floor the next
 		// boot's first run would come at once and reap it before 36 h 58 m.
 		seed(edge, start.Add(35*time.Hour+30*time.Minute-ttl))
-		// gcd's deadline: 54 h; its cached InRelease, unused for 8 days,
-		// is past url_path_ttl, and its base was last seen signed then.
-		seed(gcd, start.Add(54*time.Hour-ttl))
+		// gcd's deadline: 49 h 30 m, off the reaper's 6 h grid; its cached
+		// InRelease, unused for 8 days, is past url_path_ttl, and its base
+		// was last seen signed then.
+		seed(gcd, start.Add(49*time.Hour+30*time.Minute-ttl))
 		old := start.Add(-8 * 24 * time.Hour).Unix()
 		h, err := b.ad.writeBlobBytes(ctx, simtest.ClearsignedFixture("Origin: gcd\nSHA256:\n"))
 		if err != nil {
@@ -548,20 +558,20 @@ func TestDoD_ProductionCadenceAcrossTwelveHourlyRestarts(t *testing.T) {
 						t.Fatalf("at 48 h: %s's anchor row %v, its row %v; want the anchor deleted by url_path GC, the row kept",
 							gcd, gcdAnchor(), b.exists(t, gcd))
 					}
-					time.Sleep(6 * time.Hour)
-				case half == 4 && step == 1: // 54 h: the deadline; the run at 55 h reaps it
-					time.Sleep(30 * time.Minute)
+					// The boot's runs: 49 h (the floor; before the 49 h 30 m
+					// deadline), then 50 h, which reaps it.
+					time.Sleep(time.Hour + 59*time.Minute)
 					if !b.exists(t, gcd) {
-						t.Fatalf("%s reaped before its deadline", gcd)
+						t.Fatalf("%s reaped before the run after its deadline", gcd)
 					}
-					time.Sleep(time.Hour)
+					time.Sleep(2 * time.Minute)
 					if b.exists(t, gcd) {
-						t.Fatalf("%s not reaped although url_path GC took its anchor", gcd)
+						t.Fatalf("%s not reaped by the hourly run after its deadline, although url_path GC took its anchor", gcd)
 					}
 					if at, ok, err := b.c.SignedSeen(ctx, "http", "h", gcd); err != nil || !ok || at < old {
 						t.Fatalf("%s's marker after the reap: %d, %v, %v; want it kept", gcd, at, ok, err)
 					}
-					time.Sleep(4*time.Hour + 30*time.Minute)
+					time.Sleep(3*time.Hour + 59*time.Minute) // back on the six-hour grid: 54 h
 				default:
 					time.Sleep(6 * time.Hour)
 				}

@@ -3,13 +3,14 @@ package freshness
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"maps"
+	"path/filepath"
 	"runtime"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,6 +41,40 @@ func seedSimSuite(t *testing.T, c *cache.Cache, host, suite string, lastAt, fail
 	}
 	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite,
 		LastCheckAt: &lastAt, LastSuccessAt: &lastAt, CheckFailCount: failCount}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// seedSimSuites is seedSimSuite, fail count 0, for many suites of host:
+// one transaction on the cache's database, where seedSimSuite takes three
+// writer calls a suite (deferred minor C-38: seeding 501 suites that way
+// took 2.2 s of the -race budget).
+func seedSimSuites(t *testing.T, c *cache.Cache, host string, suites []string, lastAt int64) {
+	t.Helper()
+	if err := c.PutBlob(context.Background(), testHex64, 1); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(c.Dir(), "cache.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, suite := range suites {
+		if _, err := tx.Exec(`INSERT INTO url_path (canonical_scheme, canonical_host, path, blob_hash, upstream_url, is_metadata, request_count)
+ VALUES ('http', ?, ?, ?, ?, 1, 1)`, host, suite+"/InRelease", testHex64, "http://"+host+suite+"/InRelease"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(`INSERT INTO suite_freshness (canonical_scheme, canonical_host, suite_path, last_check_at, last_success_at, last_requested_at)
+ VALUES ('http', ?, ?, ?, ?, ?)`, host, suite, lastAt, lastAt, lastAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -286,24 +321,30 @@ func TestSimScheduler_FiveHundredStallingOneHealthy(t *testing.T) {
 		c := simtest.OpenCache(t)
 		up := simtest.NewUpstream()
 		stale := time.Now().Add(-2 * time.Hour).Unix()
-		for i := 0; i < 500; i++ {
-			suite := fmt.Sprintf("/s%03d/dists/x", i)
-			seedSimSuite(t, c, "a", suite, stale, 0)
-			up.Set("http://a"+suite+"/InRelease", simtest.Stall())
+		suites := make([]string, 500)
+		for i := range suites {
+			suites[i] = fmt.Sprintf("/s%03d/dists/x", i)
+			up.Set("http://a"+suites[i]+"/InRelease", simtest.Unavailable())
 		}
 		const sPath = "/zzz/dists/x"
 		sURL := "http://a" + sPath + "/InRelease"
-		seedSimSuite(t, c, "a", sPath, stale, 0)
+		seedSimSuites(t, c, "a", append(slices.Clone(suites), sPath), stale)
 		up.Set(sURL, simtest.NotModified())
 		const refresh = time.Hour
 		tick := refresh / 4
 		cfg := Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: refresh, Logger: simtest.DiscardLogger()}
 		_, stop := startSched(t, cfg)
 
-		// Phase 1: every stalling suite fails once while still in the
-		// healthy class (spec C4: a first failure is paid once):
-		// 500 × 2 min ≈ 16 h 40 min.
-		time.Sleep(17*time.Hour + 37*time.Minute)
+		// Phase 1: every one of the 500 fails once while still in the
+		// healthy class (spec C4: a first failure is paid once). Each
+		// answers its first check 503, an unknown end that takes no time,
+		// so the first tick fails all 500; from then on they stall
+		// (deferred minor C-38: 500 stalling first checks took 16 h 40 min
+		// of virtual time, and their ticks most of the -race budget).
+		time.Sleep(tick + time.Minute)
+		for _, suite := range suites {
+			up.Set("http://a"+suite+"/InRelease", simtest.Stall())
+		}
 		all, err := c.ListSuites(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -375,8 +416,8 @@ func TestSimScheduler_FiveHundredStallingOneHealthy(t *testing.T) {
 
 // Deferred minor B-53 (phase B DoD): the stalling-host bound with an
 // adopter wired and adoptions contending on the stalling host, at a fifth
-// of the 500-suite simulation's size (that one, without an adopter, is
-// already over the 5 s -race budget: deferred minor C-38, phase H).
+// of the 500-suite simulation's size (that one, without an adopter, fits
+// the -race budget only coarsened: deferred minor C-38).
 //
 // The contention is real (review fix round 1, Task 14): one host limiter
 // is shared by the checker and the adopter, as in production
@@ -482,9 +523,8 @@ func TestSimScheduler_StallingHostWithAdoptionContention(t *testing.T) {
 		members.setDelay(rBase+"Contents-amd64.gz", 10*time.Minute)
 		members.setDelay(rByHash, 10*time.Minute)
 		up.Set(rBase+"InRelease", simtest.Serve(relR))
-		cAdoptions := func() float64 {
-			v, _ := strconv.ParseFloat(renderedMetricLabels("acu_adoption_total", `outcome="success"`, `host="a"`), 64)
-			return v
+		cAdoptions := func() float64 { // deferred minor E-51: a value that does not parse fails the test
+			return renderedFloat(t, renderedMetricLabels("acu_adoption_total", `outcome="success"`, `host="a"`))
 		}
 		startAdoptions := cAdoptions()
 		starts.mu.Lock()

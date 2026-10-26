@@ -148,8 +148,12 @@ func TestDoD_ActiveSuitesAdoptOnceDormantSuitesStaySilent(t *testing.T) {
 			t.Fatalf("returning %v: adopted %v after its touch, want within one scheduler tick (%v) and its check",
 				returning, at[0].Sub(touched), tick)
 		}
-		for _, s := range dormant {
-			if n := len(up.Calls(anchorURL(s))); n != 0 {
+		for _, s := range dormant { // every anchor file, not InRelease alone (deferred minor E-55)
+			n := 0
+			for _, name := range []string{"InRelease", "Release", "Release.gpg"} {
+				n += len(up.Calls("http://" + s.CanonicalHost + s.SuitePath + "/" + name))
+			}
+			if n != 0 {
 				t.Fatalf("dormant %v: %d upstream requests, want 0", s, n)
 			}
 		}
