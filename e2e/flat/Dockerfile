@@ -41,7 +41,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 # archive.debian.org; the image still names deb.debian.org (design note 9).
 # bullseye-security stays: the image's own packages (perl-base) come from
 # it, so apt-file's perl cannot install without it. Retries: apt 2.2
-# (Debian 11) makes none by default.
+# (Debian 11) makes none by default. docker-clean is gone before this
+# install, so `apt-get clean` drops the .debs and caches it leaves behind.
 RUN . /etc/os-release && \
     if [ "$VERSION_CODENAME" = bullseye ]; then \
         printf '%s\n' 'deb http://archive.debian.org/debian bullseye main' \
@@ -52,6 +53,7 @@ RUN . /etc/os-release && \
     apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
         nginx-light curl jq apt-file ca-certificates && \
+    apt-get clean && \
     rm -rf /var/lib/apt/lists/* /etc/apt/sources.list /etc/apt/sources.list.d/* && \
     mkdir -p /run/acu-e2e /var/log/acu-e2e
 COPY --from=build /out/apt-cacher-ultra /usr/local/bin/apt-cacher-ultra

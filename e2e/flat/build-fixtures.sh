@@ -15,15 +15,19 @@
 # Each repository reproduces one real repository's shape (spec §3, "Real
 # flat repositories"); the comment on its builder says which. Packages are
 # named acu-<repo> (acu-epoch, acu-jenkins-direct and acu-rogue besides),
-# version 1.0 in v1 and 2.0 in v2, and install one file,
-# /usr/share/acu-e2e/<name>, that holds "<name> <version>".
+# version 1.0 in v1 and 2.0 in v2 (acu-rogue is 1.0 in both), and install
+# one file, /usr/share/acu-e2e/<name>, that holds "<name> <version>".
 #
 # AIDEV-NOTE: ruling R-H2-1 — the signing key is generated here, at image
 # build time, and never leaves the image; no key is committed. v1 is dated
-# two days before the build and v2 one day before (both in the past, so a
-# cached image stays valid: no fixture carries Valid-Until), and every file
-# of a version gets its version's mtime, so v1 and v2 never share an
-# nginx ETag or Last-Modified even when their sizes match.
+# two days before the build that made the fixtures layer and v2 one day
+# before, and every file of a version gets its version's mtime, so v1 and
+# v2 never share an nginx ETag or Last-Modified even when their sizes
+# match. A cached fixtures layer stays valid indefinitely: no fixture
+# carries Valid-Until, apt and the daemon refuse only a Date in the future
+# (the daemon's other Date rule, upstream_older, compares v2 with v1), and
+# the key never expires (`sign 0`). `docker build --no-cache-filter
+# fixtures …` regenerates the key and the dates.
 set -euo pipefail
 
 OUT="${1:-/fixtures}"
@@ -323,15 +327,23 @@ link plain.test/goreleaser "$OUT/goreleaser/current"
 
 # Shape self-checks: a scenario relying on one of these shapes would
 # pass vacuously without it (frozen-date, first-contact's inline
-# adoption of a SHA512-only Release).
-if [[ $(grep '^Date:' "$OUT/nvidia/v1/InRelease") != "$(grep '^Date:' "$OUT/nvidia/v2/InRelease")" ]]; then
-    echo "build-fixtures: libnvidia-container's v1 and v2 Dates differ (want one frozen Date)" >&2
-    exit 1
-fi
-if grep -qE '^(MD5Sum|SHA1|SHA256):' "$OUT/nvidia/v1/InRelease" "$OUT/nvidia/v2/InRelease"; then
-    echo "build-fixtures: libnvidia-container's Release is not SHA512-only" >&2
-    exit 1
-fi
+# adoption of a SHA512-only Release). Each check is positive, so a
+# missing file or a missing field fails the build instead of passing it.
+for vdir in v1 v2; do
+    rel="$OUT/nvidia/$vdir/InRelease"
+    if [[ ! -f $rel ]]; then
+        echo "build-fixtures: libnvidia-container's $vdir InRelease is missing" >&2
+        exit 1
+    fi
+    if ! grep -Fxq "Date: $DATE_FROZEN" "$rel"; then
+        echo "build-fixtures: libnvidia-container's $vdir Release lacks \"Date: $DATE_FROZEN\" (want one frozen Date)" >&2
+        exit 1
+    fi
+    if ! grep -q '^SHA512:' "$rel" || grep -qE '^(MD5Sum|SHA1|SHA256):' "$rel"; then
+        echo "build-fixtures: libnvidia-container's $vdir Release is not SHA512-only" >&2
+        exit 1
+    fi
+done
 
 chmod -R a+rX "$OUT"
 echo "build-fixtures: key $FPR; v1 dated $DATE_V1, v2 dated $DATE_V2"
