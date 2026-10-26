@@ -52,9 +52,12 @@ NOTES.md
 # Local scratchpad — not part of any image.
 prompt
 
-# Claude Code state (worktrees: hundreds of MB in the main checkout) and
+# Claude Code state (worktrees: hundreds of MB in the main checkout), the
+# superpowers workflow's git-ignored scratch (any write there would
+# otherwise invalidate the `COPY . .` layer and rebuild the daemon), and
 # the binary `go build` leaves in the repo root.
 .claude/
+.superpowers/
 /apt-cacher-ultra
 
 # Note: e2e/ is intentionally NOT excluded. The cache image's runtime
