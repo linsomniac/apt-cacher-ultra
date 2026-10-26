@@ -444,8 +444,10 @@ func TestSimCapacity_UpgradeBurstSameHost(t *testing.T) {
 			}
 			totalLost += lost[s]
 		}
-		// (4) Work-conserving: a lost offer needs another admission; and
-		// the lost-offer term is exercised (hx's).
+		// (4) Work-conserving: a lost offer needs another admission — hx's
+		// the test's synthetic lease, which admissions leaves out, so the
+		// bound has slack for it; and the lost-offer term is exercised
+		// (hx's).
 		if admissions := len(first) + len(signed); totalLost > admissions || totalLost < 1 {
 			t.Errorf("%d lost offers for %d admissions, want at least 1 and at most the admissions", totalLost, admissions)
 		}

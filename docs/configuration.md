@@ -713,9 +713,10 @@ rows and files until the pool is fixed or the suite is reaped or
 forgotten (`POST /forget`). A suite quarantined for declarations outside its signature
 adopts again on its first freshness check, because its tampered copy never
 matches a clean upstream; one quarantined because its stored file was lost
-or corrupt waits for the next upstream change, and may have no record that
-it was signed (see the threat notes in *Anchor forms and unsigned
-repositories*). A quarantined plain-text
+or corrupt adopts again once a client asks for it (with adoption enabled:
+eager first adoption; it does not wait for an upstream change), and may
+have no record that it was signed (see the threat notes in *Anchor forms
+and unsigned repositories*). A quarantined plain-text
 suite adopts again in the unsigned form, through its `Release` (its
 plain-text "InRelease" counts as absent), once a client has asked for it
 and two checks have seen the same `Release` (see *Anchor forms and
@@ -890,15 +891,15 @@ batches of 1,000 files), retires its snapshots and deletes its
 row (INFO `suite_reaped`; `acu_suites_reaped_total{reason}` counts the
 reaps). Each run that completes logs INFO `suite_reaper_run_complete` and
 sets the gauge `acu_suite_reaper_last_run_unixtime`, which has no series
-until the first completed run, an hour after the start. To catch a
-reaper that stopped, alert when the gauge has been absent for longer
-than two hours (`absent(acu_suite_reaper_last_run_unixtime)` with a
-Prometheus `for:` longer than that first hour plus one interval: a hold
-shorter than the first hour, plus the run's own time and the scrape
-delay, pages after every restart, and one under two hours pages whenever
-the first run after a start does not complete) or when its age exceeds two hours
-(one interval plus that first hour); an age alert alone never fires for
-a reaper that has not completed a run since its start.
+until the first completed run, an hour after the start; a run whose
+listing failed, that panicked or that a shutdown cut short does neither.
+To catch a reaper that stopped, alert on
+`absent(acu_suite_reaper_last_run_unixtime)` held by a Prometheus
+`for: 3h`, or on `time() - acu_suite_reaper_last_run_unixtime > 3 * 3600`:
+a restart or one failed run never pages, and a reaper that stopped
+completing runs pages within about three hours (the gauge's entry in
+[log fields](log-fields.md) gives the reasoning). The age leg alone never
+fires for a reaper that has not completed a run since its start.
 The reaper deletes no package, but a reaped suite's packages
 lose the version retention its snapshot gave them
 (`retention.max_versions_per_package` counts versions in current

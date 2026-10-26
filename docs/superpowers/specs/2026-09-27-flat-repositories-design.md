@@ -1592,8 +1592,9 @@ listing read, its reaps tried, its sweeps done, or held back by the
 forward-step guard — logs INFO `suite_reaper_run_complete` and sets the
 gauge `acu_suite_reaper_last_run_unixtime`, which has no series until the
 first completed run, after the uptime floor: an operator alerts on its
-absence held longer than the floor plus an interval, or on its age beyond
-an interval plus the floor (phase H1). The guard's forward-step report counts in
+absence held 3 h, or on its age beyond 3 h — the floor plus two
+intervals, so neither a restart nor one failed run pages, and a run that
+panicked or failed its listing sets no gauge (phase H1). The guard's forward-step report counts in
 `acu_clock_steps_detected_total` like every report. The gpg
 once-logger sets start over when a new key finds 10,000 entries.
 Snapshot GC gains sub-job C,
@@ -1750,12 +1751,18 @@ an adoption outcome), `suite_evicted`, `suite_caps_exceeded`,
 `suite_not_forgotten` (DEBUG; WARN for `reason=changed`), `gc_panicked`, `legacy_anchor_discard_failed`,
 `reconcile_snapshot_read_failed` and `source_paths_skipped`, and the 43
 lines this branch added with prose messages, renamed to snake_case event
-names, each keeping its level and fields (`suite_onboarding_failed`,
-`suite_reaper_list_suites_failed`, `admin_forget_failed`,
-`freshness_anchorless_index_over_cap`, `freshness_check_cancelled`,
-`suite_touch_failed` and their siblings; rulings R-H3 and R-H6: no release
-logged the prose; a guard test fails any new prose message, main's released
-ones excepted); new fields `anchor_form`,
+names (`suite_onboarding_failed`, `suite_reaper_list_suites_failed`,
+`admin_forget_failed`, `freshness_anchorless_index_over_cap`,
+`freshness_check_cancelled`, `suite_touch_failed` and their siblings;
+rulings R-H3 and R-H6: no release logged the prose; a guard test fails any
+new prose message, main's released ones excepted), each keeping its level
+and fields except five that phase H1 changed besides: `canonical_scheme`
+added to `freshness_check_ended_by_shutdown` and `freshness_check_cancelled`;
+`canonical_scheme`, and DEBUG at shutdown, on
+`freshness_read_anchor_rows_failed` (its absent-anchor site, GD-6); DEBUG at
+shutdown on `adoption_served_anchor_read_failed`; and
+`admin_forget_failed`'s `scheme` renamed `canonical_scheme` (below); new
+fields `anchor_form`,
 `snapshot_displaced`, `flip_held_ms`, phase G's `rows_replaced` and
 `rows_deleted` (the anchorless `freshness_check` line, C4 Dispatch 4) and
 `suite_path` in `package_hash_conflict`'s `declared` entries (C6), and phase

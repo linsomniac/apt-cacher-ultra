@@ -412,6 +412,11 @@ func (q *schedQueues) has(key string) bool {
 // nothing is ever attempted, so only staleness counts (Phase 1 parity,
 // mirroring retryGateFor); with one, a never-adopted suite is due only
 // while it has client interest (spec C4 Dispatch 3).
+//
+// AIDEV-NOTE: internal/admin's unscheduled and annotateSuiteEntries mirror
+// its dormancy, record pacing and clock-step rules for the status page's
+// backoff text (TestSuiteEntries_FailingChecksSayWhenTheBackoffEnds):
+// change both together.
 func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
 	nowU := now.Unix()
 	future := nowU + int64(clockStepTolerance/time.Second)

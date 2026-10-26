@@ -20,6 +20,10 @@ const (
 	// interestWindow is spec C4's eager-adoption interest window (a C11
 	// constant, independent of the GC settings); the v7 backfill
 	// (cache.interestWindowSeconds) uses the same 7 days.
+	//
+	// AIDEV-NOTE: internal/admin mirrors it as statusInterestWindow
+	// (unscheduled; TestSuiteEntries_FailingChecksSayWhenTheBackoffEnds):
+	// change both together.
 	interestWindow = 7 * 24 * time.Hour
 
 	// minConfirmGap is the floor of the unsigned transition's and the

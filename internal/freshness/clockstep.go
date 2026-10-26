@@ -12,6 +12,10 @@ import (
 // clockStepTolerance: stamps are whole seconds, so a sub-second backward
 // NTP step can make a just-written stamp look up to 1 s in the future.
 // Only a stamp further ahead than this counts as a clock step.
+//
+// AIDEV-NOTE: internal/admin mirrors it as statusClockStepTolerance for the
+// status page's backoff text (TestSuiteEntries_FailingChecksSayWhenTheBackoffEnds):
+// change both together.
 const clockStepTolerance = 2 * time.Second
 
 // clockStepLogEvery rate-limits clock_step_detected to one line per

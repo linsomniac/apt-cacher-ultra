@@ -43,6 +43,9 @@ func pacedByRefusal(g retryGate) bool {
 // recordPacesAdopted reports a record reason that paces an adopted suite
 // while active and not due (pacedByRefusal, suiteDue): anchor_absent
 // (ruling PE-2) and unsigned_disabled (ruling PE-12).
+//
+// AIDEV-NOTE: internal/admin's unscheduled mirrors this set
+// (TestSuiteEntries_FailingChecksSayWhenTheBackoffEnds): change both.
 func recordPacesAdopted(reason string) bool {
 	return reason == cache.ReasonAnchorAbsent || reason == cache.ReasonUnsignedDisabled
 }

@@ -911,7 +911,8 @@ func TestServeHTTP_AdoptedSuiteMissingBlob_StaleNotServed(t *testing.T) {
 	// Seed a stale url_path row for the same path. respondError's
 	// upstream-unreachable path would otherwise serve this; the
 	// recovery responder must not.
-	staleAnchor := simtest.ClearsignedFixture("stale Phase 1 InRelease") // not staleBody: that is the package's helper (deferred minor D-28)
+	// Not staleBody: that is the package's helper (deferred minor D-28).
+	staleAnchor := simtest.ClearsignedFixture("stale Phase 1 InRelease")
 	stale := writeBlob(t, h, staleAnchor)
 	now := nowUnixForTest()
 	if err := h.cache.PutURLPath(context.Background(), cache.URLPath{

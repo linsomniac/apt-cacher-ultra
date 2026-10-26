@@ -694,12 +694,14 @@ func buildSuiteEntries(rows []cache.SuiteWithAdoption, now int64) []suiteEntry {
 // set (checkFirst), a refusal or failure writes a record, a commit sets
 // the current snapshot. With adoption disabled no anchorless check runs,
 // and the Phase-1 check bumps last_success_at for an InRelease too, so
-// the field is false there. One exception, for one check: a flat suite
-// whose row an adoption-disabled InRelease miss created has
-// last_success_at set (suiteSeed stamps it), so after adoption is
-// enabled the field reads true until the suite's first check (review M-11
-// of the H1 plan). If the freshness side changes any of these, change the
-// derivation (TestSuiteEntries_Anchorless).
+// the field is false there. One exception: a flat suite whose row an
+// adoption-disabled InRelease miss created has last_success_at set
+// (suiteSeed stamps it), so after adoption is enabled the field reads true
+// until the suite's first check (review M-11 of the H1 plan), which for a
+// suite no client asked for in 7 days (dormant: suiteDue never queues it)
+// comes only once one asks again (the H1 final review's ops M-3). If the
+// freshness side changes any of these, change the derivation
+// (TestSuiteEntries_Anchorless).
 func annotateSuiteEntries(es []suiteEntry, adoptionEnabled bool, checkBackoff func(int64) time.Duration, now int64) {
 	for i := range es {
 		e := &es[i]
@@ -1036,8 +1038,10 @@ func writeStatusJSON(w io.Writer, m statusModel) error {
 // yet". It is not HTML-only: buildStatusModel passes it to
 // annotateSuiteEntries, so it also derives the JSON's
 // suites[].anchorless, and changing the convention changes the JSON
-// contract (TestStatus_AnchorlessFlatSuiteThroughTheServer). See
-// .phase-loop-notes.md "Spec issues" for the followup.
+// contract (TestStatus_AnchorlessFlatSuiteThroughTheServer). Making the
+// signal explicit (an AdoptionEnabled field in admin.Config) would need
+// cmd and server changes; until then the snapshot-nil convention is the
+// signal.
 func (s *Server) buildHTMLRenderModel(m statusModel) htmlRenderModel {
 	w := htmlRenderModel{statusModel: m, AdoptionEnabled: s.adoptionEnabled()}
 	w.Suites = suitesForHTML(m.Suites, w.AdoptionEnabled)

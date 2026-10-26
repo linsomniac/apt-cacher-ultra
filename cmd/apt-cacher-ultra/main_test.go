@@ -86,9 +86,10 @@ func loadAutoCAPool(t *testing.T, cacheDir string) *x509.CertPool {
 // is reachable) and an empty deny-CIDR list (so the default 127.0.0.0/8
 // deny does not block the test fetcher). cfg.Cache.Listen is intentionally
 // left empty — the test path goes through serveListeners with a bound :0
-// listener, not through serve. Unlike the production defaults, adoption.
-// adopt_unsigned is false here (the struct literal leaves it unset): a cmd
-// test that expects the default sets it (deferred minor E-74).
+// listener, not through serve. Unlike the production defaults,
+// adoption.adopt_unsigned is false here (the struct literal leaves it
+// unset): a cmd test that expects the default sets it (deferred minor
+// E-74).
 func minimalCfg(cacheDir string, mirrors []config.MirrorRule) *config.Config {
 	cfg := &config.Config{
 		Cache: config.CacheConfig{

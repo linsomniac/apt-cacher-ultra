@@ -240,21 +240,22 @@ type reapCandidate struct {
 // AIDEV-NOTE: deferred minor F-13 (design note 7 of the H1 plan). A run
 // that completes — the listing read, the reaps tried, the sweeps done, or
 // held back by the forward-step guard — logs suite_reaper_run_complete
-// and sets acu_suite_reaper_last_run_unixtime; one whose listing failed or
-// that a shutdown cut short does neither, so an alert on the gauge catches
-// a reaper that stopped completing runs (GC's acu_gc_last_run_unixtime is
+// and sets acu_suite_reaper_last_run_unixtime; one whose listing failed,
+// that panicked outside a held candidate (safeRun's recover) or that a
+// shutdown cut short does neither, so an alert on the gauge catches a
+// reaper that stopped completing runs (GC's acu_gc_last_run_unixtime is
 // the model). Unlike GC's, the gauge has no series until the first
 // completed run, which comes only after the uptime floor; so the alert is
-// absent(acu_suite_reaper_last_run_unixtime) OR its age > reapInterval +
-// reapUptimeFloor — an age alert alone never fires for a reaper that has
-// not completed a run since its start. The series is also absent for the
-// floor after every start, so the absent() leg must hold for longer than
-// reapUptimeFloor + reapInterval (a Prometheus for: clause): a hold
-// shorter than the floor (plus the run's own time and the scrape delay)
-// pages on every restart, and one under floor + interval pages whenever
-// the first run after a start does not complete, before the second can
-// (Task 18 review M-1). The gauge is not seeded at Run's start on purpose:
-// that would claim a run that did not happen (Task 6 review minor 3).
+// absent(acu_suite_reaper_last_run_unixtime) held by a Prometheus for: 3h
+// OR its age > 3h (docs/log-fields.md's recipe) — an age alert alone
+// never fires for a reaper that has not completed a run since its start.
+// 3 h is reapUptimeFloor + reapInterval plus one more interval of margin:
+// the age peaks near floor + interval after a restart or one failed run,
+// so a threshold at that edge paged or not on the runs' durations and the
+// scrape timing (Task 18 review M-1; the H1 final review's ops M-1).
+// Retune the recipe if either constant changes. The gauge is not seeded at
+// Run's start on purpose: that would claim a run that did not happen
+// (Task 6 review minor 3).
 func (r *Reaper) runOnce(ctx context.Context) {
 	start := time.Now()
 	rows, err := r.cache.ListSuitesWithAdoption(ctx)

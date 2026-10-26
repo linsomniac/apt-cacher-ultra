@@ -444,7 +444,7 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
           <table class="data">
             <thead><tr>
               <th>Host</th><th>Suite path</th><th>Last check</th><th>Last success</th>
-              <th>Last requested<details class="col-hint"><summary aria-label="What does Last requested mean?">i</summary><div class="col-hint__body">When a client last asked for this suite. A suite no client asks for in gc.suite_idle_ttl (720 h by default) is reaped.</div></details></th>
+              <th>Last requested<details class="col-hint"><summary aria-label="What does Last requested mean?">i</summary><div class="col-hint__body">When a client last asked for this suite. A suite whose last request is older than gc.suite_idle_ttl (720 h by default; 0s disables reaping) is reaped.</div></details></th>
               <th class="num">Snapshot</th>
               <th>Adopted<details class="col-hint"><summary aria-label="What does Adopted mean?">i</summary><div class="col-hint__body">Adoption fires only when a fresh InRelease has been observed. Suites whose upstream has not republished since process start may stay empty here without being broken.</div></details></th>
               <th>InRelease changed</th>
