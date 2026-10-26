@@ -106,3 +106,33 @@ func TestReleaseDate(t *testing.T) {
 		t.Fatalf("maxReleaseDateSkew = %v, want apt's Acquire::Max-FutureTime default (10s)", maxReleaseDateSkew)
 	}
 }
+
+// Deferred minor B-9: apt's isspace is ASCII, so a no-break space neither
+// separates the date's fields nor pads the value (the date is unreadable:
+// 0), while any ASCII blank does both.
+func TestReleaseDate_ASCIIWhitespaceOnly(t *testing.T) {
+	for text, want := range map[string]int64{
+		"Date: Sun,\u00a006 Nov 1994 08:49:37 GMT\n":   0,
+		"Date: Sun, 06 Nov 1994 08:49:37 GMT\u00a0\n":  0,
+		"Date:\tSun,\t06\tNov\v1994\f08:49:37 GMT\t\n": rfcExample,
+	} {
+		if got := releaseDate([]byte(text)); got != want {
+			t.Errorf("releaseDate(%q) = %d, want %d", text, got, want)
+		}
+	}
+}
+
+// Deferred minor B-9, the key's half (execution review G-9): apt's tag
+// parser trims ASCII blanks around the field name (B-10), but a no-break
+// space is part of the name, so "Date\u00a0:" is not the Date field (0),
+// while "Date \t:" still is.
+func TestReleaseDate_KeyTrimsASCIIBlanksOnly(t *testing.T) {
+	for text, want := range map[string]int64{
+		"Date\u00a0: Sun, 06 Nov 1994 08:49:37 GMT\n": 0,
+		"Date \t: Sun, 06 Nov 1994 08:49:37 GMT\n":    rfcExample,
+	} {
+		if got := releaseDate([]byte(text)); got != want {
+			t.Errorf("releaseDate(%q) = %d, want %d", text, got, want)
+		}
+	}
+}

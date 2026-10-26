@@ -12,9 +12,20 @@ import (
 // dated further ahead than this is "not valid yet" (spec C5).
 const maxReleaseDateSkew = 10 * time.Second
 
+// aptSpace is C's isspace in the "C" locale, apt's whitespace: ASCII
+// only, so a no-break space or other Unicode space is an ordinary
+// character (deferred minor B-9).
+const aptSpace = " \t\n\v\f\r"
+
 // releaseDate returns the Date field of verified Release text in Unix
 // seconds, or 0 when the field is missing or apt would not parse it (apt
 // treats both as 0: debmetaindex.cc).
+//
+// AIDEV-NOTE: every top-level line is read, where apt reads the first
+// paragraph only (deferred minor B-13, declined in phase H): real Release
+// files are one paragraph, and this package's test verifiers hand the
+// parsers the whole clearsign envelope — its armor header and blank line
+// first — so a first-paragraph reader finds no Date in their fixtures.
 func releaseDate(text []byte) int64 {
 	scanner := bufio.NewScanner(bytes.NewReader(text))
 	scanner.Buffer(make([]byte, 0, scanBufCap), scanBufCap)
@@ -23,11 +34,11 @@ func releaseDate(text []byte) int64 {
 		if line == "" || line[0] == ' ' || line[0] == '\t' {
 			continue
 		}
-		key, val, ok := strings.Cut(line, ":")
-		if !ok || !strings.EqualFold(strings.TrimSpace(key), "Date") {
+		key, val, found := strings.Cut(line, ":")
+		if !found || !strings.EqualFold(strings.Trim(key, aptSpace), "Date") {
 			continue
 		}
-		if t, ok := parseAptDate(strings.TrimSpace(val)); ok {
+		if t, ok := parseAptDate(strings.Trim(val, aptSpace)); ok {
 			return t
 		}
 		return 0
@@ -54,19 +65,21 @@ func releaseDate(text []byte) int64 {
 // minutes leaves a stray digit where ':' must follow, rejecting values like
 // "30:00:00" or "08:70:00" for that reason rather than a range check.
 //
-// Two deliberate divergences remain, both confined to the day token in
-// RFC 1123/asctime form (aptDigits, which is unsigned and requires the
-// whole token to be digits): apt reads it with istream >>, which stops at
-// the first non-digit, so a token such as "6," parses there as 6, where
-// this rejects it outright; and an RFC 850 day above 65535 is rejected
-// instead of wrapping. Real Release files never reach either difference.
+// Two deliberate divergences remain, both in the day token. In RFC 1123
+// and asctime form (aptDigits, unsigned, the whole token digits), apt
+// reads it with istream >>, which stops at the first non-digit, so a token
+// such as "6," parses there as 6, where this rejects it outright. In RFC
+// 850 form (aptStoi, then parseAptDate's day > 65535 bound), apt keeps
+// std::stoi's result in an unsigned short, so a day above 65535 wraps
+// there and is rejected here (deferred minor B-14: not aptDigits). Real
+// Release files never reach either difference.
 // Year (aptSignedInt) and the RFC 850 month/year parts (aptStoi) are not
 // part of this divergence: they accept an optional sign and still require
 // full consumption, matching istream >> int / std::stoi (apt's own code
 // checks that stoi consumed the whole token there too). TestParseAptDate
 // pins the behaviour.
 func parseAptDate(s string) (int64, bool) {
-	f := strings.Fields(s)
+	f := strings.FieldsFunc(s, func(r rune) bool { return strings.ContainsRune(aptSpace, r) })
 	if len(f) == 0 {
 		return 0, false
 	}
@@ -116,8 +129,8 @@ func parseAptDate(s string) (int64, bool) {
 		if day, ok = aptStoi(parts[0]); !ok || day < 0 || day > 65535 {
 			return 0, false
 		}
-		yy, ok := aptStoi(parts[2])
-		if !ok {
+		var yy int
+		if yy, ok = aptStoi(parts[2]); !ok {
 			return 0, false
 		}
 		year = 1900 + yy
