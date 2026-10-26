@@ -279,15 +279,17 @@ refused_older() {
 # with the same candidates, and anchors served from the snapshots.
 restart() {
     scenario restart "state survives a restart"
-    local before after cands_before cands_after stopped_at
+    local before after cands_before cands_after stopped_at started
     apt_update main
     before=$(snapshot_ids)
     cands_before=$(main_candidates)
     stopped_at=$(date +%s)
     stop_daemon
     start_daemon
-    (($("${CURL[@]}" -fsS "$ADMIN/?format=json" | jq .process.started_unixtime) >= stopped_at)) ||
-        fail "the daemon was not restarted"
+    started=$("${CURL[@]}" -fsS "$ADMIN/?format=json" | jq -r '.process.started_unixtime // empty' || true)
+    [[ $started =~ ^[0-9]+$ ]] || fail "no process.started_unixtime in the admin status"
+    ((started >= stopped_at)) ||
+        fail "the daemon was not restarted: process.started_unixtime $started is before the stop at $stopped_at"
     after=$(snapshot_ids)
     [[ $before == "$after" ]] || fail "snapshots changed across the restart: $before -> $after"
     apt_update main
@@ -295,7 +297,8 @@ restart() {
     [[ $cands_before == "$cands_after" ]] || fail "candidates changed across the restart: $cands_before -> $cands_after"
     # An anchor through the proxy: a flip may hold it up to flipgate.HoldMax
     # (20 s), so its limit is 35 s, not CURL's 10.
-    curl --max-time 35 -fsS -D /clients/main/k8s-InRelease.headers -o /dev/null -x "$PROXY" "http://signed.test$K8S/InRelease"
+    curl --max-time 35 -fsS -D /clients/main/k8s-InRelease.headers -o /dev/null -x "$PROXY" "http://signed.test$K8S/InRelease" ||
+        fail "the k8s InRelease through the proxy failed after the restart"
     grep -qi '^x-cache-snapshot:' /clients/main/k8s-InRelease.headers ||
         fail "the k8s InRelease is not served from its snapshot after the restart"
     passed
@@ -322,6 +325,15 @@ main_candidates() {
 # (one per source form) install 2.0 from the snapshots. Meanwhile the
 # checks their updates trigger fail, and the status page shows the failing
 # checks' backoff (backoff_shown).
+#
+# AIDEV-NOTE: upstream_down stays the last scenario before whole_run.
+# Every suite checked while nginx is down (by a client's update or by the
+# scheduler's tick) fails, and is still in its backoff after start_nginx:
+# 2 minutes after one failure, doubling (freshness.CheckBackoff). So a
+# scenario after it that waits for the scheduler's check (a bound of
+# periodic_refresh + a tick + 10 s, as the anchorless carry-forward's)
+# would time out. Design note 7 records the same cost for the unsigned
+# suite.
 upstream_down() {
     scenario upstream-down "upstream stopped: fresh clients of both forms install 2.0 from the snapshots"
     stop_nginx
@@ -361,7 +373,7 @@ backoff_shown() {
     apt_update fresh-slash
     n=$(suite signed.test "$K8S" check_fail_count)
     ((${n:-0} > 0)) || return 1
-    "${CURL[@]}" -fsS -o /clients/fresh-slash/status.html "$ADMIN/"
+    "${CURL[@]}" -fsS -o /clients/fresh-slash/status.html "$ADMIN/" || return 1
     [[ -n $(awk -v RS='</tr>' -v p="$K8S" '(index($0, ">" p "<") || index($0, ">" p " ")) && index($0, "backoff ends in")' \
         /clients/fresh-slash/status.html) ]]
 }
