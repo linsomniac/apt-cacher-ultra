@@ -366,6 +366,63 @@ fury_clean() {
         [[ $(curl --max-time 35 -s -o /dev/null -w '%{http_code}' -x "$PROXY" http://plain.test/fury/InRelease) == 404 ]]
 }
 
+# Two suites on one host flip at once while a client keeps updating both
+# over its one connection to the host (spec C8).
+two_suites() {
+    scenario two-suites "two suites of one host flip together under a client's updates"
+    client pair "$PROXY" "$SRC_CUDA" "$SRC_DISTS"
+    local start
+    start=$(date +%s)
+    apt_update pair
+    baseline "$start" signed.test "$CUDA" "$DISTS"
+    publish cuda v2
+    publish dists v2
+    until_candidates "$REACH" pair -- acu-cuda=2.0 acu-epoch=1:2.0 acu-dists=2.0
+    by_client
+    say "both suites flipped; the client saw them ${POLL_TOOK}s after the publish"
+    apt_update pair
+    local s
+    for s in "$CUDA" "$DISTS"; do
+        log_has "$SCENARIO_MARK" "$(event adoption_flip_barrier)" "$(suite_kv "$s")" 'outcome=(held|quiet_cut_short)' ||
+            fail "no held flip for $s: $(log_lines "$SCENARIO_MARK" "$(event adoption_flip_barrier)" "$(suite_kv "$s")")"
+    done
+    apt_install pair acu-cuda=2.0 acu-epoch=1:2.0 acu-dists=2.0 -- -o Debug::Acquire::http=true
+    apt_sent "$(re "http://signed.test$CUDA/./acu-epoch_1%253a2.0_amd64.deb")"
+    passed
+}
+
+# Mirror mode: every source on the cache's own address, so apt queues them
+# all on one connection (spec C8, §3). The detached Jenkins suite flips here,
+# under the normal barrier and the full grep with the signature words: a
+# Release and a Release.gpg from different snapshots would show as a
+# signature error, which no other word catches (design note 17).
+mirror_mode() {
+    scenario mirror-mode "signed flat repositories through a [[mirror]] prefix, with two flips"
+    client mirror DIRECT "deb [signed-by=$KEY] $MIRROR/ apt/stable/" \
+        "deb [signed-by=$KEY] $MIRROR/jitsi stable/" \
+        "deb [signed-by=$KEY] $MIRROR/debian-stable binary/" \
+        "deb [signed-by=$KEY] $MIRROR/core:/stable:/v1.34/deb/ /"
+    apt_update mirror -o Debug::Acquire::http=true
+    # Without a proxy apt sends the origin form of the request line.
+    apt_sent "$(re /m-signed/apt/stable/InRelease)"
+    apt_install mirror acu-sublime=1.0 acu-jitsi=1.0 acu-jenkins=1.0 acu-k8s=2.0
+    log_has "$SCENARIO_MARK" "$(event request)" "$(kv url /m-signed/files/acu-sublime_1.0_amd64.deb)" "$(kv validated_hash true)" ||
+        fail "the mirror-mode Sublime .deb was not served vouched"
+    local start
+    start=$(date +%s)
+    apt_update mirror
+    baseline "$start" signed.test "$SUBLIME" "$JENKINS"
+    publish sublime v2
+    publish jenkins v2
+    until_candidates "$REACH" mirror -- acu-sublime=2.0 acu-jenkins=2.0 acu-jenkins-direct=2.0
+    by_client
+    say "the mirror-mode client saw acu-sublime and acu-jenkins 2.0 ${POLL_TOOK}s after the publish"
+    log_has "$SCENARIO_MARK" "$(event adoption_flip_barrier)" "$(suite_kv "$JENKINS")" 'outcome=(held|quiet_cut_short)' ||
+        fail "no held flip for $JENKINS: $(log_lines "$SCENARIO_MARK" "$(event adoption_flip_barrier)" "$(suite_kv "$JENKINS")")"
+    apt_install mirror acu-sublime=2.0 acu-jenkins=2.0 acu-jenkins-direct=2.0
+    passed
+}
+
 # The snapshots survive a restart: the same snapshot ids, a clean update
 # with the same candidates, and anchors served from the snapshots.
 restart() {
@@ -475,6 +532,8 @@ pr8_table
 older_date
 frozen_date
 anchorless
+two_suites
+mirror_mode
 restart
 upstream_down
 stop_daemon
