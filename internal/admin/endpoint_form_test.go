@@ -138,6 +138,38 @@ func TestEndpoint_Reconcile_LogsBothSchemeFields(t *testing.T) {
 	}
 }
 
+// The H1 final review's ops I-1 (parked item 11): a scheme other than
+// http or https, and a host holding one (the status page's Host cell,
+// scheme://host, pasted whole), are 400 from both mutating endpoints with
+// /forget's hints. /reconcile answered both 409 "not triggered (busy, …)",
+// a request that could never succeed read as one to retry. Neither runs
+// the endpoint's work or logs its requested line.
+func TestMutatingEndpoints_SchemeAndSchemeInHostAre400(t *testing.T) {
+	for _, ep := range guardedEndpoints {
+		for _, tc := range []struct{ name, body, text string }{
+			{"another scheme", "scheme=ftp&host=h&suite=/s", "host and suite are required; scheme is http or https"},
+			{"a scheme in host", "host=https://h&suite=/s",
+				"host is the host name alone: pass the scheme in scheme (http or https) and the host without it"},
+		} {
+			t.Run(strings.TrimPrefix(ep.path, "/")+" "+tc.name, func(t *testing.T) {
+				var buf lockedBuffer
+				base, calls, cleanup := ep.start(t, withLogger(slog.New(slog.NewJSONHandler(&buf, nil))))
+				defer cleanup()
+				if status, body := postAdminBody(t, base+ep.path, tc.body); status != http.StatusBadRequest ||
+					body != tc.text+"\n" {
+					t.Errorf("%q: %d %q, want 400 %q", tc.body, status, body, tc.text+"\n")
+				}
+				if n := calls(); n != 0 {
+					t.Errorf("the endpoint ran %d times, want never", n)
+				}
+				if strings.Contains(buf.String(), "_requested") {
+					t.Errorf("a 400 logged a requested line: %s", buf.String())
+				}
+			})
+		}
+	}
+}
+
 // Deferred minor F-4: one parser for both endpoints — host, suite and
 // scheme trimmed, an empty scheme https.
 func TestParseSuiteForm(t *testing.T) {

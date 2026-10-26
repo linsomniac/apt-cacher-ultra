@@ -555,8 +555,12 @@ func (s *Server) logRefresherFailure(metricName string, err error, dur time.Dura
 //   - 202 Accepted: reconcile triggered asynchronously.
 //   - 409 Conflict: not triggered (busy, suite unknown, no current snapshot,
 //     or no free adoption slot).
-//   - 400 Bad Request: host or suite missing, or a body that is not a
-//     valid form (deferred minor F-5).
+//   - 400 Bad Request: host or suite missing, another scheme, a host
+//     holding a scheme (scheme://host, as the status page's Host cell
+//     shows it: the scheme goes in scheme), or a body that is not a valid
+//     form (deferred minor F-5). The scheme and host checks are /forget's,
+//     in parseSuiteForm (the H1 final review's ops I-1): before them
+//     either answered 409, which reads as busy.
 //   - 403 Forbidden: refused by requireMutationGuard; the body says which
 //     rule refused it.
 //   - 413 Request Entity Too Large: body exceeds 8 KiB.
@@ -657,15 +661,8 @@ func (s *Server) handleForget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	scheme, host, suite := f.scheme, f.host, f.suite
-	if host == "" || suite == "" || (scheme != "http" && scheme != "https") {
+	if host == "" || suite == "" {
 		http.Error(w, "host and suite are required; scheme is http or https", http.StatusBadRequest)
-		return
-	}
-	if strings.Contains(host, "://") {
-		// The status page's Host cell shows scheme://host; copied whole
-		// into host it matches no row (the Task 10 review's minor 4).
-		http.Error(w, "host is the host name alone: pass the scheme in scheme (http or https) and the host without it",
-			http.StatusBadRequest)
 		return
 	}
 	s.logger.Info("admin_forget_requested", "canonical_scheme", scheme, "canonical_host", host, "suite_path", suite)
@@ -701,8 +698,10 @@ type suiteForm struct {
 // (deferred minor F-4: one parser for both): at most 8 KiB — more is 413
 // "request body too large" — and a body ParseForm cannot parse (a stray
 // "%", say) is 400 "malformed form body" (deferred minor F-5); host,
-// suite and scheme are trimmed, and an empty scheme is https. When it
-// reports false it has answered.
+// suite and scheme are trimmed, and an empty scheme is https. A scheme
+// other than http or https, or a host holding "://", is 400 with a hint,
+// for both endpoints (the H1 final review's ops I-1); a missing host or
+// suite is left to each handler. When it reports false it has answered.
 //
 // AIDEV-NOTE: http.Error appends the newline: messages carry none, so
 // every error body ends in exactly one (deferred minor F-6). Call it only
@@ -724,6 +723,17 @@ func parseSuiteForm(w http.ResponseWriter, r *http.Request) (suiteForm, bool) {
 		suite: strings.TrimSpace(r.FormValue("suite"))}
 	if f.scheme == "" {
 		f.scheme = "https"
+	}
+	if f.scheme != "http" && f.scheme != "https" {
+		http.Error(w, "host and suite are required; scheme is http or https", http.StatusBadRequest)
+		return suiteForm{}, false
+	}
+	if strings.Contains(f.host, "://") {
+		// The status page's Host cell shows scheme://host; copied whole
+		// into host it matches no row (the Task 10 review's minor 4).
+		http.Error(w, "host is the host name alone: pass the scheme in scheme (http or https) and the host without it",
+			http.StatusBadRequest)
+		return suiteForm{}, false
 	}
 	return f, true
 }
