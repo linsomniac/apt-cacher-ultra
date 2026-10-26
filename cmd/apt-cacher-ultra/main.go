@@ -1056,6 +1056,9 @@ func buildAdopter(
 	if err != nil {
 		return nil, nil, fmt.Errorf("new adopter: %w", err)
 	}
+	if err := applyE2EHooks(adopter, logger); err != nil {
+		return nil, nil, fmt.Errorf("e2e hooks: %w", err)
+	}
 
 	logger.Info("phase2 adoption enabled",
 		"keyring_keys", keyring.Size(),
