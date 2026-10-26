@@ -214,7 +214,163 @@ first_contact() {
     passed
 }
 
+# PR #8's end-to-end table (plan overview, "Cross-phase interfaces", H): one
+# signed flat repository as `deb <uri>/ /` on one client and `deb <uri> ./`
+# on another; both report 2.0 within one cooldown of the v2 publish. The
+# upstream-stopped half runs in upstream_down.
+pr8_table() {
+    scenario pr8-table "one flat repository in both source forms; both see 2.0 after the v2 publish"
+    client k8s-slash "$PROXY" "$SRC_K8S"
+    client k8s-dot "$PROXY" "$SRC_K8S_DOT"
+    apt_update k8s-slash
+    apt_update k8s-dot -o Debug::Acquire::http=true
+    apt_sent "$(re "http://signed.test$K8S/./InRelease")"
+    apt_sent "$(re "http://signed.test$K8S/./Packages.gz")"
+    poll 60 "the ./ twin suite to adopt" adopted_as signed.test "$K8S/." inline
+    apt_install k8s-slash acu-k8s=1.0
+    apt_install k8s-dot acu-k8s=1.0
+
+    local start
+    start=$(date +%s)
+    apt_update k8s-slash
+    apt_update k8s-dot
+    baseline "$start" signed.test "$K8S" "$K8S/."
+    publish k8s v2
+    until_candidates "$REACH" k8s-slash k8s-dot -- acu-k8s=2.0
+    by_client
+    say "both source forms report acu-k8s 2.0 ${POLL_TOOK}s after the publish (cooldown ${COOLDOWN}s)"
+    apt_install k8s-slash acu-k8s=2.0
+    apt_install k8s-dot acu-k8s=2.0
+    passed
+}
+
+# apt ignores an older Date; so does the cache (spec C5, upstream_older).
+# apt alone would keep the existing clients at 2.0, so the check that
+# counts is the cache's: the snapshots stay and a fresh client gets 2.0.
+older_date() {
+    scenario older-date "a publish with an older Date is refused; clients keep 2.0"
+    local s before
+    before=$(snapshot_ids)
+    publish k8s v1
+    for s in "$K8S" "$K8S/."; do
+        poll "$REACH" "signed.test$s to refuse the older Date" refused_older "$s"
+    done
+    apt_update k8s-slash
+    apt_update k8s-dot
+    candidates_are k8s-slash acu-k8s=2.0 || fail "k8s-slash went back to $(candidate k8s-slash acu-k8s)"
+    candidates_are k8s-dot acu-k8s=2.0 || fail "k8s-dot went back to $(candidate k8s-dot acu-k8s)"
+    [[ $(snapshot_ids) == "$before" ]] || fail "the older-Date publish changed a snapshot: $before -> $(snapshot_ids)"
+    client k8s-fresh "$PROXY" "$SRC_K8S"
+    apt_update k8s-fresh
+    candidates_are k8s-fresh acu-k8s=2.0 || fail "a fresh client sees acu-k8s $(candidate k8s-fresh acu-k8s), want 2.0"
+    publish k8s v2
+    passed
+}
+
+# refused_older SUITE: the suite refused an older Date in this scenario;
+# a client update triggers its check.
+refused_older() {
+    apt_update k8s-slash
+    apt_update k8s-dot
+    log_has "$SCENARIO_MARK" "$(event adoption_refused)" "$(suite_kv "$1")" "$(kv reason upstream_older)"
+}
+
+# The snapshots survive a restart: the same snapshot ids, a clean update
+# with the same candidates, and anchors served from the snapshots.
+restart() {
+    scenario restart "state survives a restart"
+    local before after cands_before cands_after stopped_at
+    apt_update main
+    before=$(snapshot_ids)
+    cands_before=$(main_candidates)
+    stopped_at=$(date +%s)
+    stop_daemon
+    start_daemon
+    (($("${CURL[@]}" -fsS "$ADMIN/?format=json" | jq .process.started_unixtime) >= stopped_at)) ||
+        fail "the daemon was not restarted"
+    after=$(snapshot_ids)
+    [[ $before == "$after" ]] || fail "snapshots changed across the restart: $before -> $after"
+    apt_update main
+    cands_after=$(main_candidates)
+    [[ $cands_before == "$cands_after" ]] || fail "candidates changed across the restart: $cands_before -> $cands_after"
+    # An anchor through the proxy: a flip may hold it up to flipgate.HoldMax
+    # (20 s), so its limit is 35 s, not CURL's 10.
+    curl --max-time 35 -fsS -D /clients/main/k8s-InRelease.headers -o /dev/null -x "$PROXY" "http://signed.test$K8S/InRelease"
+    grep -qi '^x-cache-snapshot:' /clients/main/k8s-InRelease.headers ||
+        fail "the k8s InRelease is not served from its snapshot after the restart"
+    passed
+}
+
+# snapshot_ids: every signed suite's current snapshot id, one line.
+snapshot_ids() {
+    local s
+    for s in "$K8S" "$K8S/." "$CUDA" "$NVIDIA" "$JENKINS" "$SUBLIME" "$JITSI" "$DISTS"; do
+        printf '%s=%s ' "$s" "$(suite signed.test "$s" current_snapshot_id)"
+    done
+}
+
+# main_candidates: the main client's candidate of every fixture package.
+main_candidates() {
+    local p
+    for p in acu-k8s acu-cuda acu-epoch acu-nvidia acu-jenkins acu-jenkins-direct acu-sublime \
+        acu-jitsi acu-dists acu-unsigned404 acu-unsigned403 acu-fury acu-goreleaser; do
+        printf '%s=%s ' "$p" "$(candidate main "$p")"
+    done
+}
+
+# PR #8's table, second half: with the upstream stopped, two fresh clients
+# (one per source form) install 2.0 from the snapshots. Meanwhile the
+# checks their updates trigger fail, and the status page shows the failing
+# checks' backoff (backoff_shown).
+upstream_down() {
+    scenario upstream-down "upstream stopped: fresh clients of both forms install 2.0 from the snapshots"
+    stop_nginx
+    local upstream_lines
+    upstream_lines=$(wc -l < "$NGINX_LOG")
+    client fresh-slash "$PROXY" "$SRC_K8S"
+    client fresh-dot "$PROXY" "$SRC_K8S_DOT"
+    apt_update fresh-slash
+    apt_update fresh-dot
+    apt_install fresh-slash acu-k8s=2.0
+    apt_install fresh-dot acu-k8s=2.0
+    # Nothing came from the upstream: these clients were served from the
+    # snapshots alone.
+    (($(wc -l < "$NGINX_LOG") == upstream_lines)) || fail "the upstream answered during upstream-down"
+    # The overview's H1 carry (parked item 12): main.go wires
+    # admin.Config.CheckBackoff, without which a failing suite's row shows
+    # only "checks failing ×k". A client-triggered check fails within a
+    # cooldown of an update; the scheduler's own check of the suite comes
+    # within periodic_refresh and a tick of its last success at the latest.
+    poll $((PERIODIC + TICK + 10)) "the status page to show a failing check's backoff" backoff_shown
+    say "the status page shows $K8S's failing checks with their backoff ${POLL_TOOK}s into the poll"
+    start_nginx
+    passed
+}
+
+# backoff_shown: a client update, whose check of $K8S fails while nginx is
+# stopped (a refused connection ends a check unknown: spec C4's failed
+# check), then $K8S's check_fail_count is positive and its row on the
+# status page (the HTML at /, one <tr> per suite) shows "backoff ends in".
+# internal/admin's annotateSuiteEntries writes that text only for a suite
+# with a failing count, a last_check_at and a backoff the scheduler keeps
+# (unscheduled is false): an adopted suite qualifies unless an
+# anchor_absent or unsigned_disabled record paces it, and $K8S's only
+# possible record is older-date's upstream_older.
+backoff_shown() {
+    local n
+    apt_update fresh-slash
+    n=$(suite signed.test "$K8S" check_fail_count)
+    ((${n:-0} > 0)) || return 1
+    "${CURL[@]}" -fsS -o /clients/fresh-slash/status.html "$ADMIN/"
+    [[ -n $(awk -v RS='</tr>' -v p="$K8S" '(index($0, ">" p "<") || index($0, ">" p " ")) && index($0, "backoff ends in")' \
+        /clients/fresh-slash/status.html) ]]
+}
+
 setup
 first_contact
+pr8_table
+older_date
+restart
+upstream_down
 stop_daemon
 say "PASS in ${SECONDS}s: ${TIMINGS[*]}"
