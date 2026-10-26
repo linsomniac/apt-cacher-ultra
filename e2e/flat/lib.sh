@@ -55,10 +55,6 @@ APT_ERRORS='Failed to fetch|Connection failed|timed out|Hash Sum mismatch|Mirror
 # control-sig-root fails a filter that misses that form.
 APT_SIGNED_HOSTS='//signed\.test[/ ]|/m-signed[/ ]'
 APT_SIGNED_ERRORS="GPG error|OpenPGP signature verification failed|is not signed|signature verification|Clearsigned file isn't valid|Conflicting distribution"
-# The commit-delay scenario's scope (spec §7: its own grep): every error
-# but the phase-B-expiry straddle's — indexes newer than the InRelease a
-# held client got (spec C8's documented residual).
-APT_RESIDUAL='Hash Sum mismatch|unexpected size|Mirror sync in progress'
 
 SCENARIO=setup
 SCENARIO_START=$SECONDS
@@ -318,38 +314,31 @@ capt() {
     APT_CONFIG=/clients/$name/apt.conf "$@"
 }
 
-# apt_update NAME [--allow=REGEX] [apt-get options...]: apt-get update on
-# client NAME; fails when its output holds an apt error (apt_errors),
-# except lines matching REGEX. The output is kept in APT_LOG.
+# apt_update NAME [apt-get options...]: apt-get update on client NAME;
+# fails when its output holds an apt error (apt_errors). The output is
+# kept in APT_LOG.
 apt_update() {
-    local name=$1 allow=""
+    local name=$1
     shift
-    if [[ ${1:-} == --allow=* ]]; then
-        allow=${1#--allow=}
-        shift
-    fi
     APT_RUNS=$((APT_RUNS + 1))
     APT_LOG=/clients/$name/update.$APT_RUNS.log
     capt "$name" apt-get update "$@" > "$APT_LOG" 2>&1 || true
-    if [[ -n $(apt_errors "$APT_LOG" "$allow") ]]; then
+    if [[ -n $(apt_errors "$APT_LOG") ]]; then
         sed 's/^/    | /' "$APT_LOG"
         fail "apt-get update on client $name printed an error (above)"
     fi
 }
 
-# apt_errors FILE [ALLOW]: the error lines of apt output FILE — those
-# matching APT_ERRORS, and signature errors naming the signed host or the
-# mirror prefix — less the lines matching ALLOW. Every grep reads all its
-# input: no early exit for pipefail to see.
+# apt_errors FILE: the error lines of apt output FILE — those matching
+# APT_ERRORS, and signature errors naming the signed host or the mirror
+# prefix. Every grep reads all its input: no early exit for pipefail to
+# see.
 apt_errors() {
     local errs
     errs=$({
         grep -E -- "$APT_ERRORS" "$1"
         grep -E -- "$APT_SIGNED_HOSTS" "$1" | grep -E -- "$APT_SIGNED_ERRORS"
     } || true)
-    if [[ -n ${2:-} && -n $errs ]]; then
-        errs=$(grep -Ev -- "$2" <<< "$errs" || true)
-    fi
     printf '%s' "$errs"
 }
 
