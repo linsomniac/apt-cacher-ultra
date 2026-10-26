@@ -479,7 +479,8 @@ func (c *Checker) checkUnsigned(ctx, fetchCtx context.Context, out *checkOutcome
 	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			c.logger.Debug("freshness_check_cancelled", "canonical_host", host, "suite_path", suitePath)
+			c.logger.Debug("freshness_check_cancelled",
+				"canonical_scheme", suite.CanonicalScheme, "canonical_host", host, "suite_path", suitePath)
 			return nil, nil
 		}
 		c.failCheck(ctx, out, cur, suite, nowUnix, "unsigned", err)

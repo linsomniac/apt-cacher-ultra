@@ -328,7 +328,8 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 	t := c.runProbeTree(fetchCtx, suite, urls)
 	switch {
 	case t.end != nil && t.end.cancelled():
-		c.logger.Debug("freshness_check_cancelled", "canonical_host", host, "suite_path", suitePath)
+		c.logger.Debug("freshness_check_cancelled",
+			"canonical_scheme", suite.CanonicalScheme, "canonical_host", host, "suite_path", suitePath)
 		return nil
 	case t.end != nil:
 		c.failCheck(ctx, out, cur, suite, nowUnix, "probe", fmt.Errorf("%s: %w", t.endName, t.end.err))

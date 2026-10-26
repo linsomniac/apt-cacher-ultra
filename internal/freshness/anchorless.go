@@ -239,7 +239,8 @@ func (c *Checker) anchorlessRefresh(ctx, fetchCtx context.Context, out *checkOut
 		requests++
 		a, err := c.refreshAnchorlessRow(ctx, fetchCtx, suite, strings.TrimPrefix(row.Path, suitePath+"/"), row)
 		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
-			c.logger.Debug("freshness_check_cancelled", "canonical_host", host, "suite_path", suitePath)
+			c.logger.Debug("freshness_check_cancelled",
+				"canonical_scheme", suite.CanonicalScheme, "canonical_host", host, "suite_path", suitePath)
 			return
 		}
 		switch a {

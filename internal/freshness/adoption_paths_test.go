@@ -225,7 +225,9 @@ func TestAdopter_SourcesWithSkippedPathsLogsOnce(t *testing.T) {
 
 // Task 10 review I-1: a non-empty Sources file that yields no row names
 // its cause — every path refused by validateMemberPath (the stats still
-// count them), or no usable stanza at all.
+// count them), or no usable stanza at all: one without the fields, or
+// whose every Checksums-Sha256 entry is malformed (parked item 15 of the
+// H1 final review: the text says well-formed, true of both).
 func TestParseSources_NoRowNamesTheCause(t *testing.T) {
 	h := strings.Repeat("a", 64)
 	for _, tc := range []struct {
@@ -235,7 +237,9 @@ func TestParseSources_NoRowNamesTheCause(t *testing.T) {
 		{"every path refused", "Package: a\nDirectory: ./pool/a\nChecksums-Sha256:\n " + h + " 1 a_1.dsc\n " + h + " 2 a_1.tar.gz\n",
 			"sources: every path refused by validateMemberPath (2 skipped)", 2},
 		{"no usable stanza", "Package: a\nDirectory: pool/a\nFiles:\n 0123456789abcdef0123456789abcdef 1 a_1.dsc\n",
-			"sources: no stanzas with Package + Directory + Checksums-Sha256", 0},
+			"sources: no stanza with Package, Directory and a well-formed Checksums-Sha256 entry", 0},
+		{"every entry malformed", "Package: a\nDirectory: pool/a\nChecksums-Sha256:\n nothex 1 a_1.dsc\n " + h + " a_1.tar.gz\n",
+			"sources: no stanza with Package, Directory and a well-formed Checksums-Sha256 entry", 0},
 	} {
 		_, stats, err := ParseSources([]byte(tc.body))
 		if err == nil || err.Error() != tc.want || stats.PathsSkipped != tc.skipped {

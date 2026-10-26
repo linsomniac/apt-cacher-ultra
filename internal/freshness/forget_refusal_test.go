@@ -52,3 +52,26 @@ func TestReaper_ForgetSaysWhyItForgotNothing(t *testing.T) {
 		t.Fatalf("a forget that deleted nothing: err %v, or it logged suite_forgotten", err)
 	}
 }
+
+// The H1 final review's ops M-11: reason changed — the final delete found
+// the row changed under the hold, which no writer should do — is a bug
+// signal, so it is WARN, while no_suite and busy stay DEBUG (pinned above).
+// No Forget reaches changed today, so the test calls notForgotten, which
+// picks the level from the reason alone.
+func TestReaper_NotForgottenWarnsOnlyForChanged(t *testing.T) {
+	r := newReaperRig(t)
+	for _, reason := range []string{notForgottenNoSuite, notForgottenBusy, notForgottenChanged} {
+		r.reaper.notForgotten(reapKey("/r/dists/"+reason), reason)
+	}
+	want := map[string]string{"no_suite": "DEBUG", "busy": "DEBUG", "changed": "WARN"}
+	lines := r.events("suite_not_forgotten")
+	for _, m := range lines {
+		reason, _ := m["reason"].(string)
+		if m["level"] != want[reason] || m["suite_path"] != "/r/dists/"+reason {
+			t.Errorf("line %v, want %s for reason %q", m, want[reason], reason)
+		}
+	}
+	if len(lines) != 3 {
+		t.Fatalf("%d suite_not_forgotten lines, want 3", len(lines))
+	}
+}

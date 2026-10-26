@@ -395,7 +395,10 @@ func (u cancellingUpstream) Conditional(ctx context.Context, _ *fetch.Target, _,
 
 // The cancelled-caller branch: the check is abandoned, not counted as
 // failed. (Against a cache the bookkeeping write fails anyway; the log is
-// what tells the branch apart.)
+// what tells the branch apart.) The line names the suite's scheme, in its
+// twin freshness_check_ended_by_shutdown's key order, so an http suite's
+// line is told from its https namesake's (the H1 final review's prod
+// minor 4).
 func TestCheck_CancelledCallerIsNotAFailedCheckBothForms(t *testing.T) {
 	for _, form := range streakForms {
 		t.Run(form, func(t *testing.T) {
@@ -405,7 +408,8 @@ func TestCheck_CancelledCallerIsNotAFailedCheckBothForms(t *testing.T) {
 			c, _ := formChecker(t, form, 0, cancellingUpstream{cancel: cancel},
 				slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 			c.Check(ctx, "http", "h", "/r/dists/x")
-			if out := logs.String(); !strings.Contains(out, "freshness_check_cancelled") || strings.Contains(out, "freshness check failed") {
+			const line = "msg=freshness_check_cancelled canonical_scheme=http canonical_host=h suite_path=/r/dists/x"
+			if out := logs.String(); !strings.Contains(out, line) || strings.Contains(out, "freshness check failed") {
 				t.Fatalf("cancelled check not abandoned as such; logs:\n%s", out)
 			}
 		})

@@ -1653,7 +1653,8 @@ page, which now shows each suite's scheme, shows `scheme://host` in its
 Host cell — the scheme goes in `scheme`, default `https`, the rest in
 `host` — and the suite in its Suite path column; ruling PF-7; the log
 says which, at DEBUG: `suite_not_forgotten` with `reason` `no_suite`,
-`busy` or `changed`, phase H1), 400 for a
+`busy` or `changed`, the last at WARN since it signals a bug, phase H1),
+400 for a
 missing `host` or `suite`, another scheme, a `host` holding `://`
 (the Host cell pasted whole), or a body that is not a form (413 only for
 one over 8 KiB; phase H1), 500 for a database error (logged), and 503
@@ -1746,7 +1747,7 @@ an adoption outcome), `suite_evicted`, `suite_caps_exceeded`,
 `flat_host_root_unsupported`, `legacy_snapshot_quarantined`,
 `legacy_trust_audit_progress`, `legacy_trust_audit_deferred`,
 `legacy_trust_audit_completed`; phase H1's `suite_reaper_run_complete`,
-`suite_not_forgotten` (DEBUG), `gc_panicked`, `legacy_anchor_discard_failed`,
+`suite_not_forgotten` (DEBUG; WARN for `reason=changed`), `gc_panicked`, `legacy_anchor_discard_failed`,
 `reconcile_snapshot_read_failed` and `source_paths_skipped`, and the 43
 lines this branch added with prose messages, renamed to snake_case event
 names, each keeping its level and fields (`suite_onboarding_failed`,

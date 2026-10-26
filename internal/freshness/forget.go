@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
@@ -142,14 +143,24 @@ const (
 	notForgottenChanged = "changed"
 )
 
-// notForgotten logs DEBUG suite_not_forgotten with why Forget deleted
-// nothing (deferred minor F-15): no_suite (no row, before the hold or
-// under it), busy (the hold was refused) or changed (the final
+// notForgotten logs suite_not_forgotten with why Forget deleted nothing
+// (deferred minor F-15): no_suite (no row, before the hold or under it)
+// and busy (the hold was refused) at DEBUG, changed (the final
 // compare-and-delete found the row changed: no writer of the current
-// snapshot runs under the hold, so this is the defensive case). POST
-// /forget answers 409 for all of them alike — no existence oracle (spec
-// C9) — and an operator who turns DEBUG on can tell them apart here.
+// snapshot runs under the hold, so this is the defensive case) at WARN.
+// POST /forget answers 409 for all of them alike — no existence oracle
+// (spec C9) — and an operator who turns DEBUG on can tell them apart here.
+//
+// AIDEV-NOTE: the level follows the reason alone (the H1 final review's
+// ops M-11): changed means a writer changed a held suite's row, a bug to
+// report, so it must show without DEBUG; no_suite and busy are routine.
+// No Forget reaches changed today, so its level is pinned by calling this
+// directly (TestReaper_NotForgottenWarnsOnlyForChanged).
 func (r *Reaper) notForgotten(key cache.SuiteKey, reason string) {
-	r.logger.Debug("suite_not_forgotten", "canonical_scheme", key.CanonicalScheme, "canonical_host", key.CanonicalHost,
-		"suite_path", key.SuitePath, "reason", reason)
+	level := slog.LevelDebug
+	if reason == notForgottenChanged {
+		level = slog.LevelWarn
+	}
+	r.logger.Log(context.Background(), level, "suite_not_forgotten", "canonical_scheme", key.CanonicalScheme,
+		"canonical_host", key.CanonicalHost, "suite_path", key.SuitePath, "reason", reason)
 }

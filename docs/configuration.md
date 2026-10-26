@@ -1127,7 +1127,8 @@ as INFO `suite_forgotten` — with `settled=true` when its final delete
 committed although the request then failed (500, or 503 at shutdown)
 and a fresh read then found the row gone. A 409 is logged at DEBUG as
 `suite_not_forgotten`, whose `reason` says which case it was (`no_suite`,
-`busy`; `changed` should never occur).
+`busy`), or at WARN with `reason=changed`, which should never occur (a
+bug: please report it).
 
 ## `[serve]`: stale responses
 

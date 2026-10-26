@@ -600,7 +600,8 @@ func (c *Checker) checkInline(ctx, fetchCtx context.Context, out *checkOutcome, 
 		if errors.Is(err, context.Canceled) {
 			// A cancelled caller (shutdown) is not evidence about upstream;
 			// the check deadline (DeadlineExceeded) is, and counts below.
-			c.logger.Debug("freshness_check_cancelled", "canonical_host", host, "suite_path", suitePath)
+			c.logger.Debug("freshness_check_cancelled",
+				"canonical_scheme", suite.CanonicalScheme, "canonical_host", host, "suite_path", suitePath)
 			return nil, nil, false
 		}
 		// 404 with no current snapshot AND a Release url_path row →
@@ -791,7 +792,8 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 		if errors.Is(err, context.Canceled) {
 			// A cancelled caller (shutdown) is not evidence about upstream;
 			// the check deadline (DeadlineExceeded) is, and counts below.
-			c.logger.Debug("freshness_check_cancelled", "canonical_host", host, "suite_path", suitePath)
+			c.logger.Debug("freshness_check_cancelled",
+				"canonical_scheme", suite.CanonicalScheme, "canonical_host", host, "suite_path", suitePath)
 			return nil, nil
 		}
 		c.failCheck(ctx, out, cur, suite, nowUnix, "detached", err)

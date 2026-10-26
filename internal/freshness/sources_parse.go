@@ -91,10 +91,11 @@ type SourcesParseStats struct {
 // non-empty file that yields no row: "every path refused by
 // validateMemberPath" when paths reached that check and all failed it
 // (a dpkg-scansources ./pool repository, whose Directory fields start
-// "./"), otherwise "no stanzas with Package + Directory +
-// Checksums-Sha256". Every error return carries the stats counted so
-// far. The caller emits SPEC6_5 §10.2 `source_parse_failed` Warn at the
-// Sources-file granularity.
+// "./"), otherwise "no stanza with Package, Directory and a well-formed
+// Checksums-Sha256 entry" (missing fields, or every entry malformed:
+// parked item 15 of the H1 final review). Every error return carries the
+// stats counted so far. The caller emits SPEC6_5 §10.2
+// `source_parse_failed` Warn at the Sources-file granularity.
 //
 // AIDEV-NOTE: callers pass already-decompressed bytes — decompression
 // of Sources.gz / Sources.xz is the fetch layer's job, not parsing.
@@ -212,7 +213,7 @@ func ParseSources(text []byte) ([]SourceRef, SourcesParseStats, error) {
 		return nil, stats, fmt.Errorf("sources: every path refused by validateMemberPath (%d skipped)", stats.PathsSkipped)
 	}
 	if len(out) == 0 && len(bytes.TrimSpace(text)) > 0 {
-		return nil, stats, errors.New("sources: no stanzas with Package + Directory + Checksums-Sha256")
+		return nil, stats, errors.New("sources: no stanza with Package, Directory and a well-formed Checksums-Sha256 entry")
 	}
 	return out, stats, nil
 }
