@@ -300,6 +300,11 @@ func TestCheckWorker_ACheckPanicWithABrokenLoggerIsCounted(t *testing.T) {
 	if d := <-done; d.report.result != "failed" || up.calls.Load() != 1 {
 		t.Fatalf("done %+v after %d upstream calls, want result failed after the one that panicked", d, up.calls.Load())
 	}
+	// The bookkeeping runs although the report panicked: a failed check,
+	// counted and stamped (the H1 final review's tests M-2).
+	if s, ok := fc.suite("http", "h", "/r/dists/x"); !ok || s.CheckFailCount != 1 || s.LastCheckAt == nil {
+		t.Fatalf("suite %+v (found %v), want check_fail_count 1 and last_check_at set", s, ok)
+	}
 	// The worker goes on: an untracked suite's check is skipped, logging nothing.
 	work <- schedItem{ref: SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/other/dists/y"},
 		key: suiteKey("http", "h", "/other/dists/y")}

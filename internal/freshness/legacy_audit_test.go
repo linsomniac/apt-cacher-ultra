@@ -816,7 +816,10 @@ func TestRunLegacyTrustAudit_UnsignedKeepIsNotSigned(t *testing.T) {
 }
 
 // Deferred minor C-29: every error RunLegacyTrustAudit returns starts
-// "legacy trust audit:" (main's refusal line relies on it).
+// "legacy trust audit:" (main's refusal line relies on it). Two sites
+// are pinned: the batch hook's, and a later batch's read once the cache is
+// closed (the H1 final review's tests M-3); cmd's
+// TestServeListeners_LegacyAuditErrorHasOnePrefix pins the preflight's.
 func TestRunLegacyTrustAudit_ErrorsCarryThePrefix(t *testing.T) {
 	r := newRetryRig(t, 0)
 	ctx := context.Background()
@@ -831,5 +834,20 @@ func TestRunLegacyTrustAudit_ErrorsCarryThePrefix(t *testing.T) {
 	_, err := RunLegacyTrustAudit(ctx, r.cache, discardAuditLogger())
 	if !errors.Is(err, boom) || !strings.HasPrefix(err.Error(), "legacy trust audit: ") {
 		t.Fatalf("err = %v, want the batch error with the prefix", err)
+	}
+
+	env := newAdoptionTestEnv(t)
+	one := adoptLegacy(t, env, "/r/dists/one", clearsignForTest(t, realisticRelease()+"Note: one\n"), "/r/pool/o_1_amd64.deb")
+	two := adoptLegacy(t, env, "/r/dists/two", clearsignForTest(t, realisticRelease()+"Note: two\n"), "/r/pool/t_1_amd64.deb")
+	if err := env.cache.EnqueueLegacyTrustAudit(ctx, one, two); err != nil {
+		t.Fatal(err)
+	}
+	prevSize := legacyAuditBatchSize
+	t.Cleanup(func() { legacyAuditBatchSize = prevSize })
+	legacyAuditBatchSize = 1
+	legacyAuditAfterBatch = func(int) error { return env.cache.Close() } // the second batch's read fails
+	_, err = RunLegacyTrustAudit(ctx, env.cache, discardAuditLogger())
+	if err == nil || !strings.HasPrefix(err.Error(), "legacy trust audit: LegacyAuditBatch: ") {
+		t.Fatalf("err = %v, want the second batch's read error with the prefix", err)
 	}
 }

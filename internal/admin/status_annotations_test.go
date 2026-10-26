@@ -71,7 +71,7 @@ func TestSuiteEntries_Anchorless(t *testing.T) {
 func TestSuiteEntries_FailingChecksSayWhenTheBackoffEnds(t *testing.T) {
 	now := int64(1_800_000_000)
 	backoff := func(k int64) time.Duration { return time.Duration(k) * time.Minute }
-	recent, old, stale, ahead, edge := now-60, now-600, now-8*24*3600, now+3600, now+2
+	recent, old, stale, ahead, edge, beyond := now-60, now-600, now-8*24*3600, now+3600, now+2, now+3
 	reason, absent, unsignedDisabled := "gpg_failed", "anchor_absent", "unsigned_disabled"
 	snap := int64(7)
 	es := []suiteEntry{
@@ -91,9 +91,12 @@ func TestSuiteEntries_FailingChecksSayWhenTheBackoffEnds(t *testing.T) {
 			AdoptionFailReason: &unsignedDisabled, AdoptionFailCount: 1},
 		{SuitePath: "/unchecked", CheckFailCount: 3, LastRequestedUnixTime: &recent},
 		// Task 4 review M-2: a last check beyond the clock-step tolerance
-		// holds no backoff; one within it still does.
+		// holds no backoff; one within it still does. /beyond, one second
+		// past the 2 s tolerance, pins its upper bound (the H1 final
+		// review's tests M-1).
 		{SuitePath: "/future", CheckFailCount: 2, LastCheckUnixTime: &ahead, LastRequestedUnixTime: &recent},
 		{SuitePath: "/tolerated", CheckFailCount: 2, LastCheckUnixTime: &edge, LastRequestedUnixTime: &recent},
+		{SuitePath: "/beyond", CheckFailCount: 2, LastCheckUnixTime: &beyond, LastRequestedUnixTime: &recent},
 	}
 	annotateSuiteEntries(es, true, backoff, now)
 	for i, want := range []string{
@@ -108,6 +111,7 @@ func TestSuiteEntries_FailingChecksSayWhenTheBackoffEnds(t *testing.T) {
 		"checks failing ×3",
 		"checks failing ×2",
 		"checks failing ×2 · backoff ends in 2m",
+		"checks failing ×2",
 	} {
 		if es[i].CheckStatus != want {
 			t.Errorf("%s: %q, want %q", es[i].SuitePath, es[i].CheckStatus, want)

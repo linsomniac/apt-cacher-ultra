@@ -156,6 +156,22 @@ var mainProseMessages = []string{
 // record's message to that argument's index: slog's methods and this
 // repository's forwarding helpers. A new helper that forwards a message
 // parameter must be added here, so its callers' messages are checked.
+//
+// AIDEV-NOTE: the guards' known limits (the H1 final review's tests M-4,
+// M-5, M-7; none is reached by today's code):
+//   - forwardsParam accepts any parameter of a sink, not the one at its
+//     logSinks index: inside reportPanic(event, where, …) a
+//     c.logger.Error(where, …) would pass, and no caller's where be read.
+//   - logSinks is keyed by bare names: any function named warn, logFn,
+//     reportPanic, Error, … with enough arguments has one read as a
+//     message; that fails closed, with a misleading "add it to logSinks".
+//   - constants resolve only within one directory, so a shared event
+//     constant of another package (logger.Warn(events.X)) cannot pass.
+//   - parseTree does not skip testdata/, as Go tooling does (a fixture
+//     that does not parse fails every guard), and reads internal/simtest,
+//     which only tests import, as production code.
+//   - documentedEvents counts every table's first cell, path_class values
+//     included, so an event with such a name needs no row of its own.
 var logSinks = map[string]int{
 	"Debug": 0, "Info": 0, "Warn": 0, "Error": 0,
 	"DebugContext": 1, "InfoContext": 1, "WarnContext": 1, "ErrorContext": 1,

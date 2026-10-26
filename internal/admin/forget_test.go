@@ -56,6 +56,18 @@ func newBlockingForgetter() *blockingForgetter {
 	return &blockingForgetter{entered: make(chan struct{}), release: make(chan struct{}), done: make(chan struct{})}
 }
 
+// waitEntered waits for the request to reach Forget. A regression that
+// answers first (a 400 or 403) fails the test after 10 s instead of
+// hanging it until go test's -timeout (the H1 final review's tests M-9).
+func (b *blockingForgetter) waitEntered(t *testing.T) {
+	t.Helper()
+	select {
+	case <-b.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the request never reached the Forgetter")
+	}
+}
+
 func (b *blockingForgetter) Forget(ctx context.Context, _, _, _ string) (cache.ForgetResult, error) {
 	b.once.Do(func() { close(b.entered) })
 	defer close(b.done)
@@ -195,7 +207,7 @@ func TestEndpoint_Forget(t *testing.T) {
 				_ = resp.Body.Close()
 			}
 		}()
-		<-stub.entered
+		stub.waitEntered(t)
 		cancel() // the client gives up: its connection closes
 		<-sent
 		time.Sleep(200 * time.Millisecond) // net/http cancels a request's context once it sees the connection gone
@@ -370,7 +382,7 @@ func TestEndpoint_Forget_ShutdownCutsItShort(t *testing.T) {
 		text, err := io.ReadAll(resp.Body)
 		answered <- answer{status: resp.StatusCode, text: string(text), err: err}
 	}()
-	<-stub.entered
+	stub.waitEntered(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
@@ -468,7 +480,7 @@ func TestEndpoint_Forget_ShutdownLineNamesTheCanonicalScheme(t *testing.T) {
 		}
 		answered <- err
 	}()
-	<-stub.entered
+	stub.waitEntered(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := s.Shutdown(ctx); err != nil {
