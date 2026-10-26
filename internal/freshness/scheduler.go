@@ -19,8 +19,9 @@ import (
 const minFastTickInterval = 5 * time.Second
 
 // tickInterval is the scheduler's tick for refresh: SPEC §7.4's fast
-// tick, refresh / 4, floored at minFastTickInterval. Run's ticker and the
-// tests that wait for a tick read it here (deferred minor E-56).
+// tick, refresh / 4, floored at minFastTickInterval (deferred minor
+// E-56). Run's ticker and the DoD wait in dod_e_test.go read it here; the
+// other tests keep their own copies of the value on purpose, to pin it.
 func tickInterval(refresh time.Duration) time.Duration {
 	return max(refresh/4, minFastTickInterval)
 }

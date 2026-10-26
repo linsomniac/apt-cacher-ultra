@@ -81,7 +81,7 @@ func TestRun_AnOfferWhoseWakeWasSpentIsReofferedAtOnce(t *testing.T) {
 			t.Fatalf("%d anchor GETs (slot taken %v), want 3: the first tick, the lost offer and the re-offer before the next tick",
 				len(got), taken.Load() != nil)
 		}
-		if d := got[2].Sub(released); d > checkDeadline {
+		if d := got[2].Sub(released); d > time.Second { // in the bubble, "at once" is the release's own instant
 			t.Fatalf("re-offered %v after the release, want at once", d)
 		}
 	})
@@ -115,6 +115,9 @@ func TestTick_DemotesAWaiterWhoseSnapshotIsNoLongerSigned(t *testing.T) {
 	c.tick(context.Background(), q)
 	if it, ok := q.pop(admitSigned); ok {
 		t.Fatalf("after the tick: offered %+v to the reserved slot, want the waiter demoted to unsigned", it)
+	}
+	if w := q.hosts["a"].waiting; len(w) != 1 || w[0].signed {
+		t.Fatalf("after the tick: waiting %+v, want the one waiter still parked, demoted to unsigned", w)
 	}
 }
 
@@ -268,5 +271,42 @@ func TestPanicBoundaries_ABrokenLoggerNeverEscapes(t *testing.T) {
 		if got := unlogged() - before; got != 1 {
 			t.Errorf("%s: unlogged panics rose by %v, want 1", tc.name, got)
 		}
+	}
+}
+
+// Review M-2 of Task 9 (H1): a scheduled check that panics, under a log
+// handler that panics too, is contained by checkLockedSafe, which counts
+// the report it could not log (unloggedPanic) exactly once; the worker
+// sends the item's done and goes on to the next item.
+func TestCheckWorker_ACheckPanicWithABrokenLoggerIsCounted(t *testing.T) {
+	fc := newFakeCache()
+	seedFakeSuite(fc, "h", "/r/dists/x", nil)
+	up := &changedUpstream{}
+	up.panic.Store(true) // checkLocked panics; checkLockedSafe's report panics too
+	logger := slog.New(panicLogHandler{panicOn: func(r slog.Record) bool { return r.Level >= slog.LevelError }})
+	c, err := New(Config{Cache: fc, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute, Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	work := make(chan schedItem)
+	done := make(chan checkDone, 1)
+	exited := make(chan struct{})
+	go func() { defer close(exited); c.checkWorker(ctx, work, done) }()
+	defer func() { cancel(); <-exited }()
+	before := unlogged()
+	work <- schedItem{ref: SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"},
+		key: suiteKey("http", "h", "/r/dists/x")}
+	if d := <-done; d.report.result != "failed" || up.calls.Load() != 1 {
+		t.Fatalf("done %+v after %d upstream calls, want result failed after the one that panicked", d, up.calls.Load())
+	}
+	// The worker goes on: an untracked suite's check is skipped, logging nothing.
+	work <- schedItem{ref: SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/other/dists/y"},
+		key: suiteKey("http", "h", "/other/dists/y")}
+	if d := <-done; d.report.result != resultSkipped {
+		t.Fatalf("next item: done %+v, want result %s", d, resultSkipped)
+	}
+	if got := unlogged() - before; got != 1 {
+		t.Fatalf("unlogged panics rose by %v, want 1 (checkLockedSafe's report)", got)
 	}
 }

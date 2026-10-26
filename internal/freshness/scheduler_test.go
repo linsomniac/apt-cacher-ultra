@@ -538,9 +538,10 @@ func TestCheckWorker_SendsDoneWhenTheRecoverPathPanics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// checkLockedSafe swallows a panic in its own recover handler, so the
-	// panic must come from outside it to reach checkRecovered's handler: a
-	// lock-map entry that is not a mutex fails check's type assertion.
+	// checkLockedSafe contains (and counts) a panic in its own recover
+	// handler, so the panic must come from outside it to reach
+	// checkRecovered's handler: a lock-map entry that is not a mutex fails
+	// check's type assertion.
 	c.locks.Store(suiteKey("http", "h", "/r/dists/x"), struct{}{})
 	unlogged := func() float64 {
 		var f float64

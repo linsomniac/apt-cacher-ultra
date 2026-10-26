@@ -162,15 +162,19 @@ var (
 		"Suites waiting for an adoption slot; each is re-checked as soon as one it can use is released (spec C4).",
 	)
 
-	// freshnessUnloggedPanics counts recovered panics whose report could
-	// not be logged because reporting them panicked too: a scheduled
-	// check's (checkRecovered's report, caught by checkWorker's last-resort
-	// recover, deferred minor B-44) and, since phase E (B-18,
-	// unloggedPanic), an adoption's, its failure record's and the adoption
-	// heartbeat's. Any increase is a bug.
+	// freshnessUnloggedPanics counts recovered panics — of a freshness
+	// check (scheduled or client-triggered), a scheduler tick, the
+	// start-time retry spread, an adoption, its counters and admin ring
+	// event, its failure record, the adoption heartbeat, a repair or
+	// reconcile, a suite reaper run or POST /forget — that could not be
+	// logged because reporting them panicked too, or that struck the
+	// counting itself (an adoption's counters and ring event): a bug,
+	// please report it. Every boundary counts through unloggedPanic
+	// (deferred minors B-18, B-44, E-42, E-45; review M-2 of the H1 plan,
+	// and of Task 9 for checkLockedSafe's report).
 	freshnessUnloggedPanics = metrics.NewCounter(
 		"acu_freshness_unlogged_panics_total",
-		"Recovered panics (a scheduled freshness check, an adoption, its failure record or the adoption heartbeat) that could not be logged because reporting them panicked too (a bug).",
+		"Recovered panics (a freshness check, scheduler tick, retry spread, adoption and its counters, failure record, adoption heartbeat, repair, reconcile, reaper run or POST /forget) that could not be logged because reporting them panicked too, or that struck the counting itself (a bug).",
 	)
 
 	adoptionTotal = metrics.NewCounterWithCap(

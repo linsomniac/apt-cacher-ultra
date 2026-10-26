@@ -928,7 +928,9 @@ func (c *Checker) recoverGoroutine(where string, suite SuiteRef) {
 // same holds for the recover handler itself: a panic in it (a panicking
 // logger in reportPanic) would escape with the mutex held for the life
 // of the process, so its logging and bookkeeping run under nested
-// recovers and it always returns out=nil, ok=false.
+// recovers and it always returns out=nil, ok=false. A panic in its
+// logging is counted (acu_freshness_unlogged_panics_total, unloggedPanic;
+// review M-2 of Task 9), one in its bookkeeping is not.
 func (c *Checker) checkLockedSafe(ctx, fetchCtx context.Context, scheme, host, suitePath string, opts checkOpts) (out *checkOutcome, ok bool) {
 	out = &checkOutcome{report: checkReport{result: resultSkipped}}
 	defer func() {
@@ -939,7 +941,10 @@ func (c *Checker) checkLockedSafe(ctx, fetchCtx context.Context, scheme, host, s
 				defer func() { _ = recover() }()
 				f()
 			}
-			guarded(func() {
+			// The report's own panic is counted (unloggedPanic, as at every
+			// other boundary: review M-2 of Task 9); the bookkeeping's stays
+			// best effort, like bumpFailedCheck's own recover.
+			unloggedPanic(func() {
 				c.reportPanic("freshness_check_panicked", "check",
 					SuiteRef{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath}, r)
 			})
