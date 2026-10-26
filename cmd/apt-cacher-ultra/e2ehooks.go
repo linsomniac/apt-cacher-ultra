@@ -25,8 +25,8 @@ const e2eCommitDelayEnv = "ACU_E2E_COMMIT_DELAY"
 // release binary reads ACU_E2E_COMMIT_DELAY (CI greps the release build for
 // the string). The seam is the adopter's own test hook
 // (Adopter.SetCommitDelayForTest), which the flip simulations already use.
-// e2ehooks_test.go pins the parse and the log line; that the delay reaches
-// the adopter is pinned by e2e/flat's commit-delay scenario
+// e2ehooks_test.go pins the parse, its errors and the WARN line; that the
+// delay reaches the adopter is pinned by e2e/flat's commit-delay scenario
 // (outcome=hold_expired).
 func applyE2EHooks(a *freshness.Adopter, logger *slog.Logger) error {
 	v := os.Getenv(e2eCommitDelayEnv)
@@ -34,7 +34,10 @@ func applyE2EHooks(a *freshness.Adopter, logger *slog.Logger) error {
 		return nil
 	}
 	d, err := time.ParseDuration(v)
-	if err != nil || d < 0 {
+	if err != nil {
+		return fmt.Errorf("%s=%q: want a nonnegative Go duration: %w", e2eCommitDelayEnv, v, err)
+	}
+	if d < 0 {
 		return fmt.Errorf("%s=%q: want a nonnegative Go duration", e2eCommitDelayEnv, v)
 	}
 	a.SetCommitDelayForTest(d)

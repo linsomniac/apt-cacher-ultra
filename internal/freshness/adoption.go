@@ -790,8 +790,10 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 //
 // AIDEV-NOTE: exported for internal/handler's flip simulations, which
 // model a real commit's latency (a zero-time commit hides how a hold's end
-// orders against it; final review, concurrency Important 1). Named
-// *ForTest by convention; never call from non-test code.
+// orders against it; final review, concurrency Important 1), and called by
+// cmd/apt-cacher-ultra/e2ehooks.go, compiled only with -tags e2ehooks
+// (e2e/flat's test binary): a release build never calls it. Named
+// *ForTest by convention; never call it from any other non-test code.
 func (a *Adopter) SetCommitDelayForTest(d time.Duration) { a.commitDelay = d }
 
 // ctxSleep waits d, returning early with ctx.Err() on cancellation.
