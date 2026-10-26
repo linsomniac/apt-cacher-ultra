@@ -90,14 +90,20 @@ each checkout its own name.
 - **All six in sequence:** 24.5 minutes.
 
 CI runs one job per image (`.github/workflows/ci.yaml`, job `e2e-flat`).
-The timeout is 15 minutes for the short images and 30 for the two that
-wait. No CI run has been timed yet. The estimates below are the local
+Each row's `unsigned` boolean sets both whether it runs the unsigned
+scenario and its timeout: 15 minutes for the short images and 30 for the
+two that wait. The test step runs under `timeout -s INT -k 60`, 3 minutes
+inside the job's limit, so a hang usually still ends with the test's own
+failure output: the INT reaches the container as Ctrl-C does. (In 7 local
+trials docker run relayed that output 6 times; once, the container got the
+INT and exited, but docker run returned without its last lines.) No CI run
+has been timed yet. The estimates below are the local
 test times above plus a fresh runner's 2–5 minute cold build (the H2
 plan's Task 10):
 
 - a short job takes about 5–8 minutes;
 - a long-wait job takes about 8–12 minutes usually;
-- a long-wait job takes about 18–21 minutes in the third-retry case: the
+- a long-wait job takes about 16–21 minutes in the third-retry case: the
   14 minutes measured once, or up to about 16 by the harness's bounds,
   plus the build.
 
@@ -156,12 +162,16 @@ Assertions read:
   - `Failed to fetch|Connection failed|timed out|Hash Sum mismatch|Mirror sync in progress`.
   - apt's signature errors, such as `GPG error` (apt 2.x),
     `OpenPGP signature verification failed` (apt 3.x) and
-    `is not signed`. They count only on lines naming the signed host or
-    the mirror prefix (`//signed\.test[/ ]|/m-signed[/ ]`). The space in
-    that pattern is for a host-root source, which apt names with no slash
-    after the host: `http://signed.test apt/stable/`.
-  - The captive portal's aftermath prints the same signature words for
-    `plain.test`, so they do not count there.
+    `is not signed`, and any error line (`E:` on apt 2.x, `Error:` on
+    3.x). An anchor answered 404 prints only such a line,
+    `E: The repository '…' does not have a Release file` ("no longer has"
+    for a client with old lists), and apt then keeps the old lists. These
+    count only on lines naming the signed host or the mirror prefix
+    (`//signed\.test[/ ]|/m-signed[/ ]`). The space in that pattern is for
+    a host-root source, which apt names with no slash after the host:
+    `http://signed.test apt/stable/`.
+  - The captive portal's aftermath prints the same signature words and
+    `E:` lines for `plain.test`, so they do not count there.
 - **apt's `Debug::Acquire::http` request lines**, and nginx's access log:
   the request lines the cache sent upstream.
 - **The daemon's own record:** its snake_case log events, the admin
@@ -181,6 +191,9 @@ The checks that could pass vacuously have controls on every image:
   (`nowhere.test`).
 - It must also fail two signed sources checked against the wrong key: the
   `dists/` one, and the host-root one.
+- It must fail a signed source with no `Release` at all
+  (`signed.test/no-such-repo`, whose `InRelease` and `Release` nginx
+  answers 404): apt prints only its `E:` line for it.
 - The request-line check must not match a line apt never sent.
 - `poll_quietly` must time out on `false`.
 - Strict mode must refuse `acu-rogue` (502), so "no refusal" elsewhere
@@ -193,10 +206,22 @@ Every wait is bounded:
 - `commit-delay`'s loop stops at 150 s.
 
 Every curl has a time limit: 10 s, or 35 s for an anchor through the
-proxy, which a flip can hold for 20 s. A failure prints the scenario, the
-last 80 lines of the daemon's log and the last 30 of nginx's access log.
-An unexpected exit, such as a `set -e` exit, also prints the failing
-command.
+proxy, which a flip can hold for 20 s. A failure prints the scenario,
+whether the daemon is still running, the daemon log's first panic or
+crash lines if it has any, the last 80 lines of the daemon's log and the
+last 30 of nginx's access log. An unexpected exit, such as a `set -e`
+exit, also prints the failing command and its call chain.
+
+The daemon runs as four processes in turn: from setup to `commit-delay`,
+the 45 s one, from there to `restart`, and from `restart` to the end.
+Each planned stop (`stop_daemon WHICH`) first checks that process:
+`acu_flip_gate_panics_total` and `acu_freshness_unlogged_panics_total`,
+the panics it recovered without logging them, are declared on `/metrics`
+and 0, summed over every sample of each name. The counters live in
+process memory, so each process is read as it ends; the 45 s one is the
+only one whose commit outlasts its hold, the flip gate counter's only
+source. After the SIGTERM the daemon must exit with status 0. A failure
+names the stop, such as `the stop after the 45 s commit delay`.
 
 ## The fixtures
 
@@ -217,8 +242,11 @@ command.
 They run in this order and share one cache. "By the client" means the
 client saw the publish before the scheduler could have checked the suite
 again (`periodic_refresh` after its last success), so the client's own
-check carried it. "Within one cooldown" is bounded at cooldown + 20 s
-(22 s); the measured waits were 4–8 s.
+check carried it. Its premise is asserted before each publish: the suite
+has no adoption record (`adoption_fail_count` 0) and no pending change
+(no `inrelease_change_seen_at_unixtime`), either of which would let the
+scheduler check it sooner. "Within one cooldown" is bounded at the
+cooldown plus 20 s (22 s); the measured waits were 4–8 s.
 
 | Scenario | Proves |
 |---|---|
@@ -231,36 +259,117 @@ check carried it. "Within one cooldown" is bounded at cooldown + 20 s
 | `mirror-mode` | A client with four sources behind the cache's `[[mirror]]` prefix, which apt queues on one connection. apt sends the origin-form request line. Sublime's `.deb` is vouched. Two flips, Sublime and the detached Jenkins, reach it by its check, each through the barrier, and every update is clean, signature errors included. |
 | `commit-delay` | The daemon restarts with `ACU_E2E_COMMIT_DELAY=45s` (its `e2e_commit_delay_enabled` line is required). Jitsi's v2 publish then commits 45 s late while a client updates in a loop, 3 s apart, and the flip ends `hold_expired`. Every update runs under the full grep, stricter than spec §7's scoped one: this client holds v1's lists, so it cannot reach the phase-B straddle, and a mismatch here would be a bug. apt resends a timed-out request silently (2.6.1), so two other checks catch a timeout: each update takes under 28 s, and no `signed.test` request line is `client_canceled` or lasts 30 s or more. At least one Jitsi `InRelease`/`Release` request waited in the hold, and none longer than 20 s (20 500 ms, for the timer's latency). The daemon then restarts without the delay (asserted), and the client gets and installs 2.0. |
 | `unsigned-first-adoption` | (`E2E_FLAT_UNSIGNED_IMAGES` only) `/unsigned404` adopts no sooner than 5 minutes after first contact (asserted) and within 968 s. It lands at its record's first retry 5 minutes or more after the first observation, 5 to 15 minutes in practice. Its v2 then reaches the client within one cooldown. An unvouched `.deb` on `plain.test` still answers 200: an unsigned snapshot never makes its host strict. `/unsigned403` needs an hour between its observations. Once its record has logged a refusal written 305 s or more after its first observation, where a 5-minute gap would have confirmed it, it must still be unadopted and waiting `unsigned_unconfirmed`. That refusal is usually the second retry. When the second comes before 305 s (about 6–8% of runs), the check waits for the third, so it is never vacuous. |
-| `restart` | The daemon really restarted: `process.started_unixtime` is no earlier than the stop. It kept the same snapshots and the main client's candidates, an update is clean, and the k8s `InRelease` is served from its snapshot (`X-Cache-Snapshot`). |
+| `restart` | The daemon really restarted: `process.started_unixtime` is no earlier than the stop. It kept the same snapshots (every signed suite's id, none empty) and the main client's candidates, an update is clean, and the k8s `InRelease` is served from its snapshot (`X-Cache-Snapshot`). The clean update covers every signed suite's anchors: the main client keeps its old lists when one answers 404, but apt's `E:` line for it counts. |
 | `upstream-down` | PR #8's table, second half. nginx is stopped, and its access log does not grow; fresh clients of both source forms install 2.0 from the snapshots. The checks their updates trigger fail. The k8s suite's `check_fail_count` is positive, and its row on the status page shows "backoff ends in", the text `main.go`'s `CheckBackoff` wiring adds. Then nginx starts again. It runs last before `whole-run`: every suite checked while nginx is down is left in a backoff (2 minutes after one failure). |
-| `whole-run` | No `unvouched_deb_refused` on `signed.test` but `acu-rogue`'s, and none on `plain.test`. On a short image, `/unsigned404` is still unadopted (checked while under 5 minutes after first contact). The line printed says whether a retry was refused by then, so whether this check could have caught a broken 5-minute floor. The daemon's log has no logged panic, no `package_hash_conflict` and no Go runtime crash text (`panic:` or `fatal error:` at a line's start); it is scanned again after the final stop. `acu_flip_gate_panics_total` and `acu_freshness_unlogged_panics_total` are declared and 0. The daemon is running and answers `healthz`. |
+| `whole-run` | No `unvouched_deb_refused` on `signed.test` but `acu-rogue`'s, and none on `plain.test`. On a short image, `/unsigned404` is still unadopted and waiting `unsigned_unconfirmed` (checked while under 5 minutes after first contact). The line printed says whether a retry was refused by then, so whether this check could have caught a broken 5-minute floor. The daemon's log has no logged panic, no `package_hash_conflict` and no Go runtime crash text (`panic:` or `fatal error:` at a line's start); it is scanned again after the final stop. The daemon is running and answers `healthz`. The final stop then checks the last process's counters and exit status, as every planned stop does (above). |
 
 Two shapes of spec §7 are exercised only in part, and Go tests cover
 both:
 
 - **A binary detached `Release.gpg`.** apt (2.2 to 3.2) refuses one
   ("unsupported binary format"), so Jitsi's binary signature sits beside
-  an `InRelease` that apt uses. `TestSniffReleaseGPG` covers it.
+  an `InRelease` that apt uses. Two Go tests cover the cache's side:
+  `TestSniffReleaseGPG` (the sniff's binary cases) and
+  `TestVerifyDetached_HappyPath_Binary` (verifying a binary detached
+  signature).
 - **The 403 unsigned variant's first adoption.** It needs an hour, past
   any bounded run.
   `TestCheckFirst_UnsignedAfterADeniedSignatureWaitsAnHour` covers it.
 
 ## Debugging a failure
 
-The failure message names the scenario. It prints the last 80 lines of
-the daemon's log and the last 30 of nginx's access log. An unexpected
-exit also prints the failing command. When apt's output fails a check,
-apt's whole output is printed above the failure line, each line marked
-`|`; for a failure on one apt version, that is usually the part to read.
-A failure on one image only may also be that image's nginx, not its apt:
-nginx comes from each client image.
+The failure message names the scenario. It then prints:
+
+- `daemon pid N: running` or `gone` (a crash mid-scenario otherwise
+  reads as whatever poll or update was running);
+- the daemon log's first panic, conflict or crash lines, if it has any,
+  since a long crash trace can push its `panic:` line out of the tail;
+- the last 80 lines of the daemon's log and the last 30 of nginx's access
+  log.
+
+An unexpected exit also prints the failing command and its call chain,
+each function with the file and line that called it. The command is the
+text as written, so inside a helper it shows the helper's `"$@"`. A
+helper called with a redirection, such as `capt … > FILE`, has left the
+stack by then (bash 5.1 and 5.3): the chain starts at its caller.
+
+When apt's output fails a check, apt's whole output is printed above the
+failure line, each line marked `|`; for a failure on one apt version,
+that is usually the part to read. A failure on one image only may also be
+that image's nginx, not its apt: nginx comes from each client image. A
+`did not report … within 22s` failure lists what each client reported
+instead.
+
+A failure at a planned stop names the stop: a counter that is not 0,
+such as
+`acu_flip_gate_panics_total is 1 at the stop after the 45 s commit delay`,
+or an exit status, such as
+`the daemon exited with status 2 at the restart's stop` (a Go crash exits
+2, and its text is in the daemon log).
 
 A `timed out after 40s waiting for the daemon to exit` failure is
-`stop_daemon`'s bound. It covers the daemon's 30 s HTTP drain, its 1 s tunnel grace and a
-margin; a planned stop has nothing in flight and takes about a second.
-If it happens in `commit-delay`, suspect a broken 5-minute floor first:
-an unsigned adoption committing under the 45 s delay (the scenario's
-AIDEV-NOTE).
+`stop_daemon`'s bound. It covers the daemon's 30 s HTTP drain, its 1 s
+tunnel grace and a margin; a planned stop has nothing in flight and takes
+about a second. If it happens in `commit-delay`, one of two things kept a
+commit in flight under the 45 s delay (the scenario's AIDEV-NOTE): a
+broken 5-minute floor (an unsigned adoption at its 90–150 s first retry),
+or a slow runner that reached 300 s after first contact, when that
+adoption is due, before the stop. The say lines' times tell them apart:
+the line
+`stopping the daemon (the stop after the 45 s commit delay)`
+less than 300 s after `=== scenario first-contact` points at the floor;
+300 s or more, at the runner.
+
+### Flake, environment or daemon bug?
+
+CI does not retry a failed job, by design: a retry would hide a flaky
+scenario. So before re-running a red job, keep its log and classify the
+failure.
+
+- **`[e2e-flat] <image> FAIL (build)`** is the image build, the only part
+  that uses the network: a distribution mirror, Docker Hub or the Go
+  module proxy. A mirror failure names the mirror, such as
+  `Failed to fetch http://deb.debian.org/…` or `404  Not Found`. Re-run
+  that job; a mirror that moved for good is a maintenance item (below).
+- **`[e2e-flat] <image> FAIL (test)`** is the test, which uses no network:
+  its only upstream is its own nginx. So it is never a network flake.
+- **The baseline is clean.** Every scenario passed on all six images in
+  the H2 plan's runs, in its Task 9 run and in every review run since. A
+  test failure is a harness, image or daemon change until shown
+  otherwise.
+- **Compare the apt version** that `setup` prints first
+  (`apt 2.6.1; fixtures key …`) with the table above. The image tags
+  float; a new apt is a harness maintenance item, neither a flake nor a
+  daemon bug.
+- **A timing bound against its measured values** (Task 9, one 12-core
+  machine; the say lines print each run's own waits, and each
+  `--- scenario X passed (Ns)` line and the final `PASS in …` line its
+  times):
+
+  | Bound | Measured |
+  |---|---|
+  | `REACH`, a publish reaching a client, 22 s | 4–8 s |
+  | `by_client`, after the suites' last success, 30 s | 4–9 s |
+  | `/fury`'s scheduler refresh, 48 s | 33–35 s |
+  | an update in `commit-delay`, 28 s | 17–18 s (the held one) |
+  | a held request (`flip_held_ms`), 20 500 ms | at most 17 914 ms |
+  | `stop_daemon`, 40 s | about 1 s |
+  | the unsigned adoption, 968 s after first contact | 325–855 s |
+
+  A miss at one of these bounds on a loaded runner may be the runner:
+  re-run it once, keeping the first log, and if it repeats it is real. A
+  content check failing is never a timing flake: an apt error, a wrong
+  version, a 502 or 404 where 200 was expected, a panic, a hash conflict,
+  a counter or an exit status at a stop.
+- **A daemon bug** gets a failing Go regression test first, then the fix,
+  and the scenario that caught it stays as it is (ruling R-H2-4 of the H2
+  plan, `docs/superpowers/plans/2026-09-28-flat-repositories-H2-e2e.md`).
+  Never widen a bound or weaken an assertion to make a run pass. The
+  plan's Task 9, Step 4 ("Know what the planning runs fixed") lists the
+  harness failures the planning met: check a new failure against it to
+  tell a harness regression from a daemon bug.
+
+### Looking inside
 
 To look around inside, keep the container. Run `test.sh` once per
 container: it flips the fixtures and keeps the cache, so start a new
@@ -277,8 +386,10 @@ docker rm -f acu-e2e-flat-debug
 Add `-e E2E_UNSIGNED_WAIT=1` to the `test.sh` line to run the unsigned
 scenario too. The daemon's log carries an
 `msg=e2e_harness scenario=<name> unixtime=…` line at the start of each
-scenario. `APT_CONFIG=/clients/<name>/apt.conf apt-get update` repeats a
-client's update.
+scenario. `/var/log/acu-e2e/metrics.txt` is `/metrics` as the last
+planned stop read it.
+`APT_CONFIG=/clients/<name>/apt.conf apt-get update` repeats a client's
+update.
 
 ## Maintenance
 
@@ -309,9 +420,19 @@ client's update.
   - Keep `upstream_down` last before `whole_run`, and keep `commit_delay`
     ending well before 5 minutes after first contact (the AIDEV-NOTEs say
     why).
+  - Check what your scenario needs from the ones before it, and what it
+    leaves for the ones after. Some depend on the order, and the comment
+    above each such function says how: `older-date` reuses `pr8-table`'s
+    clients; `mirror-mode` comes after `pr8-table` and before
+    `commit-delay`; `unsigned-first-adoption` needs `anchorless`'s
+    goreleaser 2.0; `upstream-down` needs `pr8-table`'s 2.0 `.deb`s in
+    the cache.
   - Wait only through bounded polls (`poll`, `poll_quietly`,
-    `until_candidates`), never a bare `sleep`. Run curl through `CURL`
-    (10 s), or with `--max-time 35` for an anchor through the proxy.
+    `until_candidates`) or a loop with its own bound, as `commit-delay`'s,
+    never a bare `sleep`. Run curl through `CURL` (10 s), or with
+    `--max-time 35` for an anchor through the proxy.
+  - Stop the daemon only through `stop_daemon WHICH`, naming the stop: it
+    checks the process's counters and exit status.
   - Assert on snake_case log events, the status JSON or `/metrics`, not on
     prose log messages.
   - Never end a pipe with `grep -q` (`pipefail`).
