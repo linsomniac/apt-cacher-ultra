@@ -38,11 +38,13 @@ REACH=$((COOLDOWN + 20))
 # apt-get update's exit status says nothing about failed items (spec §7):
 # its output is grepped instead.
 APT_ERRORS='Failed to fetch|Connection failed|timed out|Hash Sum mismatch|Mirror sync in progress'
-# apt reports a signature failure in none of those words, keeps the old
-# lists and exits 0, so the next update hides it: "GPG error" (apt 2.x),
-# "OpenPGP signature verification failed" (apt 3.x, sqv), "is not signed",
-# "error occurred during the signature verification", "Clearsigned file
-# isn't valid", and "Conflicting distribution" for a wrong Suite.
+# A signature failure need not print any of those words: apt keeps the old
+# lists and exits 0, so the next update hides it, and it prints "Failed to
+# fetch" for some failures only (apt 2.6.1: for a BADSIG Release.gpg, not
+# for a missing key). These words catch it either way: "GPG error" (apt
+# 2.x), "OpenPGP signature verification failed" (apt 3.x, sqv), "is not
+# signed", "error occurred during the signature verification", "Clearsigned
+# file isn't valid", and "Conflicting distribution" for a wrong Suite.
 # Release-less and unsigned repositories behind a captive portal print the
 # same words (design note 11), so these words count only on lines naming
 # the signed host or the mirror prefix (design note 17).

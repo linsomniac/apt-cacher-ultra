@@ -366,8 +366,11 @@ fury_clean() {
         [[ $(curl --max-time 35 -s -o /dev/null -w '%{http_code}' -x "$PROXY" http://plain.test/fury/InRelease) == 404 ]]
 }
 
-# Two suites on one host flip at once while a client keeps updating both
-# over its one connection to the host (spec C8).
+# Two suites on one host publish together and flip while a client keeps
+# updating both over its one connection to the host (spec C8). The commits
+# themselves are serialised (one host slot, one hold token), so the flips
+# may land between the same two client updates or in successive ones;
+# neither is asserted.
 two_suites() {
     scenario two-suites "two suites of one host flip together under a client's updates"
     client pair "$PROXY" "$SRC_CUDA" "$SRC_DISTS"
@@ -381,10 +384,11 @@ two_suites() {
     by_client
     say "both suites flipped; the client saw them ${POLL_TOOK}s after the publish"
     apt_update pair
-    local s
+    local s lines
     for s in "$CUDA" "$DISTS"; do
-        log_has "$SCENARIO_MARK" "$(event adoption_flip_barrier)" "$(suite_kv "$s")" 'outcome=(held|quiet_cut_short)' ||
-            fail "no held flip for $s: $(log_lines "$SCENARIO_MARK" "$(event adoption_flip_barrier)" "$(suite_kv "$s")")"
+        log_has "$SCENARIO_MARK" "$(event adoption_flip_barrier)" "$(suite_kv "$s")" 'outcome=(held|quiet_cut_short)' && continue
+        lines=$(log_lines "$SCENARIO_MARK" "$(event adoption_flip_barrier)" "$(suite_kv "$s")")
+        fail "no held flip for $s: ${lines:-no adoption_flip_barrier line in this scenario}"
     done
     apt_install pair acu-cuda=2.0 acu-epoch=1:2.0 acu-dists=2.0 -- -o Debug::Acquire::http=true
     apt_sent "$(re "http://signed.test$CUDA/./acu-epoch_1%253a2.0_amd64.deb")"
@@ -395,7 +399,10 @@ two_suites() {
 # all on one connection (spec C8, §3). The detached Jenkins suite flips here,
 # under the normal barrier and the full grep with the signature words: a
 # Release and a Release.gpg from different snapshots would show as a
-# signature error, which no other word catches (design note 17).
+# signature error, which the signature words catch whether or not apt also
+# prints "Failed to fetch" (apt 2.6.1 does for a BADSIG, not for a missing
+# key; design note 17). Sublime's is the run's only flip of a host-root
+# suite.
 mirror_mode() {
     scenario mirror-mode "signed flat repositories through a [[mirror]] prefix, with two flips"
     client mirror DIRECT "deb [signed-by=$KEY] $MIRROR/ apt/stable/" \
@@ -417,8 +424,12 @@ mirror_mode() {
     until_candidates "$REACH" mirror -- acu-sublime=2.0 acu-jenkins=2.0 acu-jenkins-direct=2.0
     by_client
     say "the mirror-mode client saw acu-sublime and acu-jenkins 2.0 ${POLL_TOOK}s after the publish"
-    log_has "$SCENARIO_MARK" "$(event adoption_flip_barrier)" "$(suite_kv "$JENKINS")" 'outcome=(held|quiet_cut_short)' ||
-        fail "no held flip for $JENKINS: $(log_lines "$SCENARIO_MARK" "$(event adoption_flip_barrier)" "$(suite_kv "$JENKINS")")"
+    local s lines
+    for s in "$SUBLIME" "$JENKINS"; do
+        log_has "$SCENARIO_MARK" "$(event adoption_flip_barrier)" "$(suite_kv "$s")" 'outcome=(held|quiet_cut_short)' && continue
+        lines=$(log_lines "$SCENARIO_MARK" "$(event adoption_flip_barrier)" "$(suite_kv "$s")")
+        fail "no held flip for $s: ${lines:-no adoption_flip_barrier line in this scenario}"
+    done
     apt_install mirror acu-sublime=2.0 acu-jenkins=2.0 acu-jenkins-direct=2.0
     passed
 }
