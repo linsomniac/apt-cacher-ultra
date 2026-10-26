@@ -283,6 +283,9 @@ type Server struct {
 	// Shutdown's walkWg.Wait: refreshPoolDiskBytes must observe
 	// shutdownStarted under mu before calling Add(1), so Add(1) on
 	// a zero counter is properly ordered before any concurrent Wait.
+	// shutdownStarted also stops startRefresher from starting a
+	// refresher after Shutdown, which nothing would stop (deferred
+	// minor F-23).
 	mu              sync.Mutex
 	shutdownStarted bool
 }

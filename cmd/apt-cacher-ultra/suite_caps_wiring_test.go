@@ -39,8 +39,10 @@ var probeClient = &http.Client{Timeout: 2 * time.Second}
 // waitServing polls the daemon on addr until it answers a request. After
 // 15 s it cancels the daemon and waits (another 15 s at most) for
 // serveListeners to return on done, so nothing outlives the test and writes
-// to its logs (deferred minor D-46), then fails t. The start-and-probe loop
-// of every test that runs the daemon to its listener (deferred minor D-49).
+// to its logs (deferred minor D-46), then fails t. It is the probe loop of
+// startupLogs and TestServeListeners_ShutsDownWithTheBarrierOn (deferred
+// minor D-49); the other daemon tests wait through waitForDaemonReady,
+// which does not drain the daemon on failure.
 func waitServing(t *testing.T, addr string, cancel context.CancelFunc, done <-chan error) {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)

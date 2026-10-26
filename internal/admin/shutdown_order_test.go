@@ -26,3 +26,26 @@ func TestServer_NoRefresherStartsAfterShutdown(t *testing.T) {
 		t.Fatal("a refresher started after Shutdown: nothing stops it")
 	}
 }
+
+// Deferred minor F-23, the whole path: a Serve that comes after Shutdown
+// runs its first refresh, starts no refresher and returns nil (its HTTP
+// server is closed already).
+func TestServer_ServeAfterShutdownStartsNoRefresher(t *testing.T) {
+	s, ln, c := newAdminServer(t)
+	defer func() { _ = c.Close() }()
+	defer func() { _ = ln.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Serve(ln); err != nil {
+		t.Fatalf("Serve after Shutdown: %v", err)
+	}
+	s.mu.Lock()
+	started := s.refresherDone != nil
+	s.mu.Unlock()
+	if started {
+		t.Fatal("Serve started a refresher after Shutdown: nothing stops it")
+	}
+}
