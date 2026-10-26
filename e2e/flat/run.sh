@@ -19,6 +19,9 @@
 # Each image is independent: one failing does not stop the others. The
 # exit status is non-zero iff any image failed.
 set -euo pipefail
+# Ctrl-C ends the running container through its own trap, and docker run
+# then returns normally: stop here too rather than go on to the next image.
+trap 'echo "[e2e-flat] interrupted"; exit 130' INT TERM
 cd "$(dirname "$0")/../.."
 
 # Whitespace-split the whole value (a CI block scalar spans lines; see
@@ -35,7 +38,9 @@ if ((${#images[@]} == 0)); then
     echo "[e2e-flat] E2E_FLAT_IMAGES is empty; nothing to test"
     exit 2
 fi
-for img in "${images[@]}" "${unsigned_images[@]}"; do
+# ${a[@]+"${a[@]}"}: an array that may be empty, which set -u rejects on
+# bash before 4.4 (macOS's /bin/bash is 3.2).
+for img in "${images[@]}" ${unsigned_images[@]+"${unsigned_images[@]}"}; do
     if ! [[ $img =~ ^(debian|ubuntu):[0-9]+(\.[0-9]+)?$ ]]; then
         echo "[e2e-flat] unsupported client image '$img' (want debian:N or ubuntu:NN.NN)"
         exit 2
@@ -51,7 +56,7 @@ timings=()
 for img in "${images[@]}"; do
     tag="${img/:/-}"
     unsigned_wait=0
-    for u in "${unsigned_images[@]}"; do
+    for u in ${unsigned_images[@]+"${unsigned_images[@]}"}; do
         [[ $u == "$img" ]] && unsigned_wait=1
     done
     echo
@@ -80,7 +85,7 @@ for img in "${images[@]}"; do
 done
 
 echo
-for t in "${timings[@]}"; do
+for t in ${timings[@]+"${timings[@]}"}; do
     echo "[e2e-flat] $t"
 done
 if ((${#failures[@]} > 0)); then

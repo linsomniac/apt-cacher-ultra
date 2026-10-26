@@ -15,12 +15,12 @@ set -euo pipefail
 . /usr/local/lib/acu-e2e/lib.sh
 
 # A command that fails outside fail (nginx not binding, dpkg, a publish's
-# mv) exits through set -e: still name the scenario and show the log.
+# mv) exits through set -e: still name the scenario, the command and logs.
 on_exit() {
-    local rc=$?
+    local rc=$? cmd=$BASH_COMMAND
     if ((rc != 0 && FAILED == 0)); then
-        say "unexpected exit $rc in scenario $SCENARIO"
-        tail -n 80 "$DAEMON_LOG" 2> /dev/null | sed -E 's/ client_addr=[^ ]+//'
+        say "unexpected exit $rc in scenario $SCENARIO (command: $cmd)"
+        show_logs
     fi
 }
 trap on_exit EXIT
@@ -127,6 +127,13 @@ first_contact() {
         sed 's/^/    | /' /clients/control-sig/update.*.log
         fail "apt_update passed a signature failure: the signed-source error list is vacuous (above)"
     fi
+    # The same at the host root, which apt names with no slash after the
+    # host ("http://signed.test apt/stable/"): the host filter must see it.
+    client control-sig-root "$PROXY" "deb [signed-by=/fixtures/keys/other.gpg] http://signed.test/ apt/stable/"
+    if (apt_update control-sig-root) > /clients/control-sig-root/apt_update.out 2>&1; then
+        sed 's/^/    | /' /clients/control-sig-root/update.*.log
+        fail "apt_update passed a host-root signature failure: the signed-host filter misses it (above)"
+    fi
 
     UNSIGNED_FIRST_CONTACT=$SECONDS
     apt_update main -o Debug::Acquire::http=true
@@ -142,6 +149,9 @@ first_contact() {
         fail "apt fetched jitsi's Release.gpg; the fixture's InRelease should be used"
     fi
 
+    # Generous bounds: the update's own checks adopt, refresh or refuse
+    # every suite within seconds. 30 s is PERIODIC, over three TICKs; 90 s,
+    # three PERIODICs, leaves room for seven adoptions two at a time.
     local s
     for s in "$K8S inline" "$CUDA inline" "$NVIDIA inline" "$JENKINS detached" \
         "$SUBLIME inline" "$JITSI inline" "$DISTS inline"; do
@@ -182,24 +192,24 @@ first_contact() {
 
     # Jitsi's Contents-amd64 through apt-file, and its Sources. (Outputs go
     # to files: a grep -q at the end of a pipe can fail it under pipefail.)
-    capt main apt-file search /usr/share/acu-e2e/acu-jitsi > /clients/main/apt-file.out
+    capt main apt-file search /usr/share/acu-e2e/acu-jitsi > /clients/main/apt-file.out || true
     grep -q '^acu-jitsi: /usr/share/acu-e2e/acu-jitsi$' /clients/main/apt-file.out ||
         fail "apt-file did not find acu-jitsi's file in Contents-amd64"
-    capt main apt-cache showsrc acu-jitsi > /clients/main/showsrc.out
+    capt main apt-cache showsrc acu-jitsi > /clients/main/showsrc.out || true
     grep -q '^Package: acu-jitsi$' /clients/main/showsrc.out ||
         fail "apt-cache showsrc found no acu-jitsi source package"
 
     # Strict mode is on for signed.test: an undeclared .deb is refused...
     local st
-    st=$(curl -s -o /dev/null -w '%{http_code}' -x "$PROXY" \
-        "http://signed.test$K8S/amd64/acu-rogue_1.0_amd64.deb")
+    st=$("${CURL[@]}" -s -o /dev/null -w '%{http_code}' -x "$PROXY" \
+        "http://signed.test$K8S/amd64/acu-rogue_1.0_amd64.deb" || true)
     [[ $st == 502 ]] || fail "an undeclared .deb on signed.test answered $st, want 502 (strict mode)"
     log_has "$SCENARIO_MARK" "$(event unvouched_deb_refused)" "$(kv path "$K8S/amd64/acu-rogue_1.0_amd64.deb")" ||
         fail "no unvouched_deb_refused line for the undeclared .deb"
     # ...and pkgs.k8s.io's shape answers 403 for a file it lacks, which
     # the cache passes on. (Not Release: an inline snapshot answers its
     # suite's Release 404 itself, spec §10 item 9.)
-    st=$(curl -s -o /dev/null -w '%{http_code}' -x "$PROXY" "http://signed.test$K8S/README")
+    st=$("${CURL[@]}" -s -o /dev/null -w '%{http_code}' -x "$PROXY" "http://signed.test$K8S/README" || true)
     [[ $st == 403 ]] || fail "a missing file of the k8s shape answered $st through the cache, want 403"
     passed
 }

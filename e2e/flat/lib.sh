@@ -5,8 +5,10 @@
 #
 # AIDEV-NOTE: ruling R-H2-5 — every wait in this harness is poll (a bounded
 # poll on an observable: a log line, an HTTP answer, an apt result) with a
-# failure message; no bare sleep stands in for a condition. fail prints
-# the scenario, the daemon's log tail and nginx's access-log tail.
+# failure message; no bare sleep stands in for a condition. fail, and an
+# unexpected exit (test.sh's on_exit), print the scenario, the daemon's log
+# tail and nginx's access-log tail (show_logs). Every curl has a time limit
+# (CURL), so a hung endpoint cannot stall a poll.
 
 E2E_IMAGE="${E2E_IMAGE:-unknown image}"
 DAEMON_LOG=/var/log/acu-e2e/daemon.log
@@ -16,6 +18,10 @@ KEY=/etc/acu-e2e/keys/acu-e2e.gpg
 PROXY=http://127.0.0.1:3142
 ADMIN=http://127.0.0.1:6789
 MIRROR=http://127.0.0.1:3142/m-signed
+# Every curl of the harness: a hung endpoint fails one attempt after 10 s
+# (inside a poll, the poll goes on) instead of blocking the run until the
+# CI job's timeout. Each call answers in well under a second here.
+CURL=(curl --max-time 10)
 
 # The daemon's timers (config.toml, written by write_config). The scheduler
 # ticks every PERIODIC/4 seconds (5 s at least): 7.5 s, rounded up here.
@@ -40,7 +46,12 @@ APT_ERRORS='Failed to fetch|Connection failed|timed out|Hash Sum mismatch|Mirror
 # Release-less and unsigned repositories behind a captive portal print the
 # same words (design note 11), so these words count only on lines naming
 # the signed host or the mirror prefix (design note 17).
-APT_SIGNED_HOSTS='//signed\.test/|/m-signed/'
+# AIDEV-NOTE: apt names a host-root source (`deb http://signed.test/
+# apt/stable/`, Sublime's shape) without the slash after the host
+# (URI::ArchiveOnly): "http://signed.test apt/stable/ InRelease". So the
+# host or prefix is followed by a slash or a space; test.sh's
+# control-sig-root fails a filter that misses that form.
+APT_SIGNED_HOSTS='//signed\.test[/ ]|/m-signed[/ ]'
 APT_SIGNED_ERRORS="GPG error|OpenPGP signature verification failed|is not signed|signature verification|Clearsigned file isn't valid|Conflicting distribution"
 # The commit-delay scenario's scope (spec §7: its own grep): every error
 # but the phase-B-expiry straddle's — indexes newer than the InRelease a
@@ -63,11 +74,18 @@ say() {
 fail() {
     FAILED=1
     say "FAIL in scenario '$SCENARIO': $*"
-    echo "=== daemon log tail ($DAEMON_LOG)"
-    tail -n 80 "$DAEMON_LOG" 2>/dev/null | sed -E 's/ client_addr=[^ ]+//'
-    echo "=== nginx access log tail ($NGINX_LOG)"
-    tail -n 30 "$NGINX_LOG" 2>/dev/null
+    show_logs
     exit 1
+}
+
+# show_logs: the daemon's log tail and nginx's access-log tail (ruling
+# R-H2-5), for fail and for test.sh's unexpected-exit trap. A log not yet
+# written (nginx's, before setup starts it) prints nothing.
+show_logs() {
+    echo "=== daemon log tail ($DAEMON_LOG)"
+    tail -n 80 "$DAEMON_LOG" 2>/dev/null | sed -E 's/ client_addr=[^ ]+//' || true
+    echo "=== nginx access log tail ($NGINX_LOG)"
+    tail -n 30 "$NGINX_LOG" 2>/dev/null || true
 }
 
 # scenario NAME DESCRIPTION: starts a scenario; log assertions that pass
@@ -161,9 +179,11 @@ suite_kv() {
 
 # --- processes -----------------------------------------------------------
 
+# The nginx bounds (10 s) are generous: nginx binds and stops in well
+# under a second here; nothing in the daemon's timers bears on them.
 start_nginx() {
     nginx -c /etc/acu-e2e/nginx.conf
-    poll 10 "nginx on :80" curl -fsS -o /dev/null -H 'Host: signed.test' \
+    poll 10 "nginx on :80" "${CURL[@]}" -fsS -o /dev/null -H 'Host: signed.test' \
         http://127.0.0.1/debian/dists/acu/InRelease
 }
 
@@ -177,15 +197,19 @@ port_closed() {
 }
 
 # start_daemon [NAME=VALUE...]: starts the daemon with the environment
-# additions given, and waits for both listeners.
+# additions given, and waits for both listeners. 30 s is generous: both
+# open within a second or two of the start.
 start_daemon() {
     say "starting the daemon${*:+ with $*}"
     env "$@" /usr/local/bin/apt-cacher-ultra -config "$CONFIG" >> "$DAEMON_LOG" 2>&1 &
     DAEMON_PID=$!
-    poll 30 "the daemon's admin listener" curl -fs -o /dev/null "$ADMIN/healthz"
+    poll 30 "the daemon's admin listener" "${CURL[@]}" -fs -o /dev/null "$ADMIN/healthz"
     poll 30 "the daemon's proxy listener" bash -c '(echo > /dev/tcp/127.0.0.1/3142) 2> /dev/null'
 }
 
+# stop_daemon: SIGTERM, then 30 s for the exit: the daemon's drain budget
+# (shutdownTimeout, cmd/apt-cacher-ultra/main.go). With nothing in flight
+# it exits in about a second.
 stop_daemon() {
     [[ -n $DAEMON_PID ]] || return 0
     say "stopping the daemon"
@@ -212,7 +236,7 @@ publish() {
 # suite HOST SUITE-PATH FIELD: one field of the suite's entry in the admin
 # status JSON (suites[]); empty when the suite or the field is absent.
 suite() {
-    curl -fsS "$ADMIN/?format=json" |
+    "${CURL[@]}" -fsS "$ADMIN/?format=json" |
         jq -r --arg h "$1" --arg p "$2" --arg f "$3" \
             '.suites[] | select(.host == $h and .suite_path == $p) | .[$f] // empty'
 }
@@ -225,13 +249,14 @@ adopted_as() {
 # metric NAME-AND-LABELS: the value of one sample on /metrics (0 when it
 # has none yet).
 metric() {
-    curl -fsS "$ADMIN/metrics" | awk -v m="$1" '$1 == m {v = $2} END {print v + 0}'
+    "${CURL[@]}" -fsS "$ADMIN/metrics" | awk -v m="$1" '$1 == m {v = $2} END {print v + 0}'
 }
 
 # baseline START HOST SUITE...: waits (10 s at most) until every suite's
 # last successful check is no older than START less a cooldown — the
 # checks the client updates since START triggered, or the one whose
-# cooldown made them skip theirs — and sets BASELINE to the oldest.
+# cooldown made them skip theirs — and sets BASELINE to the oldest. 10 s
+# is generous: the checks that update fired land within a second or two.
 baseline() {
     local start=$1
     shift
