@@ -8,7 +8,17 @@
 
 **Tech Stack:** Bash 5 (`set -euo pipefail`, shellcheck 0.11), Docker with BuildKit, nginx-light, `apt-ftparchive`/`dpkg-deb`/`dpkg-source`/`gpg` in the fixture stage, `curl` and `jq` in the test image, Go 1.25 for the one test seam.
 
-**Spec:** `docs/superpowers/specs/2026-09-27-flat-repositories-design.md` (revision 11) — §7's "Real-apt end-to-end" paragraph, item by item, is this plan's requirement; §3 (apt's behaviour and the real flat repositories) gives the fixture shapes; §9's H row is the definition of done; C2 (flat forms, twins, the host-root limitation), C4 (cooldown, `periodic_refresh`, Dispatch 3–4: the anchorless refresh), C5 (the `Date` rules, the unsigned confirmation, SHA512-only Releases), C6 (vouching every Filename shape), C8 (the flip barrier and its phase-B-expiry residual) and C10 (strict mode) are what the scenarios exercise. Overview: `docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md` — the H line under "Cross-phase interfaces" (PR #8's end-to-end table), the *(G)* carry-forward "`e2e/flat` gains a Release-less repository" and "PR #8 parity" (PR #8 verified live; this e2e uses fixtures only, and H3 runs the live smoke). Phase H is three plans run in order: H1 (the sweep: `…-H1-sweep.md`), **H2 (this plan)**, H3 (README, release notes, the live-upstream smoke, the final full-diff review).
+**Spec:** `docs/superpowers/specs/2026-09-27-flat-repositories-design.md` (revision 12) — §7's "Real-apt end-to-end" paragraph, item by item, is this plan's requirement; §3 (apt's behaviour and the real flat repositories) gives the fixture shapes; §9's H row is the definition of done; C2 (flat forms, twins, the host-root limitation), C4 (cooldown, `periodic_refresh`, Dispatch 3–4: the anchorless refresh), C5 (the `Date` rules, the unsigned confirmation, SHA512-only Releases), C6 (vouching every Filename shape), C8 (the flip barrier and its phase-B-expiry residual) and C10 (strict mode) are what the scenarios exercise. Overview: `docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md` — the H line under "Cross-phase interfaces" (PR #8's end-to-end table), the *(G)* carry-forward "`e2e/flat` gains a Release-less repository" and "PR #8 parity" (PR #8 verified live; this e2e uses fixtures only, and H3 runs the live smoke). Phase H is three plans run in order: H1 (the sweep: `…-H1-sweep.md`), **H2 (this plan)**, H3 (README, release notes, the live-upstream smoke, the final full-diff review).
+
+## Revision 3 (2026-10-26): the post-H1 pre-flight
+
+Phase H1 landed (stamped 4a3a1e0). A pre-flight compared this plan with that tree (`.superpowers/sdd/2026-09-28-flat-repositories-H2-e2e/preflight-h1-delta.md`): no event, field, level, status-JSON path, metric, config key or admin call the plan relies on changed; every `old` block still occurs once; Task 12's patch applies; Task 1 replays. Changes, by the controller's rulings:
+
+- **B-1, the overview's H1 carry (parked item 12: `main.go`'s end of the `CheckBackoff` wiring is untested; *H2's*):** Task 4's `upstream-down` now polls, bounded by `PERIODIC + TICK + 10` = 48 s, until the k8s suite's row on the status page shows `backoff ends in` (`backoff_shown`) while nginx is down, with a daemon mutant that drops the wiring; Task 11 marks the carry done; Task 9's map and the README say so. This assertion was not run in revision 3 (no Docker): the implementer runs Task 4's steps and records the measured time.
+- **M-1** spec revision 12; **M-2** the guard's line is `event_docs_test.go:116` (Task 1); **M-3** design note 7 quotes `gate.holds(req.key)`; **M-4** a re-check of H1 as executed beside the plan-based one (twelve renamed DEBUG events); **M-5** H1's rename in the past tense (Global Constraints); **M-6** For H3 item 5's reason.
+- **Info, wording only:** I-1 (the H1 re-check is done), I-3 (Task 11's done markers read `*Done in H2 (…)*`). Not taken: I-2 (a step to mark H2's phase row done: H3 keeps it), I-4 (optional extra assertions) and I-5 (a cross-phase `- H2:` line), which add content rather than wording.
+
+Replayed without Docker: Task 1's Go steps on a scratch copy of 4a3a1e0 (red, green tagged and untagged, both mutations, vet, `golangci-lint --build-tags e2ehooks`), `go test -count=1 ./internal/observability/` with Task 1's row, every docs `old` block of Tasks 1, 3, 10 and 11 at 4a3a1e0 (each occurs once), Task 11's overview edits applied, `bash -n` and the per-task `shellcheck` on the changed `test.sh` (its findings are unchanged: the new helper follows `restart`), Tasks 4–8 applied to Task 3's file (byte for byte), and `backoff_shown`'s row match with gawk and mawk 1.3.4 (the images' awk) against rows shaped as the status template renders them.
 
 ## Revision 2 (2026-10-25): the design and exec reviews of draft c8e6fe4
 
@@ -39,7 +49,7 @@ Both reviews (`planH2-review/design.md`, `exec.md`) found no Critical issue and 
 | design: curl Jitsi's binary `Release.gpg` through the cache | not adopted: the replay answered 404, by design (spec §10 item 9: an inline snapshot answers its suite's `Release` and `Release.gpg` 404), and before the adoption a 200 proves passthrough only, not the sniff, which `TestSniffReleaseGPG` pins | — |
 | design: `gpgconf --kill gpg-agent` before the key's removal | adopted | Task 2 |
 | design: a workflow-level `concurrency` group | not adopted: it changes every CI job's behaviour, outside this phase's scope; left to the maintainer | — |
-| design: underspecified items | adopted: the first CI run's job times are H3's to compare with the timeouts (For H3); the README says to run `test.sh` once per container; the For-H3 time is the measured one; the H1 re-check is the controller's (it will ask after H1 is final) | Tasks 11, For H3 |
+| design: underspecified items | adopted: the first CI run's job times are H3's to compare with the timeouts (For H3); the README says to run `test.sh` once per container; the For-H3 time is the measured one; the H1 re-checks are done, against H1's plan and against H1 as executed (below) | Tasks 11, For H3 |
 | design: Task 9's map lists `two-suites` under "within one cooldown" at 60 s | adopted: `two-suites` now waits `REACH` and checks `by_client` | Tasks 6, 9 |
 | exec m-1: Tasks 3–7's shellcheck expectations | adopted: each lint step states what shellcheck prints at that task, measured on the staged files | Tasks 3–8 |
 | exec m-3: `apt_sent` can be vacuous | adopted: `apt_sent_line` and a negative control | Task 3 |
@@ -55,7 +65,11 @@ Both reviews (`planH2-review/design.md`, `exec.md`) found no Critical issue and 
 
 ### Re-check against H1 revision 2 (30c9638), 2026-10-25
 
-No H2 assertion, config key, status-JSON path or metric depends on anything H1 renames, removes or changes: H1's 43 renames (the six renamed DEBUG events among them) touch none of the events this harness reads (`request`, `freshness_check` — matched as a whole `msg=` value, so H1's `freshness_check_cancelled` and the like never match it — `adoption_success`, `adoption_refused`, `adoption_flip_barrier`, `unvouched_deb_refused`, `package_hash_conflict`) or their fields; H1 only adds status fields and changes config comments; `shutdown wait panicked` becomes `shutdown_wait_panicked`, which `whole_run`'s `[a-z_]*panicked` alternative matches. One addition: H1's `TestEveryEventIsDocumented` parses every non-test Go file under `cmd/` and `internal/` whatever its build tag, so `e2ehooks.go`'s `e2e_commit_delay_enabled` needs a `docs/log-fields.md` row, which Task 1 now adds (without it H1's guard prints `cmd/apt-cacher-ultra/e2ehooks.go:41: event e2e_commit_delay_enabled has no row in docs/log-fields.md; add one`; checked with H1's two guard files on this plan's tree, and silent with the row); it is snake_case, so `TestLogMessagesAreSnakeCase` needs no list entry. H2's two overview edits (Task 11) still apply after H1's Task 18 overview diff (applied in a scratch copy: each old text occurs once).
+No H2 assertion, config key, status-JSON path or metric depends on anything H1 renames, removes or changes: H1's 43 renames (twelve of them DEBUG) touch none of the events this harness reads (`request`, `freshness_check` — matched as a whole `msg=` value, so H1's `freshness_check_cancelled` and the like never match it — `adoption_success`, `adoption_refused`, `adoption_flip_barrier`, `unvouched_deb_refused`, `package_hash_conflict`) or their fields; H1 only adds status fields and changes config comments; `shutdown wait panicked` becomes `shutdown_wait_panicked`, which `whole_run`'s `[a-z_]*panicked` alternative matches. One addition: H1's `TestEveryEventIsDocumented` parses every non-test Go file under `cmd/` and `internal/` whatever its build tag, so `e2ehooks.go`'s `e2e_commit_delay_enabled` needs a `docs/log-fields.md` row, which Task 1 now adds (without it H1's guard prints `cmd/apt-cacher-ultra/e2ehooks.go:41: event e2e_commit_delay_enabled has no row in docs/log-fields.md; add one`; checked with H1's two guard files on this plan's tree, and silent with the row); it is snake_case, so `TestLogMessagesAreSnakeCase` needs no list entry. H2's two overview edits (Task 11) still apply after H1's Task 18 overview diff (applied in a scratch copy: each old text occurs once).
+
+### Re-check against H1 as executed (4a3a1e0), 2026-10-26
+
+The conclusion stands. The events the harness reads keep their names, levels and fields: `request` (`internal/handler/handler.go:2623`), `freshness_check` (`internal/freshness/check.go:272`), `adoption_refused` (`adoption_failure.go:121`), `adoption_success` (`adoption.go:1862`), `adoption_flip_barrier` (`flip_barrier.go:78,83`), `unvouched_deb_refused` (`handler.go:989`) and `package_hash_conflict` (`handler.go:1140`). Every production panic event ends in `_panicked` (`adoption_panicked`, `freshness_check_panicked`, `gc_panicked`, `handler_goroutine_panicked`, `shutdown_wait_panicked`). The status JSON and `/metrics` changes are additive. Config, e2e/, CI and the Makefile are unchanged since 6786529. Twelve of the 43 renames are DEBUG. The one H1 output for H2 is the overview's `CheckBackoff` carry (overview line 138), which Task 4 now covers.
 
 ## Global Constraints
 
@@ -64,7 +78,7 @@ Everything in the overview's Global Constraints that touches this plan applies. 
 - **Fixtures only.** No scenario reaches a live repository. The test container's only upstream is its own nginx; the daemon's `upstream.allowed_host_regex` admits `signed.test` and `plain.test` alone. CI's network use is the base images (Docker Hub: `golang:1.25-bookworm`, `debian:bookworm-slim`, the client image; locally also `rhysd/actionlint` for the workflow check), the distribution mirrors the image build installs from (`deb.debian.org`, `archive.debian.org`, `archive.ubuntu.com`) and the Go module proxy the build stage's `go mod download` uses, as e2e/deb's job already does (design note 13).
 - **Spec values kept** (ruling R-H2-2): the unsigned confirmation gap `max(cooldown, 5m)` = 5 minutes (1 hour after a 401/403 on a signature file), the 45 s commit delay, the flip hold's 20 s bound below apt's 30 s timeout, `flip_quiet_period` inside its `1s`–`15s` range, the six client images.
 - **No production change.** The only Go change is the `e2ehooks` seam (Task 1), compiled only with `-tags e2ehooks`; a release build (`make build`, `make deb`, nfpm, e2e/deb) contains its no-op twin and reads no `ACU_E2E_*` variable (`TestBuildAdopter_ReleaseBinaryIgnoresTheE2ECommitDelay`, and CI's grep of the release binary, Task 10).
-- **Assert on stable names.** Log assertions use only snake_case events (`request`, `freshness_check`, `adoption_success`, `adoption_refused`, `adoption_flip_barrier`, `unvouched_deb_refused`, `e2e_commit_delay_enabled`, `*_panicked`, `package_hash_conflict`) and fields, the admin status JSON (`suites[]`, `process.started_unixtime`: a locked contract) and `/metrics`. No assertion reads a prose message except `whole_run`'s panic catch-all (net/http's `http: panic serving …`; `shutdown wait panicked`, which H1 renames `shutdown_wait_panicked`: both forms match), so H1's snake_case renames (its rulings R-H3 and R-H6) cannot break this harness, which runs after H1. The event H2's Go code adds has a `docs/log-fields.md` row (Task 1), as H1's `TestEveryEventIsDocumented` requires.
+- **Assert on stable names.** Log assertions use only snake_case events (`request`, `freshness_check`, `adoption_success`, `adoption_refused`, `adoption_flip_barrier`, `unvouched_deb_refused`, `e2e_commit_delay_enabled`, `*_panicked`, `package_hash_conflict`) and fields, the admin status JSON (`suites[]`, `process.started_unixtime`: a locked contract), `/metrics`, and one status-page text, a failing suite's `backoff ends in` (Task 4: the overview's H1 carry asks for exactly that text). No assertion reads a prose message except `whole_run`'s panic catch-all (net/http's `http: panic serving …`; `shutdown wait panicked`, which H1 renamed `shutdown_wait_panicked`, matched by the regex's `[a-z_]*panicked` alternative as `gc_panicked` is), so H1's snake_case renames (its rulings R-H3 and R-H6) cannot break this harness, which runs after H1. The event H2's Go code adds has a `docs/log-fields.md` row (Task 1), as H1's `TestEveryEventIsDocumented` requires.
 - **No assertion is weakened to pass** (the controller's rule): a check that flakes gets a wider bound with its reason, never removed.
 - After the Go change (Task 1): `go test -race ./...` and `golangci-lint run ./...` are clean, `golangci-lint run --build-tags e2ehooks ./cmd/...` too, and `gofmt -l .` lists only the five known drift files (`cmd/apt-cacher-ultra/ca_print.go`, `internal/cache/cache_test.go`, `internal/cache/gc_urlpath_test.go`, `internal/freshness/hot_prefetch_test.go`, `internal/proxy/connect_stats.go`). Never run `gofmt -w` on those five.
 - Every shell file in `e2e/flat/` is bash with `set -euo pipefail` (`lib.sh` is sourced by `test.sh`, which sets it), and `shellcheck -x e2e/flat/*.sh` (run from the repo root) prints nothing once Task 8 lands; Tasks 3–7's lint steps state exactly what it prints until then (functions and variables a later task uses). No `grep -q` ends a pipe (design note 18). No bare `sleep` stands in for a condition (ruling R-H2-5); the sleeps that remain pace a poll or a client loop (`poll`'s one second, `until_candidates`' cooldown, the commit-delay loop's 3 s).
@@ -72,7 +86,7 @@ Everything in the overview's Global Constraints that touches this plan applies. 
 
 Conventions in this plan:
 
-- Shell and Dockerfile contents are written out in full: each task's files are the final ones, exactly as the planning runs executed them (design note 15). A task that extends `test.sh` gives the function bodies it adds and the one-line edit to the run list at the end of the file.
+- Shell and Dockerfile contents are written out in full: each task's files are the final ones, exactly as the planning runs executed them (design note 15), except revision 3's `backoff_shown` poll in Task 4's `upstream_down`, which only `bash -n`, `shellcheck` and a row-match test have checked (no Docker in revision 3). A task that extends `test.sh` gives the function bodies it adds and the one-line edit to the run list at the end of the file.
 - "Run" commands are run from the repo root. Expected outputs quote the planning runs; times vary with the machine, so an expected time is a range, never an assertion.
 - Each image build needs network access to Docker Hub and the distribution mirrors; a build failure that names a mirror (`Failed to fetch http://deb.debian.org/…`, `404  Not Found`) is the mirror, not the task: retry once before debugging (design note 9).
 - Daemon mutants (Task 8's checks) are scratch builds only: change the named constant in a scratch copy of the tree, build and run `e2e/flat` from it, and never commit the change.
@@ -94,8 +108,8 @@ Conventions in this plan:
 3. **The fixture shapes** (spec §3), all versions `1.0` and `2.0`: k8s `deb <uri>/ /`, Filenames `amd64/…`, `InRelease` only, nginx answering 403 for a missing file; CUDA `./…` Filenames (apt-ftparchive's dpkg-scanpackages shape) with `InRelease`, `Release` and `Release.gpg`, plus `acu-epoch` version `1:1.0`/`1:2.0` in a file named `acu-epoch_1%3a<v>_amd64.deb`; libnvidia-container `deb <uri> /`, `InRelease` only, a SHA512-only `Release` text over a `Packages` that keeps SHA256, `Date` frozen at 2018 in both versions (both checked by the build: design note 20); Jenkins `deb <uri> binary/`, detached with an armored `Release.gpg`, Filenames `binary/…` and `direct/…`; Sublime `deb <host-root> apt/stable/`, Filenames `files/…` at the host root, `files/` keeping every build; Jitsi `deb <uri> stable/` plus `deb-src`, `Acquire-By-Hash: yes`, SHA256 and SHA512 only, `Contents-amd64`, `Sources`, a binary `Release.gpg` beside `InRelease` (deviation 1); `dists/` `deb <uri> acu main`, inline; unsigned `Release`-only at `/unsigned404` (missing files 404) and `/unsigned403` (403); Release-less `Packages`/`Packages.gz` at `/fury` (Gemfury: Filenames without `./`) and `/goreleaser` (`./` Filenames). The `sub/` and `a/b/` forms' `Release` files carry the `Suite` apt checks (`binary`, `apt/stable`, `stable`), or apt warns "Conflicting distribution" as no real repository makes it.
 4. **Dates and mtimes.** v1 is dated two days before the image build and v2 one day before, both in the past and without `Valid-Until`, so a cached fixture layer stays valid; every file of a version carries its version's mtime, because otherwise v1 and v2 indexes of equal size built in the same second share nginx's ETag and `Last-Modified`, and a conditional GET would be answered 304.
 5. **"Within one cooldown", and by whom** (spec §7, PR #8's table). A client that runs `apt-get update` once a cooldown must see the new version within `REACH` = cooldown + 20 s of the publish: the first update after the publish fires the check (once the cooldown has passed), the adoption and the flip barrier (phase A's 1 s quiet after the client's last anchor, a zero-length hold) follow, and a later update sees the new snapshot. The time alone could be met by the scheduler too, so each such scenario also proves the path: `baseline START HOST SUITE…` waits until the suites' `last_success_unixtime` is no older than the client update that started at `START`, less a cooldown (the checks that update fired, or the one whose cooldown made it skip them), and `by_client` then requires the client to see the publish before `BASELINE + periodic_refresh` — the earliest the scheduler could check those suites again. Waiting for the update's own checks matters: a status read before they land would take an older stamp and could fail a correct daemon. With `periodic_refresh` at 30 s the margin is wide: the client's check carried every publish 4–8 s after the baseline in the planning runs. The anchorless refresh's own carry-forward bound, "within one `periodic_refresh`", is checked with no client at all: `periodic_refresh` + one tick + 10 s = 48 s (measured: 29–37 s after the publish).
-6. **Observables.** The admin status JSON (`/?format=json`, `suites[]`: `current_snapshot_id`, `anchor_form`, `last_success_unixtime`, `adoption_fail_*`; `process.started_unixtime`) for state; text-log events for what happened (`adoption_refused reason=upstream_older`, `adoption_flip_barrier outcome=…`, `request … validated_hash=true`, `flip_held_ms`); `/metrics` for `acu_anchorless_sniff_rejected_total{host="plain.test"}`; nginx's access log for the request lines the cache sent upstream, and for "the upstream answered nothing" while it is stopped; apt's `Debug::Acquire::http` output for the lines apt sent (CRLF-terminated, which `apt_sent_line`'s pattern allows). No assertion reads the SQLite file.
-7. **The unsigned scenario overlaps the run, and lands at a retry.** `/unsigned404`'s first contact is the first update of `first-contact`; its adoption is asserted after `commit-delay` (about 2 minutes in). The confirming observation is not the first check 5 minutes after the first one: checks before the `unsigned_unconfirmed` record's retry time see the same bytes and stay `changed_deferred` (spec C7's gate: `checkFirst`'s `deferred := gate.active && !gate.due && req.key == gate.hash`, `internal/freshness/first_adoption.go`, before `unsignedFirst` runs), and the retries come 2, 4 and 8 minutes apart, each ±25 %. So the adoption lands at the first retry at least 300 s after first contact: before 450 s when the second retry is that late, else at the third, before 900 s. The deadline is first contact + 900 s + `periodic_refresh` + one tick + 30 s (968 s; a due retry is picked up within a tick, so this is generous). The floor is asserted too: an adoption sooner than 300 s after first contact fails (`took >= 300`; `UNSIGNED_FIRST_CONTACT` is read before the first update reaches the cache, so this cannot fail a correct daemon), and on the four short images `whole_run` requires `/unsigned404` to be still unadopted at about 2 minutes, which catches a broken floor whenever that suite's first retry (90–150 s) came first. Planning runs: draft 310, 397 and 385 s (`debian:11`), 373 s (`ubuntu:26.04`); revision 2 373 and 382 s (`debian:11`), 326 and 356 s (`ubuntu:26.04`); an earlier draft whose deadline assumed 5 minutes timed out at 355 s on `ubuntu:26.04`. The record survives the scenario's restarts (the confirmation stamp is persisted). Running the scenario after `upstream-down` instead would cost up to two more minutes: that scenario's refused connections put the suite in the failing class (a 2-minute backoff).
+6. **Observables.** The admin status JSON (`/?format=json`, `suites[]`: `current_snapshot_id`, `anchor_form`, `last_success_unixtime`, `adoption_fail_*`; `process.started_unixtime`) for state; text-log events for what happened (`adoption_refused reason=upstream_older`, `adoption_flip_barrier outcome=…`, `request … validated_hash=true`, `flip_held_ms`); `/metrics` for `acu_anchorless_sniff_rejected_total{host="plain.test"}`; the status page's HTML for one text, a failing suite's `backoff ends in` (Task 4); nginx's access log for the request lines the cache sent upstream, and for "the upstream answered nothing" while it is stopped; apt's `Debug::Acquire::http` output for the lines apt sent (CRLF-terminated, which `apt_sent_line`'s pattern allows). No assertion reads the SQLite file.
+7. **The unsigned scenario overlaps the run, and lands at a retry.** `/unsigned404`'s first contact is the first update of `first-contact`; its adoption is asserted after `commit-delay` (about 2 minutes in). The confirming observation is not the first check 5 minutes after the first one: checks before the `unsigned_unconfirmed` record's retry time see the same bytes and stay `changed_deferred` (spec C7's gate: `checkFirst`'s `deferred, reason := gate.holds(req.key), gate.reason` (`retryGate.holds`: `g.active && !g.due && key == g.hash`, `internal/freshness/freshness.go`), `internal/freshness/first_adoption.go`, before `unsignedFirst` runs), and the retries come 2, 4 and 8 minutes apart, each ±25 %. So the adoption lands at the first retry at least 300 s after first contact: before 450 s when the second retry is that late, else at the third, before 900 s. The deadline is first contact + 900 s + `periodic_refresh` + one tick + 30 s (968 s; a due retry is picked up within a tick, so this is generous). The floor is asserted too: an adoption sooner than 300 s after first contact fails (`took >= 300`; `UNSIGNED_FIRST_CONTACT` is read before the first update reaches the cache, so this cannot fail a correct daemon), and on the four short images `whole_run` requires `/unsigned404` to be still unadopted at about 2 minutes, which catches a broken floor whenever that suite's first retry (90–150 s) came first. Planning runs: draft 310, 397 and 385 s (`debian:11`), 373 s (`ubuntu:26.04`); revision 2 373 and 382 s (`debian:11`), 326 and 356 s (`ubuntu:26.04`); an earlier draft whose deadline assumed 5 minutes timed out at 355 s on `ubuntu:26.04`. The record survives the scenario's restarts (the confirmation stamp is persisted). Running the scenario after `upstream-down` instead would cost up to two more minutes: that scenario's refused connections put the suite in the failing class (a 2-minute backoff).
 8. **Lower bounds for the absence checks.** "Zero `unvouched_deb_refused` on the signed host" would pass vacuously with strict mode off, so `first-contact` requests one undeclared `.deb` (`acu-rogue`, on the upstream but in no `Packages`) and requires a 502 and its refusal line; `whole-run` excludes exactly that path and also requires zero refusals on `plain.test`. Likewise every update check has a control on every apt version: `apt_update` must fail an update of a source the cache refuses (`nowhere.test`: `E: Failed to fetch …  403  Forbidden`) and one of a signed source checked against the wrong key (design note 17); `apt_sent_line` must not match a line apt never sent; `poll_quietly` must time out on `false`.
 9. **`debian:11` is past its LTS** (ended 2026-08-31): its packages moved to `archive.debian.org`, and the image still names `deb.debian.org`, whose security pool now answers 404. The test stage rewrites `sources.list` for `bullseye` (main and security: the image's own packages, `perl-base` among them, come from security, so `apt-file`'s `perl` needs it) before installing nginx and the tools; apt itself (2.2.4, the one under test) is the image's. Every `apt-get` of the image build retries three times (apt 2.2 makes none by default). Images that reach end of life later need the same treatment (README, "Maintenance").
 10. **Two Release-less repositories.** `/goreleaser` is republished while a client updates once a cooldown (the request-triggered path, "within one cooldown", `by_client`); `/fury` is republished with no client (the scheduler path, "within one `periodic_refresh`") and then put behind a captive portal (`/run/acu-e2e/captive` makes nginx answer an HTML page with 200 for every `/fury` path).
@@ -133,7 +147,7 @@ The failure modes this harness could hide, most likely first, each pinned in the
 | The commit-delay seam | `cmd/apt-cacher-ultra/e2ehooks.go`, `e2ehooks_off.go`, `e2ehooks_test.go`, `e2ehooks_off_test.go` (new); `cmd/apt-cacher-ultra/main.go` (`buildAdopter`'s one call); `docs/log-fields.md` (the `e2e_commit_delay_enabled` row) | 1 |
 | Fixtures and the image | `e2e/flat/build-fixtures.sh`, `e2e/flat/nginx.conf`, `e2e/flat/Dockerfile` (new); `.dockerignore` | 2 |
 | The harness and first contact | `e2e/flat/lib.sh`, `e2e/flat/test.sh`, `e2e/flat/run.sh` (new); `Makefile` (`e2e-flat`) | 3 |
-| PR #8's table, the older `Date`, the restart | `e2e/flat/test.sh` | 4 |
+| PR #8's table, the older `Date`, the restart, the status page's backoff | `e2e/flat/test.sh` | 4 |
 | The frozen `Date` and the Release-less carry-forward | `e2e/flat/test.sh` | 5 |
 | Two suites on one host, mirror mode | `e2e/flat/test.sh` | 6 |
 | The 45 s commit | `e2e/flat/test.sh` | 7 |
@@ -389,7 +403,7 @@ Remove the `applyE2EHooks` call from `buildAdopter` (keep both new files) and ru
 Expected: `--- FAIL: TestBuildAdopter_E2ECommitDelayFromTheEnvironment` and `--- FAIL: TestBuildAdopter_E2ECommitDelayRejectsABadValue` (the planning replay's two failing lines). Restore the call.
 
 Then delete the `e2e_commit_delay_enabled` row from `docs/log-fields.md` and run `go test -count=1 -run TestEveryEventIsDocumented ./internal/observability/` (H1's guard).
-Expected: `event_docs_test.go:117: cmd/apt-cacher-ultra/e2ehooks.go:41: event e2e_commit_delay_enabled has no row in docs/log-fields.md; add one`. Restore the row.
+Expected: `event_docs_test.go:116: cmd/apt-cacher-ultra/e2ehooks.go:41: event e2e_commit_delay_enabled has no row in docs/log-fields.md; add one`. Restore the row.
 
 - [ ] **Step 6: Full verification**
 
@@ -1837,14 +1851,14 @@ EOF
 
 ### Task 4: PR #8's end-to-end table, the older `Date` and the restart
 
-Spec §9's H row and the overview's H line: "one signed flat repository configured as `deb <uri>/ /` on one client and `deb <uri> ./` on another; both report 2.0 within one cooldown of the v2 publish, and with the upstream stopped two fresh clients install 2.0 from the snapshots"; spec §7: "an older-Date publish is ignored; state survives a restart" (design note 5; Review Focus 2, 5). "Within one cooldown" is checked twice: on time (`until_candidates "$REACH"`) and on path (`by_client`: before the scheduler could have checked the suites). The restart is proven by `process.started_unixtime`, the upstream's absence by nginx's access log, and the older `Date` by the cache's own state, not apt's (apt alone keeps an existing client at 2.0).
+Spec §9's H row and the overview's H line: "one signed flat repository configured as `deb <uri>/ /` on one client and `deb <uri> ./` on another; both report 2.0 within one cooldown of the v2 publish, and with the upstream stopped two fresh clients install 2.0 from the snapshots"; spec §7: "an older-Date publish is ignored; state survives a restart" (design note 5; Review Focus 2, 5). "Within one cooldown" is checked twice: on time (`until_candidates "$REACH"`) and on path (`by_client`: before the scheduler could have checked the suites). The restart is proven by `process.started_unixtime`, the upstream's absence by nginx's access log, and the older `Date` by the cache's own state, not apt's (apt alone keeps an existing client at 2.0). While nginx is down, `upstream-down` also proves `main.go`'s end of the `CheckBackoff` wiring (the overview's H1 carry, parked item 12): the k8s suite's checks fail, and its status-page row must show `checks failing ×k · backoff ends in …`; without the wiring it shows the count alone (`internal/admin`'s `annotateSuiteEntries`).
 
 **Files:**
 - Modify: `e2e/flat/test.sh`
 
 **Interfaces:**
 - Consumes: Task 3's `lib.sh` and `test.sh` names (`baseline`, `by_client`, `REACH`, `PERIODIC`).
-- Produces: the clients `k8s-slash` (`SRC_K8S`), `k8s-dot` (`SRC_K8S_DOT`), `k8s-fresh`, `fresh-slash`, `fresh-dot`; the twin suite `$K8S/.` (adopted inline); `k8s` published at v2 when this task's scenarios end (the older-`Date` scenario publishes v1 and restores v2); `snapshot_ids` and `main_candidates` (the comparisons of `older-date` and `restart`).
+- Produces: the clients `k8s-slash` (`SRC_K8S`), `k8s-dot` (`SRC_K8S_DOT`), `k8s-fresh`, `fresh-slash`, `fresh-dot`; the twin suite `$K8S/.` (adopted inline); `k8s` published at v2 when this task's scenarios end (the older-`Date` scenario publishes v1 and restores v2); `snapshot_ids` and `main_candidates` (the comparisons of `older-date` and `restart`); `backoff_shown` (Task 8 adds `whole_run` after it).
 
 - [ ] **Step 1: Add the PR #8 and older-`Date` scenarios after `first_contact`**
 
@@ -1956,7 +1970,9 @@ main_candidates() {
 }
 
 # PR #8's table, second half: with the upstream stopped, two fresh clients
-# (one per source form) install 2.0 from the snapshots.
+# (one per source form) install 2.0 from the snapshots. Meanwhile the
+# checks their updates trigger fail, and the status page shows the failing
+# checks' backoff (backoff_shown).
 upstream_down() {
     scenario upstream-down "upstream stopped: fresh clients of both forms install 2.0 from the snapshots"
     stop_nginx
@@ -1971,8 +1987,34 @@ upstream_down() {
     # Nothing came from the upstream: these clients were served from the
     # snapshots alone.
     (($(wc -l < "$NGINX_LOG") == upstream_lines)) || fail "the upstream answered during upstream-down"
+    # The overview's H1 carry (parked item 12): main.go wires
+    # admin.Config.CheckBackoff, without which a failing suite's row shows
+    # only "checks failing ×k". A client-triggered check fails within a
+    # cooldown of an update; the scheduler's own check of the suite comes
+    # within periodic_refresh and a tick of its last success at the latest.
+    poll $((PERIODIC + TICK + 10)) "the status page to show a failing check's backoff" backoff_shown
+    say "the status page shows $K8S's failing checks with their backoff ${POLL_TOOK}s into the poll"
     start_nginx
     passed
+}
+
+# backoff_shown: a client update, whose check of $K8S fails while nginx is
+# stopped (a refused connection ends a check unknown: spec C4's failed
+# check), then $K8S's check_fail_count is positive and its row on the
+# status page (the HTML at /, one <tr> per suite) shows "backoff ends in".
+# internal/admin's annotateSuiteEntries writes that text only for a suite
+# with a failing count, a last_check_at and a backoff the scheduler keeps
+# (unscheduled is false): an adopted suite qualifies unless an
+# anchor_absent or unsigned_disabled record paces it, and $K8S's only
+# possible record is older-date's upstream_older.
+backoff_shown() {
+    local n
+    apt_update fresh-slash
+    n=$(suite signed.test "$K8S" check_fail_count)
+    ((${n:-0} > 0)) || return 1
+    curl -fsS -o /clients/fresh-slash/status.html "$ADMIN/"
+    [[ -n $(awk -v RS='</tr>' -v p="$K8S" '(index($0, ">" p "<") || index($0, ">" p " ")) && index($0, "backoff ends in")' \
+        /clients/fresh-slash/status.html) ]]
 }
 ```
 
@@ -2010,10 +2052,11 @@ Expected, among the lines (the planning run):
 [e2e-flat debian:12   18s] === scenario restart: state survives a restart
 [e2e-flat debian:12   21s] --- scenario restart passed (3s)
 [e2e-flat debian:12   21s] === scenario upstream-down: upstream stopped: fresh clients of both forms install 2.0 from the snapshots
-[e2e-flat debian:12   22s] --- scenario upstream-down passed (1s)
-[e2e-flat debian:12   23s] PASS in 23s: first-contact 10s pr8-table 6s older-date 1s restart 3s upstream-down 1s
+[e2e-flat debian:12   …s] the status page shows /core:/stable:/v1.34/deb's failing checks with their backoff …s into the poll
+[e2e-flat debian:12   …s] --- scenario upstream-down passed (…s)
+[e2e-flat debian:12   …s] PASS in …s: first-contact 10s pr8-table 6s older-date 1s restart 3s upstream-down …s
 ```
-nginx also prints `[notice] … signal process started` on stderr when `upstream-down` stops it; harmless.
+nginx also prints `[notice] … signal process started` on stderr when `upstream-down` stops it; harmless. The `backoff_shown` line and the times after it are not measured: revision 3 added that poll without Docker. Record the poll's time here and in Task 9; expect a few seconds (a refused connection fails the client-triggered check at once: `fetch.Client.Conditional` makes one attempt). If the 48 s bound ever flakes, widen it with its reason; never drop the check.
 
 - [ ] **Step 5: Mutation checks**
 
@@ -2026,6 +2069,8 @@ Run each, one at a time, reverting before the next, with `E2E_FLAT_IMAGES=debian
    Expected: `FAIL in scenario 'restart': the daemon was not restarted`.
 4. In `upstream_down`, delete the `stop_nginx` and `start_nginx` lines (exec review I-2).
    Expected: `FAIL in scenario 'upstream-down': the upstream answered during upstream-down`.
+5. A daemon mutant, in a scratch copy only (Global Constraints; the overview's H1 carry): in `cmd/apt-cacher-ultra/main.go`, delete the line `CheckBackoff:            freshness.CheckBackoff,` (`serveListeners`' `admin.Config`).
+   Expected: `FAIL in scenario 'upstream-down': timed out after 48s waiting for the status page to show a failing check's backoff`. Not replayed in revision 3 (no Docker): run it once with the implementation.
 
 `older-date`'s new checks (the snapshot ids, the fresh client) have no single-site mutant: a daemon that skips the `upstream_older` refusal fails the poll before them, and the planning runs found no edit that makes the cache adopt v1 while still logging the refusal. They are equalities a correct daemon passes by construction.
 
@@ -2047,7 +2092,9 @@ e2e/flat: PR #8's end-to-end table, the older Date and the restart
 Both source forms of one signed flat repository report 2.0 within one
 cooldown of its v2 publish, carried by the clients' own checks, and, with
 the upstream stopped (its access log unchanged), fresh clients of both
-forms install 2.0 from the snapshots; an older-Date publish is refused
+forms install 2.0 from the snapshots, and the status page shows the
+failing checks' backoff (main.go's CheckBackoff wiring); an older-Date
+publish is refused
 and changes no snapshot; after a real restart the snapshots and
 candidates are unchanged.
 
@@ -2549,7 +2596,7 @@ record_of() {
 }
 ```
 
-- [ ] **Step 2: Add the whole-run assertions after `upstream_down`**
+- [ ] **Step 2: Add the whole-run assertions after `backoff_shown`**
 
 ```bash
 # Whole-run assertions over the daemon's log.
@@ -2604,7 +2651,7 @@ whole_run
 stop_daemon
 ```
 
-The file now equals the planning run's `test.sh`; its run list reads `setup`, `first_contact`, `pr8_table`, `older_date`, `frozen_date`, `anchorless`, `two_suites`, `mirror_mode`, `commit_delay`, `unsigned_first_adoption`, `restart`, `upstream_down`, `whole_run`, `stop_daemon`, `say "PASS …"`.
+The file now equals the planning run's `test.sh` plus revision 3's `backoff_shown` poll (Task 4); its run list reads `setup`, `first_contact`, `pr8_table`, `older_date`, `frozen_date`, `anchorless`, `two_suites`, `mirror_mode`, `commit_delay`, `unsigned_first_adoption`, `restart`, `upstream_down`, `whole_run`, `stop_daemon`, `say "PASS …"`.
 
 - [ ] **Step 4: Run it on a short image and on a long-wait image**
 
@@ -2719,6 +2766,7 @@ Expected: `gofmt -l` lists only the five drift files; `0 issues.` twice; every p
 | A 45 s commit delay, no client timeouts, a scoped grep | `commit-delay` (Task 1's seam; every error but the residual's) |
 | The unsigned first adoption on the oldest and newest images only, after its 5-minute confirmation | `unsigned-first-adoption` (`E2E_FLAT_UNSIGNED_IMAGES`; the floor and the deadline; design note 7) |
 | PR #8's end-to-end table | `pr8-table`, `upstream-down` (nginx's log unchanged) |
+| The overview's H1 carry: `main.go`'s end of the `CheckBackoff` wiring (parked item 12) | `upstream-down` (`backoff_shown`: the status page's `backoff ends in`) |
 | The *(G)* carry-forward (a Release-less repository: within one `periodic_refresh`; HTML keeps the old index) | `anchorless` (`fury`) |
 | The CI change | Task 10 |
 | The docs | Task 11 |
@@ -2871,7 +2919,7 @@ EOF
 
 ### Task 11: Documentation: `e2e/flat/README.md`, the Makefile help, the overview, and the list for H3
 
-The brief's docs DoD: how to run it, image selection, what each scenario proves; the Makefile help; a "for H3" list (below, in this plan: H3 writes the README and the release notes). This task also marks the two overview items this phase closes. The times are the measured ones (exec review m-8): the unsigned adoption lands 5 to 15 minutes after first contact, which costs a long-wait image about 3 to 14 minutes more than a short one.
+The brief's docs DoD: how to run it, image selection, what each scenario proves; the Makefile help; a "for H3" list (below, in this plan: H3 writes the README and the release notes). This task also marks the three overview items this phase closes (the H cross-phase line, the *(G)* Release-less item and the *(H1)* `CheckBackoff` carry). The times are the measured ones (exec review m-8): the unsigned adoption lands 5 to 15 minutes after first contact, which costs a long-wait image about 3 to 14 minutes more than a short one.
 
 **Files:**
 - Create: `e2e/flat/README.md`
@@ -2989,7 +3037,7 @@ check carried it.
 | `commit-delay` | With a 45 s commit (`ACU_E2E_COMMIT_DELAY`), Jitsi's flip's hold expires at 20 s: anchor requests waited under 20 s and no update printed any error but the documented phase-B-expiry residual's (a mismatch: this scenario's grep allows those words and nothing else); the first update after the commit is clean. |
 | `unsigned-first-adoption` | (`E2E_FLAT_UNSIGNED_IMAGES` only) The unsigned repository adopts no sooner than 5 minutes after first contact, at its record's first retry after that (5 to 15 minutes), then updates at once; its host stays unstrict; the 403 variant is still waiting after its record's second retry has passed 5 minutes (its gap is an hour). |
 | `restart` | The daemon really restarted (`process.started_unixtime`), and kept the same snapshots and candidates; a clean update; anchors served from the snapshots. |
-| `upstream-down` | PR #8's table, second half: with nginx stopped — its access log does not grow — fresh clients of both source forms install 2.0 from the snapshots. |
+| `upstream-down` | PR #8's table, second half: with nginx stopped — its access log does not grow — fresh clients of both source forms install 2.0 from the snapshots. The checks their updates trigger fail, and the status page's row for the k8s suite shows `checks failing ×k · backoff ends in …`, the text `main.go`'s `CheckBackoff` wiring adds. |
 | `whole-run` | No `unvouched_deb_refused` on `signed.test` but `acu-rogue`, none on `plain.test`; on a short image, `unsigned404` still unadopted (the 5-minute floor, when its first retry came first); no panic and no `package_hash_conflict` in the daemon's log. |
 
 Two shapes of spec §7 are exercised only in part: apt (2.2 to 3.2) refuses
@@ -3079,13 +3127,22 @@ a republished index reaches a client within one `periodic_refresh`, and an upstr
 ```
 new:
 ```
-a republished index reaches a client within one `periodic_refresh`, and an upstream that then answers HTML keeps the old index. *Done in phase H2 (`…-H2-e2e.md`, Task 5: the `anchorless` scenario).*
+a republished index reaches a client within one `periodic_refresh`, and an upstream that then answers HTML keeps the old index. *Done in H2 (Task 5: the `anchorless` scenario).*
+```
+
+old:
+```
+Breaking it loses only the text. *H2's.*
+```
+new:
+```
+Breaking it loses only the text. *Done in H2 (Task 4: the `upstream-down` scenario's `backoff_shown`).*
 ```
 
 - [ ] **Step 4: Verify**
 
-Run: `grep -c 'e2e-flat' Makefile && grep -n 'Done in phase H2' docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md && git diff --check`
-Expected: `2` (the `.PHONY` line and the target); one overview line; `git diff --check` prints nothing.
+Run: `grep -c 'e2e-flat' Makefile && grep -n 'Done in H2' docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md && git diff --check`
+Expected: `2` (the `.PHONY` line and the target); two overview lines (the `CheckBackoff` carry and the *(G)* item); `git diff --check` prints nothing.
 
 Run: `go test -count=1 -run 'TestEveryEventIsDocumented|TestLogMessagesAreSnakeCase' ./internal/observability/`
 Expected: `ok` (H1's guards: Task 1's `e2e_commit_delay_enabled` row still stands; this task adds no event).
@@ -3746,7 +3803,7 @@ What this phase leaves for H3 to write or check, each with its source:
 2. **The unsigned confirmation's real duration** (`docs/configuration.md`, *Anchor forms and unsigned repositories*, safeguard 2; the README's unsigned paragraph): "at least 5 minutes; with the retry schedule, usually 5 to 15" — a never-adopted unsigned repository adopts at the first retry of its `unsigned_unconfirmed` record at least 5 minutes after the first observation (ruling R-H2-6, design note 7).
 3. **After a captive portal** (`docs/configuration.md`, *Flat repositories*, the limits of the refresh without a `Release`): the first `apt update` through the cache after the outage can still show the portal's page for a Release-less repository's `InRelease` or `Release`, which a client's miss cached during it; the check that update triggers deletes them, so the next update is clean (design note 11).
 4. **A binary detached `Release.gpg`** (optional, *Flat repositories*): the cache adopts a repository that publishes only `Release` and a binary `Release.gpg`, but apt 2.2–3.2 refuses it ("unsupported binary format"), so such a repository is unusable through any path; Jitsi publishes an `InRelease` beside it (deviation 1).
-5. **Spec §7**, in H3's revision (this phase leaves the spec alone so its revision number cannot collide with H1's): the two deviations above, design note 5's reading of "within one cooldown" (by the client's check, before the scheduler's), and design note 7's timing of the unsigned confirmation.
+5. **Spec §7**, in H3's revision (this phase leaves the spec alone: H1 took revision 12, and H3's revision records these with its own changes): the two deviations above, design note 5's reading of "within one cooldown" (by the client's check, before the scheduler's), and design note 7's timing of the unsigned confirmation.
 6. **Release notes, 1.1.0:** the e2e harness is new (fixtures only); the live-upstream smoke (overview, "PR #8 parity") stays the manual step before the release.
 7. **The overview's phase table:** H2's commit once it lands.
 8. **The first CI run's job times** against Task 10's timeouts (15 and 30 minutes): if a short job takes over 10 minutes or a long-wait job over 25, raise its timeout with the measured reason (design review, "underspecified"; this plan measured one machine only).
@@ -3757,4 +3814,4 @@ e2e/deb's phase 4 failure on this branch (CI's `deb-test`), found while planning
 
 ## Self-review against spec §7 (done while writing)
 
-Every clause of §7's "Real-apt end-to-end" paragraph and of §9's H row maps to a scenario in Task 9's table or to deviation 1 or 2. Revision 2's files ran green on all six images (the final files once each; earlier iterations also on `debian:12`, `debian:11` and `ubuntu:26.04`) in a fresh scratch copy at c8e6fe4; the draft's files ran green on all six (and in the exec review). The staged `test.sh` of Tasks 3–7 each ran green on `debian:12`, their `shellcheck` findings are the ones each task's lint step lists, and applying Tasks 4–8 as worded to Task 3's file gives the final file byte for byte. The mutation checks of Tasks 2, 3, 4, 5, 7 and 8 were replayed in revision 2 and failed as stated (Task 8's daemon mutants on `debian:11`; the earliest of them on an iteration that lacked only the `INT` trap and `second_retry_past_5m`'s adoption check, which the code they mutate does not touch); Task 1's red step and mutation check and Task 12's were replayed in the draft round, and Task 1's file changed only in its comment (its Go checks re-ran clean). Task 2's smoke command ran as written. Task 12's patch applies to 6786529 (`patch --dry-run`), its failing run (Step 1) and its green runs on `ubuntu:24.04` and `ubuntu:26.04` (Step 3) were replayed, and its `test.sh` is shellcheck-clean.
+Every clause of §7's "Real-apt end-to-end" paragraph and of §9's H row maps to a scenario in Task 9's table or to deviation 1 or 2, and the overview's one H1 carry for H2 (`CheckBackoff`) to `upstream-down`. Revision 3 ran no image: its `backoff_shown` poll and Task 4's mutation 5 are the implementer's first run (the revision note lists what was replayed). Revision 2's files ran green on all six images (the final files once each; earlier iterations also on `debian:12`, `debian:11` and `ubuntu:26.04`) in a fresh scratch copy at c8e6fe4; the draft's files ran green on all six (and in the exec review). The staged `test.sh` of Tasks 3–7 each ran green on `debian:12`, their `shellcheck` findings are the ones each task's lint step lists, and applying Tasks 4–8 as worded to Task 3's file gives the final file byte for byte. The mutation checks of Tasks 2, 3, 4, 5, 7 and 8 were replayed in revision 2 and failed as stated (Task 8's daemon mutants on `debian:11`; the earliest of them on an iteration that lacked only the `INT` trap and `second_retry_past_5m`'s adoption check, which the code they mutate does not touch); Task 1's red step and mutation check and Task 12's were replayed in the draft round, and Task 1's file changed only in its comment (its Go checks re-ran clean). Task 2's smoke command ran as written. Task 12's patch applies to 6786529 (`patch --dry-run`), its failing run (Step 1) and its green runs on `ubuntu:24.04` and `ubuntu:26.04` (Step 3) were replayed, and its `test.sh` is shellcheck-clean.
