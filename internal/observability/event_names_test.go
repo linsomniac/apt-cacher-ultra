@@ -400,12 +400,16 @@ func logMessages(t *testing.T) map[string]string {
 // fieldValues returns the values f assigns to the field named field: the
 // right side of each assignment to a selector of that name (h.step, h.err =
 // stepReap, err), and the value of each key of that name in a composite
-// literal of the struct type f declares it in (heldReap). A positional
-// element of such a literal is reported: its value cannot be told from the
-// other fields', so it would pass unread.
+// literal of the struct type f declares it in (heldReap), its type written
+// or elided inside a slice, array or map literal of it ([]heldReap{{…}},
+// map[k]heldReap{k: {…}}; the H1 final fix re-review's minor 1). A
+// positional element of such a literal is reported: its value cannot be
+// told from the other fields', so it would pass unread. A second struct
+// type declaring the field stops the test: the scope would be ambiguous.
+// A named slice or map type of the struct is not followed.
 func fieldValues(t *testing.T, f goFile, field string) []ast.Expr {
 	t.Helper()
-	var typeName string
+	var declaring []string
 	for _, decl := range f.file.Decls {
 		g, ok := decl.(*ast.GenDecl)
 		if !ok || g.Tok != token.TYPE {
@@ -416,14 +420,69 @@ func fieldValues(t *testing.T, f goFile, field string) []ast.Expr {
 			if st, ok := ts.Type.(*ast.StructType); ok && slices.ContainsFunc(st.Fields.List, func(fl *ast.Field) bool {
 				return slices.ContainsFunc(fl.Names, func(n *ast.Ident) bool { return n.Name == field })
 			}) {
-				typeName = ts.Name.Name
+				declaring = append(declaring, ts.Name.Name)
 			}
 		}
 	}
-	if typeName == "" {
+	switch {
+	case len(declaring) == 0:
 		t.Errorf("%s: no struct type declares the field %s that fieldMessages names", f.rel, field)
+	case len(declaring) > 1:
+		t.Fatalf("%s: struct types %s each declare the field %s that fieldMessages names, so the guard cannot tell "+
+			"which one's literals carry the message; rename the others' field (internal/observability/event_names_test.go)",
+			f.rel, strings.Join(declaring, " and "), field)
+	}
+	var typeName string
+	if len(declaring) == 1 {
+		typeName = declaring[0]
 	}
 	var values []ast.Expr
+	// checkLit reads lit as a literal of type typ: its own type, or, when
+	// elided, its enclosing literal's element or key type.
+	var checkLit func(lit *ast.CompositeLit, typ ast.Expr)
+	checkLit = func(lit *ast.CompositeLit, typ ast.Expr) {
+		if star, ok := typ.(*ast.StarExpr); ok {
+			typ = star.X // []*heldReap{{…}}
+		}
+		var key, elem ast.Expr
+		switch tt := typ.(type) {
+		case *ast.Ident:
+			if tt.Name != typeName {
+				return
+			}
+			for _, e := range lit.Elts {
+				kv, ok := e.(*ast.KeyValueExpr)
+				if !ok {
+					t.Errorf("%s:%d: a %s literal with positional fields; key them (%s: …), so the guard reads its %s",
+						f.rel, guardFset.Position(e.Pos()).Line, typeName, field, field)
+					return
+				}
+				if k, ok := kv.Key.(*ast.Ident); ok && k.Name == field {
+					values = append(values, kv.Value)
+				}
+			}
+			return
+		case *ast.ArrayType:
+			elem = tt.Elt
+		case *ast.MapType:
+			key, elem = tt.Key, tt.Value
+		default:
+			return
+		}
+		for _, e := range lit.Elts {
+			var k ast.Expr
+			v := e
+			if kv, ok := e.(*ast.KeyValueExpr); ok {
+				k, v = kv.Key, kv.Value
+			}
+			if c, ok := k.(*ast.CompositeLit); ok && c.Type == nil && key != nil {
+				checkLit(c, key)
+			}
+			if c, ok := v.(*ast.CompositeLit); ok && c.Type == nil {
+				checkLit(c, elem)
+			}
+		}
+	}
 	ast.Inspect(f.file, func(n ast.Node) bool {
 		switch s := n.(type) {
 		case *ast.AssignStmt:
@@ -437,19 +496,8 @@ func fieldValues(t *testing.T, f goFile, field string) []ast.Expr {
 				}
 			}
 		case *ast.CompositeLit:
-			if id, ok := s.Type.(*ast.Ident); !ok || id.Name != typeName {
-				return true
-			}
-			for _, e := range s.Elts {
-				kv, ok := e.(*ast.KeyValueExpr)
-				if !ok {
-					t.Errorf("%s:%d: a %s literal with positional fields; key them (%s: …), so the guard reads its %s",
-						f.rel, guardFset.Position(e.Pos()).Line, typeName, field, field)
-					break
-				}
-				if key, ok := kv.Key.(*ast.Ident); ok && key.Name == field {
-					values = append(values, kv.Value)
-				}
+			if s.Type != nil && typeName != "" { // an elided literal is read through its enclosing one
+				checkLit(s, s.Type)
 			}
 		}
 		return true
