@@ -115,6 +115,7 @@ func TestReleaseDate_ASCIIWhitespaceOnly(t *testing.T) {
 		"Date: Sun,\u00a006 Nov 1994 08:49:37 GMT\n":   0,
 		"Date: Sun, 06 Nov 1994 08:49:37 GMT\u00a0\n":  0,
 		"Date:\tSun,\t06\tNov\v1994\f08:49:37 GMT\t\n": rfcExample,
+		"Date: Sun, 06 Nov 1994 08:49:37 GMT\r\r\n":    rfcExample,
 	} {
 		if got := releaseDate([]byte(text)); got != want {
 			t.Errorf("releaseDate(%q) = %d, want %d", text, got, want)

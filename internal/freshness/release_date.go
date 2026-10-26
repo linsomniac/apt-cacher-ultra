@@ -65,19 +65,29 @@ func releaseDate(text []byte) int64 {
 // minutes leaves a stray digit where ':' must follow, rejecting values like
 // "30:00:00" or "08:70:00" for that reason rather than a range check.
 //
-// Two deliberate divergences remain, both in the day token. In RFC 1123
-// and asctime form (aptDigits, unsigned, the whole token digits), apt
-// reads it with istream >>, which stops at the first non-digit, so a token
-// such as "6," parses there as 6, where this rejects it outright. In RFC
-// 850 form (aptStoi, then parseAptDate's day > 65535 bound), apt keeps
-// std::stoi's result in an unsigned short, so a day above 65535 wraps
-// there and is rejected here (deferred minor B-14: not aptDigits). Real
-// Release files never reach either difference.
-// Year (aptSignedInt) and the RFC 850 month/year parts (aptStoi) are not
-// part of this divergence: they accept an optional sign and still require
-// full consumption, matching istream >> int / std::stoi (apt's own code
-// checks that stoi consumed the whole token there too). TestParseAptDate
-// pins the behaviour.
+// AIDEV-NOTE: these deliberate divergences from apt remain, and a change
+// here must not widen them. In RFC 1123 and asctime form the day
+// (aptDigits: unsigned, digits only, at most five) is read by apt with
+// istream >> into an unsigned short, which stops at the first non-digit,
+// takes a leading sign (a negative value wraps: "-65530" reads 6) and any
+// number of leading zeros, so "6,", "+6" and "000006" parse there as 6,
+// where this rejects them outright. In RFC 850 form (aptStoi, then
+// parseAptDate's day > 65535 bound), apt keeps std::stoi's result in an
+// unsigned short, so a day above 65535 wraps there and is rejected here
+// (deferred minor B-14: not aptDigits). apt lowers the weekday per byte,
+// so a non-ASCII letter such as U+0130 never matches there, where
+// strings.ToLower maps it to "i" here. In releaseDate, apt skips any \r
+// that follows a newline, then takes a line starting with a space, tab,
+// \v or \f as a continuation and reads a Date value folded onto
+// continuation lines, where releaseDate continues only on a space or tab
+// in the line's first byte and reads the value from the Date line alone;
+// and apt takes the last of duplicate Date fields, releaseDate the first.
+// Year (aptSignedInt) and the RFC 850 month/year parts (aptStoi) do not
+// diverge: they accept an optional sign and still require full
+// consumption, matching istream >> int / std::stoi (apt's own code checks
+// that stoi consumed the whole token there too). TestParseAptDate pins the
+// behaviour. Real Release files reach none of these divergences, so the
+// result is the same in practice.
 func parseAptDate(s string) (int64, bool) {
 	f := strings.FieldsFunc(s, func(r rune) bool { return strings.ContainsRune(aptSpace, r) })
 	if len(f) == 0 {
