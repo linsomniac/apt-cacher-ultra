@@ -201,7 +201,7 @@ first_contact() {
 
     # Strict mode is on for signed.test: an undeclared .deb is refused...
     local st
-    st=$("${CURL[@]}" -s -o /dev/null -w '%{http_code}' -x "$PROXY" \
+    st=$("${CURL[@]}" -sS -o /dev/null -w '%{http_code}' -x "$PROXY" \
         "http://signed.test$K8S/amd64/acu-rogue_1.0_amd64.deb" || true)
     [[ $st == 502 ]] || fail "an undeclared .deb on signed.test answered $st, want 502 (strict mode)"
     log_has "$SCENARIO_MARK" "$(event unvouched_deb_refused)" "$(kv path "$K8S/amd64/acu-rogue_1.0_amd64.deb")" ||
@@ -209,7 +209,7 @@ first_contact() {
     # ...and pkgs.k8s.io's shape answers 403 for a file it lacks, which
     # the cache passes on. (Not Release: an inline snapshot answers its
     # suite's Release 404 itself, spec §10 item 9.)
-    st=$("${CURL[@]}" -s -o /dev/null -w '%{http_code}' -x "$PROXY" "http://signed.test$K8S/README" || true)
+    st=$("${CURL[@]}" -sS -o /dev/null -w '%{http_code}' -x "$PROXY" "http://signed.test$K8S/README" || true)
     [[ $st == 403 ]] || fail "a missing file of the k8s shape answered $st through the cache, want 403"
     passed
 }

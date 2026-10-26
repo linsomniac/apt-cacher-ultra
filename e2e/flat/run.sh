@@ -21,7 +21,8 @@
 set -euo pipefail
 # Ctrl-C ends the running container through its own trap, and docker run
 # then returns normally: stop here too rather than go on to the next image.
-trap 'echo "[e2e-flat] interrupted"; exit 130' INT TERM
+trap 'echo "[e2e-flat] interrupted"; exit 130' INT
+trap 'echo "[e2e-flat] terminated"; exit 143' TERM
 cd "$(dirname "$0")/../.."
 
 # Whitespace-split the whole value (a CI block scalar spans lines; see

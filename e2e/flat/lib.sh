@@ -207,14 +207,15 @@ start_daemon() {
     poll 30 "the daemon's proxy listener" bash -c '(echo > /dev/tcp/127.0.0.1/3142) 2> /dev/null'
 }
 
-# stop_daemon: SIGTERM, then 30 s for the exit: the daemon's drain budget
-# (shutdownTimeout, cmd/apt-cacher-ultra/main.go). With nothing in flight
-# it exits in about a second.
+# stop_daemon: SIGTERM, then 40 s for the exit: the daemon's HTTP drain
+# budget (shutdownTimeout, 30 s, cmd/apt-cacher-ultra/main.go), its 1 s
+# tunnel grace and a margin for the teardown. Every planned stop has
+# nothing in flight, and then the daemon exits in about a second.
 stop_daemon() {
     [[ -n $DAEMON_PID ]] || return 0
     say "stopping the daemon"
     kill "$DAEMON_PID"
-    poll 30 "the daemon to exit" daemon_gone
+    poll 40 "the daemon to exit" daemon_gone
     wait "$DAEMON_PID" 2> /dev/null || true
     DAEMON_PID=""
 }
