@@ -444,8 +444,9 @@ mirror_mode() {
 #
 # Every update runs under the full grep, stricter than spec §7's scoped
 # one: this client cannot reach spec C8's phase-B straddle. It fetched v1's
-# lists before the publish, so every update in the window gets a 304 for
-# the old InRelease and requests no index, and Jitsi's by-hash requests are
+# lists before the publish, so every update before the commit gets a 304
+# for the old InRelease and requests no index (one during the commit gets
+# v2's InRelease and indexes, a matching pair), and Jitsi's by-hash requests are
 # served from the displaced snapshot. A straddle's words here (Hash Sum
 # mismatch, unexpected size) would be a bug, such as a non-atomic flip of
 # Jitsi's, not the residual.
@@ -455,7 +456,9 @@ mirror_mode() {
 # delay applies to every adoption commit, and a stop waits for a commit
 # that has started: /unsigned404's first adoption (300 s after its first
 # contact at the earliest) in flight at the second stop_daemon would
-# outlast that stop's 40 s.
+# outlast that stop's 40 s. So if that stop times out here, suspect a
+# broken 5-minute floor (an unsigned adoption at its 90-150 s first
+# retry) before this scenario.
 commit_delay() {
     scenario commit-delay "a 45 s commit: held anchor requests never reach apt's timeout"
     stop_daemon
@@ -471,7 +474,8 @@ commit_delay() {
         t0=$SECONDS
         apt_update delay
         took=$((SECONDS - t0))
-        ((took < 28)) || fail "an update took ${took}s: one of its requests reached apt's 30 s timeout"
+        ((took < 28)) ||
+            fail "an update took ${took}s, longer than a held update can (the 20 s hold plus apt's own time): a request may have reached apt's 30 s timeout"
         lengths+=" ${took}s"
         sleep 3
     done
@@ -501,7 +505,8 @@ commit_delay() {
     start_daemon
     ! log_has "$mark" "$(event e2e_commit_delay_enabled)" ||
         fail "the daemon restarted with the commit delay still enabled"
-    # The first update after the commit fetches v2's InRelease and indexes.
+    # The update after the restart sees v2 (fetched now, or by a loop update
+    # during the commit).
     apt_update delay
     candidates_are delay acu-jitsi=2.0 || fail "the client sees acu-jitsi $(candidate delay acu-jitsi)"
     apt_install delay acu-jitsi=2.0
