@@ -222,9 +222,10 @@ was. The reaper liveness alert:
 `absent(acu_suite_reaper_last_run_unixtime)` held by a Prometheus
 `for: 3h`, or `time() - acu_suite_reaper_last_run_unixtime > 3 * 3600`.
 Runs are hourly, the first an hour after the start, so the gauge's age
-peaks near one hour, and near two after a restart or one failed run:
-neither pages, whatever the runs' durations and the scrape timing, and a
-reaper that stopped completing runs pages within about three hours. The
+peaks near one hour and its absence after a restart lasts about one; one
+failed run makes either about two, which does not page, whatever the
+runs' durations and the scrape timing, and a reaper that stopped
+completing runs pages within about three hours. The
 age leg alone never fires for a reaper that has not completed a run
 since its start) and the counter `acu_gc_retired_reaped_total` (retired
 snapshots that snapshot GC deleted: those of reaped, forgotten and
