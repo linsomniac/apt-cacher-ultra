@@ -119,6 +119,17 @@ func TestHostAdoptions_WaiterCap(t *testing.T) {
 	})
 }
 
+// Deferred minor E-58: with nothing in flight a request re-runs its lookup
+// at once even while the waiter cap is reached — the host's last adoption
+// ended and its 64 waiters are still unwinding.
+func TestHostAdoptions_NothingInFlightBeatsTheWaiterCap(t *testing.T) {
+	h := newHostAdoptions()
+	h.waiters["a"] = strictWaitersPerHost // an ended adoption's waiters, not yet unwound
+	if !h.wait(context.Background(), "a", strictWait) {
+		t.Fatal("a request with nothing in flight was refused for the waiter cap")
+	}
+}
+
 // Spec C10: the checker counts a signed adoption in flight from its spawn
 // until its goroutine returns (after the commit); an unsigned adoption is
 // not counted (it never vouches).

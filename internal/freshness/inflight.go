@@ -77,13 +77,16 @@ func (h *hostAdoptions) inFlight(host string) bool {
 	return h.n[host] > 0
 }
 
-// wait blocks until host has no signed adoption in flight, max passes or
-// ctx ends, and reports whether the caller may re-run its lookup: false
-// when the host already has strictWaitersPerHost waiters, or max is below
-// strictMinWait (the caller refuses at once), and false when ctx ended
-// during the wait (the client left: design note 31, no retry — the
-// caller answers client_canceled). With nothing in flight it returns true
-// at once. A request that waits is counted
+// wait blocks until host has no signed adoption in flight, maxWait
+// passes or ctx ends, and reports whether the caller may re-run its
+// lookup. With nothing in flight it returns true at once — before the
+// waiter cap, so a request that arrives as the last adoption ends, with
+// waiters still unwinding, re-runs its lookup instead of being refused
+// (deferred minor E-58). Otherwise false when the host already has
+// strictWaitersPerHost waiters, or maxWait is below strictMinWait (the
+// caller refuses at once), and false when ctx ended during the wait (the
+// client left: design note 31, no retry — the caller answers
+// client_canceled). A request that waits is counted
 // (acu_strict_adoption_waits_total).
 //
 // AIDEV-NOTE: never return true on ctx.Done: the caller's re-run lookup
@@ -91,17 +94,17 @@ func (h *hostAdoptions) inFlight(host string) bool {
 // served the unvouched .deb, which a MITM tunnel's writer (alive while
 // Drain cancels the inner request's context) delivered (review fix round
 // 1, Task 9). The handler also checks the context itself after any wait.
-func (h *hostAdoptions) wait(ctx context.Context, host string, max time.Duration) bool {
+func (h *hostAdoptions) wait(ctx context.Context, host string, maxWait time.Duration) bool {
 	h.mu.Lock()
-	if h.waiters[host] >= strictWaitersPerHost {
-		h.mu.Unlock()
-		return false
-	}
 	if h.n[host] == 0 {
 		h.mu.Unlock()
 		return true
 	}
-	if max < strictMinWait {
+	if h.waiters[host] >= strictWaitersPerHost {
+		h.mu.Unlock()
+		return false
+	}
+	if maxWait < strictMinWait {
 		h.mu.Unlock()
 		return false
 	}
@@ -120,7 +123,7 @@ func (h *hostAdoptions) wait(ctx context.Context, host string, max time.Duration
 		}
 		h.mu.Unlock()
 	}()
-	t := time.NewTimer(max)
+	t := time.NewTimer(maxWait)
 	defer t.Stop()
 	select {
 	case <-ch:

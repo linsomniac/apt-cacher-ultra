@@ -226,6 +226,12 @@ func TestServeHTTP_StrictWaitRefusals(t *testing.T) {
 			for _, rec := range logs.records() {
 				if rec["msg"] == "unvouched_deb_refused" {
 					n++
+					// Deferred minor E-59: the refusal after a wait carries
+					// the count its first attempt read (the rig's one
+					// snapshot), as the immediate refusal does.
+					if rec["current_snapshot_count"] != float64(1) {
+						t.Fatalf("unvouched_deb_refused current_snapshot_count = %v, want 1", rec["current_snapshot_count"])
+					}
 				}
 			}
 			if n != 1 {
@@ -482,5 +488,27 @@ func TestClassifyStrictMode_LookupErrors(t *testing.T) {
 	}
 	if n := warns(); n != 1 {
 		t.Fatalf("%d coverage-lookup WARNs for a database fault, want 1", n)
+	}
+}
+
+// Deferred minor E-59: on the hit path, a refusal with nothing in flight
+// on the host does not wait (AdoptionsInFlight is asked first) and is
+// immediate.
+func TestServeHTTP_StrictHitWithNothingInFlightDoesNotWait(t *testing.T) {
+	a := &fakeAdoptions{inFlight: false, ok: true}
+	h, _, srvURL, scheme, canon := strictWaitRig(t, a)
+	deb := []byte("a cached .deb")
+	blob := writeBlob(t, h, deb)
+	if err := h.cache.PutURLPath(context.Background(), cache.URLPath{CanonicalScheme: scheme, CanonicalHost: canon,
+		Path: waitDebPath, BlobHash: &blob, UpstreamURL: srvURL + waitDebPath}); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srvURL, waitDebPath))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status %d, want the strict-mode refusal", rec.Code)
+	}
+	if n := a.waits.Load(); n != 0 {
+		t.Fatalf("waited %d times, want 0 (nothing in flight)", n)
 	}
 }

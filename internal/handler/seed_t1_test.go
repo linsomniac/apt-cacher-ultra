@@ -290,12 +290,16 @@ func TestServeHTTP_MissBackstopSharesTheRequestsBudget(t *testing.T) {
 
 // Spec C3 T1-on-seed: only the creating request fires T1 — a coalesced
 // miss waiter shares the leader's result, creation included, and fires
-// nothing. (Proposed by the executability review; kills X27.)
+// nothing. (Proposed by the executability review; kills X27.) The leader
+// waits at its host slot until the second miss has joined it, so the two
+// coalesce without a wall-clock window (deferred minor E-66).
 func TestServeHTTP_CoalescedCreatingMissFiresT1Once(t *testing.T) {
 	r := newSuiteRig(t, true, 0)
 	var fetches atomic.Int32
 	r.h.fetch = slowUpstream{staticUpstream: staticUpstream{r.srv.URL + "/r/dists/s/InRelease": rowInRelease},
-		delay: 300 * time.Millisecond, fetches: &fetches}
+		fetches: &fetches}
+	_, host, port := splitURL(t, r.srv.URL)
+	holdHostSlotsUntilJoined(t, r.h, hostKey(host, port), 0)
 	var wg sync.WaitGroup
 	for range 2 {
 		wg.Add(1)
