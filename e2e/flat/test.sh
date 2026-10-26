@@ -513,6 +513,84 @@ commit_delay() {
     passed
 }
 
+# The unsigned first adoption waits for a second observation of the same
+# Release at least 5 minutes after the first (spec C5): run on the oldest
+# and newest images only (spec §7).
+#
+# AIDEV-NOTE: the confirming observation is the first retry of the
+# unsigned_unconfirmed record that falls 5 minutes or more after the first
+# observation: the checks in between see the same bytes before the
+# record's retry time and stay changed_deferred (spec C7's gate). The
+# retries come 2, then 4, then 8 minutes apart, each ±25 %, so the
+# adoption lands between 300 s and 900 s after first contact (design
+# note 7); the deadline adds a refresh interval, a tick and 30 s.
+UNSIGNED_DEADLINE=$((900 + PERIODIC + TICK + 30))
+unsigned_first_adoption() {
+    if [[ ${E2E_UNSIGNED_WAIT:-0} != 1 ]]; then
+        say "=== scenario unsigned-first-adoption: skipped on this image (E2E_UNSIGNED_WAIT is not 1)"
+        return 0
+    fi
+    scenario unsigned-first-adoption "an unsigned repository adopts after the 5-minute confirmation"
+    local left=$((UNSIGNED_FIRST_CONTACT + UNSIGNED_DEADLINE - SECONDS)) took
+    ((left > 0)) || left=1
+    if ! poll_quietly "$left" adopted_as plain.test /unsigned404 unsigned; then
+        fail "plain.test/unsigned404 did not adopt within ${UNSIGNED_DEADLINE}s of its first contact: $(record_of /unsigned404)"
+    fi
+    took=$((SECONDS - UNSIGNED_FIRST_CONTACT))
+    # Spec C5 safeguard 2: never before 5 minutes. UNSIGNED_FIRST_CONTACT is
+    # taken before the first update reaches the cache, so the first
+    # observation is no earlier and this bound cannot fail a correct daemon.
+    ((took >= 300)) || fail "plain.test/unsigned404 adopted ${took}s after its first contact, before the 5-minute confirmation"
+    say "plain.test/unsigned404 adopted ${took}s after its first contact"
+    # Updates of an established unsigned repository adopt at once.
+    publish unsigned404 v2
+    until_candidates "$REACH" main -- acu-unsigned404=2.0
+    apt_install main acu-unsigned404=2.0
+    # An unsigned snapshot never makes its host strict (spec C10): a .deb
+    # no snapshot vouches is still served on plain.test.
+    [[ $("${CURL[@]}" -s -o /dev/null -w '%{http_code}' -x "$PROXY" http://plain.test/goreleaser/acu-goreleaser_2.0_amd64.deb) == 200 ]] ||
+        fail "plain.test refused an unvouched .deb after an unsigned adoption"
+    # The 403 variant needs an hour between its observations: once its
+    # record's second retry has come 5 minutes or more after its first
+    # observation — where a 5-minute gap would have confirmed it — it is
+    # still unadopted.
+    left=$((UNSIGNED_FIRST_CONTACT + UNSIGNED_DEADLINE - SECONDS))
+    ((left > 0)) || left=1
+    poll_quietly "$left" second_retry_past_5m /unsigned403 ||
+        fail "plain.test/unsigned403's record never reached its second retry past 5 minutes: $(record_of /unsigned403)"
+    [[ -z $(suite plain.test /unsigned403 current_snapshot_id) ]] ||
+        fail "plain.test/unsigned403 adopted $((SECONDS - UNSIGNED_FIRST_CONTACT))s after its first contact, before its one-hour confirmation"
+    [[ $(suite plain.test /unsigned403 adoption_fail_reason) == unsigned_unconfirmed ]] ||
+        fail "plain.test/unsigned403 is not waiting for its confirmation: $(record_of /unsigned403)"
+    passed
+}
+
+# second_retry_past_5m PATH: plain.test PATH's record has been written three
+# times (the first observation and two retries) and its first observation
+# is 5 minutes old — or PATH adopted, which clears the record (the caller
+# then fails on the adoption).
+#
+# AIDEV-NOTE: it checks the record's count and its first observation's
+# age, not when the second retry came. A second retry before 300 s (about
+# 6 % of runs, deviation 2) satisfies it although no retry has yet come 5
+# minutes after the first observation, and the 403 check is then vacuous:
+# Task 8's first deniedConfirmGap-mutant run passed that way (second retry
+# at +285 s).
+second_retry_past_5m() {
+    local count first
+    [[ -z $(suite plain.test "$1" current_snapshot_id) ]] || return 0
+    count=$(suite plain.test "$1" adoption_fail_count)
+    first=$(suite plain.test "$1" adoption_fail_first_unixtime)
+    [[ -n $count && -n $first ]] && ((count >= 3 && $(date +%s) - first >= 300))
+}
+
+# record_of PATH: plain.test PATH's failure record, from the status JSON.
+record_of() {
+    "${CURL[@]}" -fsS "$ADMIN/?format=json" | jq -c --arg p "$1" '.suites[] | select(.host == "plain.test" and .suite_path == $p) |
+        {adoption_fail_reason, adoption_fail_count, adoption_fail_first_unixtime,
+         adoption_next_retry_unixtime, last_check_unixtime, now: now | floor}'
+}
+
 # The snapshots survive a restart: the same snapshot ids, a clean update
 # with the same candidates, and anchors served from the snapshots.
 restart() {
@@ -616,6 +694,31 @@ backoff_shown() {
         /clients/fresh-slash/status.html) ]]
 }
 
+# Whole-run assertions over the daemon's log.
+whole_run() {
+    scenario whole-run "log-wide assertions"
+    local refused
+    refused=$(log_lines 0 "$(event unvouched_deb_refused)" "$(kv canonical_host signed.test)" |
+        grep -Ev -- "$(kv path "$K8S/amd64/acu-rogue_1.0_amd64.deb")" || true)
+    [[ -z $refused ]] || fail "unvouched_deb_refused on signed.test: $refused"
+    # plain.test has no signed snapshot, so strict mode never applies there
+    # (spec C10: unsigned and anchorless suites never count).
+    refused=$(log_lines 0 "$(event unvouched_deb_refused)" "$(kv canonical_host plain.test)")
+    [[ -z $refused ]] || fail "unvouched_deb_refused on plain.test: $refused"
+    # The 5-minute floor where the unsigned scenario did not run: a run
+    # this short must not have adopted plain.test/unsigned404 (it catches a
+    # broken floor whenever that suite's first retry came before now).
+    if [[ ${E2E_UNSIGNED_WAIT:-0} != 1 ]] && ((SECONDS - UNSIGNED_FIRST_CONTACT < 300)); then
+        [[ -z $(suite plain.test /unsigned404 current_snapshot_id) ]] ||
+            fail "plain.test/unsigned404 adopted $((SECONDS - UNSIGNED_FIRST_CONTACT))s after its first contact, before the 5-minute confirmation"
+    fi
+    local bad
+    bad=$(log_lines 0 '(^| )msg=("[^"]*panic|[a-z_]*panicked( |$))|(^| )msg=package_hash_conflict( |$)')
+    [[ -z $bad ]] || fail "panics or conflicts in the daemon log: $bad"
+    kill -0 "$DAEMON_PID" || fail "the daemon is not running"
+    passed
+}
+
 setup
 first_contact
 pr8_table
@@ -625,7 +728,9 @@ anchorless
 two_suites
 mirror_mode
 commit_delay
+unsigned_first_adoption
 restart
 upstream_down
+whole_run
 stop_daemon
 say "PASS in ${SECONDS}s: ${TIMINGS[*]}"
