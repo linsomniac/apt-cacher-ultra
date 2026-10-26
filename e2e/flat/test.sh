@@ -16,10 +16,22 @@ set -euo pipefail
 
 # A command that fails outside fail (nginx not binding, dpkg, a publish's
 # mv) exits through set -e: still name the scenario, the command and logs.
+# The command is as written, so inside a helper it is the helper's text
+# ("$@" unexpanded); the call chain names the helper and the lines that
+# called it, innermost first. The trap still sees the stack of a set -e
+# exit: FUNCNAME[0] is on_exit and the last entry main; FUNCNAME[i] was
+# called at BASH_LINENO[i] of the file that holds its caller,
+# BASH_SOURCE[i+1]. A helper called with a redirection (`capt … > FILE`)
+# has left the stack by then (bash 5.1 and 5.3): the chain starts at its
+# caller, and the command's text names the helper.
 on_exit() {
-    local rc=$? cmd=$BASH_COMMAND
+    local rc=$? cmd=$BASH_COMMAND i chain=""
     if ((rc != 0 && FAILED == 0)); then
+        for ((i = 1; i < ${#FUNCNAME[@]} - 1; i++)); do
+            chain+=" ${FUNCNAME[i]} (called at ${BASH_SOURCE[i + 1]##*/}:${BASH_LINENO[i]})"
+        done
         say "unexpected exit $rc in scenario $SCENARIO (command: $cmd)"
+        say "call chain:${chain:- none (the top level)}"
         show_logs
     fi
 }
@@ -134,6 +146,17 @@ first_contact() {
         sed 's/^/    | /' /clients/control-sig-root/update.*.log
         fail "apt_update passed a host-root signature failure: the signed-host filter misses it (above)"
     fi
+    # And a signed source with no Release at all: nginx answers 404 for its
+    # InRelease and its Release, and apt prints only "E: The repository …
+    # does not have a Release file", none of the other words (lib.sh,
+    # APT_SIGNED_ERRORS), and exits 0. A suite whose anchors the cache
+    # answered 404 later in the run would print the same error ("no longer
+    # has" for a client with old lists), so the error list must catch it.
+    client control-norel "$PROXY" "deb [signed-by=$KEY] http://signed.test/no-such-repo/ /"
+    if (apt_update control-norel) > /clients/control-norel/apt_update.out 2>&1; then
+        sed 's/^/    | /' /clients/control-norel/update.*.log
+        fail "apt_update passed an update with no Release file: the signed-host error list misses apt's E: line (above)"
+    fi
 
     UNSIGNED_FIRST_CONTACT=$SECONDS
     apt_update main -o Debug::Acquire::http=true
@@ -151,7 +174,9 @@ first_contact() {
 
     # Generous bounds: the update's own checks adopt, refresh or refuse
     # every suite within seconds. 30 s is PERIODIC, over three TICKs; 90 s,
-    # three PERIODICs, leaves room for seven adoptions two at a time.
+    # three PERIODICs, leaves room for the seven first adoptions one at a
+    # time (admission runs one adoption per host, and all seven are on
+    # signed.test; the whole scenario takes 8-9 s).
     local s
     for s in "$K8S inline" "$CUDA inline" "$NVIDIA inline" "$JENKINS detached" \
         "$SUBLIME inline" "$JITSI inline" "$DISTS inline"; do
@@ -247,10 +272,12 @@ pr8_table() {
 # apt ignores an older Date; so does the cache (spec C5, upstream_older).
 # apt alone would keep the existing clients at 2.0, so the check that
 # counts is the cache's: the snapshots stay and a fresh client gets 2.0.
+# Order: reuses pr8-table's clients, which hold k8s 2.0.
 older_date() {
     scenario older-date "a publish with an older Date is refused; clients keep 2.0"
     local s before
-    before=$(snapshot_ids)
+    read_snapshot_ids
+    before=$SNAPSHOT_IDS
     publish k8s v1
     for s in "$K8S" "$K8S/."; do
         poll "$REACH" "signed.test$s to refuse the older Date" refused_older "$s"
@@ -259,7 +286,8 @@ older_date() {
     apt_update k8s-dot
     candidates_are k8s-slash acu-k8s=2.0 || fail "k8s-slash went back to $(candidate k8s-slash acu-k8s)"
     candidates_are k8s-dot acu-k8s=2.0 || fail "k8s-dot went back to $(candidate k8s-dot acu-k8s)"
-    [[ $(snapshot_ids) == "$before" ]] || fail "the older-Date publish changed a snapshot: $before -> $(snapshot_ids)"
+    read_snapshot_ids
+    [[ $SNAPSHOT_IDS == "$before" ]] || fail "the older-Date publish changed a snapshot: $before -> $SNAPSHOT_IDS"
     client k8s-fresh "$PROXY" "$SRC_K8S"
     apt_update k8s-fresh
     candidates_are k8s-fresh acu-k8s=2.0 || fail "a fresh client sees acu-k8s $(candidate k8s-fresh acu-k8s), want 2.0"
@@ -403,6 +431,8 @@ two_suites() {
 # prints "Failed to fetch" (apt 2.6.1 does for a BADSIG, not for a missing
 # key; design note 17). Sublime's is the run's only flip of a host-root
 # suite.
+# Order: after pr8-table (it installs acu-k8s 2.0) and before commit-delay
+# (it installs acu-jitsi 1.0, which commit-delay publishes v2 of).
 mirror_mode() {
     scenario mirror-mode "signed flat repositories through a [[mirror]] prefix, with two flips"
     client mirror DIRECT "deb [signed-by=$KEY] $MIRROR/ apt/stable/" \
@@ -456,12 +486,16 @@ mirror_mode() {
 # delay applies to every adoption commit, and a stop waits for a commit
 # that has started: /unsigned404's first adoption (300 s after its first
 # contact at the earliest) in flight at the second stop_daemon would
-# outlast that stop's 40 s. So if that stop times out here, suspect a
-# broken 5-minute floor (an unsigned adoption at its 90-150 s first
-# retry) before this scenario.
+# outlast that stop's 40 s. So if that stop times out here, one of two
+# things happened: a broken 5-minute floor (an unsigned adoption at its
+# 90-150 s first retry), or a slow runner on which the run reached first
+# contact + 300 s before this stop. The say lines' run times tell them
+# apart: "stopping the daemon (the stop after the 45 s commit delay)"
+# under 300 s after "=== scenario first-contact" points at the floor; 300 s
+# or more, at the runner.
 commit_delay() {
     scenario commit-delay "a 45 s commit: held anchor requests never reach apt's timeout"
-    stop_daemon
+    stop_daemon "the stop before the 45 s commit delay"
     start_daemon ACU_E2E_COMMIT_DELAY=45s
     log_has "$SCENARIO_MARK" "$(event e2e_commit_delay_enabled)" "$(kv commit_delay 45s)" ||
         fail "the daemon did not enable the 45 s commit delay (built without -tags e2ehooks?)"
@@ -499,7 +533,7 @@ commit_delay() {
     # the timer's latency.
     ((max <= 20000 + 500)) || fail "a request waited ${max} ms in a hold, over 20 s"
     say "held requests: $(wc -w <<< "$held"), longest wait ${max} ms"
-    stop_daemon
+    stop_daemon "the stop after the 45 s commit delay"
     local mark
     mark=$(log_mark)
     start_daemon
@@ -526,6 +560,8 @@ commit_delay() {
 # note 7); the deadline adds a refresh interval, a tick and 30 s.
 UNSIGNED_DEADLINE=$((900 + PERIODIC + TICK + 30))
 RETRY_PAST_5M=""
+# Order: after anchorless (its plain.test probe fetches anchorless's
+# acu-goreleaser 2.0, which answers 404 before that publish).
 unsigned_first_adoption() {
     if [[ ${E2E_UNSIGNED_WAIT:-0} != 1 ]]; then
         say "=== scenario unsigned-first-adoption: skipped on this image (E2E_UNSIGNED_WAIT is not 1)"
@@ -624,19 +660,20 @@ record_of() {
 # with the same candidates, and anchors served from the snapshots.
 restart() {
     scenario restart "state survives a restart"
-    local before after cands_before cands_after stopped_at started
+    local before cands_before cands_after stopped_at started
     apt_update main
-    before=$(snapshot_ids)
+    read_snapshot_ids
+    before=$SNAPSHOT_IDS
     cands_before=$(main_candidates)
     stopped_at=$(date +%s)
-    stop_daemon
+    stop_daemon "the restart's stop"
     start_daemon
     started=$("${CURL[@]}" -fsS "$ADMIN/?format=json" | jq -r '.process.started_unixtime // empty' || true)
     [[ $started =~ ^[0-9]+$ ]] || fail "no process.started_unixtime in the admin status"
     ((started >= stopped_at)) ||
         fail "the daemon was not restarted: process.started_unixtime $started is before the stop at $stopped_at"
-    after=$(snapshot_ids)
-    [[ $before == "$after" ]] || fail "snapshots changed across the restart: $before -> $after"
+    read_snapshot_ids
+    [[ $before == "$SNAPSHOT_IDS" ]] || fail "snapshots changed across the restart: $before -> $SNAPSHOT_IDS"
     apt_update main
     cands_after=$(main_candidates)
     [[ $cands_before == "$cands_after" ]] || fail "candidates changed across the restart: $cands_before -> $cands_after"
@@ -649,11 +686,18 @@ restart() {
     passed
 }
 
-# snapshot_ids: every signed suite's current snapshot id, one line.
-snapshot_ids() {
-    local s
+# read_snapshot_ids: sets SNAPSHOT_IDS to every signed suite's current
+# snapshot id, on one line, and fails on an empty id (no snapshot, or a
+# failed status read), so two reads cannot compare equal on empty ids. A
+# variable, not output: fail cannot end the run from inside $(…).
+SNAPSHOT_IDS=""
+read_snapshot_ids() {
+    local s id
+    SNAPSHOT_IDS=""
     for s in "$K8S" "$K8S/." "$CUDA" "$NVIDIA" "$JENKINS" "$SUBLIME" "$JITSI" "$DISTS"; do
-        printf '%s=%s ' "$s" "$(suite signed.test "$s" current_snapshot_id)"
+        id=$(suite signed.test "$s" current_snapshot_id || true)
+        [[ -n $id ]] || fail "no current snapshot id for signed.test$s (no snapshot, or the status read failed)"
+        SNAPSHOT_IDS+="$s=$id "
     done
 }
 
@@ -678,7 +722,8 @@ main_candidates() {
 # scenario after it that waits for the scheduler's check (a bound of
 # periodic_refresh + a tick + 10 s, as the anchorless carry-forward's)
 # would time out. Design note 7 records the same cost for the unsigned
-# suite.
+# suite. It also needs pr8-table's acu-k8s 2.0 .debs in the cache: its
+# fresh clients install them with the upstream stopped.
 upstream_down() {
     scenario upstream-down "upstream stopped: fresh clients of both forms install 2.0 from the snapshots"
     stop_nginx
@@ -736,51 +781,35 @@ whole_run() {
     [[ -z $refused ]] || fail "unvouched_deb_refused on plain.test: $refused"
     # The 5-minute floor where the unsigned scenario did not run: a run
     # this short must not have adopted plain.test/unsigned404 (it catches a
-    # broken floor whenever that suite's first retry came before now).
-    # Whether it did is said, not asserted: an adoption_fail_count of 2 or
-    # more means a retry was refused before now; adoption_fail_reason
-    # unsigned_unconfirmed means the read worked and the suite still waits.
+    # broken floor whenever that suite's first retry came before now), and
+    # it still waits for its confirmation (adoption_fail_reason
+    # unsigned_unconfirmed, which also proves the status read worked).
+    # Whether a retry came before now is said, not asserted: an
+    # adoption_fail_count of 2 or more means one was refused.
     local since=$((SECONDS - UNSIGNED_FIRST_CONTACT)) count reason
     if [[ ${E2E_UNSIGNED_WAIT:-0} == 1 ]]; then
         say "the 5-minute floor check: not run here (unsigned-first-adoption asserted the floor)"
     elif ((since < 300)); then
         [[ -z $(suite plain.test /unsigned404 current_snapshot_id) ]] ||
             fail "plain.test/unsigned404 adopted ${since}s after its first contact, before the 5-minute confirmation"
-        count=$(suite plain.test /unsigned404 adoption_fail_count)
-        reason=$(suite plain.test /unsigned404 adoption_fail_reason)
+        reason=$(suite plain.test /unsigned404 adoption_fail_reason || true)
+        [[ $reason == unsigned_unconfirmed ]] ||
+            fail "plain.test/unsigned404 is not waiting for its confirmation ${since}s after its first contact: $(record_of /unsigned404)"
+        count=$(suite plain.test /unsigned404 adoption_fail_count || true)
         say "the 5-minute floor check: plain.test/unsigned404 unadopted ${since}s after its first contact," \
-            "adoption_fail_count ${count:-none} (2 or more: a retry was refused by now), adoption_fail_reason ${reason:-none}"
+            "adoption_fail_count ${count:-none} (2 or more: a retry was refused by now), adoption_fail_reason $reason"
     else
         say "the 5-minute floor check: skipped, ${since}s after first contact (300 s or more)"
     fi
     local bad
     bad=$(panics_in_log)
     [[ -z $bad ]] || fail "panics or conflicts in the daemon log: $bad"
-    # Panics the daemon recovered without logging them are only counted.
-    # The counters start at 0 with each process: these are the process
-    # restart started. A counter never incremented has no sample (metric
-    # reads 0), so each must at least be declared: a renamed one fails
-    # here instead of reading 0.
-    local m n
-    "${CURL[@]}" -fsS -o /clients/main/metrics.txt "$ADMIN/metrics" || fail "the daemon's /metrics did not answer"
-    for m in acu_flip_gate_panics_total acu_freshness_unlogged_panics_total; do
-        grep -q "^# TYPE $m counter\$" /clients/main/metrics.txt || fail "/metrics declares no counter $m"
-        n=$(metric "$m")
-        ((n == 0)) || fail "$m is $n, want 0"
-    done
+    # The recovered panics only counted (acu_flip_gate_panics_total,
+    # acu_freshness_unlogged_panics_total) are checked at every planned
+    # stop, this process's at the final one (lib.sh, process_checks).
     kill -0 "$DAEMON_PID" || fail "the daemon is not running"
     "${CURL[@]}" -fsS -o /dev/null "$ADMIN/healthz" || fail "the daemon does not answer its healthz"
     passed
-}
-
-# panics_in_log: the daemon log's panic and hash-conflict lines: a
-# recovered panic's event (*_panicked, net/http's "http: panic serving
-# …"), package_hash_conflict, and Go's runtime crash text at the start of
-# a line (an unrecovered panic or a fatal error, which reach the log
-# through start_daemon's 2>&1: a crash during a planned stop shows only
-# here, since stop_daemon ignores the exit status).
-panics_in_log() {
-    log_lines 0 '(^| )msg=("[^"]*panic|[a-z_]*panicked( |$))|(^| )msg=package_hash_conflict( |$)|^(panic|fatal error): '
 }
 
 # after_final_stop: the final stop comes after whole_run, so its log is
@@ -804,6 +833,6 @@ unsigned_first_adoption
 restart
 upstream_down
 whole_run
-stop_daemon
+stop_daemon "the final stop"
 after_final_stop
 say "PASS in ${SECONDS}s: ${TIMINGS[*]}"

@@ -53,8 +53,13 @@ APT_ERRORS='Failed to fetch|Connection failed|timed out|Hash Sum mismatch|Mirror
 # (URI::ArchiveOnly): "http://signed.test apt/stable/ InRelease". So the
 # host or prefix is followed by a slash or a space; test.sh's
 # control-sig-root fails a filter that misses that form.
+# Any error line (E: on apt 2.x, Error: on 3.x) naming the signed host
+# counts too: an InRelease and a Release that both answer 404 print only
+# "E: The repository '…' does not have a Release file" ("no longer has"
+# for a source with old lists), none of the words above, and apt keeps
+# the old lists; test.sh's control-norel fails a filter that misses it.
 APT_SIGNED_HOSTS='//signed\.test[/ ]|/m-signed[/ ]'
-APT_SIGNED_ERRORS="GPG error|OpenPGP signature verification failed|is not signed|signature verification|Clearsigned file isn't valid|Conflicting distribution"
+APT_SIGNED_ERRORS="GPG error|OpenPGP signature verification failed|is not signed|signature verification|Clearsigned file isn't valid|Conflicting distribution|^(E|Error):"
 
 SCENARIO=setup
 SCENARIO_START=$SECONDS
@@ -76,10 +81,27 @@ fail() {
     exit 1
 }
 
-# show_logs: the daemon's log tail and nginx's access-log tail (ruling
-# R-H2-5), for fail and for test.sh's unexpected-exit trap. A log not yet
-# written (nginx's, before setup starts it) prints nothing.
+# show_logs: whether the daemon still runs, the daemon log's first panic or
+# crash lines, its tail and nginx's access-log tail (ruling R-H2-5), for
+# fail and for test.sh's unexpected-exit trap. A crash mid-scenario fails
+# as whatever poll or update was running, and a long crash trace can push
+# its `panic:` header out of the tail: the lines before the tails show
+# both. A log not yet written (nginx's, before setup starts it) prints
+# nothing.
 show_logs() {
+    if [[ -z $DAEMON_PID ]]; then
+        echo "=== daemon: none started by the harness at this point"
+    elif kill -0 "$DAEMON_PID" 2> /dev/null; then
+        echo "=== daemon pid $DAEMON_PID: running"
+    else
+        echo "=== daemon pid $DAEMON_PID: gone"
+    fi
+    local p
+    p=$(panics_in_log 2> /dev/null | head -n 5 || true)
+    if [[ -n $p ]]; then
+        echo "=== the daemon log's first panic, conflict or crash lines (panics_in_log)"
+        printf '%s\n' "$p"
+    fi
     echo "=== daemon log tail ($DAEMON_LOG)"
     tail -n 80 "$DAEMON_LOG" 2>/dev/null | sed -E 's/ client_addr=[^ ]+//' || true
     echo "=== nginx access log tail ($NGINX_LOG)"
@@ -171,6 +193,16 @@ event() {
     kv msg "$1"
 }
 
+# panics_in_log: the daemon log's panic and hash-conflict lines: a
+# recovered panic's event (*_panicked, net/http's "http: panic serving
+# …"), package_hash_conflict, and Go's runtime crash text at the start of
+# a line (an unrecovered panic or a fatal error, which reach the log
+# through start_daemon's 2>&1). test.sh's whole_run and after_final_stop
+# fail on any; show_logs prints the first few.
+panics_in_log() {
+    log_lines 0 '(^| )msg=("[^"]*panic|[a-z_]*panicked( |$))|(^| )msg=package_hash_conflict( |$)|^(panic|fatal error): '
+}
+
 suite_kv() {
     kv suite_path "$1"
 }
@@ -205,21 +237,56 @@ start_daemon() {
     poll 30 "the daemon's proxy listener" bash -c '(echo > /dev/tcp/127.0.0.1/3142) 2> /dev/null'
 }
 
-# stop_daemon: SIGTERM, then 40 s for the exit: the daemon's HTTP drain
-# budget (shutdownTimeout, 30 s, cmd/apt-cacher-ultra/main.go), its 1 s
-# tunnel grace and a margin for the teardown. Every planned stop has
-# nothing in flight, and then the daemon exits in about a second.
+# stop_daemon WHICH: a planned stop, WHICH naming it in messages. First the
+# process's own checks (process_checks), then SIGTERM, then 40 s for the
+# exit: the daemon's HTTP drain budget (shutdownTimeout, 30 s,
+# cmd/apt-cacher-ultra/main.go), its 1 s tunnel grace and a margin for
+# the teardown. Every planned stop has nothing in flight, and then the
+# daemon exits in about a second, with status 0: run returns nil after
+# the signal (signal.NotifyContext, serve's nil listener error), and env
+# execs the daemon, so DAEMON_PID is the daemon itself. Any other status
+# (a crash during the stop, an os.Exit) fails the stop.
+#
+# AIDEV-NOTE: only the planned stops come here. fail and test.sh's on_exit
+# stop nothing: a failed run's daemon ends with the container. So these
+# checks, which call fail, cannot recurse into a second failure or mask
+# the first. A cleanup stop added to a failure path must skip them.
 stop_daemon() {
+    local which=$1 rc=0
     [[ -n $DAEMON_PID ]] || return 0
-    say "stopping the daemon"
+    say "stopping the daemon ($which)"
+    process_checks "$which"
     kill "$DAEMON_PID"
-    poll 40 "the daemon to exit" daemon_gone
-    wait "$DAEMON_PID" 2> /dev/null || true
+    poll 40 "the daemon to exit at $which" daemon_gone
+    wait "$DAEMON_PID" 2> /dev/null || rc=$?
+    ((rc == 0)) || fail "the daemon exited with status $rc at $which"
     DAEMON_PID=""
 }
 
 daemon_gone() {
     ! kill -0 "$DAEMON_PID" 2> /dev/null
+}
+
+# process_checks WHICH: before a planned stop, the panics this daemon
+# process recovered without logging them, which only its counters record:
+# acu_flip_gate_panics_total (the flip barrier's hold-expiry timer, which
+# runs only when a commit outlasts its hold: commit-delay's 45 s daemon)
+# and acu_freshness_unlogged_panics_total (adoptions, failure records,
+# heartbeats, repair, reconcile). The counters live in process memory and
+# start at 0 with each process, so each process is read as it ends; the
+# run has four (setup to commit-delay, the 45 s one, the one after it to
+# restart, and restart's to the final stop). Each counter is summed over
+# every sample of its name, so a label added later cannot make it read 0;
+# a counter never incremented has no sample, so each must be declared: a
+# renamed one fails here instead of reading 0.
+process_checks() {
+    local which=$1 m n f=/var/log/acu-e2e/metrics.txt
+    "${CURL[@]}" -fsS -o "$f" "$ADMIN/metrics" || fail "the daemon's /metrics did not answer at $which"
+    for m in acu_flip_gate_panics_total acu_freshness_unlogged_panics_total; do
+        grep -q "^# TYPE $m counter\$" "$f" || fail "/metrics declares no counter $m at $which"
+        n=$(metric_sum "$m" "$f")
+        ((n == 0)) || fail "$m is $n at $which, want 0 (this daemon process recovered a panic it did not log)"
+    done
 }
 
 # publish REPO VERSION: points the upstream's REPO/current at VERSION
@@ -251,6 +318,12 @@ metric() {
     "${CURL[@]}" -fsS "$ADMIN/metrics" | awk -v m="$1" '$1 == m {v = $2} END {print v + 0}'
 }
 
+# metric_sum NAME FILE: the sum of every sample of metric NAME, with or
+# without labels, in FILE, a copy of /metrics (0 when it has none).
+metric_sum() {
+    awk -v m="$1" '$1 == m || index($1, m "{") == 1 {v += $2} END {print v + 0}' "$2"
+}
+
 # baseline START HOST SUITE...: waits (10 s at most) until every suite's
 # last successful check is no older than START less a cooldown — the
 # checks the client updates since START triggered, or the one whose
@@ -260,6 +333,31 @@ baseline() {
     local start=$1
     shift
     poll 10 "the suites' checks after the client's update" baseline_met "$start" "$@"
+    by_client_premise "$@"
+}
+
+# by_client_premise HOST SUITE...: by_client's premise holds — the
+# scheduler checks each suite no sooner than periodic_refresh after its
+# last success. Two states would let it check sooner (suiteDue,
+# internal/freshness/scheduler.go): an adoption record, whose retry is due
+# on its own schedule, and a pending change (inrelease_change_seen_at
+# set). So each suite has neither, or a scenario's publish could be
+# carried by the scheduler while by_client credits the client.
+by_client_premise() {
+    local host=$1 s entry v
+    shift
+    for s in "$@"; do
+        entry=$("${CURL[@]}" -fsS "$ADMIN/?format=json" | jq -c --arg h "$host" --arg p "$s" \
+            '.suites[] | select(.host == $h and .suite_path == $p) |
+                {adoption_fail_count, inrelease_change_seen_at_unixtime}' || true)
+        [[ -n $entry ]] || fail "by_client's premise: no status entry for $host$s"
+        v=$(jq -r '.adoption_fail_count' <<< "$entry")
+        [[ $v == 0 ]] ||
+            fail "by_client's premise: $host$s has adoption_fail_count $v, want 0 (its record's retry lets the scheduler check it sooner): $entry"
+        v=$(jq -r '.inrelease_change_seen_at_unixtime // empty' <<< "$entry")
+        [[ -z $v ]] ||
+            fail "by_client's premise: $host$s has inrelease_change_seen_at_unixtime $v, want none (a pending change lets the scheduler check it sooner): $entry"
+    done
 }
 
 baseline_met() {
@@ -408,11 +506,28 @@ until_candidates() {
         done
         ((all)) && break
         if ((SECONDS - start >= limit)); then
-            fail "clients ${names[*]} did not report ${specs[*]} within ${limit}s"
+            fail "clients ${names[*]} did not report ${specs[*]} within ${limit}s; they report:$(seen_candidates "${names[@]}" -- "${specs[@]}")"
         fi
         sleep "$COOLDOWN"
     done
     POLL_TOOK=$((SECONDS - start))
+}
+
+# seen_candidates NAME... -- PACKAGE=VERSION...: each client's candidate of
+# each package, for until_candidates' timeout message.
+seen_candidates() {
+    local names=() n spec c
+    while [[ $1 != -- ]]; do
+        names+=("$1")
+        shift
+    done
+    shift
+    for n in "${names[@]}"; do
+        for spec in "$@"; do
+            c=$(candidate "$n" "${spec%%=*}" || true)
+            printf ' %s:%s=%s' "$n" "${spec%%=*}" "${c:-none}"
+        done
+    done
 }
 
 # --- request lines -------------------------------------------------------
