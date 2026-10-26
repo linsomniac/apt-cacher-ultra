@@ -154,15 +154,16 @@ func TestSimLim1_AttemptsAcrossTheJitter(t *testing.T) {
 // untrusted phase keeps its 10 days: the 7-day interest window lapses
 // inside it, so its floor catches a suite gone dormant without the day-5
 // touch (B-57). The older-content phase runs 5 days and each clock step 2,
-// every bound at the same per-day rate, so the run stays well under the
-// 5 s -race budget (executability review D6, ruling PE-8: about 3.6–4 s).
-// Re-time it under -race before lengthening any phase.
+// every bound at the same per-day rate, so the run stays under the 4.5 s
+// -race budget (executability review D6, ruling PE-8: about 3.6–4 s; up
+// to 4.2 s in phase H1, so its headroom is small). Re-time it under -race
+// before lengthening any phase.
 func TestSimRetry_LongRunDateRulesAndClockSteps(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		// The offset is process-global: a Fatal between a clock step and
 		// its inline restore() must not leak the step into later tests.
 		t.Cleanup(wallclock.SetOffsetForTest(0))
-		// 2 h 40 m keeps the run well under 5 s under -race while one tick
+		// 2 h 40 m keeps the run under the 4.5 s -race budget while one tick
 		// (40 m) stays below the 1 h retry cap, so the attempt bounds keep
 		// their teeth; every phase boundary below stays off the tick grid.
 		const refresh = 160 * time.Minute

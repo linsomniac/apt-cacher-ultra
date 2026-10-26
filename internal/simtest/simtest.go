@@ -13,8 +13,9 @@
 //     ServeContent's Last-Modified and by SweepTmp) are real host times, so
 //     inside a bubble the pool mtime always looks newer than any stamp.
 //   - Cost under -race (dev box): ~3.5 ms per freshness check and ~1 ms
-//     per scheduler tick. Keep each simulation under ~5 s under -race by
-//     choosing coarser intervals, not by dropping assertions.
+//     per scheduler tick. Keep each simulation under 4.5 s under -race
+//     (ruling PE-8) by choosing coarser intervals, not by dropping
+//     assertions.
 package simtest
 
 import (
@@ -110,7 +111,13 @@ func After(d time.Duration, next Behavior) Behavior {
 	}
 }
 
-// Unavailable answers 503 at once: an unknown end that costs no time.
+// Unavailable answers 503 at once: an unknown end that costs no time. It
+// returns the error *fetch.StatusError{Code: 503}, not a ConditionalResult.
+// The real Conditional returns a 5xx as fetch.ErrUpstreamServerError,
+// wrapped, without a *StatusError. errors.Is matches this one to that
+// sentinel too, and the checker's probe classifies both as unknown (only
+// 401, 403, 404 and 410 are absent), though only this one carries its
+// code, 503, into the probe's outcome.
 func Unavailable() Behavior {
 	return func(context.Context, string) (*fetch.ConditionalResult, error) {
 		return nil, &fetch.StatusError{Code: 503}

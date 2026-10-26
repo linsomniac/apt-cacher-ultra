@@ -123,8 +123,8 @@ func TestSimFlip_DetachedBusySuiteStraddlesOnlyWithoutTheBarrier(t *testing.T) {
 
 // busySuiteSim runs the busy-suite simulation at 0s and 10s, for the
 // inline or the detached form, each as its own subtest (final review,
-// tests Minor 4: each bubble is measured on its own against the 5 s
-// -race budget).
+// tests Minor 4: each bubble is measured on its own against the 4.5 s
+// -race budget, ruling PE-8).
 func busySuiteSim(t *testing.T, detached bool) {
 	for _, quiet := range []time.Duration{0, 10 * time.Second} {
 		t.Run("quiet="+quiet.String(), func(t *testing.T) { busySuiteBubble(t, detached, quiet) })

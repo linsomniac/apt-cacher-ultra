@@ -66,7 +66,8 @@ func TestDoD_ActiveSuitesAdoptOnceDormantSuitesStaySilent(t *testing.T) {
 			t.Fatal(err)
 		}
 		up := simtest.NewUpstream()
-		anchorURL := func(s SuiteRef) string { return "http://" + s.CanonicalHost + s.SuitePath + "/InRelease" }
+		suiteURL := func(s SuiteRef, name string) string { return "http://" + s.CanonicalHost + s.SuitePath + "/" + name }
+		anchorURL := func(s SuiteRef) string { return suiteURL(s, "InRelease") }
 		backfill := time.Now().Add(-interestWindow).Unix()
 		var active, dormant []SuiteRef
 		var rejected, returning SuiteRef
@@ -151,7 +152,7 @@ func TestDoD_ActiveSuitesAdoptOnceDormantSuitesStaySilent(t *testing.T) {
 		for _, s := range dormant { // every anchor file, not InRelease alone (deferred minor E-55)
 			n := 0
 			for _, name := range []string{"InRelease", "Release", "Release.gpg"} {
-				n += len(up.Calls("http://" + s.CanonicalHost + s.SuitePath + "/" + name))
+				n += len(up.Calls(suiteURL(s, name)))
 			}
 			if n != 0 {
 				t.Fatalf("dormant %v: %d upstream requests, want 0", s, n)

@@ -1291,7 +1291,7 @@ func TestCheck_BothSignedFormsFailingUnderJitterStayWithinTheirBounds(t *testing
 	kIn, kDet := bothFormsFailing(r)
 	lateral, detached, windows, twice, since := 0, 0, 0, 0, 0
 	var lateralRetry int64
-	for m := 0; m < 2*24*60; m += 5 { // two days, a check every five minutes
+	for m := 5; m <= 2*24*60; m += 5 { // two days, a check every five minutes, at minute m
 		r.clock.advance(5 * time.Minute)
 		calls := r.ver.calls()
 		r.check()

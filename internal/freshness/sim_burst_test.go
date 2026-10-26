@@ -38,7 +38,7 @@ import (
 // needs a signed admission, the run's only other admissions (final fix
 // wave FW-4 (a); the uncounted two-probe bound failed 4–10 runs in 40
 // under CPU load). The run lasts 80 virtual minutes (the last adoption
-// starts at about 68): ruling PE-8's 5 s budget under -race, with margin.
+// starts at about 68): ruling PE-8's 4.5 s budget under -race, with margin.
 func TestSimCapacity_UpgradeBurst(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()

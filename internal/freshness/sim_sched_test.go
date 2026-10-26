@@ -48,7 +48,14 @@ func seedSimSuite(t *testing.T, c *cache.Cache, host, suite string, lastAt, fail
 // seedSimSuites is seedSimSuite, fail count 0, for many suites of host:
 // one transaction on the cache's database, where seedSimSuite takes three
 // writer calls a suite (deferred minor C-38: seeding 501 suites that way
-// took 2.2 s of the -race budget).
+// took 2.2 s of the -race budget). One stamp differs: each suite's
+// last_requested_at is lastAt, where seedSimSuite's is the instant it
+// seeds (createSuiteTx stamps now).
+//
+// AIDEV-NOTE: a second, test-only connection that bypasses the cache's
+// writer and has none of its pragmas (busy_timeout, foreign_keys): call it
+// before the scheduler starts, while nothing else writes the cache, or
+// either side's write can fail with SQLITE_BUSY.
 func seedSimSuites(t *testing.T, c *cache.Cache, host string, suites []string, lastAt int64) {
 	t.Helper()
 	if err := c.PutBlob(context.Background(), testHex64, 1); err != nil {

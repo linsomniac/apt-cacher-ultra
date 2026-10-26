@@ -22,9 +22,9 @@ import (
 
 // simReapEvery is the ninety-day simulation's reaper interval (deliberate
 // deviation 2): six hours, not the hourly reapInterval, so ninety days fit
-// the 5 s -race budget; the uptime floor stays one hour. Task 6 and
-// TestDoD_ProductionCadenceAcrossTwelveHourlyRestarts pin the hourly
-// cadence.
+// the 4.5 s -race budget (ruling PE-8); the uptime floor stays one hour.
+// Task 6 and TestDoD_ProductionCadenceAcrossTwelveHourlyRestarts pin the
+// hourly cadence.
 const simReapEvery = 6 * time.Hour
 
 // simCadence is a simulation boot's reaper interval and gc.url_path_ttl.
