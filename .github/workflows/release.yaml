@@ -80,6 +80,15 @@ jobs:
           VERSION: ${{ steps.vars.outputs.version }}
         run: make build VERSION="$VERSION"
 
+      # e2e/flat's test seam is compiled only with -tags e2ehooks: never
+      # ship a binary that has it.
+      - name: Verify no e2e test seam
+        run: |
+          if grep -q ACU_E2E_ build/apt-cacher-ultra; then
+            echo "Release binary contains the e2e test seam (ACU_E2E_)" >&2
+            exit 1
+          fi
+
       - name: Install nfpm
         run: |
           set -euo pipefail

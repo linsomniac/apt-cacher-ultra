@@ -20,9 +20,19 @@ jobs:
           cache: true
       - run: go vet ./...
       - run: go test -race -timeout 10m ./...
+      # e2e/flat's test binary seam (cmd/apt-cacher-ultra/e2ehooks.go),
+      # compiled only with this tag.
+      - name: e2ehooks seam
+        run: |
+          go vet -tags e2ehooks ./cmd/apt-cacher-ultra/
+          go test -tags e2ehooks -count=1 -run 'E2ECommitDelay' ./cmd/apt-cacher-ultra/
       - name: Verify portable Linux binary
         run: |
           CGO_ENABLED=1 make build
+          if grep -q ACU_E2E_ build/apt-cacher-ultra; then
+            echo "Release binary contains the e2e test seam (ACU_E2E_)" >&2
+            exit 1
+          fi
           program_headers="$(readelf --program-headers --wide build/apt-cacher-ultra)"
           if [[ "$program_headers" == *INTERP* ]]; then
             echo "Binary requires an external ELF interpreter" >&2
@@ -78,6 +88,34 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: bash e2e/deb/run.sh
+
+  # Spec §7 real-apt end-to-end test of flat repositories
+  # (e2e/flat/README.md): nginx, the daemon and apt clients in one
+  # container, one job per client image so every apt version (2.2 to 3.2)
+  # runs on every change. The rows with `unsigned` (the oldest and newest
+  # images) also wait for the unsigned confirmation, 5 to 15 minutes after
+  # first contact; the others take about 2.5 minutes plus the image build.
+  # No retry: a flaky scenario must show. A failure that names a
+  # distribution mirror is re-run alone.
+  e2e-flat:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: 'debian:11', unsigned: 'debian:11', timeout: 30 }
+          - { image: 'ubuntu:22.04', unsigned: '', timeout: 15 }
+          - { image: 'ubuntu:24.04', unsigned: '', timeout: 15 }
+          - { image: 'debian:12', unsigned: '', timeout: 15 }
+          - { image: 'debian:13', unsigned: '', timeout: 15 }
+          - { image: 'ubuntu:26.04', unsigned: 'ubuntu:26.04', timeout: 30 }
+    timeout-minutes: ${{ matrix.timeout }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: bash e2e/flat/run.sh
+        env:
+          E2E_FLAT_IMAGES: ${{ matrix.image }}
+          E2E_FLAT_UNSIGNED_IMAGES: ${{ matrix.unsigned }}
 
   # Fast unit tests for the apt-repo publishing scripts
   # (scripts/select-stable-tags.sh, scripts/build-apt-repo.sh). Docker-free
