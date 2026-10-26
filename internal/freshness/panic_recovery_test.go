@@ -93,6 +93,7 @@ func TestCheck_AdoptionPanicIsRecovered(t *testing.T) {
 	trackSuite(t, env.cache, SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"})
 	ad, err := NewAdopter(AdoptionConfig{
 		Cache: env.cache, Fetcher: env.fetcher, Verifier: panickingVerifier{}, HostLimiter: hostsem.New(8),
+		Logger: discardLogger(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -155,7 +156,7 @@ func TestCheck_AdoptionPanicRecoveredBeforeMutexRelease(t *testing.T) {
 	ctx := context.Background()
 	seedStaleAnchor(t, env.cache)
 	trackSuite(t, env.cache, SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"})
-	ad, err := NewAdopter(AdoptionConfig{Cache: env.cache, Fetcher: env.fetcher, Verifier: panickingVerifier{}, HostLimiter: hostsem.New(8)})
+	ad, err := NewAdopter(AdoptionConfig{Cache: env.cache, Fetcher: env.fetcher, Verifier: panickingVerifier{}, HostLimiter: hostsem.New(8), Logger: discardLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}

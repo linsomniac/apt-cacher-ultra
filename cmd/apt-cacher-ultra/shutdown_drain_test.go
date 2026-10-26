@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"net"
-	"net/http"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -60,19 +59,7 @@ func TestServeListeners_ShutsDownWithTheBarrierOn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- serveListeners(ctx, cfg, silentBuildLogger(), ln, nil, nil, nil) }()
-	deadline := time.Now().Add(15 * time.Second)
-	for {
-		resp, err := http.Get("http://" + ln.Addr().String() + "/probe")
-		if err == nil {
-			_ = resp.Body.Close()
-			break
-		}
-		if time.Now().After(deadline) {
-			cancel()
-			t.Fatalf("daemon not serving within 15s: %v", err)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitServing(t, ln.Addr().String(), cancel, done)
 	cancel()
 	select {
 	case err := <-done:

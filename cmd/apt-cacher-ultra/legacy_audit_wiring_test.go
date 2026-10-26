@@ -50,7 +50,7 @@ func TestServeListeners_LegacyAuditRunsBeforeGCAndServing(t *testing.T) {
 	// inline snapshot whose stored InRelease is plain text, queued. Plain
 	// text on purpose (spec §7 "Fixtures", ruling PD-2): it models a
 	// legacy snapshot the audit must quarantine.
-	c, err := cache.Open(ctx, cacheDir, nil)
+	c, err := cache.Open(ctx, cacheDir, silentBuildLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestServeListeners_LegacyAuditRunsBeforeGCAndServing(t *testing.T) {
 		t.Fatalf("the GC startup pass ran before the legacy trust audit")
 	}
 	stop()
-	c2, err := cache.Open(ctx, cacheDir, nil)
+	c2, err := cache.Open(ctx, cacheDir, silentBuildLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestServeListeners_LegacyAuditErrorHasOnePrefix(t *testing.T) {
 	t.Cleanup(func() { metrics.Default.UnregisterAddedSinceForTest(preMetrics) })
 	ctx := context.Background()
 	cacheDir := t.TempDir()
-	c, err := cache.Open(ctx, cacheDir, nil)
+	c, err := cache.Open(ctx, cacheDir, silentBuildLogger())
 	if err != nil {
 		t.Fatal(err)
 	}

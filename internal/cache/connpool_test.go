@@ -70,7 +70,7 @@ func TestOpen_ConcurrentReadersKeepTheirConnections(t *testing.T) {
 // -race; the connections it would free are bounded by the cap.
 func TestOpen_IdleConnectionsStayThroughQuiet(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		c, err := Open(context.Background(), t.TempDir(), nil)
+		c, err := Open(context.Background(), t.TempDir(), discardSlog())
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}

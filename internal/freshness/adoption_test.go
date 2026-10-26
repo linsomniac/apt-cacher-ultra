@@ -483,7 +483,7 @@ func TestAdopter_FormDriftWARN_OnFormTransition(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -836,6 +836,7 @@ func newTolerantAdopter(t *testing.T, env *adoptionTestEnv) *Adopter {
 		Verifier:                       passThroughVerifier{},
 		HostLimiter:                    hostsem.New(8),
 		TolerateOptionalMemberFailures: true,
+		Logger:                         discardLogger(),
 	})
 	if err != nil {
 		t.Fatalf("NewAdopter: %v", err)
@@ -1182,13 +1183,14 @@ func TestAdopter_RejectsUnsetDependencies(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			c, _ := cache.Open(context.Background(), dir, nil)
+			c, _ := cache.Open(context.Background(), dir, discardLogger())
 			t.Cleanup(func() { _ = c.Close() })
 			cfg := AdoptionConfig{
 				Cache:       c,
 				Fetcher:     newFakeFetcher(),
 				Verifier:    passThroughVerifier{},
 				HostLimiter: hostsem.New(1),
+				Logger:      discardLogger(),
 			}
 			tc.mutate(&cfg)
 			if _, err := NewAdopter(cfg); err == nil {
@@ -1615,7 +1617,7 @@ func TestBlobHeartbeatTracker_ConcurrentAddSnapshot(t *testing.T) {
 
 func TestRunHeartbeatTicker_AdvancesHeartbeatAt(t *testing.T) {
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1695,7 +1697,7 @@ func TestRunHeartbeatTicker_AdvancesHeartbeatAt(t *testing.T) {
 
 func TestRunHeartbeatTicker_DisabledWhenIntervalZero(t *testing.T) {
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1723,7 +1725,7 @@ func TestRunHeartbeatTicker_DisabledWhenIntervalZero(t *testing.T) {
 
 func TestRunHeartbeatTicker_ExitsOnCancelWithoutTickingMoreThanOnce(t *testing.T) {
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1782,7 +1784,7 @@ func TestAdopter_MemberSkipped_404SkipsMidList(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -2124,7 +2126,7 @@ func TestAdopter_MultiArch_NoFilter_AllArchsAdopted(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -2338,7 +2340,7 @@ func TestAdopter_MultiArch_AllowlistFiltersOutOtherArchs(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -2444,7 +2446,7 @@ func TestAdopter_Allowlist_KeepsBinaryAllIndexTarget(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -2546,7 +2548,7 @@ func TestAdopter_Allowlist_BlocksPublishWhenBinaryAllUnavailable(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -2641,7 +2643,7 @@ func TestAdopter_Sources_HappyPath(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -2742,7 +2744,7 @@ func TestAdopter_Sources_CrossVariantDisagreement(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -2839,7 +2841,7 @@ func TestAdopter_Sources_IntraFileOrigTarballConflict(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -2918,7 +2920,7 @@ func TestAdopter_PdiffIndex_HappyPath(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -3006,7 +3008,7 @@ func TestAdopter_PdiffIndex_MalformedEntriesSkipped(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -3077,7 +3079,7 @@ func TestAdopter_MultiArch_AllowlistKeepsSourcePseudoArch(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}

@@ -1906,6 +1906,7 @@ func TestCheck_UnchangedTick_ReconcilesDegraded(t *testing.T) {
 		Architectures:                  []string{"amd64"},
 		TolerateOptionalMemberFailures: true,
 		RepairSkippedMembers:           true,
+		Logger:                         discardLogger(),
 	})
 	if err != nil {
 		t.Fatalf("NewAdopter: %v", err)
@@ -2036,6 +2037,7 @@ func TestCheck_FailedTick_DoesNotReconcile(t *testing.T) {
 		Architectures:                  []string{"amd64"},
 		TolerateOptionalMemberFailures: true,
 		RepairSkippedMembers:           true,
+		Logger:                         discardLogger(),
 	})
 	if err != nil {
 		t.Fatalf("NewAdopter: %v", err)
@@ -2123,6 +2125,7 @@ func TestCheck_UnchangedTick_LogsReconcileFailure(t *testing.T) {
 		HostLimiter:          hostsem.New(8),
 		Architectures:        []string{"amd64"},
 		RepairSkippedMembers: true, // gates the tick-path reconcile too
+		Logger:               discardLogger(),
 	})
 	if err != nil {
 		t.Fatalf("NewAdopter: %v", err)

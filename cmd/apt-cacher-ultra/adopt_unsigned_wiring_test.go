@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"log/slog"
 	"strings"
 	"testing"
@@ -51,7 +52,14 @@ func TestWarnSuiteCaps_ZeroCapAndReadFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	warnSuiteCaps(context.Background(), c, 100, slog.New(slog.NewJSONHandler(&logs, nil)))
-	if !strings.Contains(logs.String(), `"level":"WARN","msg":"suite_cap_usage_read_failed"`) {
+	warned := false // the decoded record, not a key-order-dependent substring (deferred minor E-73)
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var rec map[string]any
+		if json.Unmarshal([]byte(line), &rec) == nil && rec["msg"] == "suite_cap_usage_read_failed" && rec["level"] == "WARN" {
+			warned = true
+		}
+	}
+	if !warned {
 		t.Fatalf("a failed cap read was not a WARN:\n%s", logs.String())
 	}
 }

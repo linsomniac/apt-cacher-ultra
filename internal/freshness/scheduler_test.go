@@ -496,7 +496,9 @@ func TestRun_SurvivesARescheduleRestartPanic(t *testing.T) {
 		up := simtest.NewUpstream()
 		up.Set("http://h/r/dists/x/InRelease", simtest.NotModified())
 		ad, err := NewAdopter(AdoptionConfig{Cache: simtest.OpenCache(t), Fetcher: newFakeFetcher(),
-			Verifier: passThroughVerifier{}, HostLimiter: hostsem.New(8)})
+			Verifier: passThroughVerifier{}, HostLimiter: hostsem.New(8),
+			Logger: discardLogger(),
+		})
 		if err != nil {
 			t.Fatal(err)
 		}

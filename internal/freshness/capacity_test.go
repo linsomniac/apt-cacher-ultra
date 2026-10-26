@@ -100,7 +100,7 @@ func TestCheck_NoSlotQueuesDetachedToo(t *testing.T) {
 // adoptions across hosts, and a queued suite runs once the slot frees.
 func TestCheck_GlobalSlotCapsConcurrentAdoptions(t *testing.T) {
 	ctx := context.Background()
-	c, err := cache.Open(ctx, t.TempDir(), nil)
+	c, err := cache.Open(ctx, t.TempDir(), discardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,9 @@ func TestCheck_GlobalSlotCapsConcurrentAdoptions(t *testing.T) {
 		up.setAt("http://"+host+rigSuite+"/InRelease", signedRelease("cap", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs}))
 	}
 	ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: bf, Verifier: passThroughVerifier{},
-		HostLimiter: hostsem.New(8), MaxConcurrent: 1})
+		HostLimiter: hostsem.New(8), MaxConcurrent: 1,
+		Logger: discardLogger(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,14 +167,16 @@ func TestCheck_GlobalSlotCapsConcurrentAdoptions(t *testing.T) {
 // without waiting for it.
 func TestCheck_RepairObeysTheGlobalSlot(t *testing.T) {
 	ctx := context.Background()
-	c, err := cache.Open(ctx, t.TempDir(), nil)
+	c, err := cache.Open(ctx, t.TempDir(), discardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	setupFF := newFakeFetcher()
 	setupAd, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: setupFF, Verifier: passThroughVerifier{},
-		HostLimiter: hostsem.New(8), TolerateOptionalMemberFailures: true})
+		HostLimiter: hostsem.New(8), TolerateOptionalMemberFailures: true,
+		Logger: discardLogger(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +205,9 @@ func TestCheck_RepairObeysTheGlobalSlot(t *testing.T) {
 		bf.put("http://"+host+suitePath+"/by-hash/SHA256/"+shaOf(goods[i]), goods[i])
 	}
 	repAd, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: bf, Verifier: passThroughVerifier{},
-		HostLimiter: hostsem.New(8), MaxConcurrent: 1, RepairSkippedMembers: true})
+		HostLimiter: hostsem.New(8), MaxConcurrent: 1, RepairSkippedMembers: true,
+		Logger: discardLogger(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +408,9 @@ func TestAdoption_MaxDurationBoundsAStalledAdoption(t *testing.T) {
 		pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": testHex64})
 		rel := signedRelease("slow", 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})
 		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: stallFetcher{}, Verifier: passThroughVerifier{},
-			HostLimiter: hostsem.New(8), MaxConcurrent: 2, MaxDuration: 20 * time.Minute})
+			HostLimiter: hostsem.New(8), MaxConcurrent: 2, MaxDuration: 20 * time.Minute,
+			Logger: discardLogger(),
+		})
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -161,21 +161,25 @@ func TestPhase2Chaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 	stack.checker.WaitForAdoptions()
 
 	// Phase 2: close the member-fetch gate, swap upstream to serve B,
-	// and drive ONE InRelease GET to start adoption. The freshness
+	// and drive an InRelease GET to start adoption. The freshness
 	// conditional GET completes (returning B's bytes), Check spawns
 	// the adoption goroutine, the goroutine VerifyInline-s and reaches
 	// the member-fetch step — at which point it blocks on the gate.
 	// We wait for the gate to record at least one waiter so the
 	// chaos burst is guaranteed to run with adoption stuck mid-prefetch.
 	memberFetchGate.Close()
-	current.Store(&snapB)
 
-	rec := httptest.NewRecorder()
-	stack.handler.ServeHTTP(rec, proxyReq("GET", srv.URL, chaos2Suite+"/InRelease"))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("trigger adoption: status=%d body=%q", rec.Code, rec.Body.String())
-	}
-	if err := memberFetchGate.WaitForWaiter(5 * time.Second); err != nil {
+	// Deferred minor C-39: a phase-1c T1 check may still hold the suite
+	// when the trigger's T1 check peeks, and that check is then dropped
+	// (resultBusy: the check's TryLock peek), so no adoption starts. Hold
+	// the suite for 100 ms across the first trigger GET, making the window
+	// certain, and trigger until the gate parks the adoption. The hold
+	// comes before the swap: a leftover phase-1c check can then only have
+	// seen A, so it starts no adoption that would park at the gate holding
+	// the suite, where the hold could never be taken.
+	holdSuiteBriefly(t, stack, upstreamURL.Hostname(), 100*time.Millisecond)
+	current.Store(&snapB)
+	if err := triggerUntilParked(t, stack, memberFetchGate, srv.URL, chaos2Suite+"/InRelease", 5*time.Second); err != nil {
 		t.Fatalf("adoption never reached member-fetch gate: %v", err)
 	}
 
@@ -824,4 +828,49 @@ func newPhase2ChaosStackWithVerifier(t *testing.T, upstream *url.URL, gate *chao
 		t.Fatalf("New: %v", err)
 	}
 	return &phase2ChaosStack{handler: h, checker: checker, adopter: adopter}
+}
+
+// holdSuiteBriefly holds the chaos suite's mutex for d, from a goroutine,
+// as a phase-1c T1 check still finishing its writes would (deferred minor
+// C-39). It retries the hold (HoldSuite does not wait) for up to 5 s.
+func holdSuiteBriefly(t *testing.T, stack *phase2ChaosStack, host string, d time.Duration) {
+	t.Helper()
+	key := cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: host, SuitePath: chaos2Suite}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if release, ok := stack.checker.HoldSuite(key); ok {
+			go func() {
+				time.Sleep(d)
+				release(false)
+			}()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("could not hold the chaos suite")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// triggerUntilParked GETs path every 20 ms until the member-fetch gate
+// parks an adoption, for at most timeout (deferred minor C-39): one GET's
+// T1 check is dropped (resultBusy) while anything else holds the suite,
+// and then no adoption starts — the reason waitForFlip nudges too. Every
+// answer must be 200.
+func triggerUntilParked(t *testing.T, stack *phase2ChaosStack, gate *chaos2Gate, srvURL, path string, timeout time.Duration) error {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		rec := httptest.NewRecorder()
+		stack.handler.ServeHTTP(rec, proxyReq("GET", srvURL, path))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("trigger adoption %s: status=%d body=%q", path, rec.Code, rec.Body.String())
+		}
+		if gate.WaitForWaiter(20*time.Millisecond) == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("no waiter arrived within %v", timeout)
+		}
+	}
 }

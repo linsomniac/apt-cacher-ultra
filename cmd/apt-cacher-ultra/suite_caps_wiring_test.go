@@ -32,6 +32,36 @@ func TestCheckerConfig_CarriesMaxSuites(t *testing.T) {
 	}
 }
 
+// probeClient bounds each startup probe, so a hung request ends inside
+// waitServing's 15 s deadline (deferred minor D-49).
+var probeClient = &http.Client{Timeout: 2 * time.Second}
+
+// waitServing polls the daemon on addr until it answers a request. After
+// 15 s it cancels the daemon and waits (another 15 s at most) for
+// serveListeners to return on done, so nothing outlives the test and writes
+// to its logs (deferred minor D-46), then fails t. The start-and-probe loop
+// of every test that runs the daemon to its listener (deferred minor D-49).
+func waitServing(t *testing.T, addr string, cancel context.CancelFunc, done <-chan error) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		resp, err := probeClient.Get("http://" + addr + "/healthz-probe")
+		if err == nil {
+			_ = resp.Body.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(15 * time.Second):
+			}
+			t.Fatalf("daemon not serving within 15s: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // startupLogs runs the daemon on a config of cacheDir plus extra TOML until
 // it serves, shuts it down, and returns its log lines, decoded.
 func startupLogs(t *testing.T, cacheDir, extra string) []map[string]any {
@@ -55,19 +85,7 @@ func startupLogs(t *testing.T, cacheDir, extra string) []map[string]any {
 	go func() { done <- serveListeners(ctx, cfg, slog.New(slog.NewJSONHandler(&logs, nil)), ln, nil, nil, nil) }()
 	// Wait until the daemon serves (the startup line and the startup
 	// checks precede it), then shut it down.
-	deadline := time.Now().Add(15 * time.Second)
-	for {
-		resp, err := http.Get("http://" + ln.Addr().String() + "/healthz-probe")
-		if err == nil {
-			_ = resp.Body.Close()
-			break
-		}
-		if time.Now().After(deadline) {
-			cancel()
-			t.Fatalf("daemon not serving within 15s: %v", err)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitServing(t, ln.Addr().String(), cancel, done)
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("serveListeners: %v", err)

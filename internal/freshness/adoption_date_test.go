@@ -50,7 +50,9 @@ func adoptDated(t *testing.T, env *adoptionTestEnv, ad *Adopter, label string, d
 func fixedNowAdopter(t *testing.T, env *adoptionTestEnv, now time.Time) *Adopter {
 	t.Helper()
 	ad, err := NewAdopter(AdoptionConfig{Cache: env.cache, Fetcher: env.fetcher, Verifier: passThroughVerifier{},
-		HostLimiter: hostsem.New(8), now: func() time.Time { return now }})
+		HostLimiter: hostsem.New(8), now: func() time.Time { return now },
+		Logger: discardLogger(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

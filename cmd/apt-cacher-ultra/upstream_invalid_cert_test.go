@@ -39,6 +39,8 @@ package main
 import (
 	"context"
 	"crypto/x509"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -60,13 +62,17 @@ func TestServe_HTTPSUpstream_InvalidCert_Returns502(t *testing.T) {
 	t.Cleanup(restore)
 
 	var upstreamHits atomic.Int32
-	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		// If we ever reach here, the TLS handshake unexpectedly
 		// succeeded — the test should fail by counter assertion below.
 		upstreamHits.Add(1)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("should not be served"))
 	}))
+	// Every handshake fails by design: its "TLS handshake error" line is
+	// noise in the test output (deferred minor D-58).
+	upstream.Config.ErrorLog = log.New(io.Discard, "", 0)
+	upstream.StartTLS()
 	defer upstream.Close()
 
 	// Mirror the test upstream's HTTPS URL under /ubuntu so a plain

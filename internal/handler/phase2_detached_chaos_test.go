@@ -154,21 +154,25 @@ func TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 	}
 	stack.checker.WaitForAdoptions()
 
-	// Phase 2: close gate, swap upstream to B, drive ONE Release GET
+	// Phase 2: close gate, swap upstream to B, drive a Release GET
 	// to start adoption. The freshness check sees snap.ReleaseHash !=
 	// nil, picks the detached branch, conditional-GETs Release,
 	// observes change, fetches Release.gpg, and spawns the adoption
 	// goroutine. The goroutine VerifyDetaches → reaches member fetch
 	// → blocks on the gate.
 	memberFetchGate.Close()
-	current.Store(&snapB)
 
-	rec := httptest.NewRecorder()
-	stack.handler.ServeHTTP(rec, proxyReq("GET", srv.URL, chaos2Suite+"/Release"))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("trigger detached adoption: status=%d body=%q", rec.Code, rec.Body.String())
-	}
-	if err := memberFetchGate.WaitForWaiter(5 * time.Second); err != nil {
+	// Deferred minor C-39: a phase-1c T1 check may still hold the suite
+	// when the trigger's T1 check peeks, and that check is then dropped
+	// (resultBusy: the check's TryLock peek), so no adoption starts. Hold
+	// the suite for 100 ms across the first trigger GET, making the window
+	// certain, and trigger until the gate parks the adoption. The hold
+	// comes before the swap: a leftover phase-1c check can then only have
+	// seen A, so it starts no adoption that would park at the gate holding
+	// the suite, where the hold could never be taken.
+	holdSuiteBriefly(t, stack, upstreamURL.Hostname(), 100*time.Millisecond)
+	current.Store(&snapB)
+	if err := triggerUntilParked(t, stack, memberFetchGate, srv.URL, chaos2Suite+"/Release", 5*time.Second); err != nil {
 		t.Fatalf("detached adoption never reached member-fetch gate: %v", err)
 	}
 

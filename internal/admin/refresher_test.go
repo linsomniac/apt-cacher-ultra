@@ -239,7 +239,7 @@ func TestRefresher_HostsemGaugesAppearAfterAcquire(t *testing.T) {
 // observe acu_blobs_db_count=2 — no polling, no sleep.
 func TestRefresher_FirstScrapeSeesPopulatedGauges(t *testing.T) {
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}

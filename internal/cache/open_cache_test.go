@@ -29,14 +29,17 @@ func captureDefaultLog(t *testing.T, buf *bytes.Buffer) {
 // were (Task 12 review: the capture used to swallow every later line).
 func TestOpenCache_LogsNothing(t *testing.T) {
 	w, flags := log.Writer(), log.Flags()
+	var buf bytes.Buffer
 	t.Run("open", func(t *testing.T) {
-		var buf bytes.Buffer
 		captureDefaultLog(t, &buf)
 		openCache(t)
-		if buf.Len() != 0 {
-			t.Fatalf("openCache logged:\n%s", buf.String())
-		}
 	})
+	// Read after the subtest's cleanups: openCache's Close ran while the
+	// capture was still on, so a line Close logs is caught too (deferred
+	// minor D-60).
+	if buf.Len() != 0 {
+		t.Fatalf("openCache logged:\n%s", buf.String())
+	}
 	if log.Writer() != w || log.Flags() != flags {
 		t.Fatalf("log package left redirected (writer %T, flags %d; want %T, %d)", log.Writer(), log.Flags(), w, flags)
 	}

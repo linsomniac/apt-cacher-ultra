@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -45,7 +44,7 @@ type hotPrefetchFixture struct {
 func newHotPrefetchFixture(t *testing.T, budget time.Duration) *hotPrefetchFixture {
 	t.Helper()
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -59,6 +58,7 @@ func newHotPrefetchFixture(t *testing.T, budget time.Duration) *hotPrefetchFixtu
 		HostLimiter:       hostsem.New(8),
 		HotPackagesWindow: 24 * time.Hour,
 		HotPrefetchBudget: budget,
+		Logger:            discardLogger(),
 	})
 	if err != nil {
 		t.Fatalf("NewAdopter: %v", err)
@@ -337,13 +337,13 @@ func TestRunHotPrefetch_EmptyHotSet(t *testing.T) {
 // (if unusual) Release files.
 func TestBuildPackageHashes_AllowsDuplicatePackageArch(t *testing.T) {
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
 	defer func() { _ = c.Close() }()
 
-	logger := slog.Default()
+	logger := discardLogger()
 	a := &Adopter{cache: c, logger: logger}
 
 	debHashA := strings.Repeat("a", 64)
@@ -400,12 +400,12 @@ func TestBuildPackageHashes_AllowsDuplicatePackageArch(t *testing.T) {
 // anyway). User decision (round-5); reverses the round-1 ride-along.
 func TestBuildPackageHashes_VersionlessBinaryStanzaSkippedCoverageIntact(t *testing.T) {
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
 	defer func() { _ = c.Close() }()
-	a := &Adopter{cache: c, logger: slog.Default()}
+	a := &Adopter{cache: c, logger: discardLogger()}
 
 	withVer := strings.Repeat("a", 64)
 	noVer := strings.Repeat("b", 64)
@@ -451,12 +451,12 @@ func TestBuildPackageHashes_VersionlessBinaryStanzaSkippedCoverageIntact(t *test
 // round-5 non-punitive decision.
 func TestBuildPackageHashes_AllVersionlessBinaryFlipsCoverage(t *testing.T) {
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
 	defer func() { _ = c.Close() }()
-	a := &Adopter{cache: c, logger: slog.Default()}
+	a := &Adopter{cache: c, logger: discardLogger()}
 
 	a1 := strings.Repeat("a", 64)
 	b1 := strings.Repeat("b", 64)
@@ -493,12 +493,12 @@ func TestBuildPackageHashes_AllVersionlessBinaryFlipsCoverage(t *testing.T) {
 // FULL incomplete-identity condition, not just version=='' (round-9 finding).
 func TestBuildPackageHashes_IncompleteIdentityBinarySkipped(t *testing.T) {
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
 	defer func() { _ = c.Close() }()
-	a := &Adopter{cache: c, logger: slog.Default()}
+	a := &Adopter{cache: c, logger: discardLogger()}
 
 	good := strings.Repeat("a", 64)
 	noArch := strings.Repeat("b", 64)

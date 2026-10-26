@@ -32,8 +32,39 @@ import (
 // + a base URL ("http://127.0.0.1:<port>") + a cleanup func.
 func startAdminServer(t *testing.T, opts ...adminOpt) (*Server, string, func()) {
 	t.Helper()
+	s, ln, c := newAdminServer(t, opts...)
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		_ = s.Serve(ln)
+	}()
+	cleanup := func() {
+		// Deferred minor F-23: the cache closes only once the server is
+		// done — Shutdown, its refresher included, and Serve, whose first
+		// refresh runs before it listens — or the TempDir cleanup can meet
+		// a WAL file still open (directory not empty). Thirty seconds, and
+		// a slow shutdown is reported, not ignored.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := s.Shutdown(ctx); err != nil {
+			t.Errorf("admin Shutdown: %v", err)
+		}
+		select {
+		case <-served:
+		case <-ctx.Done():
+			t.Errorf("admin Serve still running 30s after Shutdown")
+		}
+		_ = c.Close()
+	}
+	return s, "http://" + ln.Addr().String(), cleanup
+}
+
+// newAdminServer constructs an admin Server over a real cache and gc.GC,
+// with an ephemeral listener it does not serve.
+func newAdminServer(t *testing.T, opts ...adminOpt) (*Server, net.Listener, *cache.Cache) {
+	t.Helper()
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -90,16 +121,7 @@ func startAdminServer(t *testing.T, opts ...adminOpt) (*Server, string, func()) 
 		_ = ln.Close()
 		t.Fatalf("admin.New: %v", err)
 	}
-
-	go func() { _ = s.Serve(ln) }()
-
-	cleanup := func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = s.Shutdown(ctx)
-		_ = c.Close()
-	}
-	return s, "http://" + cfg.AdminAddr, cleanup
+	return s, ln, c
 }
 
 type adminOpt func(*Config)

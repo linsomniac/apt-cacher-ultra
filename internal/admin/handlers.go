@@ -268,7 +268,10 @@ func wantsJSON(r *http.Request) bool {
 // promptly when the process is shutting down.
 func (s *Server) startRefresher() {
 	s.mu.Lock()
-	if s.refresherStop != nil {
+	// AIDEV-NOTE: a Shutdown that came first — while Serve's synchronous
+	// first refresh ran — had no refresher to stop, and nothing would stop
+	// this one: start none (deferred minor F-23).
+	if s.refresherStop != nil || s.shutdownStarted {
 		s.mu.Unlock()
 		return
 	}

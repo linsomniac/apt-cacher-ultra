@@ -236,6 +236,7 @@ func newRetryAdopter(t *testing.T, c *cache.Cache, f AdoptionFetcher, retries in
 		TolerateOptionalMemberFailures: true,
 		MemberRetryCount:               retries,
 		MemberRetryDelay:               delay,
+		Logger:                         discardLogger(),
 	})
 	if err != nil {
 		t.Fatalf("NewAdopter: %v", err)
@@ -447,6 +448,7 @@ func adoptWithIntegritySkip(t *testing.T, env *adoptionTestEnv) (*Adopter, []byt
 		HostLimiter:                    hostsem.New(8),
 		TolerateOptionalMemberFailures: true,
 		RepairSkippedMembers:           true,
+		Logger:                         discardLogger(),
 	})
 	if err != nil {
 		t.Fatalf("NewAdopter: %v", err)
@@ -532,6 +534,7 @@ func TestRepairSkippedMembers_DisabledByConfig(t *testing.T) {
 		HostLimiter:                    hostsem.New(8),
 		TolerateOptionalMemberFailures: true,
 		RepairSkippedMembers:           false,
+		Logger:                         discardLogger(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -609,6 +612,7 @@ func TestChecker_FreshTickRepairsSkippedMembers(t *testing.T) {
 		HostLimiter:                    hostsem.New(8),
 		TolerateOptionalMemberFailures: true,
 		RepairSkippedMembers:           true,
+		Logger:                         discardLogger(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -691,6 +695,7 @@ func newRequiredArchAdopter(t *testing.T, env *adoptionTestEnv, required []strin
 		HostLimiter:                    hostsem.New(8),
 		TolerateOptionalMemberFailures: true,
 		RequiredArchitectures:          required,
+		Logger:                         discardLogger(),
 	})
 	if err != nil {
 		t.Fatalf("NewAdopter: %v", err)
@@ -876,6 +881,7 @@ func TestAdopter_ArchFilterCoversOptionalMembers(t *testing.T) {
 		Verifier:      passThroughVerifier{},
 		HostLimiter:   hostsem.New(8),
 		Architectures: []string{"amd64"},
+		Logger:        discardLogger(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -920,12 +926,14 @@ func TestNewAdopter_RejectsNegativeRetryConfig(t *testing.T) {
 	if _, err := NewAdopter(AdoptionConfig{
 		Cache: env.cache, Fetcher: env.fetcher, Verifier: passThroughVerifier{},
 		HostLimiter: hostsem.New(1), MemberRetryCount: -1,
+		Logger: discardLogger(),
 	}); err == nil {
 		t.Error("MemberRetryCount=-1 accepted, want error")
 	}
 	if _, err := NewAdopter(AdoptionConfig{
 		Cache: env.cache, Fetcher: env.fetcher, Verifier: passThroughVerifier{},
 		HostLimiter: hostsem.New(1), MemberRetryDelay: -time.Second,
+		Logger: discardLogger(),
 	}); err == nil {
 		t.Error("MemberRetryDelay=-1s accepted, want error")
 	}
