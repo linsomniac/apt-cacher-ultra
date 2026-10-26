@@ -52,6 +52,11 @@ NOTES.md
 # Local scratchpad — not part of any image.
 prompt
 
+# Claude Code state (worktrees: hundreds of MB in the main checkout) and
+# the binary `go build` leaves in the repo root.
+.claude/
+/apt-cacher-ultra
+
 # Note: e2e/ is intentionally NOT excluded. The cache image's runtime
 # stage does `COPY e2e/cache.toml`, and .dockerignore filtering applies
 # to the build-context tarball itself — excluding e2e/ here would make
