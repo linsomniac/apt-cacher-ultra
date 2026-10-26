@@ -49,7 +49,8 @@ e2e:
 # ubuntu:26.04 also wait for the unsigned confirmation, which lands 5 to 15
 # minutes after first contact (about 6 to 7 minutes each in all, about 14
 # when a third retry is needed). Override with E2E_FLAT_IMAGES (and
-# E2E_FLAT_UNSIGNED_IMAGES).
+# E2E_FLAT_UNSIGNED_IMAGES); give each checkout its own E2E_FLAT_NAME (the
+# image and container name prefix) so concurrent runs do not collide.
 e2e-flat:
 	bash e2e/flat/run.sh
 

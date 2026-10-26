@@ -340,8 +340,9 @@ if [[ $ready -eq 0 ]]; then
 fi
 
 # 2a: prime the cache with V1's InRelease (cache miss → upstream).
-# This populates url_path so the freshness check has a baseline to
-# compare against.
+# The miss creates the suite, and its first check adopts V1 at once
+# (2a'). The url_path row it stores matters only until then: once a
+# snapshot is current, the check reconstructs a missing anchor row.
 echo "[deb-test] phase 2: GET InRelease via proxy (V1, primes cache)"
 status=$(curl -sS -x http://127.0.0.1:3142 \
     -o /tmp/inrelease.v1 \
@@ -414,7 +415,7 @@ status=$(curl -sS -x http://127.0.0.1:3142 \
     -o /tmp/inrelease.followup \
     -w '%{http_code}' \
     --max-time 10 \
-    http://127.0.0.1/dists/noble/InRelease)
+    http://127.0.0.1/dists/noble/InRelease || echo "000")
 if [[ "$status" != "200" ]]; then
     echo "FAIL: follow-up InRelease returned $status"
     cat "$hdrs_file" || true
@@ -504,9 +505,10 @@ fi
 
 # 3a: prime the cache with V1-detached's Release + Release.gpg. We do
 # NOT request InRelease — the upstream doesn't serve it and the cache
-# would 404. Both Release and Release.gpg url_path rows are required
-# for the detached fallback path; without them, the freshness checker
-# skips with a "no cached Release url_path" debug log.
+# would 404. The Release miss creates the suite, whose first check
+# adopts V1-detached at once (3a'); the url_path rows matter only until
+# then: once a snapshot is current, the check reconstructs a missing
+# anchor row.
 echo "[deb-test] phase 3: GET Release + Release.gpg via proxy (V1-detached, primes cache)"
 for path in /dists/noble/Release /dists/noble/Release.gpg; do
     status=$(curl -sS -x http://127.0.0.1:3142 \
@@ -571,7 +573,12 @@ echo "[deb-test] adopted detached snapshot id=$adopted_id (after ${SNAPSHOT_AFTE
 # inline-mode adoption that somehow ran against detached fixtures.
 echo "[deb-test] phase 3: verify snapshot $adopted_id is detached form"
 form_columns=$(sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
-    "SELECT IFNULL(inrelease_hash, '<null>') || '|' || IFNULL(release_hash, '<null>') || '|' || IFNULL(release_gpg_hash, '<null>') FROM suite_snapshot WHERE snapshot_id=$adopted_id;")
+    "SELECT IFNULL(inrelease_hash, '<null>') || '|' || IFNULL(release_hash, '<null>') || '|' || IFNULL(release_gpg_hash, '<null>') FROM suite_snapshot WHERE snapshot_id=$adopted_id;" || echo "")
+if [[ -z "$form_columns" ]]; then
+    echo "FAIL: cannot read snapshot $adopted_id's hashes from suite_snapshot"
+    dump_adoption_state
+    exit 1
+fi
 ir_hash="${form_columns%%|*}"
 rest="${form_columns#*|}"
 r_hash="${rest%%|*}"
@@ -599,7 +606,7 @@ status=$(curl -sS -x http://127.0.0.1:3142 \
     -o /tmp/release.followup \
     -w '%{http_code}' \
     --max-time 10 \
-    http://127.0.0.1/dists/noble/Release)
+    http://127.0.0.1/dists/noble/Release || echo "000")
 if [[ "$status" != "200" ]]; then
     echo "FAIL: follow-up Release returned $status"
     cat "$hdrs_file" || true
