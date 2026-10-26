@@ -43,9 +43,9 @@ It needs Docker on an amd64 host, and network access to:
   `security.ubuntu.com`);
 - the Go module proxy (the build stage's `go mod download`).
 
-The fixture packages are built for amd64 (two are `all`). On an arm64
-host, such as Apple Silicon or an arm64 runner, apt finds no candidate for
-most of them and the run fails.
+The fixture packages are built for amd64; three, Jenkins's two and
+Jitsi's, are `all`. On an arm64 host, such as Apple Silicon or an arm64
+runner, apt finds no candidate for most of them and the run fails.
 
 `run.sh` does not pull: it uses a client image already on the machine as
 it is. To test what CI tests (CI starts with no images), `docker pull` the
@@ -53,12 +53,20 @@ client images first.
 
 Each image is built and run on its own. One failing does not stop the
 others, and the exit status is 1 if any failed. An unsupported image name
-or `E2E_FLAT_NAME` exits 2 before anything is built.
+or `E2E_FLAT_NAME` exits 2 before anything is built. `run.sh` runs on
+bash 3.2 or later, macOS's `/bin/bash` included.
 
-Ctrl-C stops the whole run: the running test ends at its next command,
-printing its logs, and `run.sh` exits 130 instead of going on to the next
-image (143 for a TERM). `docker stop` on one test container ends that
-image's test the same way; it counts as failed, and the run goes on.
+Stopping a run:
+
+- **Ctrl-C** stops the whole run. It reaches `docker run` too, which
+  passes it to the container, so the running test ends at its next
+  command, printing its logs. `run.sh` then exits 130 instead of going on
+  to the next image.
+- **A TERM sent to `run.sh` alone** is not passed to the container. The
+  current image's build or test finishes first, and then `run.sh` exits
+  143 instead of starting the next.
+- **`docker stop` on one test container** ends that image's test at its
+  next command. It counts as failed, and the run goes on.
 
 Two runs on one machine with the same `E2E_FLAT_NAME` share image tags and
 container names, and each run removes a container of its name first. Give
@@ -76,11 +84,25 @@ each checkout its own name.
     about 6–8% of runs for each. The scenario then waits for that record's
     third retry, and the image takes about 14 minutes (one such run took
     855 s).
+  - Together that is about 13% of long-wait runs, roughly one in seven
+    or eight. This is derived from the retry schedule (2, then 4
+    minutes, each ±25%), not measured.
 - **All six in sequence:** 24.5 minutes.
 
 CI runs one job per image (`.github/workflows/ci.yaml`, job `e2e-flat`).
 The timeout is 15 minutes for the short images and 30 for the two that
-wait. A long-wait job can take about 18–21 minutes in the third-retry case.
+wait. No CI run has been timed yet. The estimates below are the local
+test times above plus a fresh runner's 2–5 minute cold build (the H2
+plan's Task 10):
+
+- a short job takes about 5–8 minutes;
+- a long-wait job takes about 8–12 minutes usually;
+- a long-wait job takes about 18–21 minutes in the third-retry case: the
+  14 minutes measured once, or up to about 16 by the harness's bounds,
+  plus the build.
+
+With two long-wait jobs, roughly one CI run in four has one that long
+(derived, as above).
 
 ## How it works
 
@@ -145,6 +167,13 @@ Assertions read:
 - **The daemon's own record:** its snake_case log events, the admin
   status JSON (`/?format=json`) and `/metrics`. One status-page text is
   read too: a failing suite's "backoff ends in".
+- **The proxy's answers, read with curl:**
+  - status codes: 502 for `acu-rogue`, 403 for the k8s shape's missing
+    file, 404 for `/fury`'s `InRelease` after the portal, and 200 for an
+    unvouched `.deb` on `plain.test`;
+  - the `X-Cache-Snapshot` header on the k8s `InRelease` after the
+    restart;
+  - the body of `/fury`'s `Packages.gz` behind the portal.
 
 The checks that could pass vacuously have controls on every image:
 
@@ -220,8 +249,18 @@ both:
 
 The failure message names the scenario. It prints the last 80 lines of
 the daemon's log and the last 30 of nginx's access log. An unexpected
-exit also prints the failing command. A failure on one image only may be
-that image's nginx, not its apt: nginx comes from each client image.
+exit also prints the failing command. When apt's output fails a check,
+apt's whole output is printed above the failure line, each line marked
+`|`; for a failure on one apt version, that is usually the part to read.
+A failure on one image only may also be that image's nginx, not its apt:
+nginx comes from each client image.
+
+A `timed out after 40s waiting for the daemon to exit` failure is
+`stop_daemon`'s bound. It covers the daemon's 30 s HTTP drain, its 1 s tunnel grace and a
+margin; a planned stop has nothing in flight and takes about a second.
+If it happens in `commit-delay`, suspect a broken 5-minute floor first:
+an unsigned adoption committing under the 45 s delay (the scenario's
+AIDEV-NOTE).
 
 To look around inside, keep the container. Run `test.sh` once per
 container: it flips the fixtures and keeps the cache, so start a new

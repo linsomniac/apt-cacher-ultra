@@ -4,7 +4,8 @@
 # container (nginx, the daemon and apt clients in one container).
 #
 #   E2E_FLAT_IMAGES           client images, whitespace-separated (default:
-#                             the six of spec §7, oldest apt first)
+#                             the six of spec §7, the oldest apt first and
+#                             the newest last)
 #   E2E_FLAT_UNSIGNED_IMAGES  the images that also run the unsigned
 #                             first-adoption scenario, which waits for its
 #                             confirmation, 5 to 15 minutes after first
