@@ -25,12 +25,17 @@ jobs:
       - name: e2ehooks seam
         run: |
           go vet -tags e2ehooks ./cmd/apt-cacher-ultra/
-          go test -tags e2ehooks -count=1 -run 'E2ECommitDelay' ./cmd/apt-cacher-ultra/
+          go test -tags e2ehooks -count=1 ./cmd/apt-cacher-ultra/
       - name: Verify portable Linux binary
         run: |
           CGO_ENABLED=1 make build
           if grep -q ACU_E2E_ build/apt-cacher-ultra; then
             echo "Release binary contains the e2e test seam (ACU_E2E_)" >&2
+            exit 1
+          fi
+          buildinfo="$(go version -m build/apt-cacher-ultra)"
+          if [[ "$buildinfo" == *-tags=*e2ehooks* ]]; then
+            echo "Release binary was built with -tags e2ehooks" >&2
             exit 1
           fi
           program_headers="$(readelf --program-headers --wide build/apt-cacher-ultra)"
@@ -98,6 +103,7 @@ jobs:
   # No retry: a flaky scenario must show. A failure that names a
   # distribution mirror is re-run alone.
   e2e-flat:
+    name: e2e-flat (${{ matrix.image }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

@@ -80,15 +80,6 @@ jobs:
           VERSION: ${{ steps.vars.outputs.version }}
         run: make build VERSION="$VERSION"
 
-      # e2e/flat's test seam is compiled only with -tags e2ehooks: never
-      # ship a binary that has it.
-      - name: Verify no e2e test seam
-        run: |
-          if grep -q ACU_E2E_ build/apt-cacher-ultra; then
-            echo "Release binary contains the e2e test seam (ACU_E2E_)" >&2
-            exit 1
-          fi
-
       - name: Install nfpm
         run: |
           set -euo pipefail
@@ -107,6 +98,25 @@ jobs:
         # Override Makefile-computed DEB_VERSION (which only strips
         # leading non-digits) so prerelease tags get tilde-translated.
         run: make deb VERSION="$VERSION" DEB_VERSION="$DEB_VERSION"
+
+      # e2e/flat's test seam is compiled only with -tags e2ehooks: never
+      # ship a binary that has it. Checked after `make deb`, whose `build`
+      # prerequisite rebuilds build/apt-cacher-ultra: this is the file nfpm
+      # just packaged and the next step stages. The grep catches the seam's
+      # ACU_E2E_ names; the build-info check catches the tag itself,
+      # whatever the names.
+      - name: Verify no e2e test seam
+        run: |
+          test -s build/apt-cacher-ultra
+          if grep -q ACU_E2E_ build/apt-cacher-ultra; then
+            echo "Release binary contains the e2e test seam (ACU_E2E_)" >&2
+            exit 1
+          fi
+          buildinfo="$(go version -m build/apt-cacher-ultra)"
+          if [[ "$buildinfo" == *-tags=*e2ehooks* ]]; then
+            echo "Release binary was built with -tags e2ehooks" >&2
+            exit 1
+          fi
 
       - name: Stage release artifacts
         env:

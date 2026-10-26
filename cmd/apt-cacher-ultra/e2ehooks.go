@@ -22,12 +22,14 @@ const e2eCommitDelayEnv = "ACU_E2E_COMMIT_DELAY"
 //
 // AIDEV-NOTE: compiled only with `go build -tags e2ehooks` (e2e/flat's
 // Dockerfile); every other build gets e2ehooks_off.go's no-op, so no
-// release binary reads ACU_E2E_COMMIT_DELAY (CI greps the release build for
-// the string). The seam is the adopter's own test hook
-// (Adopter.SetCommitDelayForTest), which the flip simulations already use.
-// e2ehooks_test.go pins the parse, its errors and the WARN line; that the
-// delay reaches the adopter is pinned by e2e/flat's commit-delay scenario
-// (outcome=hold_expired).
+// release binary reads ACU_E2E_COMMIT_DELAY. Every e2ehooks environment
+// variable must start with ACU_E2E_: CI's test job and the release
+// workflow grep release binaries for that prefix (they also check the
+// build info for the tag, whatever the names). The seam is the adopter's
+// own test hook (Adopter.SetCommitDelayForTest), which the flip
+// simulations already use. e2ehooks_test.go pins the parse, its errors and
+// the WARN line; that the delay reaches the adopter is pinned by e2e/flat's
+// commit-delay scenario (outcome=hold_expired).
 func applyE2EHooks(a *freshness.Adopter, logger *slog.Logger) error {
 	v := os.Getenv(e2eCommitDelayEnv)
 	if v == "" || a == nil {
