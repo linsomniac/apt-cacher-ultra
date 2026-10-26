@@ -125,8 +125,10 @@ jobs:
       # scenario and both log tails) would be lost. timeout(1) instead
       # sends INT to the whole step's process group 3 minutes before the
       # job's limit (27 of 30, 12 of 15): docker run passes it into the
-      # container, test.sh's INT trap prints the tails within seconds
-      # (docker run relayed them in 6 of 7 local trials), and -k 60 kills
+      # container, and test.sh's INT trap prints the tails once the command
+      # it is running returns, since bash runs a trap only between commands:
+      # normally within seconds, but a command stuck for good still loses
+      # them (docker run relayed them in 6 of 7 local trials). -k 60 kills
       # what is left a minute later. The last 2 minutes cover the checkout
       # before this step and the runner's own overhead.
       - run: timeout -s INT -k 60 "${E2E_STEP_MINUTES}m" bash e2e/flat/run.sh

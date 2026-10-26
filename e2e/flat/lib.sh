@@ -90,7 +90,7 @@ fail() {
 # nothing.
 show_logs() {
     if [[ -z $DAEMON_PID ]]; then
-        echo "=== daemon: none started by the harness at this point"
+        echo "=== daemon: none running under the harness (not yet started, or ended by a planned stop)"
     elif kill -0 "$DAEMON_PID" 2> /dev/null; then
         echo "=== daemon pid $DAEMON_PID: running"
     else
@@ -319,9 +319,11 @@ metric() {
 }
 
 # metric_sum NAME FILE: the sum of every sample of metric NAME, with or
-# without labels, in FILE, a copy of /metrics (0 when it has none).
+# without labels, in FILE, a copy of /metrics (0 when it has none). The
+# value is a sample's last field ($NF), not $2: a label value may hold a
+# space, and the daemon's renderer (internal/metrics) writes no timestamp.
 metric_sum() {
-    awk -v m="$1" '$1 == m || index($1, m "{") == 1 {v += $2} END {print v + 0}' "$2"
+    awk -v m="$1" '$1 == m || index($1, m "{") == 1 {v += $NF} END {print v + 0}' "$2"
 }
 
 # baseline START HOST SUITE...: waits (10 s at most) until every suite's

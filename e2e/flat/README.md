@@ -331,6 +331,9 @@ failure.
   module proxy. A mirror failure names the mirror, such as
   `Failed to fetch http://deb.debian.org/…` or `404  Not Found`. Re-run
   that job; a mirror that moved for good is a maintenance item (below).
+  A build can also fail on the code itself (a Go compile error, a
+  Dockerfile change): that fails the same way on every image, and on a
+  re-run.
 - **`[e2e-flat] <image> FAIL (test)`** is the test, which uses no network:
   its only upstream is its own nginx. So it is never a network flake.
 - **The baseline is clean.** Every scenario passed on all six images in
