@@ -275,6 +275,86 @@ refused_older() {
     log_has "$SCENARIO_MARK" "$(event adoption_refused)" "$(suite_kv "$1")" "$(kv reason upstream_older)"
 }
 
+# libnvidia-container's Date never changes: a new publish with the same
+# Date adopts (spec C5: only an older Date is refused).
+frozen_date() {
+    scenario frozen-date "an InRelease-only, SHA512-only repository with a frozen Date publishes v2"
+    local start
+    start=$(date +%s)
+    apt_update main
+    baseline "$start" signed.test "$NVIDIA"
+    publish nvidia v2
+    until_candidates "$REACH" main -- acu-nvidia=2.0
+    by_client
+    say "acu-nvidia 2.0 reached the client ${POLL_TOOK}s after the publish"
+    apt_install main acu-nvidia=2.0
+    log_has "$SCENARIO_MARK" "$(event request)" "$(kv path "$NVIDIA/./acu-nvidia_2.0_amd64.deb")" "$(kv validated_hash true)" ||
+        fail "acu-nvidia 2.0 was not served vouched"
+    passed
+}
+
+# Release-less repositories (spec C4 Dispatch 4) and the phase G
+# carry-forward: a republished index reaches a client within one cooldown
+# when clients ask, and within one periodic_refresh when none does; an
+# upstream that then answers HTML keeps the old index.
+anchorless() {
+    scenario anchorless "Release-less repositories: republished indexes, then a captive portal"
+    local start rejected
+    start=$(date +%s)
+    apt_update main
+    baseline "$start" plain.test /goreleaser
+    publish goreleaser v2
+    until_candidates "$REACH" main -- acu-goreleaser=2.0
+    by_client
+    say "acu-goreleaser 2.0 reached the client ${POLL_TOOK}s after the publish (cooldown ${COOLDOWN}s)"
+    apt_install main acu-goreleaser=2.0
+
+    publish fury v2
+    # No client asks: the scheduler alone refreshes it.
+    poll $((PERIODIC + TICK + 10)) "the scheduler's anchorless refresh of /fury" log_has "$SCENARIO_MARK" \
+        "$(event freshness_check)" "$(suite_kv /fury)" "$(kv result anchorless_refreshed)" 'rows_replaced=[1-9]'
+    say "the scheduler refreshed /fury ${POLL_TOOK}s after the publish (periodic_refresh ${PERIODIC}s)"
+    apt_update main
+    candidates_are main acu-fury=2.0 || fail "the client sees acu-fury $(candidate main acu-fury), want 2.0"
+    apt_install main acu-fury=2.0
+
+    say "the upstream now answers an HTML page for every /fury path"
+    rejected=$(metric 'acu_anchorless_sniff_rejected_total{host="plain.test"}')
+    touch /run/acu-e2e/captive
+    # A client during the outage keeps its index: the cache answers the
+    # index from its copy, and the check an update triggers (once a
+    # cooldown) rejects the portal's page. apt also reports the page it got
+    # for the missing Release, as it would fetching directly.
+    poll "$REACH" "an anchorless check to reject the HTML page" update_until_rejected "$rejected"
+    candidates_are main acu-fury=2.0 || fail "behind the portal the client sees acu-fury $(candidate main acu-fury)"
+    "${CURL[@]}" -fsS -o /clients/main/fury-Packages.gz -x "$PROXY" http://plain.test/fury/Packages.gz
+    zcat /clients/main/fury-Packages.gz > /clients/main/fury-Packages
+    grep -q '^Version: 2.0$' /clients/main/fury-Packages ||
+        fail "the cache no longer serves /fury's 2.0 Packages.gz behind the captive portal"
+    rm /run/acu-e2e/captive
+    # The portal's pages the outage's misses cached as InRelease and
+    # Release are deleted by the next anchorless check, which the next
+    # client update triggers (spec C4 Dispatch 4: an anchor answered 404).
+    poll "$REACH" "/fury's updates to be clean after the portal" fury_clean
+    passed
+}
+
+# update_until_rejected BEFORE: a client update, and the sniff-rejection
+# counter of plain.test has grown past BEFORE.
+update_until_rejected() {
+    apt_update main
+    (($(metric 'acu_anchorless_sniff_rejected_total{host="plain.test"}') > $1))
+}
+
+# fury_clean: an update shows no error for /fury, and the cache answers
+# /fury's InRelease 404 again (the portal's cached page is gone). The
+# InRelease is an anchor, so its limit is 35 s, as restart's.
+fury_clean() {
+    apt_update main
+    ! grep -E '^(E|Err|Error):.*plain\.test/fury' "$APT_LOG" > /dev/null &&
+        [[ $(curl --max-time 35 -s -o /dev/null -w '%{http_code}' -x "$PROXY" http://plain.test/fury/InRelease) == 404 ]]
+}
+
 # The snapshots survive a restart: the same snapshot ids, a clean update
 # with the same candidates, and anchors served from the snapshots.
 restart() {
@@ -382,6 +462,8 @@ setup
 first_contact
 pr8_table
 older_date
+frozen_date
+anchorless
 restart
 upstream_down
 stop_daemon
