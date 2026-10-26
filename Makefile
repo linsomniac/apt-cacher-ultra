@@ -44,7 +44,12 @@ e2e:
 
 # Spec §7 real-apt end-to-end test of flat repositories: nginx, the daemon
 # and apt clients in one container per client image (e2e/flat/README.md).
-# E2E_FLAT_IMAGES selects the images (default: the six of spec §7).
+# Default images: debian:11 ubuntu:22.04 ubuntu:24.04 debian:12 debian:13
+# ubuntu:26.04, about 2.5 minutes each plus the build; debian:11 and
+# ubuntu:26.04 also wait for the unsigned confirmation, which lands 5 to 15
+# minutes after first contact (about 6 to 7 minutes each in all, about 14
+# when a third retry is needed). Override with E2E_FLAT_IMAGES (and
+# E2E_FLAT_UNSIGNED_IMAGES).
 e2e-flat:
 	bash e2e/flat/run.sh
 
