@@ -173,7 +173,10 @@ var logSinks = map[string]int{
 // constant nor a forwarding helper's parameter, each with the constants
 // its value comes from. The list is checked against the code: every value
 // the field is assigned in its file must be one of them (or a snake_case
-// literal), so a new step fails until it is listed here.
+// literal), so a new step fails until it is listed here, and each of them
+// must be assigned, so a stale entry fails too. A literal of the field's
+// struct type must key its fields, so each value is read (the H1 final
+// review's tests I-1).
 var fieldMessages = map[string][]string{
 	"internal/freshness/reaper.go h.step": {"stepReadRow", "stepDeleteMetadata", "stepReap"},
 }
@@ -350,9 +353,11 @@ func logMessages(t *testing.T) map[string]string {
 			if f.rel != rel {
 				continue
 			}
-			for _, v := range fieldValues(f.file, field) {
+			assigned := map[string]bool{}
+			for _, v := range fieldValues(t, f, field) {
 				where := f.rel + ":" + strconv.Itoa(guardFset.Position(v.Pos()).Line)
 				if id, ok := v.(*ast.Ident); ok && slices.Contains(names, id.Name) {
+					assigned[id.Name] = true
 					continue
 				}
 				if lit, ok := v.(*ast.BasicLit); ok && lit.Kind == token.STRING {
@@ -365,17 +370,45 @@ func logMessages(t *testing.T) map[string]string {
 					"make it a snake_case event constant and add it there (internal/observability/event_names_test.go)",
 					where, expr, types.ExprString(v))
 			}
+			for _, c := range names {
+				if !assigned[c] {
+					t.Errorf("%s: fieldMessages[%q] lists %s, which %s is never assigned; "+
+						"remove it there (internal/observability/event_names_test.go)", f.rel, key, c, expr)
+				}
+			}
 		}
 	}
 	return msgs
 }
 
-// fieldValues returns the values file assigns to a field named field: the
+// fieldValues returns the values f assigns to the field named field: the
 // right side of each assignment to a selector of that name (h.step, h.err =
-// stepReap, err), and the value of each composite-literal key of that name.
-func fieldValues(file *ast.File, field string) []ast.Expr {
+// stepReap, err), and the value of each key of that name in a composite
+// literal of the struct type f declares it in (heldReap). A positional
+// element of such a literal is reported: its value cannot be told from the
+// other fields', so it would pass unread.
+func fieldValues(t *testing.T, f goFile, field string) []ast.Expr {
+	t.Helper()
+	var typeName string
+	for _, decl := range f.file.Decls {
+		g, ok := decl.(*ast.GenDecl)
+		if !ok || g.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range g.Specs {
+			ts := spec.(*ast.TypeSpec)
+			if st, ok := ts.Type.(*ast.StructType); ok && slices.ContainsFunc(st.Fields.List, func(fl *ast.Field) bool {
+				return slices.ContainsFunc(fl.Names, func(n *ast.Ident) bool { return n.Name == field })
+			}) {
+				typeName = ts.Name.Name
+			}
+		}
+	}
+	if typeName == "" {
+		t.Errorf("%s: no struct type declares the field %s that fieldMessages names", f.rel, field)
+	}
 	var values []ast.Expr
-	ast.Inspect(file, func(n ast.Node) bool {
+	ast.Inspect(f.file, func(n ast.Node) bool {
 		switch s := n.(type) {
 		case *ast.AssignStmt:
 			for i, lhs := range s.Lhs {
@@ -387,9 +420,20 @@ func fieldValues(file *ast.File, field string) []ast.Expr {
 					}
 				}
 			}
-		case *ast.KeyValueExpr:
-			if key, ok := s.Key.(*ast.Ident); ok && key.Name == field {
-				values = append(values, s.Value)
+		case *ast.CompositeLit:
+			if id, ok := s.Type.(*ast.Ident); !ok || id.Name != typeName {
+				return true
+			}
+			for _, e := range s.Elts {
+				kv, ok := e.(*ast.KeyValueExpr)
+				if !ok {
+					t.Errorf("%s:%d: a %s literal with positional fields; key them (%s: …), so the guard reads its %s",
+						f.rel, guardFset.Position(e.Pos()).Line, typeName, field, field)
+					break
+				}
+				if key, ok := kv.Key.(*ast.Ident); ok && key.Name == field {
+					values = append(values, kv.Value)
+				}
 			}
 		}
 		return true

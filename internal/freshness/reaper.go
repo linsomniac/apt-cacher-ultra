@@ -600,7 +600,9 @@ func (r *Reaper) reapSuite(ctx context.Context, c reapCandidate) (reaped bool) {
 // failure line's message. A new step must be a snake_case event constant,
 // listed in fieldMessages in internal/observability/event_names_test.go
 // (whose guard fails any other value assigned to h.step), with a
-// docs/log-fields.md row (the suite reaper's shared one).
+// docs/log-fields.md row (the suite reaper's shared one). A heldReap
+// literal keys its fields (the guard fails a positional one, whose step
+// it cannot read), and a step no longer assigned leaves the list.
 const (
 	stepReadRow        = "suite_reaper_read_suite_row_failed"
 	stepDeleteMetadata = "suite_reaper_delete_metadata_failed"
