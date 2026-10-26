@@ -1,4 +1,4 @@
-.PHONY: build test test-race lint fmt deb e2e deb-test apt-repo-test clean
+.PHONY: build test test-race lint fmt deb e2e e2e-flat deb-test apt-repo-test clean
 
 GO        ?= go
 BIN       := apt-cacher-ultra
@@ -41,6 +41,12 @@ deb: build
 # `docker` + `docker compose`.
 e2e:
 	bash e2e/run.sh
+
+# Spec §7 real-apt end-to-end test of flat repositories: nginx, the daemon
+# and apt clients in one container per client image (e2e/flat/README.md).
+# E2E_FLAT_IMAGES selects the images (default: the six of spec §7).
+e2e-flat:
+	bash e2e/flat/run.sh
 
 # SPEC §14 step 3 .deb install validation: build the .deb in a
 # golang stage, then install on each Ubuntu LTS target and verify
