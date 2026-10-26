@@ -299,7 +299,7 @@ frozen_date() {
 # upstream that then answers HTML keeps the old index.
 anchorless() {
     scenario anchorless "Release-less repositories: republished indexes, then a captive portal"
-    local start rejected
+    local start rejected mark
     start=$(date +%s)
     apt_update main
     baseline "$start" plain.test /goreleaser
@@ -309,9 +309,17 @@ anchorless() {
     say "acu-goreleaser 2.0 reached the client ${POLL_TOOK}s after the publish (cooldown ${COOLDOWN}s)"
     apt_install main acu-goreleaser=2.0
 
+    # AIDEV-NOTE: two orderings. The 48 s bound, periodic_refresh + a tick
+    # + 10 s, counts from the publish and holds because /fury's last
+    # success was at or before it: the scheduler checks /fury again
+    # periodic_refresh after that success, picked up within a tick. And
+    # this scheduler half comes before the portal half: the portal's failed
+    # checks put /fury into the scheduler's 2-minute backoff
+    # (freshness.CheckBackoff), past this bound.
+    mark=$(log_mark)
     publish fury v2
     # No client asks: the scheduler alone refreshes it.
-    poll $((PERIODIC + TICK + 10)) "the scheduler's anchorless refresh of /fury" log_has "$SCENARIO_MARK" \
+    poll $((PERIODIC + TICK + 10)) "the scheduler's anchorless refresh of /fury" log_has "$mark" \
         "$(event freshness_check)" "$(suite_kv /fury)" "$(kv result anchorless_refreshed)" 'rows_replaced=[1-9]'
     say "the scheduler refreshed /fury ${POLL_TOOK}s after the publish (periodic_refresh ${PERIODIC}s)"
     apt_update main
@@ -327,8 +335,10 @@ anchorless() {
     # for the missing Release, as it would fetching directly.
     poll "$REACH" "an anchorless check to reject the HTML page" update_until_rejected "$rejected"
     candidates_are main acu-fury=2.0 || fail "behind the portal the client sees acu-fury $(candidate main acu-fury)"
-    "${CURL[@]}" -fsS -o /clients/main/fury-Packages.gz -x "$PROXY" http://plain.test/fury/Packages.gz
-    zcat /clients/main/fury-Packages.gz > /clients/main/fury-Packages
+    "${CURL[@]}" -fsS -o /clients/main/fury-Packages.gz -x "$PROXY" http://plain.test/fury/Packages.gz ||
+        fail "the cache did not answer /fury/Packages.gz behind the captive portal"
+    zcat /clients/main/fury-Packages.gz > /clients/main/fury-Packages ||
+        fail "the cache's /fury/Packages.gz behind the portal is not gzip (the portal's page?)"
     grep -q '^Version: 2.0$' /clients/main/fury-Packages ||
         fail "the cache no longer serves /fury's 2.0 Packages.gz behind the captive portal"
     rm /run/acu-e2e/captive
@@ -336,6 +346,7 @@ anchorless() {
     # Release are deleted by the next anchorless check, which the next
     # client update triggers (spec C4 Dispatch 4: an anchor answered 404).
     poll "$REACH" "/fury's updates to be clean after the portal" fury_clean
+    say "/fury's updates were clean ${POLL_TOOK}s after the portal"
     passed
 }
 
