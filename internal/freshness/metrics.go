@@ -174,7 +174,7 @@ var (
 	// and of Task 9 for checkLockedSafe's report).
 	freshnessUnloggedPanics = metrics.NewCounter(
 		"acu_freshness_unlogged_panics_total",
-		"Recovered panics (a freshness check, scheduler tick, retry spread, adoption and its counters, failure record, adoption heartbeat, repair, reconcile, reaper run or POST /forget) that could not be logged because reporting them panicked too, or that struck the counting itself (a bug).",
+		"Recovered panics — of a freshness check (scheduled or client-triggered), scheduler tick, retry spread, adoption and its counters, failure record, adoption heartbeat, repair, reconcile, reaper run or POST /forget — that could not be logged because reporting them panicked too, or that struck the counting itself (a bug).",
 	)
 
 	adoptionTotal = metrics.NewCounterWithCap(
