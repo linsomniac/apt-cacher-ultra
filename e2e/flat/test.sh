@@ -525,6 +525,7 @@ commit_delay() {
 # adoption lands between 300 s and 900 s after first contact (design
 # note 7); the deadline adds a refresh interval, a tick and 30 s.
 UNSIGNED_DEADLINE=$((900 + PERIODIC + TICK + 30))
+RETRY_PAST_5M=""
 unsigned_first_adoption() {
     if [[ ${E2E_UNSIGNED_WAIT:-0} != 1 ]]; then
         say "=== scenario unsigned-first-adoption: skipped on this image (E2E_UNSIGNED_WAIT is not 1)"
@@ -550,38 +551,65 @@ unsigned_first_adoption() {
     # no snapshot vouches is still served on plain.test.
     [[ $("${CURL[@]}" -s -o /dev/null -w '%{http_code}' -x "$PROXY" http://plain.test/goreleaser/acu-goreleaser_2.0_amd64.deb) == 200 ]] ||
         fail "plain.test refused an unvouched .deb after an unsigned adoption"
-    # The 403 variant needs an hour between its observations: once its
-    # record's second retry has come 5 minutes or more after its first
-    # observation — where a 5-minute gap would have confirmed it — it is
-    # still unadopted.
+    # The 403 variant needs an hour between its observations: once a retry
+    # of its record has come 5 minutes or more after its first observation
+    # — where a 5-minute gap would have confirmed it — it is still
+    # unadopted.
     left=$((UNSIGNED_FIRST_CONTACT + UNSIGNED_DEADLINE - SECONDS))
     ((left > 0)) || left=1
-    poll_quietly "$left" second_retry_past_5m /unsigned403 ||
-        fail "plain.test/unsigned403's record never reached its second retry past 5 minutes: $(record_of /unsigned403)"
+    poll_quietly "$left" retry_past_5m /unsigned403 ||
+        fail "plain.test/unsigned403's record had no retry 5 minutes or more after its first observation: $(record_of /unsigned403)"
     [[ -z $(suite plain.test /unsigned403 current_snapshot_id) ]] ||
         fail "plain.test/unsigned403 adopted $((SECONDS - UNSIGNED_FIRST_CONTACT))s after its first contact, before its one-hour confirmation"
     [[ $(suite plain.test /unsigned403 adoption_fail_reason) == unsigned_unconfirmed ]] ||
         fail "plain.test/unsigned403 is not waiting for its confirmation: $(record_of /unsigned403)"
+    say "plain.test/unsigned403 still waits after a retry ${RETRY_PAST_5M}s after its first observation"
     passed
 }
 
-# second_retry_past_5m PATH: plain.test PATH's record has been written three
-# times (the first observation and two retries) and its first observation
-# is 5 minutes old — or PATH adopted, which clears the record (the caller
-# then fails on the adoption).
+# retry_past_5m PATH: a retry of plain.test PATH's record came 5 minutes or
+# more after its first observation, and RETRY_PAST_5M is how long after —
+# or PATH adopted, which clears the record (the caller then fails on the
+# adoption). The first observation is the record's
+# adoption_fail_first_unixtime, the stamp the daemon measures the
+# confirmation gap from; a write's time is its adoption_refused line's
+# next_retry_unixtime - retry_in_seconds.
 #
-# AIDEV-NOTE: it checks the record's count and its first observation's
-# age, not when the second retry came. A second retry before 300 s (about
-# 6 % of runs, deviation 2) satisfies it although no retry has yet come 5
-# minutes after the first observation, and the 403 check is then vacuous:
-# Task 8's first deniedConfirmGap-mutant run passed that way (second retry
-# at +285 s).
-second_retry_past_5m() {
-    local count first
+# AIDEV-NOTE: a write's time, not the record's count: the retries come 2,
+# then 4 minutes apart, each ±25 %, so in about 6 % of runs the second
+# retry comes before 300 s (deviation 2), and "two retries and a first
+# observation 5 minutes old" then holds with no retry past 5 minutes (the
+# 403 check passed vacuously in Task 8's first deniedConfirmGap-mutant
+# run, second retry at +285 s). Such a run waits for the third retry
+# instead, 630-905 s after the first observation (8 minutes ±25 % after a
+# second retry before 305 s): with a tick, about 916 s after first contact
+# at the latest, inside UNSIGNED_DEADLINE. A write counts from 305 s: both
+# logged fields are truncated to the second, so the difference can be the
+# write's second or the one after (1 s), and the daemon reads its clock
+# for the gap when the check starts, before the probe's requests, and
+# again for the write (a few milliseconds here; 4 s allowed). The first
+# observation's own write is at its stamp or a second after, so it never
+# counts.
+retry_past_5m() {
+    local first next delay
     [[ -z $(suite plain.test "$1" current_snapshot_id) ]] || return 0
-    count=$(suite plain.test "$1" adoption_fail_count)
     first=$(suite plain.test "$1" adoption_fail_first_unixtime)
-    [[ -n $count && -n $first ]] && ((count >= 3 && $(date +%s) - first >= 300))
+    [[ -n $first ]] || return 1
+    while read -r next delay; do
+        if ((next - delay >= first + 305)); then
+            RETRY_PAST_5M=$((next - delay - first))
+            return 0
+        fi
+    done < <(log_lines 0 "$(event adoption_refused)" "$(kv canonical_host plain.test)" "$(suite_kv "$1")" \
+        "$(kv reason unsigned_unconfirmed)" | awk '{
+            n = r = ""
+            for (i = 1; i <= NF; i++) {
+                if (index($i, "next_retry_unixtime=") == 1) n = substr($i, 21)
+                if (index($i, "retry_in_seconds=") == 1) r = substr($i, 18)
+            }
+            if (n != "" && r != "") print n, r
+        }')
+    return 1
 }
 
 # record_of PATH: plain.test PATH's failure record, from the status JSON.
