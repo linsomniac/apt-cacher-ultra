@@ -249,8 +249,11 @@ type reapCandidate struct {
 // reapUptimeFloor — an age alert alone never fires for a reaper that has
 // not completed a run since its start. The series is also absent for the
 // floor after every start, so the absent() leg must hold for longer than
-// reapUptimeFloor + reapInterval (a Prometheus for: clause) or it pages
-// on every restart. The gauge is not seeded at Run's start on purpose:
+// reapUptimeFloor + reapInterval (a Prometheus for: clause): a hold
+// shorter than the floor (plus the run's own time and the scrape delay)
+// pages on every restart, and one under floor + interval pages whenever
+// the first run after a start does not complete, before the second can
+// (Task 18 review M-1). The gauge is not seeded at Run's start on purpose:
 // that would claim a run that did not happen (Task 6 review minor 3).
 func (r *Reaper) runOnce(ctx context.Context) {
 	start := time.Now()

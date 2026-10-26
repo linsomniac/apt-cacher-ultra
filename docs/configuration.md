@@ -709,8 +709,8 @@ a missing file, or one too large for the audit to read
 (`anchor_oversized`, not proven bad), keeps its rows. A snapshot whose
 pool file cannot be read at all is deferred, not judged: an ERROR
 `legacy_trust_audit_deferred` names it at every start, and it keeps its
-rows and files until the pool is fixed or the suite is forgotten
-(`POST /forget`). A suite quarantined for declarations outside its signature
+rows and files until the pool is fixed or the suite is reaped or
+forgotten (`POST /forget`). A suite quarantined for declarations outside its signature
 adopts again on its first freshness check, because its tampered copy never
 matches a clean upstream; one quarantined because its stored file was lost
 or corrupt waits for the next upstream change, and may have no record that
@@ -893,8 +893,10 @@ sets the gauge `acu_suite_reaper_last_run_unixtime`, which has no series
 until the first completed run, an hour after the start. To catch a
 reaper that stopped, alert when the gauge has been absent for longer
 than two hours (`absent(acu_suite_reaper_last_run_unixtime)` with a
-Prometheus `for:` longer than that first hour plus one interval; a
-shorter one pages after every restart) or when its age exceeds two hours
+Prometheus `for:` longer than that first hour plus one interval: a hold
+shorter than the first hour, plus the run's own time and the scrape
+delay, pages after every restart, and one under two hours pages whenever
+the first run after a start does not complete) or when its age exceeds two hours
 (one interval plus that first hour); an age alert alone never fires for
 a reaper that has not completed a run since its start.
 The reaper deletes no package, but a reaped suite's packages

@@ -87,7 +87,6 @@ var mainEventsWithoutARow = []string{
 	"schema_migrating",
 	"snapshot_member_refetch_mismatch",
 	"source_hash_conflict",
-	"source_parse_failed",
 	"source_parsed",
 	"stale_serve",
 	"tls_mitm_enabled",
