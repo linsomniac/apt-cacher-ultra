@@ -129,6 +129,52 @@ stop_daemon() {
     echo "WARN: :3142 still reachable 5s after stop_daemon"
 }
 
+# wait_snapshot COLUMN FILE LIMIT: polls once a second, LIMIT times,
+# until /dists/noble's current snapshot records FILE's SHA-256 in
+# COLUMN (inrelease_hash or release_hash). Sets SNAPSHOT_ID and
+# SNAPSHOT_AFTER (seconds) on success; returns 1 on timeout.
+#
+# AIDEV-NOTE: eager first adoption (flat-repositories spec C4 Dispatch
+# 3) adopts a suite at its first contact, so "some snapshot is current"
+# no longer says which upstream version was adopted: every wait names
+# the exact anchor bytes it expects.
+wait_snapshot() {
+    local column=$1 file=$2 limit=$3 want got i
+    want="$(sha256sum "$file" | cut -d' ' -f1)"
+    SNAPSHOT_ID=""
+    # An unreadable FILE would leave want empty, which a snapshot whose
+    # COLUMN is NULL (IFNULL → '') would match: refuse it instead.
+    if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "wait_snapshot: cannot hash $file"
+        return 1
+    fi
+    for i in $(seq 1 "$limit"); do
+        got=$(sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+            "SELECT f.current_snapshot_id || '|' || IFNULL(s.${column}, '') FROM suite_freshness f JOIN suite_snapshot s ON s.snapshot_id = f.current_snapshot_id WHERE f.suite_path='/dists/noble' LIMIT 1;" \
+            2>/dev/null || echo "")
+        if [[ -n "$got" && "${got#*|}" == "$want" ]]; then
+            SNAPSHOT_ID="${got%%|*}"
+            SNAPSHOT_AFTER=$i
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# dump_adoption_state: the suite and snapshot rows and the daemon log
+# tail, for a failed wait.
+dump_adoption_state() {
+    echo "=== suite_freshness ==="
+    sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+        "SELECT canonical_scheme, canonical_host, suite_path, current_snapshot_id, inrelease_change_seen_at FROM suite_freshness;" || true
+    echo "=== suite_snapshot ==="
+    sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+        "SELECT snapshot_id, suite_path, inrelease_hash, release_hash, release_gpg_hash, adopted_at FROM suite_snapshot;" || true
+    echo "=== daemon log tail ==="
+    tail -100 "$daemon_log" || true
+}
+
 echo "[deb-test] launching daemon (same ExecStart as systemd unit)"
 runuser -u apt-cacher-ultra -- \
     /usr/sbin/apt-cacher-ultra --config /etc/apt-cacher-ultra/config.toml \
@@ -185,9 +231,11 @@ echo "[deb-test] phase 1 (package contract + listener) PASS"
 #
 # Restart the daemon under an adoption-mode config and verify the
 # cache adopts a snapshot when upstream's signed InRelease changes.
-# Adoption only fires on changed InRelease bytes (freshness.go:455);
-# the fixture provides V1 + V2 trees signed with the same key, and
-# we drive a swap between two metadata GETs.
+# The fixture provides V1 + V2 trees signed with the same key. The
+# first GET of V1 adopts it at once (eager first adoption, flat-
+# repositories spec C4 Dispatch 3); swapping to V2 and GETting the
+# InRelease again drives a second, change-driven adoption, which this
+# phase waits for by V2's exact InRelease bytes.
 # ============================================================
 
 echo
@@ -305,6 +353,18 @@ if [[ "$status" != "200" ]]; then
 fi
 echo "[deb-test] V1 InRelease: $(wc -c < /tmp/inrelease.v1) bytes"
 
+# 2a': that miss created the suite and started its first check, which
+# adopts V1 at once (eager first adoption). Wait for it, so the V2
+# change below is checked against an adopted suite, not raced by the
+# first adoption still holding the suite.
+echo "[deb-test] phase 2: wait for the eager first adoption of V1"
+if ! wait_snapshot inrelease_hash /fixture-v1/dists/noble/InRelease 30; then
+    echo "FAIL: V1 was not adopted at first contact within 30s"
+    dump_adoption_state
+    exit 1
+fi
+echo "[deb-test] V1 adopted at first contact: snapshot id=$SNAPSHOT_ID (after ${SNAPSHOT_AFTER}s)"
+
 # 2b: swap upstream to V2 (different .deb version → different
 # Packages SHA256 → different Release content → different InRelease
 # bytes). Sleep > cooldown (1s) so the next request's freshness
@@ -315,10 +375,10 @@ rm -rf /var/www/html/*
 cp -r /fixture-v2/dists /var/www/html/
 cp -r /fixture-v2/pool /var/www/html/
 
-# 2c: drive a second InRelease GET. The cache hits its url_path row
-# from 2a, fires maybeFireFreshness, the freshness check sees changed
+# 2c: drive a second InRelease GET. The cache serves it from the V1
+# snapshot, fires maybeFireFreshness, the freshness check sees changed
 # bytes, and spawns the adoption goroutine.
-echo "[deb-test] phase 2: GET InRelease via proxy (cache hit → fires freshness check → adoption)"
+echo "[deb-test] phase 2: GET InRelease via proxy (snapshot hit → fires freshness check → adoption)"
 status=$(curl -sS -x http://127.0.0.1:3142 \
     -o /tmp/inrelease.trigger \
     -w '%{http_code}' \
@@ -329,36 +389,18 @@ if [[ "$status" != "200" ]]; then
     exit 1
 fi
 
-# 2d: poll suite_freshness for current_snapshot_id. Adoption is
-# async; the response in 2c was served from the V1 cache (it doesn't
-# wait for adoption to commit).
-echo "[deb-test] phase 2: poll suite_freshness for current_snapshot_id"
-adopted=0
-adopted_id=""
-for i in $(seq 1 30); do
-    val=$(sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
-        "SELECT IFNULL(current_snapshot_id, '') FROM suite_freshness WHERE suite_path='/dists/noble' LIMIT 1;" \
-        2>/dev/null || echo "")
-    if [[ -n "$val" ]]; then
-        adopted=1
-        adopted_id="$val"
-        echo "[deb-test] adopted snapshot id=$val (after ${i}s)"
-        break
-    fi
-    sleep 1
-done
-if [[ $adopted -eq 0 ]]; then
-    echo "FAIL: no snapshot adopted within 60s"
-    echo "=== suite_freshness ==="
-    sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
-        "SELECT canonical_scheme, canonical_host, suite_path, current_snapshot_id, inrelease_change_seen_at FROM suite_freshness;" || true
-    echo "=== suite_snapshot ==="
-    sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
-        "SELECT snapshot_id, canonical_host, suite_path, adopted_at FROM suite_snapshot;" || true
-    echo "=== daemon log tail ==="
-    tail -100 "$daemon_log" || true
+# 2d: poll for the V2 snapshot. Adoption is async (the response in 2c
+# came from the V1 snapshot), and the flip barrier first waits for the
+# suite's InRelease serves to go quiet (adoption.flip_quiet_period,
+# 10 s by default).
+echo "[deb-test] phase 2: poll for the V2 snapshot"
+if ! wait_snapshot inrelease_hash /fixture-v2/dists/noble/InRelease 60; then
+    echo "FAIL: V2 was not adopted within 60s"
+    dump_adoption_state
     exit 1
 fi
+adopted_id="$SNAPSHOT_ID"
+echo "[deb-test] adopted V2 snapshot id=$adopted_id (after ${SNAPSHOT_AFTER}s)"
 
 # 2e: a follow-up GET should now serve via snapshot_member resolution
 # and set the X-Cache-Snapshot response header (SPEC2 §6.1 / §10.1).
@@ -390,21 +432,15 @@ echo "[deb-test] phase 2 (inline adoption smoke) PASS"
 # SPEC2 §7.6.3 phase 3: detached-mode adoption smoke
 #
 # Re-runs the phase-2 flow with detached fixtures (Release +
-# Release.gpg, no InRelease). Validates that the freshness checker
-# falls back from the inline path to detached when no InRelease
-# url_path row exists, and that adoption produces a snapshot whose
-# release_hash is set and inrelease_hash is nil.
+# Release.gpg, no InRelease). Validates that a suite whose upstream
+# publishes no InRelease is adopted in the detached form — at first
+# contact, by the probe tree (InRelease absent → Release →
+# Release.gpg: flat-repositories spec C4 Dispatch 3), then again when
+# its Release changes — and that the adopted snapshot's release_hash
+# is set and inrelease_hash is nil.
 #
 # A clean cache directory is required: phase 2 already adopted an
-# inline snapshot. After the wipe there is no InRelease url_path
-# row alongside the seeded Release rows, so the inline checker
-# takes the missing-InRelease-url_path branch (freshness.go
-# checkLockedInline → fallback=true) and the freshness goroutine
-# runs RunDetached. The companion 404 fallback branch (cached
-# InRelease url_path row + 404 from upstream + nil current
-# snapshot) is covered by unit tests in freshness_test.go; the
-# e2e harness only needs to confirm one fallback flavor end-to-end
-# because both branches converge on the same RunDetached call.
+# inline snapshot.
 # ============================================================
 
 echo
@@ -476,6 +512,16 @@ for path in /dists/noble/Release /dists/noble/Release.gpg; do
 done
 echo "[deb-test] V1 Release: $(wc -c < /tmp/Release.v1d) bytes; Release.gpg: $(wc -c < /tmp/Release.gpg.v1d) bytes"
 
+# 3a': the Release miss created the suite; its first check adopts
+# V1-detached at once (eager first adoption, detached form).
+echo "[deb-test] phase 3: wait for the eager first adoption of V1-detached"
+if ! wait_snapshot release_hash /fixture-v1-detached/dists/noble/Release 30; then
+    echo "FAIL: V1-detached was not adopted at first contact within 30s"
+    dump_adoption_state
+    exit 1
+fi
+echo "[deb-test] V1-detached adopted at first contact: snapshot id=$SNAPSHOT_ID (after ${SNAPSHOT_AFTER}s)"
+
 # 3b: swap to V2-detached.
 echo "[deb-test] phase 3: swap nginx webroot to V2-detached"
 sleep 2
@@ -483,16 +529,13 @@ rm -rf /var/www/html/*
 cp -r /fixture-v2-detached/dists /var/www/html/
 cp -r /fixture-v2-detached/pool /var/www/html/
 
-# 3c: drive a Release GET. Cache hits its url_path row, fires the
-# freshness check. detectForm sees no current_snapshot_id, defaults
-# to inline. checkLockedInline tries to look up InRelease url_path,
-# finds none, sees Release rows exist → returns (nil, true) /
-# fallback. checkLockedDetached fetches Release (200, changed),
-# fetches Release.gpg, builds an adoptionRequest with
-# form=detached. The Check goroutine routes to RunDetached, which
-# verifies the detached signature and commits a snapshot with
-# release_hash + release_gpg_hash set.
-echo "[deb-test] phase 3: GET Release via proxy (cache hit → fires freshness → detached fallback → adoption)"
+# 3c: drive a Release GET. The cache serves it from the V1-detached
+# snapshot and fires the freshness check: the current snapshot is
+# detached, so the check probes InRelease (absent), then GETs Release
+# (200, changed) and Release.gpg, and the adoption goroutine runs
+# RunDetached, which verifies the detached signature and commits a
+# snapshot with release_hash + release_gpg_hash set.
+echo "[deb-test] phase 3: GET Release via proxy (snapshot hit → fires freshness → detached adoption)"
 status=$(curl -sS -x http://127.0.0.1:3142 \
     -o /tmp/Release.trigger \
     -w '%{http_code}' \
@@ -503,34 +546,15 @@ if [[ "$status" != "200" ]]; then
     exit 1
 fi
 
-# 3d: poll for adoption. Same poll window as phase 2.
-echo "[deb-test] phase 3: poll suite_freshness for current_snapshot_id"
-adopted=0
-adopted_id=""
-for i in $(seq 1 30); do
-    val=$(sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
-        "SELECT IFNULL(current_snapshot_id, '') FROM suite_freshness WHERE suite_path='/dists/noble' LIMIT 1;" \
-        2>/dev/null || echo "")
-    if [[ -n "$val" ]]; then
-        adopted=1
-        adopted_id="$val"
-        echo "[deb-test] adopted detached snapshot id=$val (after ${i}s)"
-        break
-    fi
-    sleep 1
-done
-if [[ $adopted -eq 0 ]]; then
-    echo "FAIL: no detached snapshot adopted within 30s"
-    echo "=== suite_freshness ==="
-    sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
-        "SELECT canonical_scheme, canonical_host, suite_path, current_snapshot_id, inrelease_change_seen_at FROM suite_freshness;" || true
-    echo "=== suite_snapshot ==="
-    sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
-        "SELECT snapshot_id, suite_path, inrelease_hash, release_hash, release_gpg_hash, adopted_at FROM suite_snapshot;" || true
-    echo "=== daemon log tail ==="
-    tail -100 "$daemon_log" || true
+# 3d: poll for the V2-detached snapshot. Same window as phase 2.
+echo "[deb-test] phase 3: poll for the V2-detached snapshot"
+if ! wait_snapshot release_hash /fixture-v2-detached/dists/noble/Release 60; then
+    echo "FAIL: V2-detached was not adopted within 60s"
+    dump_adoption_state
     exit 1
 fi
+adopted_id="$SNAPSHOT_ID"
+echo "[deb-test] adopted detached snapshot id=$adopted_id (after ${SNAPSHOT_AFTER}s)"
 
 # 3e: assert the snapshot is in detached form — release_hash is set,
 # release_gpg_hash is set, inrelease_hash is NULL. This is the
@@ -590,34 +614,36 @@ echo "[deb-test] phase 3 (detached adoption smoke) PASS"
 # wiring; this section proves the same wiring works from the
 # packaged binary running under the packaged config schema.
 #
-# Flow (V1 → V2 → V1 chain so two adoptions actually fire):
+# Flow (V1 → V2: the first adoption happens at first contact):
 #   1. Stop, wipe cache, stage V1 fixture, restart with Phase 3
 #      config (hot_packages.window, adoption.hot_prefetch_budget).
-#   2. Prime cache by GETting V1 InRelease (cold-cache miss). No
-#      adoption fires here — there's no current_snapshot_id yet
-#      and no upstream divergence to drive freshness.
-#   3. Swap nginx webroot to V2. Drive a second InRelease GET. The
-#      cached V1 bytes diverge from upstream V2 → freshness fires
-#      → V2 adoption commits. This is the FIRST adoption
-#      (prior_snapshot_id was NULL → hot_count=0).
-#   4. GET the V2 .deb so url_path.last_requested_at on
-#      hello-acu_1.1_amd64.deb is recorded (V1=1.0, V2=1.1 per the
-#      Dockerfile's repo-build VER args) — that's the (Package,
-#      Arch) signal SPEC3 §7.5.3 Stage 1 mines on the next
-#      adoption.
-#   5. Swap nginx webroot back to V1. Drive a third InRelease GET.
-#      Cached V2 bytes diverge from upstream V1 → V1 adoption
-#      fires. prior_snapshot_id = V2's id → hot pair (hello-acu,
-#      amd64) is hot → Stage 2 maps it to V1's
-#      hello-acu_1.0_amd64.deb → hot prefetch warms it.
-#   6. Assert:
-#        - adoption_hot_prefetch_complete fires for the V1 snapshot
+#   2. Prime the cache by GETting V1 InRelease (cold-cache miss). The
+#      miss creates the suite and its first check adopts V1 at once
+#      (eager first adoption, flat-repositories spec C4 Dispatch 3).
+#      This is the FIRST adoption (no prior snapshot → hot_count=0).
+#   3. GET the V1 .deb so url_path.last_requested_at on
+#      hello-acu_1.0_amd64.deb is recorded — the (Package, Arch)
+#      signal SPEC3 §7.5.3 Stage 1 mines on the next adoption.
+#   4. Swap nginx webroot to V2 (hello-acu 1.1) and GET InRelease.
+#      The changed InRelease drives the SECOND adoption, whose prior
+#      snapshot is V1's: Stage 1 finds the hot pair (hello-acu,
+#      amd64) requested from it, Stage 2 maps it to V2's
+#      hello-acu_1.1_amd64.deb, and hot prefetch warms it before the
+#      flip.
+#   5. Assert:
+#        - adoption_hot_prefetch_complete fires for the V2 snapshot
 #          with hot_count >= 1, fetched >= 1, failed=0,
 #          mismatched=0;
-#        - url_path row for hello-acu_1.0_amd64.deb exists with a
-#          non-null blob_hash AND last_fetched_at (proves
-#          CommitAdoption wrote the prefetched row in the flip
-#          transaction per SPEC3 §7.5.1).
+#        - url_path row for hello-acu_1.1_amd64.deb exists with a
+#          non-null blob_hash AND last_fetched_at, and no client has
+#          requested it (request_count = 0): CommitAdoption wrote
+#          the prefetched row in the flip transaction per SPEC3
+#          §7.5.1.
+#
+# AIDEV-NOTE: until eager first adoption this phase ran V1 → V2 → V1
+# because the cold prime adopted nothing; now the cold prime is the
+# first adoption, and going back to V1 would be refused (spec C5:
+# rollback_refused / upstream_older), so the second cycle is V1 → V2.
 # ============================================================
 
 echo
@@ -683,9 +709,8 @@ if [[ $ready -eq 0 ]]; then
     exit 1
 fi
 
-# 4a: cold-cache prime with V1 InRelease. The freshness check fires
-# only on subsequent hits, so this MISS just establishes a url_path
-# row pointing at the V1 bytes; no adoption fires yet.
+# 4a: cold-cache prime with V1 InRelease. The miss establishes the
+# url_path row and creates the suite; its first check adopts V1.
 echo "[deb-test] phase 4: cold prime — GET V1 InRelease via proxy"
 status=$(curl -sS -x http://127.0.0.1:3142 \
     -o /tmp/p4.inrelease.v1 \
@@ -697,15 +722,48 @@ if [[ "$status" != "200" ]]; then
     exit 1
 fi
 
-# 4b: swap upstream to V2 so the next freshness check sees changed
-# bytes (cached=V1, upstream=V2). Sleep > cooldown.
-echo "[deb-test] phase 4: swap nginx webroot to V2 (drives V2 adoption)"
+echo "[deb-test] phase 4: wait for V1's first adoption (eager, at first contact)"
+if ! wait_snapshot inrelease_hash /fixture-v1/dists/noble/InRelease 30; then
+    echo "FAIL: phase-4 V1 was not adopted at first contact within 30s"
+    dump_adoption_state
+    exit 1
+fi
+v1_id="$SNAPSHOT_ID"
+echo "[deb-test] phase 4 V1 adopted snapshot id=$v1_id (after ${SNAPSHOT_AFTER}s)"
+
+# 4b: hit the V1 .deb so SPEC3 §7.5.3 Stage 1 has a hot pair to mine
+# from the V1 snapshot on the next adoption. The (Package=hello-acu,
+# Arch=amd64) tuple is recorded with last_requested_at.
+V1_DEB_PATH="/pool/main/h/hello-acu/hello-acu_1.0_amd64.deb"
+echo "[deb-test] phase 4: GET V1 .deb to record url_path.last_requested_at"
+status=$(curl -sS -x http://127.0.0.1:3142 \
+    -o /tmp/p4.deb.v1 \
+    -w '%{http_code}' \
+    --max-time 10 \
+    "http://127.0.0.1${V1_DEB_PATH}" || echo "000")
+if [[ "$status" != "200" ]]; then
+    echo "FAIL: phase-4 V1 deb GET returned $status"
+    exit 1
+fi
+v1_lr=$(sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+    "SELECT IFNULL(last_requested_at, '') FROM url_path WHERE path='${V1_DEB_PATH}';" \
+    2>/dev/null || echo "")
+if [[ -z "$v1_lr" ]]; then
+    echo "FAIL: phase-4 V1 .deb url_path.last_requested_at not recorded"
+    sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+        "SELECT path, last_requested_at, request_count FROM url_path;" || true
+    exit 1
+fi
+
+# 4c: swap upstream to V2 so the next freshness check sees changed
+# bytes (current snapshot V1, upstream V2). Sleep > cooldown.
+echo "[deb-test] phase 4: swap nginx webroot to V2 (drives V2 adoption + hot prefetch)"
 sleep 2
 rm -rf /var/www/html/*
 cp -r /fixture-v2/dists /var/www/html/
 cp -r /fixture-v2/pool /var/www/html/
 
-echo "[deb-test] phase 4: GET InRelease to trigger V2 adoption (1st adoption)"
+echo "[deb-test] phase 4: GET InRelease to trigger V2 adoption (2nd adoption + hot prefetch)"
 status=$(curl -sS -x http://127.0.0.1:3142 \
     -o /tmp/p4.inrelease.trigger.v2 \
     -w '%{http_code}' \
@@ -716,102 +774,25 @@ if [[ "$status" != "200" ]]; then
     exit 1
 fi
 
-echo "[deb-test] phase 4: poll for V2 adoption (1st)"
-v2_id=""
-for i in $(seq 1 30); do
-    val=$(sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
-        "SELECT IFNULL(current_snapshot_id, '') FROM suite_freshness WHERE suite_path='/dists/noble' LIMIT 1;" \
-        2>/dev/null || echo "")
-    if [[ -n "$val" ]]; then
-        v2_id="$val"
-        echo "[deb-test] phase 4 V2 adopted snapshot id=$v2_id (after ${i}s)"
-        break
-    fi
-    sleep 1
-done
-if [[ -z "$v2_id" ]]; then
-    echo "FAIL: phase-4 V2 adoption did not flip current_snapshot_id within 30s"
-    tail -100 "$daemon_log" || true
+echo "[deb-test] phase 4: poll for V2 adoption (2nd)"
+if ! wait_snapshot inrelease_hash /fixture-v2/dists/noble/InRelease 60; then
+    echo "FAIL: phase-4 V2 adoption did not flip the suite within 60s (still v1_id=$v1_id)"
+    dump_adoption_state
     exit 1
 fi
+v2_id="$SNAPSHOT_ID"
+echo "[deb-test] phase 4 V2 adopted snapshot id=$v2_id (after ${SNAPSHOT_AFTER}s; prior was $v1_id)"
 
-# 4c: hit the V2 .deb so SPEC3 §7.5.3 Stage 1 has a hot pair to
-# mine on the next adoption. The (Package=hello-acu, Arch=amd64)
-# tuple is recorded with last_requested_at via the Phase 1 fetch
-# path (no snapshot prefetch happened in 4b — this was the first
-# adoption with prior_snapshot_id=NULL, hot_count=0).
-# V2 fixture is version 1.1 (V1 is 1.0); see e2e/deb/Dockerfile
-# repo-build args (VER=1.1).
-V2_DEB_PATH="/pool/main/h/hello-acu/hello-acu_1.1_amd64.deb"
-echo "[deb-test] phase 4: GET V2 .deb to record url_path.last_requested_at"
-status=$(curl -sS -x http://127.0.0.1:3142 \
-    -o /tmp/p4.deb.v2 \
-    -w '%{http_code}' \
-    --max-time 10 \
-    "http://127.0.0.1${V2_DEB_PATH}" || echo "000")
-if [[ "$status" != "200" ]]; then
-    echo "FAIL: phase-4 V2 deb GET returned $status"
-    exit 1
-fi
-v2_lr=$(sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
-    "SELECT IFNULL(last_requested_at, '') FROM url_path WHERE path='${V2_DEB_PATH}';" \
-    2>/dev/null || echo "")
-if [[ -z "$v2_lr" ]]; then
-    echo "FAIL: phase-4 V2 .deb url_path.last_requested_at not recorded"
-    sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
-        "SELECT path, last_requested_at, request_count FROM url_path;" || true
-    exit 1
-fi
-
-# 4d: swap upstream BACK to V1 so the next freshness check fires
-# again (cached InRelease bytes are V2's after 4b adoption; upstream
-# is V1's again). This drives the SECOND adoption — the one whose
-# hot-set Stage 1 query finds the (hello-acu, amd64) hot pair from
-# the V2 snapshot.
-echo "[deb-test] phase 4: swap nginx webroot back to V1 (drives V1 adoption + hot prefetch)"
-sleep 2
-rm -rf /var/www/html/*
-cp -r /fixture-v1/dists /var/www/html/
-cp -r /fixture-v1/pool /var/www/html/
-
-echo "[deb-test] phase 4: GET InRelease to trigger V1 adoption (2nd adoption + hot prefetch)"
-status=$(curl -sS -x http://127.0.0.1:3142 \
-    -o /tmp/p4.inrelease.trigger.v1 \
-    -w '%{http_code}' \
-    --max-time 10 \
-    http://127.0.0.1/dists/noble/InRelease || echo "000")
-if [[ "$status" != "200" ]]; then
-    echo "FAIL: phase-4 V1 trigger InRelease returned $status"
-    exit 1
-fi
-
-echo "[deb-test] phase 4: poll for V1 adoption (2nd)"
-v1_id=""
-for i in $(seq 1 30); do
-    val=$(sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
-        "SELECT IFNULL(current_snapshot_id, '') FROM suite_freshness WHERE suite_path='/dists/noble' LIMIT 1;" \
-        2>/dev/null || echo "")
-    if [[ -n "$val" && "$val" != "$v2_id" ]]; then
-        v1_id="$val"
-        echo "[deb-test] phase 4 V1 adopted snapshot id=$v1_id (after ${i}s; prior was $v2_id)"
-        break
-    fi
-    sleep 1
-done
-if [[ -z "$v1_id" ]]; then
-    echo "FAIL: phase-4 V1 adoption did not flip current_snapshot_id within 30s (still v2_id=$v2_id)"
-    tail -100 "$daemon_log" || true
-    exit 1
-fi
-
-# 4e: assert SPEC3 §10.2 adoption_hot_prefetch_complete event fired
-# for the V1 snapshot with hot_count >= 1, fetched >= 1, failed=0,
+# 4d: assert SPEC3 §10.2 adoption_hot_prefetch_complete event fired
+# for the V2 snapshot with hot_count >= 1, fetched >= 1, failed=0,
 # mismatched=0. This is the "hot pair was warmed" oracle.
-echo "[deb-test] phase 4: assert adoption_hot_prefetch_complete fired for snapshot $v1_id"
+echo "[deb-test] phase 4: assert adoption_hot_prefetch_complete fired for snapshot $v2_id"
+# `|| true`: with no such line the greps fail the pipeline, and set -e
+# would exit before the FAIL below names what is missing.
 hot_line=$(grep "msg=adoption_hot_prefetch_complete" "$daemon_log" \
-    | grep "snapshot_id=$v1_id" | tail -1)
+    | grep "snapshot_id=$v2_id" | tail -1) || true
 if [[ -z "$hot_line" ]]; then
-    echo "FAIL: no adoption_hot_prefetch_complete log line for snapshot $v1_id"
+    echo "FAIL: no adoption_hot_prefetch_complete log line for snapshot $v2_id"
     echo "=== relevant log tail ==="
     grep -E "hot_prefetch|adoption_" "$daemon_log" | tail -30 || true
     exit 1
@@ -825,11 +806,11 @@ fetched=$(printf '%s\n' "$hot_line" | grep -oE '(^| )fetched=[0-9]+' | tr -dc '0
 failed=$(printf '%s\n' "$hot_line" | grep -oE '(^| )failed=[0-9]+' | tr -dc '0-9')
 mismatched=$(printf '%s\n' "$hot_line" | grep -oE '(^| )mismatched=[0-9]+' | tr -dc '0-9')
 if [[ "${hot_count:-0}" -lt 1 ]]; then
-    echo "FAIL: phase-4 hot_count=$hot_count, want >= 1 (Stage 1 should mine the V2 hot pair)"
+    echo "FAIL: phase-4 hot_count=$hot_count, want >= 1 (Stage 1 should mine the V1 hot pair)"
     exit 1
 fi
 if [[ "${fetched:-0}" -lt 1 ]]; then
-    echo "FAIL: phase-4 fetched=$fetched, want >= 1 (the V1 path should warm)"
+    echo "FAIL: phase-4 fetched=$fetched, want >= 1 (the V2 path should warm)"
     exit 1
 fi
 if [[ "${failed:-0}" -ne 0 ]]; then
@@ -841,31 +822,34 @@ if [[ "${mismatched:-0}" -ne 0 ]]; then
     exit 1
 fi
 
-# 4f: assert the V1 .deb's url_path row exists with a non-null
-# blob_hash and last_fetched_at — proof CommitAdoption inserted the
-# prefetched row. SPEC3 §7.5.1: the row is inserted in the same
-# transaction as the snapshot flip.
-V1_DEB_PATH="/pool/main/h/hello-acu/hello-acu_1.0_amd64.deb"
-v1_row=$(sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
-    "SELECT IFNULL(blob_hash, '') || '|' || IFNULL(last_fetched_at, '') FROM url_path WHERE path='${V1_DEB_PATH}';" \
+# 4e: assert the V2 .deb's url_path row exists with a non-null
+# blob_hash and last_fetched_at, and that no client requested it —
+# proof CommitAdoption inserted the prefetched row. SPEC3 §7.5.1: the
+# row is inserted in the same transaction as the snapshot flip.
+V2_DEB_PATH="/pool/main/h/hello-acu/hello-acu_1.1_amd64.deb"
+v2_row=$(sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
+    "SELECT IFNULL(blob_hash, '') || '|' || IFNULL(last_fetched_at, '') || '|' || request_count FROM url_path WHERE path='${V2_DEB_PATH}';" \
     2>/dev/null || echo "")
-if [[ -z "$v1_row" || "$v1_row" == "|" ]]; then
-    echo "FAIL: phase-4 V1 .deb url_path row missing or has null blob_hash"
+if [[ -z "$v2_row" ]]; then
+    echo "FAIL: phase-4 V2 .deb url_path row missing"
     sqlite3 -readonly /var/cache/apt-cacher-ultra/cache.db \
-        "SELECT path, blob_hash, last_fetched_at, last_requested_at FROM url_path;" || true
+        "SELECT path, blob_hash, last_fetched_at, last_requested_at, request_count FROM url_path;" || true
     exit 1
 fi
-v1_blob="${v1_row%%|*}"
-v1_lf="${v1_row#*|}"
-if [[ -z "$v1_blob" ]]; then
-    echo "FAIL: phase-4 V1 .deb url_path.blob_hash is null"
+IFS='|' read -r v2_blob v2_lf v2_rc <<< "$v2_row"
+if [[ -z "$v2_blob" ]]; then
+    echo "FAIL: phase-4 V2 .deb url_path.blob_hash is null"
     exit 1
 fi
-if [[ -z "$v1_lf" ]]; then
-    echo "FAIL: phase-4 V1 .deb url_path.last_fetched_at is null (prefetch should set this)"
+if [[ -z "$v2_lf" ]]; then
+    echo "FAIL: phase-4 V2 .deb url_path.last_fetched_at is null (prefetch should set this)"
     exit 1
 fi
-echo "[deb-test] phase 4 V1 .deb url_path: blob_hash=${v1_blob:0:12}.. last_fetched_at=$v1_lf"
+if [[ "$v2_rc" != "0" ]]; then
+    echo "FAIL: phase-4 V2 .deb url_path.request_count=$v2_rc, want 0 (the row should come from the prefetch, not a client)"
+    exit 1
+fi
+echo "[deb-test] phase 4 V2 .deb url_path: blob_hash=${v2_blob:0:12}.. last_fetched_at=$v2_lf request_count=$v2_rc"
 
 echo "[deb-test] phase 4 (Phase 3 hot-prefetch) PASS"
 echo "[deb-test] OVERALL PASS"
