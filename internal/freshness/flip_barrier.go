@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
@@ -111,8 +112,10 @@ func barrierOutcome(outcome string, commitErr error) string {
 // and unsigned forms — index consistency depends on the Release text, not
 // on its signature). A read error answers false, so the barrier runs (the
 // safe direction); one other than "no row" is logged (deferred minor
-// C-16). The read runs under the shutdown signal, like the barrier's own
-// waits (ruling R-C2), never unbounded.
+// C-16): at WARN, or at DEBUG when a shutdown cut the read short, as the
+// check's local steps are (deferred minor E-13, FW-3 (d)). The read runs
+// under the shutdown signal, like the barrier's own waits (ruling R-C2),
+// never unbounded.
 func (a *Adopter) servedAnchorUnchanged(ctx context.Context, suite SuiteRef, p *adoptionPayload) bool {
 	path, want := suite.SuitePath+inReleaseFilename, p.inlineHash
 	if p.form == adoptionFormDetached || p.form == adoptionFormUnsigned {
@@ -122,7 +125,11 @@ func (a *Adopter) servedAnchorUnchanged(ctx context.Context, suite SuiteRef, p *
 	defer cancel()
 	row, err := a.cache.LookupURL(rctx, suite.CanonicalScheme, suite.CanonicalHost, path)
 	if err != nil && !errors.Is(err, cache.ErrNotFound) {
-		a.logger.Warn("adoption_served_anchor_read_failed",
+		level := slog.LevelWarn
+		if p.stopErr(ctx) != nil || errors.Is(err, context.Canceled) {
+			level = slog.LevelDebug
+		}
+		a.logger.Log(ctx, level, "adoption_served_anchor_read_failed",
 			"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "path", path, "err", err)
 	}
 	return err == nil && row.BlobHash != nil && *row.BlobHash == want

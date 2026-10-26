@@ -24,8 +24,13 @@ import (
 // BlobWriter (which hashes SHA-256 as it writes) with a SHA-512 hasher
 // beside it, so a SHA-512 declaration is checked before the bytes reach
 // pool/.
+//
+// AIDEV-NOTE: the BlobWriter is a field, never embedded (deferred minor
+// E-10): memberWriter's method set has no Finalize or
+// FinalizeExpectingHash, so only verifyMember — which checks every
+// declared hash first — can move a member's bytes into pool/.
 type memberWriter struct {
-	*cache.BlobWriter
+	blob   *cache.BlobWriter
 	sha512 hash.Hash
 }
 
@@ -34,20 +39,26 @@ func newMemberWriter(c *cache.Cache) (*memberWriter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &memberWriter{BlobWriter: w, sha512: sha512.New()}, nil
+	return &memberWriter{blob: w, sha512: sha512.New()}, nil
 }
 
 // Write writes p to the temp blob and feeds both hashers.
 func (w *memberWriter) Write(p []byte) (int, error) {
-	n, err := w.BlobWriter.Write(p)
+	n, err := w.blob.Write(p)
 	w.sha512.Write(p[:n])
 	return n, err
 }
 
+// Written is the byte count written so far (fetch.FetchDst).
+func (w *memberWriter) Written() int64 { return w.blob.Written() }
+
+// Abort removes the temp blob; a no-op once verifyMember finalized it.
+func (w *memberWriter) Abort() error { return w.blob.Abort() }
+
 // Truncate restarts the blob and both hashers (a resumed fetch whose
 // validator changed starts over; fetch.FetchDst).
 func (w *memberWriter) Truncate() error {
-	if err := w.BlobWriter.Truncate(); err != nil {
+	if err := w.blob.Truncate(); err != nil {
 		return err
 	}
 	w.sha512.Reset()
@@ -102,14 +113,14 @@ func verifyMember(w *memberWriter, m ReleaseMember, size int64, rehashPooled fun
 	}
 	if m.SHA256 == "" {
 		if rehashPooled != nil {
-			if err := rehashPooled(w.HashSum()); err != nil {
+			if err := rehashPooled(w.blob.HashSum()); err != nil {
 				_ = w.Abort()
 				return "", err
 			}
 		}
-		return w.Finalize(size)
+		return w.blob.Finalize(size)
 	}
-	got, err := w.FinalizeExpectingHash(m.SHA256, size)
+	got, err := w.blob.FinalizeExpectingHash(m.SHA256, size)
 	if errors.Is(err, cache.ErrHashMismatch) {
 		return "", &memberHashMismatch{algo: "SHA256", declared: m.SHA256, actual: got}
 	}

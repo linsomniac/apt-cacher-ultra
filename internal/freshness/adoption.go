@@ -2790,9 +2790,12 @@ type sourcePathDecl struct {
 // DROPS the conflicting artifact (never guesses a hash; it falls back
 // to trust-on-fetch serving) while the suite still adopts. The error
 // return is retained for the signature but is always nil today.
-// SPEC6_5 §11 H3/H4/H11 per-stanza skips happen inside ParseSources
+// SPEC6_5 §11 H3/H4 per-stanza skips happen inside ParseSources
 // silently — operators see the per-Sources-file granularity at the
-// source_parsed Debug log; per-stanza visibility is a future phase.
+// source_parsed Debug log; the H11 skips (a path validateMemberPath
+// refuses) are counted and logged once per Sources file at INFO,
+// source_paths_skipped (deferred minor GD-2; INFO, review M-8: it
+// repeats at every adoption and the operator cannot act on it).
 //
 // Non-/dists/ layouts (where repoRootFromSuitePath returns false)
 // return (nil, 0, nil): source rows are simply not populated. Phase 1
@@ -2858,6 +2861,19 @@ func (a *Adopter) buildSourceHashes(suite SuiteRef, snapshotID int64,
 			"stanza_count", stats.StanzaCount,
 			"package_hash_rows", len(refs),
 		)
+		if stats.PathsSkipped > 0 {
+			// Ruling PG-21 keeps validateMemberPath for a Sources file's
+			// paths: one with a "%" or a "." segment gets no source row.
+			a.logger.Info("source_paths_skipped",
+				"canonical_scheme", suite.CanonicalScheme,
+				"canonical_host", suite.CanonicalHost,
+				"suite_path", suite.SuitePath,
+				"snapshot_id", snapshotID,
+				"member_path", m.Path,
+				"count", stats.PathsSkipped,
+				"first", stats.FirstSkipped,
+			)
+		}
 		for _, ref := range refs {
 			fullPath := repoRoot + ref.Path
 			if existing, dup := dedup[fullPath]; dup {

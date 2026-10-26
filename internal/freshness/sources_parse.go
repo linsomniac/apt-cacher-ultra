@@ -48,6 +48,13 @@ const MaxSourceStanzas = 1_000_000
 // the input alongside the per-Sources-file row count.
 type SourcesParseStats struct {
 	StanzaCount int
+	// PathsSkipped counts the file paths (<Directory>/<filename>) left
+	// out because the Directory or the path failed validateMemberPath
+	// (deferred minor GD-2: kept narrower than validateFilename, ruling
+	// PG-21), and FirstSkipped is the first of them, so the caller can
+	// say so (source_paths_skipped) instead of dropping them silently.
+	PathsSkipped int
+	FirstSkipped string
 }
 
 // ParseSources parses an apt Sources file (uncompressed) and returns
@@ -66,7 +73,9 @@ type SourcesParseStats struct {
 //     against `..` segments per SPEC6_5 §11 H11 — even though signed
 //     input means the upstream has already vouched for the bytes,
 //     we refuse to materialize a `package_hash` row for an unsafe
-//     suite-relative path).
+//     suite-relative path). Such paths — every file of a stanza whose
+//     Directory fails, and each file whose own path fails — are
+//     counted in SourcesParseStats.PathsSkipped (deferred minor GD-2).
 //
 // Per-entry filename validation also rejects `/`, backslash, and NUL
 // — a Sources `Checksums-Sha256` filename is a basename within the
@@ -113,9 +122,7 @@ func ParseSources(text []byte) ([]SourceRef, SourcesParseStats, error) {
 		if packageName == "" || directory == "" || len(sha256Entries) == 0 {
 			return nil
 		}
-		if err := validateMemberPath(directory); err != nil {
-			return nil
-		}
+		dirOK := validateMemberPath(directory) == nil
 		for _, e := range sha256Entries {
 			if !validHexSHA256(e.sha256) {
 				continue
@@ -128,7 +135,11 @@ func ParseSources(text []byte) ([]SourceRef, SourcesParseStats, error) {
 				continue
 			}
 			full := directory + "/" + e.filename
-			if err := validateMemberPath(full); err != nil {
+			if !dirOK || validateMemberPath(full) != nil {
+				stats.PathsSkipped++
+				if stats.FirstSkipped == "" {
+					stats.FirstSkipped = full
+				}
 				continue
 			}
 			if len(out) >= MaxSourceStanzas {
