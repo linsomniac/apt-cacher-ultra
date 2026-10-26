@@ -434,6 +434,47 @@ mirror_mode() {
     passed
 }
 
+# A commit slower than the flip barrier's 20 s hold (spec §7): no client
+# times out. The straddle a phase-B expiry allows is a documented residual
+# (spec C8), so this scenario's grep allows its words and nothing else
+# (APT_RESIDUAL).
+commit_delay() {
+    scenario commit-delay "a 45 s commit: held anchor requests never reach apt's timeout"
+    stop_daemon
+    start_daemon ACU_E2E_COMMIT_DELAY=45s
+    log_has "$SCENARIO_MARK" "$(event e2e_commit_delay_enabled)" "$(kv commit_delay 45s)" ||
+        fail "the daemon did not enable the 45 s commit delay (built without -tags e2ehooks?)"
+    client delay "$PROXY" "$SRC_JITSI" "$SRC_K8S" "$SRC_DISTS"
+    apt_update delay
+    publish jitsi v2
+    local start=$SECONDS mismatches=0
+    until log_has "$SCENARIO_MARK" "$(event adoption_success)" "$(suite_kv "$JITSI")"; do
+        ((SECONDS - start < 150)) || fail "the delayed jitsi adoption did not commit within 150s"
+        apt_update delay --allow="$APT_RESIDUAL"
+        if grep -q 'Hash Sum mismatch' "$APT_LOG"; then
+            mismatches=$((mismatches + 1))
+        fi
+        sleep 3
+    done
+    say "the delayed commit landed $((SECONDS - start))s after the publish; updates with the residual mismatch: $mismatches"
+    log_has "$SCENARIO_MARK" "$(event adoption_flip_barrier)" "$(suite_kv "$JITSI")" "$(kv outcome hold_expired)" ||
+        fail "the jitsi flip did not end hold_expired: $(log_lines "$SCENARIO_MARK" "$(event adoption_flip_barrier)")"
+    local held max=0 ms
+    held=$(log_lines "$SCENARIO_MARK" "$(event request)" "(^| )path=$(re "$JITSI")/(InRelease|Release)( |\$)" \
+        'flip_held_ms=' | grep -oE 'flip_held_ms=[0-9]+' | cut -d= -f2 || true)
+    [[ -n $held ]] || fail "no jitsi InRelease or Release request waited in the hold"
+    for ms in $held; do ((ms > max)) && max=$ms; done
+    ((max <= 20000)) || fail "a request waited ${max} ms in a hold, over 20 s"
+    say "held requests: $(wc -w <<< "$held"), longest wait ${max} ms"
+    stop_daemon
+    start_daemon
+    # The residual clears with the next update: no error of any kind.
+    apt_update delay
+    candidates_are delay acu-jitsi=2.0 || fail "the client sees acu-jitsi $(candidate delay acu-jitsi)"
+    apt_install delay acu-jitsi=2.0
+    passed
+}
+
 # The snapshots survive a restart: the same snapshot ids, a clean update
 # with the same candidates, and anchors served from the snapshots.
 restart() {
@@ -545,6 +586,7 @@ frozen_date
 anchorless
 two_suites
 mirror_mode
+commit_delay
 restart
 upstream_down
 stop_daemon
