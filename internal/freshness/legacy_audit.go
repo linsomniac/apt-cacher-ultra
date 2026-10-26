@@ -128,6 +128,19 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 				case cache.LegacyAuditQuarantine, cache.LegacyAuditQuarantineSigned:
 					res.Quarantined++
 					legacyQuarantinedTotal.Inc()
+					// Logged after the batch commits: a crash can lose the
+					// line, never the effect. Before the pool-file removal
+					// below, so its ERROR follows the line it qualifies (the H1
+					// final review's ops M-6).
+					logger.Warn("legacy_snapshot_quarantined",
+						"reason", reasons[i],
+						"snapshot_id", d.SnapshotID,
+						"canonical_host", decided[i].CanonicalHost,
+						"suite_path", decided[i].SuitePath,
+						"anchor_form", string(decided[i].Form),
+						"was_current", effects[d.SnapshotID].WasCurrent,
+						"anchor_rows_deleted", effects[d.SnapshotID].AnchorRowsDeleted,
+					)
 					if d.DropAnchorRows {
 						// AIDEV-NOTE: ruling R-H2 as amended by review C-1 and
 						// re-review N-1 (phase H1). The rotted pool file goes too,
@@ -141,33 +154,35 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 						// commit: a lost commit would leave the snapshots queued
 						// with their anchors missing, and when every queued inline
 						// anchor is missing the next start's preflight refuses to
-						// start ("is the pool mounted?"). A crash between the
-						// commit and this removal leaves the file, as a failed
-						// removal does: the rows are gone, so a changed upstream
-						// heals, and an unchanged one is healed by the eager
-						// re-adoption's rehash (writeBlobBytes) once a client asks
-						// with adoption enabled; the audit does not revisit it.
-						if err := legacyDiscardAnchor(c, *decided[i].SingleAnchorHash); err != nil {
+						// start ("is the pool mounted?"). For the same reason it
+						// waits while another snapshot still queued names the file
+						// (an http and an https suite of one repository share it;
+						// the H1 final review's prod minor 3): removed now, a lost
+						// commit of that snapshot's later batch would leave it
+						// queued with its anchor missing. Its own audit then finds
+						// the file corrupt, quarantines it and removes the file; a
+						// queue read that fails keeps the file and logs the
+						// failure. A crash between the commit and this removal
+						// leaves the file, as a failed removal does: the rows are
+						// gone, so a changed upstream heals, and an unchanged one
+						// is healed by the eager re-adoption's rehash
+						// (writeBlobBytes) once a client asks with adoption
+						// enabled; the audit does not revisit it.
+						hash := *decided[i].SingleAnchorHash
+						queued, err := c.LegacyAuditQueueNamesAnchor(ctx, hash)
+						if err == nil && !queued {
+							err = legacyDiscardAnchor(c, hash)
+						}
+						if err != nil {
 							logger.Error("legacy_anchor_discard_failed",
 								"snapshot_id", d.SnapshotID,
 								"canonical_host", decided[i].CanonicalHost,
 								"suite_path", decided[i].SuitePath,
-								"blob_hash", *decided[i].SingleAnchorHash,
+								"blob_hash", hash,
 								"err", err,
 							)
 						}
 					}
-					// Logged after the batch commits: a crash can lose the
-					// line, never the effect.
-					logger.Warn("legacy_snapshot_quarantined",
-						"reason", reasons[i],
-						"snapshot_id", d.SnapshotID,
-						"canonical_host", decided[i].CanonicalHost,
-						"suite_path", decided[i].SuitePath,
-						"anchor_form", string(decided[i].Form),
-						"was_current", effects[d.SnapshotID].WasCurrent,
-						"anchor_rows_deleted", effects[d.SnapshotID].AnchorRowsDeleted,
-					)
 				}
 			}
 		}

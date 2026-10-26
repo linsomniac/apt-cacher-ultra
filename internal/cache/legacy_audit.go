@@ -93,6 +93,24 @@ SELECT q.snapshot_id, s.snapshot_id IS NULL,
 	return out, rows.Err()
 }
 
+// LegacyAuditQueueNamesAnchor reports whether a snapshot still queued in
+// legacy_trust_audit has hash as its stored InRelease (inrelease_hash).
+// A read: the audit asks it before removing a corrupt anchor's pool file,
+// which waits while another queued snapshot names that file (the H1 final
+// review's prod minor 3).
+func (c *Cache) LegacyAuditQueueNamesAnchor(ctx context.Context, hash string) (bool, error) {
+	var queued bool
+	err := c.db.QueryRowContext(ctx, `
+SELECT EXISTS (SELECT 1
+                 FROM legacy_trust_audit q
+                 JOIN suite_snapshot s ON s.snapshot_id = q.snapshot_id
+                WHERE s.inrelease_hash = ?)`, hash).Scan(&queued)
+	if err != nil {
+		return false, fmt.Errorf("LegacyAuditQueueNamesAnchor: %w", err)
+	}
+	return queued, nil
+}
+
 // ApplyLegacyAuditDecisions applies one batch of audit decisions in ONE
 // writer transaction (spec §6.1) and reports, for each quarantined
 // snapshot, whether it was current and how many url_path rows of its

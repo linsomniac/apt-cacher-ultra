@@ -204,6 +204,46 @@ func TestReconcile_AnUnreadableSnapshotIsLoggedAndCountsUnsigned(t *testing.T) {
 	}
 }
 
+// The H1 final review's prod minor 1: Reconcile logs its snapshot read
+// failure while it holds the suite mutex, so the log runs under
+// unloggedPanic. A broken log handler is counted once and Reconcile
+// returns; without the boundary the panic reached net/http with the mutex
+// held, and every later check of the suite answered busy for the life of
+// the process.
+func TestReconcile_ABrokenLoggerLeavesTheSuiteFree(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adopt()
+	fc := &snapReadFailCache{Cache: r.cache}
+	fc.fail.Store(true)
+	logger := slog.New(panicLogHandler{panicOn: func(rec slog.Record) bool { return rec.Message == "reconcile_snapshot_read_failed" }})
+	chk, err := New(Config{Cache: fc, Fetcher: r.up, HostLimiter: hostsem.New(8), Adopter: r.adopter, Logger: logger,
+		now: r.clock.now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := mustAcquire(t, chk.admission, "other", true) // the reserved slot is left: Reconcile answers false
+	defer held.release()
+	before := unlogged()
+	func() {
+		defer func() {
+			if v := recover(); v != nil {
+				t.Errorf("Reconcile panicked: %v", v)
+			}
+		}()
+		if chk.Reconcile(context.Background(), "http", rigHost, rigSuite) {
+			t.Fatal("a reconcile whose snapshot could not be read took the reserved slot")
+		}
+	}()
+	if got := unlogged() - before; got != 1 {
+		t.Errorf("unlogged panics rose by %v, want 1 (the read failure's line)", got)
+	}
+	release, ok := chk.HoldSuite(cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: rigHost, SuitePath: rigSuite})
+	if !ok {
+		t.Fatal("the suite is still held after Reconcile returned")
+	}
+	release(false)
+}
+
 // Deferred minor E-37: a future last_success_at is reported by a check
 // that runs, not by a client check the cooldown turns away.
 func TestCheck_FutureLastSuccessIsReportedBelowTheCooldown(t *testing.T) {

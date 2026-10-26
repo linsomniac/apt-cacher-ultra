@@ -1288,15 +1288,24 @@ func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string)
 	// unsigned (fail-closed), logged (deferred minor E-31). ctx is the
 	// admin request's: a read a client hang-up cut short is DEBUG, not
 	// WARN (ruling PG-35, the E-13 class; Task 8 review M-2).
+	//
+	// AIDEV-NOTE: the mutex is held here with no defer (it is handed to the
+	// goroutine below), so the log runs under unloggedPanic (the H1 final
+	// review's prod minor 1): a panicking log handler that reached net/http
+	// would leave the suite held for the life of the process, every later
+	// check of it busy. Anything else logged before the hand-off needs the
+	// same boundary.
 	signed := false
 	if snap, err := c.cache.GetSuiteSnapshot(ctx, snapID); err != nil {
 		level := slog.LevelWarn
 		if ctx.Err() != nil {
 			level = slog.LevelDebug
 		}
-		c.logger.Log(ctx, level, "reconcile_snapshot_read_failed",
-			"err", err, "snapshot_id", snapID,
-			"canonical_scheme", scheme, "canonical_host", host, "suite_path", suitePath)
+		unloggedPanic(func() {
+			c.logger.Log(ctx, level, "reconcile_snapshot_read_failed",
+				"err", err, "snapshot_id", snapID,
+				"canonical_scheme", scheme, "canonical_host", host, "suite_path", suitePath)
+		})
 	} else {
 		signed = signedForm(snap.Form)
 	}

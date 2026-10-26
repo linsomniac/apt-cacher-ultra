@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
@@ -129,7 +130,8 @@ func TestRunLegacyTrustAudit_CorruptAnchorDropsItsRowsOversizedKeepsThem(t *test
 // (ERROR legacy_anchor_discard_failed) and the quarantine proceeds: its
 // url_path rows still go, so a changed upstream still heals it. The
 // removal comes after the batch commits (re-review N-1): the seam sees
-// the rows already deleted.
+// the rows already deleted. Its ERROR follows the quarantine's WARN (the
+// H1 final review's ops M-6), so the log reads in order.
 func TestRunLegacyTrustAudit_AFailedDiscardIsLoggedAndTheQuarantineProceeds(t *testing.T) {
 	env := newAdoptionTestEnv(t)
 	ctx := context.Background()
@@ -170,6 +172,10 @@ func TestRunLegacyTrustAudit_AFailedDiscardIsLoggedAndTheQuarantineProceeds(t *t
 		recs[0]["err"] != "pool is read-only" || recs[0]["snapshot_id"] != float64(rotten) ||
 		recs[0]["canonical_host"] != "h" || recs[0]["suite_path"] != "/r/dists/rotten" {
 		t.Fatalf("records %v, want one ERROR naming the snapshot, the blob and the error", recs)
+	}
+	out := logs.String()
+	if q, f := strings.Index(out, `"msg":"legacy_snapshot_quarantined"`), strings.Index(out, `"msg":"legacy_anchor_discard_failed"`); q < 0 || q > f {
+		t.Fatalf("legacy_snapshot_quarantined at %d, legacy_anchor_discard_failed at %d; want the quarantine line first", q, f)
 	}
 }
 
@@ -229,6 +235,75 @@ func TestRunLegacyTrustAudit_TwoSnapshotsSharingARottedAnchorInOneBatch(t *testi
 	}
 	if recs := logRecords(t, logs, "legacy_anchor_discard_failed"); len(recs) != 0 {
 		t.Fatalf("records %v, want none: the second removal finds the file already gone", recs)
+	}
+}
+
+// The H1 final review's prod minor 3: two queued snapshots sharing one
+// rotted InRelease in different batches. The first batch's quarantine
+// deletes every row of the blob but leaves the file, since the second
+// snapshot, still queued, names it: removed then, a lost commit of the
+// second batch would leave that snapshot queued with its anchor missing,
+// and when every queued inline anchor is missing the next start refuses
+// ("is the pool mounted?"). The second snapshot's own audit finds the
+// file corrupt, quarantines it and removes the file.
+func TestRunLegacyTrustAudit_TwoSnapshotsSharingARottedAnchorAcrossBatches(t *testing.T) {
+	env := newAdoptionTestEnv(t)
+	ctx := context.Background()
+	c := env.cache
+	shared := clearsignForTest(t, realisticRelease()+"Note: shared\n")
+	first := adoptLegacy(t, env, "/r/dists/one", shared, "/r/pool/o_1_amd64.deb")
+	second := adoptLegacy(t, env, "/r/dists/two", shared, "/r/pool/t_1_amd64.deb")
+	snap, err := c.GetSuiteSnapshot(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := *snap.SingleAnchorHash
+	if snap2, err := c.GetSuiteSnapshot(ctx, second); err != nil || snap2.SingleAnchorHash == nil || *snap2.SingleAnchorHash != hash {
+		t.Fatalf("second snapshot %+v, %v; want the same InRelease blob %s", snap2, err, hash)
+	}
+	rotBlob(t, c, hash)
+	if err := c.ClearSignedSeenForTest(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.EnqueueLegacyTrustAudit(ctx, first, second); err != nil {
+		t.Fatal(err)
+	}
+	prevSize, prevAfter := legacyAuditBatchSize, legacyAuditAfterBatch
+	t.Cleanup(func() { legacyAuditBatchSize, legacyAuditAfterBatch = prevSize, prevAfter })
+	legacyAuditBatchSize = 1
+	legacyAuditAfterBatch = func(n int) error {
+		if _, err := os.Stat(c.BlobPath(hash)); n == 1 && err != nil {
+			t.Errorf("after the first batch the shared pool file: %v, want kept for the queued second snapshot", err)
+		}
+		return nil
+	}
+	logs := &lockedBuffer{}
+	res, err := RunLegacyTrustAudit(ctx, c, slog.New(slog.NewJSONHandler(logs, nil)))
+	if err != nil || res.Quarantined != 2 {
+		t.Fatalf("audit = %+v, %v; want both quarantined", res, err)
+	}
+	for _, p := range []string{"/r/dists/one/InRelease", "/r/dists/two/InRelease"} {
+		if _, err := c.LookupURL(ctx, "http", "h", p); !errors.Is(err, cache.ErrNotFound) {
+			t.Errorf("%s: %v, want deleted", p, err)
+		}
+	}
+	if _, err := os.Stat(c.BlobPath(hash)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the shared rotted pool file: %v, want removed after the second batch", err)
+	}
+	want := map[float64]float64{float64(first): 2, float64(second): 0}
+	lines := logRecords(t, logs, "legacy_snapshot_quarantined")
+	for _, m := range lines {
+		id, _ := m["snapshot_id"].(float64)
+		n, ok := want[id]
+		if !ok || m["reason"] != "anchor_corrupt" || m["anchor_rows_deleted"] != n {
+			t.Errorf("line %v, want reason anchor_corrupt and anchor_rows_deleted %v", m, n)
+		}
+	}
+	if len(lines) != 2 {
+		t.Fatalf("%d quarantine lines, want 2", len(lines))
+	}
+	if recs := logRecords(t, logs, "legacy_anchor_discard_failed"); len(recs) != 0 {
+		t.Fatalf("records %v, want none", recs)
 	}
 }
 

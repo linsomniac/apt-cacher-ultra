@@ -152,3 +152,45 @@ BEGIN SELECT RAISE(ABORT, 'injected url_path delete failure'); END`); err != nil
 		t.Fatal("the anchor row is gone after a rolled-back batch")
 	}
 }
+
+// The H1 final review's prod minor 3: LegacyAuditQueueNamesAnchor answers
+// true only while a snapshot still queued for the audit stores hash as its
+// InRelease. A snapshot not queued, another hash, or one the audit has
+// dequeued answers false; a closed cache answers its error.
+func TestLegacyAuditQueueNamesAnchor(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	defer stubNow(t, 1_800_000_000)()
+	anchor := seedBlob(t, c, "a shared anchor")
+	first := commitInline(t, c, "/r/dists/one", anchor)
+	second := commitInline(t, c, "/r/dists/two", anchor)
+	other := seedBlob(t, c, "another anchor")
+	ask := func(hash string, want bool) {
+		t.Helper()
+		if got, err := c.LegacyAuditQueueNamesAnchor(ctx, hash); err != nil || got != want {
+			t.Fatalf("LegacyAuditQueueNamesAnchor(%s) = %v, %v; want %v", hash, got, err, want)
+		}
+	}
+	ask(anchor, false) // nothing queued
+	if err := c.EnqueueLegacyTrustAudit(ctx, first, second); err != nil {
+		t.Fatal(err)
+	}
+	ask(anchor, true)
+	ask(other, false)
+	if _, err := c.ApplyLegacyAuditDecisions(ctx, []LegacyAuditDecision{
+		{SnapshotID: first, Outcome: LegacyAuditQuarantine, DropAnchorRows: true}}); err != nil {
+		t.Fatal(err)
+	}
+	ask(anchor, true) // second is still queued
+	if _, err := c.ApplyLegacyAuditDecisions(ctx, []LegacyAuditDecision{
+		{SnapshotID: second, Outcome: LegacyAuditQuarantine, DropAnchorRows: true}}); err != nil {
+		t.Fatal(err)
+	}
+	ask(anchor, false)
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.LegacyAuditQueueNamesAnchor(ctx, anchor); err == nil {
+		t.Fatal("a closed cache answered no error")
+	}
+}

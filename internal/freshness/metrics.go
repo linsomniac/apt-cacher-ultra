@@ -168,13 +168,15 @@ var (
 	// event, its failure record, the adoption heartbeat, a repair or
 	// reconcile, a suite reaper run or POST /forget — that could not be
 	// logged because reporting them panicked too, or that struck the
-	// counting itself (an adoption's counters and ring event): a bug,
-	// please report it. Every boundary counts through unloggedPanic
+	// counting itself (an adoption's counters and ring event), and POST
+	// /reconcile's snapshot read failure line when logging it panicked
+	// while the suite was held (the H1 final review's prod minor 1): a
+	// bug, please report it. Every boundary counts through unloggedPanic
 	// (deferred minors B-18, B-44, E-42, E-45; review M-2 of the H1 plan,
 	// and of Task 9 for checkLockedSafe's report).
 	freshnessUnloggedPanics = metrics.NewCounter(
 		"acu_freshness_unlogged_panics_total",
-		"Recovered panics — of a freshness check (scheduled or client-triggered), scheduler tick, retry spread, adoption and its counters, failure record, adoption heartbeat, repair, reconcile, reaper run or POST /forget — that could not be logged because reporting them panicked too, or that struck the counting itself (a bug).",
+		"Recovered panics — of a freshness check (scheduled or client-triggered), scheduler tick, retry spread, adoption and its counters, failure record, adoption heartbeat, repair, reconcile, reaper run or POST /forget — that could not be logged because reporting them panicked too, or that struck the counting itself; also a POST /reconcile log line that panicked while it held the suite (a bug).",
 	)
 
 	adoptionTotal = metrics.NewCounterWithCap(
