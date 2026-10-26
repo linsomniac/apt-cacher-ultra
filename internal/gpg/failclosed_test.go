@@ -50,9 +50,11 @@ func TestVerifyInline_FailsClosedWhateverRequireSignature(t *testing.T) {
 					t.Errorf("%s: missing and malformed must stay distinct", c.name)
 				}
 			}
-			// The genuine envelope still verifies in every mode.
-			if out, err := v.VerifyInline(context.Background(), newSuite(), good); err != nil || len(out) == 0 {
-				t.Errorf("require=%v accept_any=%v: genuine envelope rejected: %v", require, anyFlag, err)
+			// The genuine envelope still verifies, to the signed text, in
+			// every mode (review M-1).
+			if out, err := v.VerifyInline(context.Background(), newSuite(), good); err != nil || !bytes.Equal(out, []byte(fakeReleasePlaintext)) {
+				t.Errorf("require=%v accept_any=%v: genuine envelope: out=%q err=%v, want the signed text %q",
+					require, anyFlag, out, err, fakeReleasePlaintext)
 			}
 		}
 	}
@@ -179,8 +181,10 @@ func TestVerifyInline_AcceptsACRLFEnvelopeWithABlankPaddedMarker(t *testing.T) {
 		t.Fatal("the handler's sniff refuses a body adoption accepts")
 	}
 	out, err := v.VerifyInline(context.Background(), newSuite(), body)
-	if err != nil || len(out) == 0 {
-		t.Fatalf("VerifyInline = %q, %v; want the signed text", out, err)
+	// The exact signed text: the CRLF lines decode to the LF text that was
+	// signed (review M-1).
+	if err != nil || !bytes.Equal(out, []byte(fakeReleasePlaintext)) {
+		t.Fatalf("VerifyInline = %q, %v; want the signed text %q", out, err, fakeReleasePlaintext)
 	}
 }
 

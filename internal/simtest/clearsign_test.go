@@ -25,6 +25,9 @@ func TestClearsignedFixture(t *testing.T) {
 	cases := []struct{ text, plain string }{
 		{"Origin: x\nSHA256:\n 0123 1 main/Packages\n", "Origin: x\nSHA256:\n 0123 1 main/Packages"},
 		{"Origin: x\nSuite: y", "Origin: x\nSuite: y"},
+		// Each line's trailing spaces and tabs are trimmed, as the doc
+		// says (review M-3).
+		{"Origin: x \t\nSuite: y\t \n", "Origin: x\nSuite: y"},
 	}
 	for _, c := range cases {
 		f := ClearsignedFixture(c.text)
