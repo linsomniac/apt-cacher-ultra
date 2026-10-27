@@ -344,7 +344,16 @@ cache and never refreshed, and the daemon logs WARN
 `flat_host_root_unsupported` (at most one line a minute).
 
 A signed or unsigned flat repository is adopted like any other (see
-*Anchor forms and unsigned repositories*). When its `Release` lists its
+*Anchor forms and unsigned repositories*). Releases before 1.1.0 never
+adopted a flat repository, so its signing key may be installed only on
+the clients (for `signed-by=`); a signed one now needs it on the cache
+host too (see *Trust and signer pins*): copy it to `/etc/apt/keyrings` or
+a directory of `keyring_dirs` and restart the daemon, which reads keys
+only at startup. Until then each adoption of the repository fails
+(outcome `gpg_failed`, or `unpinned_suite` under `require_pinned_signer`
+while no `[[trusted_signer]]` matches the host) and logs WARN
+`adoption_run_failed`, on the schedule of *How failed adoptions are
+retried*. When its `Release` lists its
 root `Packages`, that file's fetch failing fails the adoption; a signed
 `Release` that lists none adopts with incomplete coverage
 (`no_packages_members`), which turns strict mode off for its host (an
@@ -410,8 +419,10 @@ refresh, so apt's `If-Modified-Since` sees a replacement. The check logs
 `freshness_check` with `result=anchorless_refreshed` or
 `anchorless_unchanged` and the number of files it replaced and deleted
 (`rows_replaced`, `rows_deleted`), and the repository is adopted at the
-first check after it starts publishing an `InRelease` or `Release`. A flat
-repository the cache has seen signed (a record of a signature for its
+first check after it starts publishing an `InRelease` or a signed
+`Release` (an unsigned one after its confirmation: safeguard 2 of
+*Anchor forms and unsigned repositories*). A flat repository the cache
+has seen signed (a record of a signature for its
 path, a cached `InRelease` or `Release.gpg` that passes its check, or an
 adopted signed snapshot) is never refreshed this way: when its `InRelease`
 and `Release` disappear it fails its checks and shows "refused:
@@ -447,7 +458,8 @@ triggers finds `InRelease` and `Release` answered 404 again (or, behind
 Amazon S3 or CloudFront, 403) and deletes them, so the next update is
 clean. The page cached as `Release.gpg` stays: apt never asks for it
 while the repository publishes no `Release`, but if the repository later
-publishes one, apt fetches `Release.gpg` beside it and prints a
+publishes one without an `InRelease`, apt fetches `Release.gpg` beside it
+and prints a
 signature error for the page (`Signed file isn't valid, got 'NODATA'`)
 until the cache adopts the repository — a signed one at its first check,
 an unsigned one after its confirmation (see *Anchor forms and unsigned
@@ -619,11 +631,13 @@ Unsigned adoption has five safeguards:
    that later turns into 404s confirms after the shorter gap). The
    confirming check is the first of the suite's retries (2 minutes,
    doubling, each ±25 %) that comes that long after the first
-   observation, so with the default `cooldown` a new unsigned repository
-   is adopted at least 5 minutes after its first `apt update` through the
-   cache — usually 5 to 15. Until then the status page shows "refused:
-   unsigned_unconfirmed". A `Release`
-   generated anew for each request, or one that differs between
+   observation; a due retry runs at the scheduler's next tick, every
+   quarter of `periodic_refresh`, or at a client's `apt update` after it.
+   So with the default `cooldown` and `periodic_refresh` a new unsigned
+   repository is adopted at least 5 minutes after its first `apt update`
+   through the cache — usually 5 to 15. Until then the status page shows
+   "refused: unsigned_unconfirmed". A `Release` generated anew for each
+   request, or one that differs between
    load-balanced backends, never shows the same bytes twice and stays
    unconfirmed; it is asked for again at its retry times (2 minutes,
    doubling to an hour) or once `periodic_refresh` has passed, like any
@@ -876,12 +890,12 @@ never adopted a flat repository, so one never made its host strict; now:
   repository not adopted yet (after an upgrade the host's repositories
   adopt one at a time) — is refused, where earlier releases passed it
   through.
-- A flat snapshot with incomplete coverage turns strict mode off for its
-  whole host, as an incomplete `dists/` snapshot does: a `Packages` stanza
-  without a SHA256 (`no_sha256`), say, or a signed `Release` that lists no
-  root `Packages` (`no_packages_members`). The adoption logs INFO
-  `package_coverage_incomplete` with the snapshot and the reason, and a
-  `.deb` then served unvouched on that host logs INFO
+- A signed flat snapshot with incomplete coverage turns strict mode off
+  for its whole host, as an incomplete `dists/` snapshot does: a
+  `Packages` stanza without a SHA256 (`no_sha256`), say, or a signed
+  `Release` that lists no root `Packages` (`no_packages_members`). The
+  adoption logs INFO `package_coverage_incomplete` with the snapshot and
+  the reason, and a `.deb` then served unvouched on that host logs INFO
   `unvouched_deb_passthrough_no_coverage` (at most once an hour per path)
   naming the snapshot as `incomplete_snapshot_id`.
 - The first install from a flat repository a client has just added to a
