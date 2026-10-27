@@ -55,7 +55,7 @@ The controller's rulings on the reviews (2026-10-27):
 - **PH3-8 — a new task: package upgrades restart a running daemon** (Task 4), before the documentation tasks that describe it.
 - **PH3-9 — the minors accepted** with their text: C-M-1 to C-M-16 (C-M-8 as V-I3's text; C-M-10 by PH3-6), V-M-1 to V-M-16 (V-M-4: Task 5 is required and runs before the final task; V-M-9: R-H6 decided; V-M-15: e2e/live runs "before 1.1.0, and before later releases that change the request path, adoption or vouching"), E-M-1 to E-M-13 (E-M-13's `all_adopted` run, not only written), and the exec review's three notes (CI's timing in the pre-RC list; Task 5's script checks every edit before it writes; the final run's row in e2e/live's *Results*).
 - **PH3-10 — Task 5 is required** (D2): "optional" is gone throughout; D2 is under *Decided*.
-- **PH3-11 — `main_test.go`'s two `TestServe_GracefulShutdown_*` tests take `serveUntilCleanup` too** (a finding of the revision): the same defect as parked item 14, the same helper, failure path only, and the cleanup costs nothing once the test has read `serveDone`. Task 2 converts 14 daemon starts.
+- **PH3-11 — `main_test.go`'s two `TestServe_GracefulShutdown_*` tests take `serveUntilCleanup` too** (a finding of the revision): the same defect as parked item 14, the same helper, failure path only, and the cleanup costs nothing once the test has read `serveDone`. Task 2 converts 14 daemon starts (17 with the three of execution ruling PH3-15, R-H3-6).
 
 The planner's rulings (each says why; the controller confirmed them, as revised above):
 
@@ -64,7 +64,7 @@ The planner's rulings (each says why; the controller confirmed them, as revised 
 - **R-H3-3 — a home for the decisions that outlive H3:** a new file, `docs/open-decisions.md`, owned by the maintainer: each entry says what is open, its evidence (files, commits, tests, reports), the recommendation and the date, and moves to a *Decided* section when he rules. The overview is a development plan (consumed when the branch merges) and its decisions block records what was decided; a file in `docs/` beside the operator docs outlives the phase and is where the next contributor looks. The overview's decisions block points at it. Decided by PH3-2.
 - **R-H3-4 — the live smoke's shape** (`e2e/live`, Task 3): one `debian:12` container with a release-built daemon (no build tags: the binary a release ships) and apt clients as state directories (e2e/flat's design note 2), sourcing e2e/flat's `lib.sh` (copied into the image, not duplicated; `lib.sh`'s header names what the smoke uses), with the clients using the `http://HTTPS///<host>/…` convention, so no CA is installed. The vendors' signing keys are fetched from the vendors at run time, not committed (the same keys the vendors' install instructions name); the packages' Debian dependencies are installed in the image build, directly, so every apt run of the smoke goes through the cache alone. Adoption on, `integrity.refuse_unvouched_debs = true`, every other setting the shipped default. Manual, never in CI (five vendors' availability would gate merges): before 1.1.0, and before later releases that change the request path, adoption or vouching (PH3-9). It ran green during planning (Task 3's expected output).
 - **R-H3-5 — the test-output noise (the overview's H1 carry, final tests review M-8):** one `TestMain` per package (`internal/fetch`, `internal/metrics`) that sets a discarding default logger, instead of a logger in each of `internal/fetch`'s 28 `New(Options{…})` calls and an `ErrorLog` on each TLS server: `slog.SetDefault` also routes the `log` package — where `net/http` writes `http: TLS handshake error` for a server without `ErrorLog` — through the discarding handler, and a test added later is covered without remembering to. The one test that reads the default logger, `internal/metrics`' `TestGauge_CapWarningStaysOneShotAcrossResets`, sets its own and restores it. Measured: 35 `fetch retry`, 5 `TLS handshake error` and 4 `metrics_series_cap_reached` lines before, none after, the same 142 tests.
-- **R-H3-6 — the cmd tests' daemon drain (the overview's H1 carry, parked item 14), as revised by PH3-7:** a helper `serveUntilCleanup(t, ctx, cancel, serve)` in a new test file starts the daemon for the 14 tests that cancel it only at their end (`defer cancel()`, `serveDone` read last: the 12 readiness waits' tests and, by PH3-11, `main_test.go`'s two shutdown tests) and registers, at the start, a `t.Cleanup` that cancels and waits for `serveListeners` to return — the `ca_constraints_log_test.go` pattern the carry names — so every failing exit, the readiness wait's or a later one, drains the daemon before the test's earlier cleanups run. The six tests whose own `t.Cleanup` already cancels and waits keep their pattern. (The first draft's `waitReadyOrStop` drained only the readiness failure: review V-I1.)
+- **R-H3-6 — the cmd tests' daemon drain (the overview's H1 carry, parked item 14), as revised by PH3-7:** a helper `serveUntilCleanup(t, ctx, cancel, serve)` in a new test file starts the daemon for the 17 tests that cancel it only at their end (`defer cancel()`, the result read last: the 12 readiness waits' tests; by PH3-11, `main_test.go`'s two `TestServe_GracefulShutdown_Kills*` tests; and, by the execution ruling PH3-15 after Task 2's review, `reaper_wiring_test.go`'s `TestServeListeners_StartsTheReaperWhateverGCSays`, `TestServe_GracefulShutdown_DrainsInflight` and `TestServe_ReturnsListenError`) and registers, at the start, a `t.Cleanup` that cancels and waits for `serveListeners` to return — the `ca_constraints_log_test.go` pattern the carry names — so every failing exit, the readiness wait's or a later one, drains the daemon before the test's earlier cleanups run. The rule is that every `serveListeners` start in a cmd test drains: the tests whose own `t.Cleanup` already cancels and waits (the six of the carry and `upstream_proxy_test.go` on `serveDone`, four on a `WaitGroup`) and the two `waitServing` callers keep their pattern, and Task 2 Step 6's census checks every start. When the test passed, the helper logs nothing. (The first draft's `waitReadyOrStop` drained only the readiness failure: review V-I1.)
 - **R-H3-7 — version and packaging for the RC:** nothing in the tree carries a version. `make build` and the release workflow take the version from the tag (`git describe --tags`; `main.Version` by `-ldflags`), nfpm takes it from `VERSION`, and `release.yaml` turns `1.1.0-rc1` into the Debian version `1.1.0~rc1` and marks the GitHub release a prerelease, which the apt-repository publisher skips (`scripts/select-stable-tags.sh` drops prereleases). No source file carries a version string (`grep` in Task 10). Task 10 dry-runs both builds with the RC's version.
 - **R-H3-8 — the live smoke's results** go in the release notes as they were measured during planning (the overview asks for them there), dated; Task 10 reruns the smoke on the final tree and its Step 9 replaces the notes' *Testing* results with that run's date, versions and times (re-running `check_notes.py`) and adds it to `e2e/live/README.md`'s *Results*; the maintainer's run on the tagged tree replaces them again if it differs (review V-M-5). A different result on the final run is a finding (ruling R-H2-4: report, never work around).
 
@@ -106,7 +106,7 @@ The failure modes this phase's output can have that would bite a person using th
 | Area | Files | Task |
 |---|---|---|
 | Test-output noise | `internal/fetch/main_test.go`, `internal/metrics/main_test.go` (new) | 1 |
-| The cmd tests' daemon drain | `cmd/apt-cacher-ultra/serve_until_cleanup_test.go` (new); 12 cmd test files (14 daemon starts) | 2 |
+| The cmd tests' daemon drain | `cmd/apt-cacher-ultra/serve_until_cleanup_test.go` (new); 13 cmd test files (17 daemon starts) | 2 |
 | The live-upstream smoke | `e2e/live/Dockerfile`, `e2e/live/run.sh`, `e2e/live/smoke.sh`, `e2e/live/README.md` (new); `Makefile` (`e2e-live`); `e2e/flat/lib.sh` (a header comment) | 3 |
 | The package upgrade's restart | `packaging/scripts/postinstall.sh`, `packaging/scripts/preremove.sh` (its comment); `e2e/deb/Dockerfile`, `e2e/deb/test.sh` (phase 5) | 4 |
 | The Go 1.27 toolchain | `.github/workflows/ci.yaml`, `.github/workflows/release.yaml`, `e2e/flat/Dockerfile`, `e2e/deb/Dockerfile`, `e2e/live/Dockerfile`, `e2e/Dockerfile.cache`, `e2e/flat/README.md` | 5 |
@@ -186,7 +186,8 @@ import (
 // A test that checks a log line passes its own Options.Logger.
 //
 // AIDEV-NOTE: this is the package's only TestMain; a test that needs the
-// default logger's output sets slog.SetDefault itself and restores it.
+// default logger's output sets slog.SetDefault itself and restores it, and
+// does not call t.Parallel.
 func TestMain(m *testing.M) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	os.Exit(m.Run())
@@ -212,7 +213,8 @@ import (
 // sets its own default logger and restores this one.
 //
 // AIDEV-NOTE: this is the package's only TestMain; a test that needs the
-// default logger's output sets slog.SetDefault itself and restores it.
+// default logger's output sets slog.SetDefault itself and restores it, and
+// does not call t.Parallel.
 func TestMain(m *testing.M) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	os.Exit(m.Run())
@@ -272,21 +274,41 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
 ```
 
+As executed, Task 1 is two commits: the one above (c07e974) and, after the task's review, its one Minor (4fa2c78, execution ruling PH3-14): the AIDEV-NOTEs gained "and does not call t.Parallel", as Steps 2 and 3 now show them. The default logger is process-global, so a parallel test that swapped it would capture other tests' lines; neither package calls `t.Parallel` (`grep -rn 't\.Parallel' internal/fetch internal/metrics` prints nothing). Steps 4 and 5 print the same on the reworded files.
+
+```bash
+git add internal/fetch/main_test.go internal/metrics/main_test.go
+git commit -F - <<'EOF'
+Tests: a test that swaps the default logger does not run in parallel
+
+The TestMain AIDEV-NOTEs in internal/fetch and internal/metrics now
+say that a test that needs the default logger's output, besides setting
+slog.SetDefault itself and restoring it, does not call t.Parallel: the
+default logger is process-global, so a parallel test that swaps it
+would capture concurrently running tests' lines (a count assertion such
+as TestGauge_CapWarningStaysOneShotAcrossResets' would flake) and undo
+the silencing for them while it runs. Neither package calls t.Parallel
+today. Comment only. The H3 Task 1 review's Minor (ruling PH3-14).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
 ---
 
 ### Task 2: The cmd tests' daemon drain: `serveUntilCleanup`
 
-The overview's *(H1)* carry (H1 final review, parked item 14): 14 of the cmd tests that start the daemon with `serveListeners` only `defer cancel()` and read `serveDone` at their end — 12 with a readiness wait (the carry's callers) and `main_test.go`'s two `TestServe_GracefulShutdown_*` tests, which have the same defect without one (ruling PH3-11) — so any `t.Fatal*` before that end — a readiness wait's, or one of the later ones (40 in the twelve: a failed dial, a failed assertion) — returns with the daemon still running, racing the `shutdownTimeout` restore (a data race under `-race`: `serveListeners` reads it for its drain, `cmd/apt-cacher-ultra/main.go:836`) and the `TempDir` removal their cleanups make. Failure path only; it never masks a pass. The carry's remedy is a helper that starts `serveListeners` and registers cancel-plus-wait at the start (the `ca_constraints_log_test.go` pattern), so every exit drains. Test-only (ruling R-H3-6, as revised by PH3-7 for review V-I1).
+The overview's *(H1)* carry (H1 final review, parked item 14): 17 of the cmd tests that run `serveListeners` in a goroutine have no drain of their own — they only `defer cancel()` and read its result at their end: 12 with a readiness wait (the carry's callers), `main_test.go`'s two `TestServe_GracefulShutdown_Kills*` tests, which have the same defect without one (ruling PH3-11), and three in other shapes that the task's review found (execution ruling PH3-15): `reaper_wiring_test.go`'s `TestServeListeners_StartsTheReaperWhateverGCSays`, and `main_test.go`'s `TestServe_GracefulShutdown_DrainsInflight` and `TestServe_ReturnsListenError` — so any `t.Fatal*` before that end — a readiness wait's, or one of the later ones (40 in the twelve: a failed dial, a failed assertion) — returns with the daemon still running, racing the `shutdownTimeout` restore (a data race under `-race`: `serveListeners` reads it for its drain, `cmd/apt-cacher-ultra/main.go:836`) and the `TempDir` removal their cleanups make. Failure path only; it never masks a pass. The carry's remedy is a helper that starts `serveListeners` and registers cancel-plus-wait at the start (the `ca_constraints_log_test.go` pattern), so every exit drains. Test-only (ruling R-H3-6, as revised by PH3-7 for review V-I1 and by PH3-15).
 
 **Files:**
 - Create: `cmd/apt-cacher-ultra/serve_until_cleanup_test.go`
-- Modify: the daemon start (four lines each) in `cmd/apt-cacher-ultra/connect_log_test.go`, `connect_shutdown_test.go` (two), `mitm_metrics_integration_test.go`, `cert_cache_evicted_test.go`, `inner_get_deny_range_test.go`, `connect_tls_failed_log_test.go`, `cert_issued_test.go`, `shutdown_orphan_blob_test.go`, `clock_skew_log_test.go`, `ca_expiry_test.go`, `mitm_handshake_metric_test.go`, `main_test.go` (two)
+- Modify: the daemon start (four lines each) in `cmd/apt-cacher-ultra/connect_log_test.go`, `connect_shutdown_test.go` (two), `mitm_metrics_integration_test.go`, `cert_cache_evicted_test.go`, `inner_get_deny_range_test.go`, `connect_tls_failed_log_test.go`, `cert_issued_test.go`, `shutdown_orphan_blob_test.go`, `clock_skew_log_test.go`, `ca_expiry_test.go`, `mitm_handshake_metric_test.go`, `main_test.go` (two, and two in other shapes: `TestServe_GracefulShutdown_DrainsInflight`'s `WaitGroup` start and its end, `TestServe_ReturnsListenError`'s start), `reaper_wiring_test.go` (its second test's one-line start)
 
 **Interfaces:**
-- Consumes: `serveListeners` (`cmd/apt-cacher-ultra/main.go`, unchanged); each converted test's `ctx`, `cancel` (from `context.WithCancel`) and its later reads of `serveDone`, unchanged.
-- Produces: `serveUntilCleanup(t testing.TB, ctx context.Context, cancel context.CancelFunc, serve func(context.Context) error) <-chan error`, a test helper of package `main`: it starts `serve(ctx)` in a goroutine, returns the channel that carries its result (buffered, one value), and registers a `t.Cleanup` that cancels and waits for `serve` to return (15 s at most, then `t.Errorf`), and, when the test failed and `serve` had returned before any cancel, logs `serve`'s error.
+- Consumes: `serveListeners` (`cmd/apt-cacher-ultra/main.go`, unchanged); each converted test's `ctx`, `cancel` (from `context.WithCancel`) and its later reads of the result (`serveDone`; `done` in `TestServe_ReturnsListenError`), unchanged but for `TestServe_GracefulShutdown_DrainsInflight`'s `wg.Wait()` and `serveErr` check, which become a read of `serveDone`.
+- Produces: `serveUntilCleanup(t testing.TB, ctx context.Context, cancel context.CancelFunc, serve func(context.Context) error) <-chan error`, a test helper of package `main`: it starts `serve(ctx)` in a goroutine, returns the channel that carries its result (buffered, one value), and registers a `t.Cleanup` that cancels and waits for `serve` to return (15 s at most, then `t.Errorf`), and, when the test failed and `serve` had returned before any cancel, logs `serve`'s error (a test that passed logs nothing).
 
-The six tests that register, before their readiness wait, a `t.Cleanup` that cancels the daemon and waits for `serveDone` (`ca_constraints_log_test.go`, `ca_lifecycle_log_test.go`, `legacy_audit_wiring_test.go`, `reaper_wiring_test.go`, `status_tls_mitm_integration_test.go`, `disabled_mode_parity_daemon_test.go`) drain already and keep their pattern, as does `upstream_proxy_test.go` (its `t.Cleanup(shutdown)` cancels and waits). `main_test.go`'s two `TestServe_GracefulShutdown_*` tests have no readiness wait, but the same shape and the same defect (a `t.Fatalf` such as "warm get" or "slow dial" before their own cancel), so they take the helper too (ruling PH3-11): failure path only, and once a test has read `serveDone` at its end the cleanup costs nothing — those two time their own shutdown after their own `cancel()`, which the helper does not touch.
+The tests that drain already keep their own drain, a `t.Cleanup` registered right after the start that cancels the daemon and waits: on `serveDone` in the six of the carry (`ca_constraints_log_test.go`, `ca_lifecycle_log_test.go`, `legacy_audit_wiring_test.go`, `reaper_wiring_test.go`'s first test, `TestServe_ForgetIsWired`, `status_tls_mitm_integration_test.go`, `disabled_mode_parity_daemon_test.go`) and `upstream_proxy_test.go` (its `t.Cleanup(shutdown)`), or on a `WaitGroup` in `main_test.go`'s `TestServe_EndToEnd_MirrorFetchAndCache` and `TestServe_DisallowedHostReturnsForbidden`, `upstream_invalid_cert_test.go` and `upstream_redirect_test.go`; `suite_caps_wiring_test.go` and `shutdown_drain_test.go` cancel and wait right after `waitServing`, which drains on its own timeout. `main_test.go`'s two `TestServe_GracefulShutdown_Kills*` tests have no readiness wait, but the same shape and the same defect (a `t.Fatalf` such as "warm get" or "slow dial" before their own cancel), so they take the helper too (ruling PH3-11): failure path only, and once a test has read `serveDone` at its end the cleanup costs nothing — those two time their own shutdown after their own `cancel()`, which the helper does not touch. The task's review found three more with the same defect in other shapes, which the plan's list had missed (Step 6's `grep -l` works per file, and `reaper_wiring_test.go`'s first test drains): `TestServeListeners_StartsTheReaperWhateverGCSays` (a one-line start; its readiness `t.Fatal`s precede its cancel), `TestServe_GracefulShutdown_DrainsInflight` (a `WaitGroup` start; `t.Fatalf`s before and after its cancel, all before its `wg.Wait()`) and `TestServe_ReturnsListenError` (its daemon returns on the listener's close by design, so only its 5 s timeout can leave it running; it is the one caller whose passing run reaches the early log's `t.Failed()` check, which the fourth subtest pins). Ruling PH3-15 converts them, so the rule is "every `serveListeners` start in a cmd test drains", not a list of exceptions; Step 6's census checks it.
 
 - [ ] **Step 1: Write the guard test first**
 
@@ -336,7 +358,8 @@ func (f *fakeTB) runCleanups() {
 // TestServeUntilCleanup pins serveUntilCleanup: a test that fails before
 // its end leaves a daemon that its cleanup cancels and waits for; a test
 // that read done at its end costs the cleanup nothing; and a daemon that
-// returned before any cancel has its error logged when the test failed.
+// returned before any cancel has its error logged when the test failed,
+// and only then.
 func TestServeUntilCleanup(t *testing.T) {
 	// slowServe is a daemon that serves until ctx is cancelled, then takes
 	// 200 ms to stop, and sets stopped when it has.
@@ -394,6 +417,20 @@ func TestServeUntilCleanup(t *testing.T) {
 			t.Fatalf("logs %q; want serve's error, once", ft.logs)
 		}
 	})
+
+	t.Run("a passing test whose daemon returned before any cancel", func(t *testing.T) {
+		ft := &fakeTB{TB: t}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := serveUntilCleanup(ft, ctx, cancel, func(context.Context) error {
+			return errors.New("http: accept tcp 127.0.0.1:1: use of closed network connection")
+		})
+		<-done // as TestServe_ReturnsListenError reads it
+		ft.runCleanups()
+		if len(ft.errs) != 0 || len(ft.logs) != 0 {
+			t.Fatalf("errors %q, logs %q; want none", ft.errs, ft.logs)
+		}
+	})
 }
 ```
 
@@ -402,7 +439,7 @@ The fake `testing.TB` is how the test observes a failing test's exit: a real `t.
 - [ ] **Step 2: Run it to see it fail**
 
 Run: `go test -count=1 -run 'TestServeUntilCleanup' ./cmd/apt-cacher-ultra/`
-Expected: the build fails: `undefined: serveUntilCleanup` (three times, one per subtest).
+Expected: the build fails: `undefined: serveUntilCleanup` (four times, one per subtest).
 
 - [ ] **Step 3: Add the helper**
 
@@ -420,13 +457,27 @@ In `cmd/apt-cacher-ultra/serve_until_cleanup_test.go`, between the import block 
 // done costs it nothing. When the test failed and serve had returned
 // before any cancel (a bind or configuration error, say), the cleanup logs
 // serve's error: a readiness failure then says why the daemon never
-// answered.
+// answered. A test that passed logs nothing, even when serve returned
+// before any cancel (TestServe_ReturnsListenError's does, by design).
 //
-// AIDEV-NOTE: the 14 cmd tests that cancel their daemon only at their end
-// (12 readiness waits, main_test.go's two shutdown tests) start it with this
-// helper; the six whose own t.Cleanup cancels and waits, and
-// upstream_proxy_test.go, keep their pattern. TestServeUntilCleanup pins it
-// through a fake testing.TB whose cleanups it runs as a t.Fatal would.
+// AIDEV-NOTE: every cmd test that runs serveListeners in a goroutine drains
+// it on every exit. The 17 with no drain of their own (defer cancel(), the
+// result read last) start it with this helper: the 12 with a readiness
+// wait, reaper_wiring_test.go's
+// TestServeListeners_StartsTheReaperWhateverGCSays, and main_test.go's
+// three TestServe_GracefulShutdown_* tests and TestServe_ReturnsListenError.
+// The others keep their own: a t.Cleanup, registered right after the
+// start, that cancels and waits, on serveDone in ca_constraints_log_test.go,
+// ca_lifecycle_log_test.go, disabled_mode_parity_daemon_test.go,
+// legacy_audit_wiring_test.go, reaper_wiring_test.go's
+// TestServe_ForgetIsWired, status_tls_mitm_integration_test.go and
+// upstream_proxy_test.go, or on a WaitGroup in main_test.go's EndToEnd and
+// DisallowedHost tests, upstream_invalid_cert_test.go and
+// upstream_redirect_test.go; suite_caps_wiring_test.go and
+// shutdown_drain_test.go cancel and wait right after waitServing, which
+// drains on its own timeout. A new daemon test starts with this helper.
+// TestServeUntilCleanup pins it through a fake testing.TB whose cleanups
+// it runs as a t.Fatal would.
 func serveUntilCleanup(t testing.TB, ctx context.Context, cancel context.CancelFunc,
 	serve func(context.Context) error) <-chan error {
 	t.Helper()
@@ -461,22 +512,23 @@ func serveUntilCleanup(t testing.TB, ctx context.Context, cancel context.CancelF
 - [ ] **Step 4: Run it to see it pass, then its mutants fail**
 
 Run: `go test -race -count=1 -run 'TestServeUntilCleanup' -v ./cmd/apt-cacher-ultra/`
-Expected: `--- PASS: TestServeUntilCleanup` and its three subtests (0.4 s in planning).
+Expected: `--- PASS: TestServeUntilCleanup` and its four subtests (0.4 s in planning and as built).
 
 Mutants (one at a time, each reverted after), with the same command:
 
 | Mutant (in `serveUntilCleanup`'s cleanup) | Fails with |
 |---|---|
-| no cancel: delete the cleanup's `cancel()` | `serve_until_cleanup_test.go:110: the cleanup returned before the daemon had stopped` (after the 15 s bound) |
-| no wait: delete the `select { … }` block (six lines) | `serve_until_cleanup_test.go:105: the cleanup returned before the daemon had stopped`, after a `WARNING: DATA RACE` on `early` |
-| waits on `done`: `case <-stopped:` → `case <-done:` in that block | `:131: the cleanup took 15.0…s and reported ["serveListeners had not returned 15s after the cancel"]; want at once, nothing`, then `:145: logs []; want serve's error, once` |
-| early log inverted: `if early && t.Failed() {` → `if early && !t.Failed() {` | `:145: logs []; want serve's error, once` |
+| no cancel: delete the cleanup's `cancel()` | `serve_until_cleanup_test.go:125: the cleanup returned before the daemon had stopped` (after the 15 s bound) |
+| no wait: delete the `select { … }` block (six lines) | `serve_until_cleanup_test.go:120: the cleanup returned before the daemon had stopped`, then a `WARNING: DATA RACE` on `early` (the goroutine's write, `:54`, against the cleanup's read, `:60`), charged to the second subtest: the write comes 200 ms after the read |
+| waits on `done`: `case <-stopped:` → `case <-done:` in that block | `:146: the cleanup took 15.0…s and reported ["serveListeners had not returned 15s after the cancel"]; want at once, nothing`, then `:160: logs []; want serve's error, once` and `:174: errors ["serveListeners had not returned 15s after the cancel"], logs []; want none` |
+| early log inverted: `if early && t.Failed() {` → `if early && !t.Failed() {` | `:160: logs []; want serve's error, once`, then `:174: errors [], logs ["serveListeners returned before any cancel: http: accept tcp 127.0.0.1:1: use of closed network connection"]; want none` |
+| early log unconditional: `if early && t.Failed() {` → `if early {` | `:174: errors [], logs ["serveListeners returned before any cancel: http: accept tcp 127.0.0.1:1: use of closed network connection"]; want none` (the first three subtests pass: only the fourth pins the `t.Failed()` half) |
 
-(The line numbers are the mutated file's; unmutated, the first two failures sit at line 111.)
+(The line numbers are the mutated file's; unmutated, the first two failures sit at line 126.)
 
-- [ ] **Step 5: Convert the 14 daemon starts**
+- [ ] **Step 5: Convert the 17 daemon starts**
 
-Each of the 14 is exactly these four lines (`logger` is `newTestLogger()` in some), with `ctx` and `cancel` from `context.WithCancel` in scope:
+Fourteen are exactly these four lines (`logger` is `newTestLogger()` in some), with `ctx` and `cancel` from `context.WithCancel` in scope:
 
 ```go
 	serveDone := make(chan error, 1)
@@ -527,6 +579,50 @@ EOF
 
 Expected: `replaced 14 blocks` (two each in `connect_shutdown_test.go` and `main_test.go`).
 
+The other three have other shapes (ruling PH3-15): `reaper_wiring_test.go`'s second test starts the daemon in one line; `TestServe_GracefulShutdown_DrainsInflight` starts it under a `WaitGroup` and ends with `wg.Wait()` and a check of `serveErr`, which become a read of `serveDone` (the `sync` import stays: `sync.Once` is still used); `TestServe_ReturnsListenError` keeps its channel's name, `done`. The script checks every edit before it writes. Run:
+
+```bash
+python3 - <<'EOF'
+import pathlib
+import sys
+
+d = pathlib.Path("cmd/apt-cacher-ultra")
+start = "\tserveDone := serveUntilCleanup(t, ctx, cancel, func(ctx context.Context) error {\n"
+edits = {
+    "reaper_wiring_test.go": [
+        ("\tserveDone := make(chan error, 1)\n"
+         "\tgo func() { serveDone <- serveListeners(ctx, cfg, silentBuildLogger(), ln, nil, nil, nil) }()\n",
+         start + "\t\treturn serveListeners(ctx, cfg, silentBuildLogger(), ln, nil, nil, nil)\n\t})\n"),
+    ],
+    "main_test.go": [
+        ("\tvar wg sync.WaitGroup\n\twg.Add(1)\n\tvar serveErr error\n\tgo func() {\n\t\tdefer wg.Done()\n"
+         "\t\tserveErr = serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)\n\t}()\n",
+         start + "\t\treturn serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)\n\t})\n"),
+        ('\twg.Wait()\n\tif serveErr != nil {\n\t\tt.Fatalf("serveListeners: %v", serveErr)\n\t}\n}\n',
+         '\tif err := <-serveDone; err != nil {\n\t\tt.Fatalf("serveListeners: %v", err)\n\t}\n}\n'),
+        ("\tdone := make(chan error, 1)\n\tgo func() {\n"
+         "\t\tdone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)\n\t}()\n",
+         "\tdone := serveUntilCleanup(t, ctx, cancel, func(ctx context.Context) error {\n"
+         "\t\treturn serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)\n\t})\n"),
+    ],
+}
+out = {}
+for name, pairs in edits.items():
+    p = d / name
+    s = p.read_text()
+    for old, new in pairs:
+        if s.count(old) != 1:
+            sys.exit(f"{p}: {s.count(old)} matches for {old!r}; nothing written")
+        s = s.replace(old, new)
+    out[p] = s
+for p, s in out.items():
+    p.write_text(s)
+print("converted 3 tests")
+EOF
+```
+
+Expected: `converted 3 tests`.
+
 - [ ] **Step 6: Check where the helper is called, and which daemons are still started by hand**
 
 Run:
@@ -547,9 +643,10 @@ cmd/apt-cacher-ultra/connect_log_test.go:1
 cmd/apt-cacher-ultra/connect_shutdown_test.go:2
 cmd/apt-cacher-ultra/connect_tls_failed_log_test.go:1
 cmd/apt-cacher-ultra/inner_get_deny_range_test.go:1
-cmd/apt-cacher-ultra/main_test.go:2
+cmd/apt-cacher-ultra/main_test.go:4
 cmd/apt-cacher-ultra/mitm_handshake_metric_test.go:1
 cmd/apt-cacher-ultra/mitm_metrics_integration_test.go:1
+cmd/apt-cacher-ultra/reaper_wiring_test.go:1
 cmd/apt-cacher-ultra/shutdown_orphan_blob_test.go:1
 cmd/apt-cacher-ultra/ca_constraints_log_test.go
 cmd/apt-cacher-ultra/ca_lifecycle_log_test.go
@@ -560,7 +657,26 @@ cmd/apt-cacher-ultra/status_tls_mitm_integration_test.go
 cmd/apt-cacher-ultra/upstream_proxy_test.go
 ```
 
-The second list is the six tests whose own cleanup drains and `upstream_proxy_test.go` (its `t.Cleanup(shutdown)`).
+The first list is the 17 starts in 13 files. The second is the six tests whose own cleanup drains and `upstream_proxy_test.go` (its `t.Cleanup(shutdown)`); `reaper_wiring_test.go` is in both, since `grep -l` works per file (its first test drains, its second takes the helper). So the rule — every `serveListeners` start in a cmd test drains — is checked by a census of every call, one line per form:
+
+```bash
+grep -h 'serveListeners(' cmd/apt-cacher-ultra/*_test.go | sed -E 's/^\s+//; s/serveListeners\(.*/serveListeners(…)/' | LC_ALL=C sort | uniq -c
+```
+
+Expected:
+
+```
+      1 _ = serveListeners(…)
+      1 err = serveListeners(…)
+      2 go func() { done <- serveListeners(…)
+      2 go func() { serveDone <- serveListeners(…)
+     17 return serveListeners(…)
+      5 serveDone <- serveListeners(…)
+      3 serveErr := serveListeners(…)
+      3 serveErr = serveListeners(…)
+```
+
+`return` is the helper's 17 callers; `serveDone <-` (seven, two of them one-line) the seven with their own `t.Cleanup` on `serveDone`; `serveErr =` and `_ =` the four `WaitGroup` starts with a `t.Cleanup` that cancels and waits; `done <-` the two `waitServing` callers (`suite_caps_wiring_test.go`, `shutdown_drain_test.go`); `serveErr :=` and `err =` four synchronous calls, which return before the test goes on. A start in a new form changes this output, and its drain is then checked by hand.
 
 - [ ] **Step 7: The package under `-race`, vet, lint, format**
 
@@ -599,6 +715,45 @@ cleanups it runs as a t.Fatal would: a cleanup without its cancel or
 its wait fails it (serve_until_cleanup_test.go: the cleanup returned
 before the daemon had stopped), as do one that waits on done and one
 that drops the early error.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
+As executed, Task 2 is two commits: the one above (5cc1d08: the helper with its first AIDEV-NOTE and three subtests, and the fourteen four-line starts) and, after the task's review, fix round 1 (766e7eb, execution ruling PH3-15: Step 5's three other starts, the fourth subtest, and the doc comments and AIDEV-NOTE as Steps 1 and 3 now show them). Steps 1–7 describe the tree after both.
+
+```bash
+git add cmd/apt-cacher-ultra/serve_until_cleanup_test.go cmd/apt-cacher-ultra/main_test.go \
+    cmd/apt-cacher-ultra/reaper_wiring_test.go
+git commit -F - <<'EOF'
+cmd tests: every daemon start drains, three more tests and a quiet pass
+
+5cc1d08's fourteen conversions missed three tests with the same
+failure-path defect (the H3 Task 2 review's Important 1, ruling PH3-15):
+reaper_wiring_test.go's TestServeListeners_StartsTheReaperWhateverGCSays
+(a one-line start whose early t.Fatal raced its shutdownTimeout and
+runReaper restore and its TempDir removal: with a t.Fatal injected after
+the start, 17 of 40 runs ended with "TempDir RemoveAll cleanup: ...
+directory not empty", none of 40 once converted), main_test.go's
+TestServe_GracefulShutdown_DrainsInflight (a WaitGroup start; its
+wg.Wait() and serveErr check become a read of serveDone) and
+TestServe_ReturnsListenError (its daemon returns on the listener's
+close; only its 5 s timeout could leave it running). They start the
+daemon with serveUntilCleanup now, so every cmd test that runs
+serveListeners in a goroutine drains it on every exit; the helper's
+AIDEV-NOTE states that rule and names the 17 callers and the tests that
+keep their own drain.
+
+TestServeUntilCleanup gains a fourth subtest: a passing test whose
+daemon returned before any cancel (TestServe_ReturnsListenError's case)
+logs nothing. The t.Failed() half of the early log was unpinned: with
+"if early {" the three subtests passed; the fourth fails it
+(serve_until_cleanup_test.go:174: logs ["serveListeners returned before
+any cancel: ..."]; want none).
+
+Not changed (pre-existing, failure path only): DrainsInflight's "upstream
+never saw the in-flight request" exit can hang in its deferred
+upstream.Close() when the request reaches the upstream late.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
