@@ -489,10 +489,9 @@ func TestServe_GracefulShutdown_KillsHungFetchAfterDrainBudget(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	serveDone := make(chan error, 1)
-	go func() {
-		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
-	}()
+	serveDone := serveUntilCleanup(t, ctx, cancel, func(ctx context.Context) error {
+		return serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
+	})
 
 	// Kick off the request. We do not care about its body — only that
 	// it reaches the upstream so we know the fetch is in flight.
@@ -579,10 +578,9 @@ func TestServe_GracefulShutdown_KillsSlowClientAfterDrainBudget(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	serveDone := make(chan error, 1)
-	go func() {
-		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
-	}()
+	serveDone := serveUntilCleanup(t, ctx, cancel, func(ctx context.Context) error {
+		return serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
+	})
 
 	// Warm the cache so the slow-client request below is a cache HIT,
 	// exercising the ServeContent path codex called out specifically.
