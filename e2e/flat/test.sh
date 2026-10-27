@@ -727,17 +727,21 @@ main_candidates() {
 upstream_down() {
     scenario upstream-down "upstream stopped: fresh clients of both forms install 2.0 from the snapshots"
     stop_nginx
-    local upstream_lines
-    upstream_lines=$(wc -l < "$NGINX_LOG")
     client fresh-slash "$PROXY" "$SRC_K8S"
     client fresh-dot "$PROXY" "$SRC_K8S_DOT"
     apt_update fresh-slash
     apt_update fresh-dot
     apt_install fresh-slash acu-k8s=2.0
     apt_install fresh-dot acu-k8s=2.0
-    # Nothing came from the upstream: these clients were served from the
-    # snapshots alone.
-    (($(wc -l < "$NGINX_LOG") == upstream_lines)) || fail "the upstream answered during upstream-down"
+    # Their .debs came from the cache: every .deb request line of the
+    # scenario, one per client at least, is a hit. (Counting nginx's
+    # access-log lines instead could not fail: nothing writes it while it
+    # is stopped. Final review R8 #5.)
+    local debs others
+    debs=$(log_lines "$SCENARIO_MARK" "$(event request)" '(^| )path=[^ ]*\.deb( |$)')
+    others=$(grep -vE -- "$(kv outcome hit)" <<< "$debs" || true)
+    (($(grep -c . <<< "$debs") >= 2)) && [[ -z $others ]] ||
+        fail "the fresh clients' .debs were not all cache hits: ${others:-$(grep -c . <<< "$debs") .deb request lines, want 2 or more}"
     # The overview's H1 carry (parked item 12): main.go wires
     # admin.Config.CheckBackoff, without which a failing suite's row shows
     # only "checks failing ×k". A client-triggered check fails within a
