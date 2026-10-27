@@ -14,8 +14,8 @@
 
 Everything in the overview's Global Constraints applies. In particular:
 
-- **Nothing goes to GitHub.** No push, pull request, tag, release, issue or comment, and nothing on PR #8. The maintainer opens the pull request and tags 1.1.0-rc1 himself; Task 10 prepares and dry-runs it locally.
-- **No production Go change**, no schema change, no config key. The Go changes of Tasks 1, 2 and 6 are `_test.go` files only. Never edit an entry of `migrations` in `internal/cache/schema.go`. The package's maintainer scripts change (Task 4, the maintainer's decision H-2), proven by e2e/deb.
+- **Nothing goes to GitHub.** No push, pull request, tag, release, issue or comment, and nothing on PR #8. The maintainer opens the pull request and tags 1.1.0-rc1; Task 10 prepares and dry-runs it locally.
+- **No production Go change**, no schema change, no config key. The Go changes of Tasks 1, 2 and 6 are `_test.go` files only, and Task 9's is a comment: the cache writer's `AIDEV-NOTE` (execution ruling PH3-24). Never edit an entry of `migrations` in `internal/cache/schema.go`. The package's maintainer scripts change (Task 4, the maintainer's decision H-2), proven by e2e/deb.
 - `go test -race ./...` and `golangci-lint run ./...` are clean, and `gofmt -l .` lists only the five drift files (`cmd/apt-cacher-ultra/ca_print.go`, `internal/cache/cache_test.go`, `internal/cache/gc_urlpath_test.go`, `internal/freshness/hot_prefetch_test.go`, `internal/proxy/connect_stats.go`) at the end of every task that touches Go. Never run `gofmt -w` on those five.
 - **Every doc claim is checked against the code at HEAD** by a step of its task: a grep with its expected output, or a named test. Text written from memory is wrong (the H2 lesson: seven review rounds moved the harness away from its plan). A claim whose check fails is corrected to what the code does, never the reverse, and the correction is reported.
 - **Every change is proven:** a test (red, then green, with a mutant that fails it), a guard test, a grep check with its expected output, or a recorded run.
@@ -61,7 +61,7 @@ The planner's rulings (each says why; the controller confirmed them, as revised 
 
 - **R-H3-1 — the release notes live in the tree:** `docs/release-notes/1.1.0.md`, which the maintainer pastes into the GitHub release's body (or passes to `gh release edit <tag> --notes-file`); `release.yaml` keeps `generate_release_notes: true`, whose commit list then follows the pasted text. The project has never kept release notes in the tree: no `CHANGELOG`, `NEWS` or release-notes file in its history, and the tags' messages are one line (`apt-cacher-ultra 1.0.2`) or one paragraph (1.0.0). In the tree, the notes are reviewed with the code, checked against it by this plan's steps, versioned with the release they describe, and readable offline; a workflow change (`body_path`) would add a release-time failure (a tag without its file) and a second convention for release candidates, for a paste the maintainer makes once per release. Decided by PH3-1.
 - **R-H3-2 — `flip_held_ms` (H2 For H3 item 9):** the row says the value is about 20000 at most, since the hold's 20 s timer can fire a few milliseconds late (Task 6 Step 9). `flipgate.(*Gate).AnchorStart` arms its own `time.NewTimer(g.holdMax)` when the request joins the hold and sets `t.held = now.Sub(joined)` after the timer or the hold's release fires and the gate's mutex is taken (`internal/flipgate/gate.go`), so a request that joined as the hold began can log a few milliseconds over 20000; e2e/flat's `commit-delay` allows 20500 and measured at most 17914. A dashboard bound of exactly 20000 would misfire; the nominal bound stays the documented one.
-- **R-H3-3 — a home for the decisions that outlive H3:** a new file, `docs/open-decisions.md`, owned by the maintainer: each entry says what is open, its evidence (files, commits, tests, reports), the recommendation and the date, and moves to a *Decided* section when he rules. The overview is a development plan (consumed when the branch merges) and its decisions block records what was decided; a file in `docs/` beside the operator docs outlives the phase and is where the next contributor looks. The overview's decisions block points at it. Decided by PH3-2.
+- **R-H3-3 — a home for the decisions that outlive H3:** a new file, `docs/open-decisions.md`, owned by the maintainer: each entry says what is open, its evidence (files, commits, tests, reports), the recommendation and the date, and moves to a *Decided* section when the maintainer rules. The overview is a development plan (consumed when the branch merges) and its decisions block records what was decided; a file in `docs/` beside the operator docs outlives the phase and is where the next contributor looks. The overview's decisions block points at it. Decided by PH3-2.
 - **R-H3-4 — the live smoke's shape** (`e2e/live`, Task 3): one `debian:12` container with a release-built daemon (no build tags: the binary a release ships) and apt clients as state directories (e2e/flat's design note 2), sourcing e2e/flat's `lib.sh` (copied into the image, not duplicated; `lib.sh`'s header names what the smoke uses), with the clients using the `http://HTTPS///<host>/…` convention, so no CA is installed. The vendors' signing keys are fetched from the vendors at run time, not committed (the same keys the vendors' install instructions name); the packages' Debian dependencies are installed in the image build, directly, so every apt run of the smoke goes through the cache alone. Adoption on, `integrity.refuse_unvouched_debs = true`, every other setting the shipped default. Manual, never in CI (five vendors' availability would gate merges): before 1.1.0, and before later releases that change the request path, adoption or vouching (PH3-9). It ran green during planning (Task 3's expected output).
 - **R-H3-5 — the test-output noise (the overview's H1 carry, final tests review M-8):** one `TestMain` per package (`internal/fetch`, `internal/metrics`) that sets a discarding default logger, instead of a logger in each of `internal/fetch`'s 28 `New(Options{…})` calls and an `ErrorLog` on each TLS server: `slog.SetDefault` also routes the `log` package — where `net/http` writes `http: TLS handshake error` for a server without `ErrorLog` — through the discarding handler, and a test added later is covered without remembering to. The one test that reads the default logger, `internal/metrics`' `TestGauge_CapWarningStaysOneShotAcrossResets`, sets its own and restores it. Measured: 35 `fetch retry`, 5 `TLS handshake error` and 4 `metrics_series_cap_reached` lines before, none after, the same 142 tests.
 - **R-H3-6 — the cmd tests' daemon drain (the overview's H1 carry, parked item 14), as revised by PH3-7:** a helper `serveUntilCleanup(t, ctx, cancel, serve)` in a new test file starts the daemon for the 17 tests that cancel it only at their end (`defer cancel()`, the result read last: the 12 readiness waits' tests; by PH3-11, `main_test.go`'s two `TestServe_GracefulShutdown_Kills*` tests; and, by the execution ruling PH3-15 after Task 2's review, `reaper_wiring_test.go`'s `TestServeListeners_StartsTheReaperWhateverGCSays`, `TestServe_GracefulShutdown_DrainsInflight` and `TestServe_ReturnsListenError`) and registers, at the start, a `t.Cleanup` that cancels and waits for `serveListeners` to return — the `ca_constraints_log_test.go` pattern the carry names — so every failing exit, the readiness wait's or a later one, drains the daemon before the test's earlier cleanups run. The rule is that every `serveListeners` start in a cmd test drains: the tests whose own `t.Cleanup` already cancels and waits (the six of the carry and `upstream_proxy_test.go` on `serveDone`, four on a `WaitGroup`) and the two `waitServing` callers keep their pattern, and Task 2 Step 6's census checks every start. When the test passed, the helper logs nothing. (The first draft's `waitReadyOrStop` drained only the readiness failure: review V-I1.)
@@ -2525,11 +2525,11 @@ EOF
 
 ### Task 6: Operator docs: strict mode on flat hosts, the unsigned confirmation, the captive portal's aftermath, binary `Release.gpg`, `flip_held_ms`, the restart on upgrade
 
-The docs carries marked *H3's*: the overview's "PR #8 parity" H (strict mode's three consequences in `docs/configuration.md`), H2's For H3 items 2 (the unsigned confirmation's real duration in `docs/configuration.md` safeguard 2 and `docs/admin-ui-spec.md`; the README's home is Task 7), 3 (the captive portal's aftermath, `Release.gpg` included), 4 (a binary `Release.gpg`) and 9 (the `flip_held_ms` row, ruling R-H3-2). Before item 3's text calls the `Release.gpg` error transient, a handler test pins that an adopted unsigned snapshot never serves the cached page (design note 4). The strict-mode text says when a flat host turns strict and who is refused then (review C-I2), *Upgrading an existing cache* says the package's upgrade now restarts a running daemon (Task 4; ruling PH3-8), and the pre-flight checks that spec §8's `docs/configuration.md` items are all there (review V-M-13).
+The docs carries marked *H3's*: the overview's "PR #8 parity" H (strict mode's three consequences in `docs/configuration.md`), H2's For H3 items 2 (the unsigned confirmation's real duration in `docs/configuration.md` safeguard 2 and `docs/admin-ui-spec.md`; the README's home is Task 7), 3 (the captive portal's aftermath, `Release.gpg` included), 4 (a binary `Release.gpg`) and 9 (the `flip_held_ms` row, ruling R-H3-2). Before item 3's text calls the `Release.gpg` error transient, a handler test pins that an adopted unsigned snapshot never serves the cached page (design note 4). The strict-mode text says when a flat host turns strict and who is refused then (review C-I2), *Upgrading an existing cache* says the package's upgrade now restarts a running daemon (Task 4; ruling PH3-8), and the pre-flight checks that spec §8's `docs/configuration.md` items are all there (review V-M-13). As executed, two rounds followed (Step 12): PH3-19 told operators to check `systemctl status` after the upgrade, since apt does not show a new binary that exits at startup; the docs fix round (ruling PH3-23 and the round's cross-cutting points) added that a signed flat repository needs its signing key on the cache host, qualified "usually 5 to 15" by the default `cooldown` and `periodic_refresh`, said that an unsigned `Release` adopts only after its confirmation, that only a signed flat snapshot with incomplete coverage turns strict mode off, and that apt fetches the portal's `Release.gpg` only without an `InRelease`. The steps below show the text as built.
 
 **Files:**
 - Create: `internal/handler/portal_aftermath_test.go`
-- Modify: `docs/configuration.md` (five places), `docs/admin-ui-spec.md` (§4.5, *Unsigned and absent-anchor refusals*), `docs/log-fields.md` (`flip_held_ms`)
+- Modify: `docs/configuration.md` (seven places), `docs/admin-ui-spec.md` (§4.5, *Unsigned and absent-anchor refusals*), `docs/log-fields.md` (`flip_held_ms`)
 
 **Interfaces:**
 - Consumes: the handler test helpers `newFlipStack`, `(*flipStack).cacheRow`, `.track`, `.current`, `.members` (`internal/handler/flip_stack_test.go`, `suite_rows_test.go`), `plainVerifier`, `flipSimHost`, `hdrXCacheSnapshot`; `freshness.NewAdopter`, `(*freshness.Adopter).RunUnsigned`.
@@ -2560,6 +2560,22 @@ for p in '^| `adopt_unsigned` |' '^| `flip_quiet_period` |' '^| `max_duration` |
     'at most a tenth of it per upstream host'; do
     printf '%s %s\n' "$(grep -c -- "$p" docs/configuration.md)" "$p"
 done
+grep -n 'Type=simple\|Restart=always\|RestartSec=5' packaging/systemd/apt-cacher-ultra.service
+grep -n 'return max(refresh/4, minFastTickInterval)\|retryDue := c.adopter != nil && s.AdoptionFailCount > 0' internal/freshness/scheduler.go
+grep -n 'c.Freshness.Cooldown.Duration = 60 \* time.Second\|c.Freshness.PeriodicRefresh.Duration = 15 \* time.Minute' internal/config/config.go
+grep -n 'deferred, reason := gate.holds(req.key), gate.reason\|proceed, refusal, err := c.unsignedFirst(' internal/freshness/first_adoption.go
+grep -n -A1 'func (a \*Adopter) buildPackageHashes' internal/freshness/adoption.go | grep -c 'if form == cache.FormUnsigned {'
+grep -n 'DefaultTrustedGPGDir       = \|DefaultKeyringsDir         = \|DefaultUsrShareKeyringsDir = ' internal/gpg/keyring.go
+grep -n 'KeyringDirs \[\]string `toml:"keyring_dirs"`\|RequirePinnedSigner bool `toml:"require_pinned_signer"`' internal/config/config.go
+grep -n 'adopter, keyring, err = buildAdopter(\|dirs = append(dirs, cfg.Adoption.KeyringDirs...)\|keyring, err := gpg.LoadKeyringWithEmbedded(' cmd/apt-cacher-ultra/main.go
+grep -c 'buildAdopter(cfg' cmd/apt-cacher-ultra/main.go
+grep -n 'signal.NotifyContext' cmd/apt-cacher-ultra/main.go
+grep -c 'SIGHUP' cmd/apt-cacher-ultra/main.go
+grep -n 'return "unpinned_suite"\|return "gpg_failed"' internal/freshness/metrics.go
+grep -n 'if v.requirePinned {' internal/gpg/verifier.go
+grep -n 'if outcome == "refused" {\|c.logger.Log(context.Background(), level, "adoption_run_failed",' internal/freshness/freshness.go
+grep -n -A3 '^var refusalReasons = ' internal/cache/adoption_failure.go
+grep -c 'installing a missing key or fixing pins takes effect without waiting an hour' docs/configuration.md
 ```
 
 Expected:
@@ -2609,9 +2625,42 @@ Expected:
 1 ^### Suite reaping$
 1 a hold lasts at most 20 s, below apt's 30 s timeout
 1 at most a tenth of it per upstream host
+8:Type=simple
+12:Restart=always
+13:RestartSec=5
+26:	return max(refresh/4, minFastTickInterval)
+442:	retryDue := c.adopter != nil && s.AdoptionFailCount > 0 && s.AdoptionNextRetryAt != nil && *s.AdoptionNextRetryAt <= nowU
+1636:		c.Freshness.Cooldown.Duration = 60 * time.Second
+1639:		c.Freshness.PeriodicRefresh.Duration = 15 * time.Minute
+383:	deferred, reason := gate.holds(req.key), gate.reason
+385:		proceed, refusal, err := c.unsignedFirst(ctx, cur, req, t, gate, now)
+1
+44:	DefaultTrustedGPGDir       = "/etc/apt/trusted.gpg.d"
+45:	DefaultKeyringsDir         = "/etc/apt/keyrings"
+46:	DefaultUsrShareKeyringsDir = "/usr/share/keyrings"
+171:	RequirePinnedSigner bool `toml:"require_pinned_signer"`
+217:	KeyringDirs []string `toml:"keyring_dirs"`
+583:		adopter, keyring, err = buildAdopter(cfg, c, fetchClient, hostLimiter, logger)
+990:	dirs = append(dirs, cfg.Adoption.KeyringDirs...)
+995:	keyring, err := gpg.LoadKeyringWithEmbedded(dirs, embedded, logger)
+1
+209:	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+0
+341:		return "unpinned_suite"
+343:		return "gpg_failed"
+565:		if v.requirePinned {
+688:			if outcome == "refused" {
+691:			c.logger.Log(context.Background(), level, "adoption_run_failed",
+35:var refusalReasons = []string{
+36-	ReasonUpstreamOlder, ReasonRollbackRefused, ReasonUnsignedDowngradeRefused,
+37-	ReasonUnsignedUnconfirmed, ReasonUnsignedTooLarge, ReasonAnchorAbsent, ReasonUnsignedDisabled,
+38-}
+1
 ```
 
 What each line backs: the four strict-matrix rows are the three PR #8 parity consequences (a flat-only host is strict; an incomplete flat snapshot turns strict mode off for its host, naming it in `unvouched_deb_passthrough_no_coverage`; a third minor's first adoption is waited for while it runs and refused while it is queued); the passthrough line is INFO and keyed per host, path and hour; strict mode counts the host's *current* signed snapshots only, so the first signed flat snapshot makes the host strict while its other suites are still unadopted (`HostCurrentSnapshotsCoverage`, `internal/cache/queries.go`); an unsigned snapshot vouches nothing (`declaredExactSQL` and its fallback `declaredBySuffixSQL` both require `anchor_form <> 'unsigned'`); a host admits one adoption at a time (`admission.tryAcquire`), and the strict wait covers only an adoption in flight (`AdoptionsInFlight`), so a queued one's packages are refused; the two coverage reasons exist; the unsigned confirmation is the first retry (2 minutes, doubling, ±25 %) at least `max(cooldown, 5 min)` after the first observation, an hour when the confirming check sees a 401/403 on a signature file (`deniedConfirmGap`); the anchorless refresh deletes only the cached `InRelease` and `Release` (so a cached `Release.gpg` stays); a hold's waiter arms its own 20 s timer from when it joined and its wait is measured after the gate's mutex (so `flip_held_ms` can exceed 20000 by the timer's lateness); the cache accepts a binary `Release.gpg` (its sniff and its detached verification: `2`, both tests ran — a renamed test would print `0`, review E-M-6); the postinst's try-restart (Task 4); and the loop's sixteen counts, each at least 1, are spec §8's `docs/configuration.md` items: the five new keys' rows (C11), the unsigned threat notes, never-downgrade, the LAN-client note, the changed `require_signature = false`, the legacy audit at upgrade, strict mode's unsigned and first-use behaviour (its flat behaviour is this task's), eager first adoption, suite reaping, the barrier's bound below apt's timeout and the per-host suite cap. apt's refusal of a binary detached signature is e2e/flat's planning observation on all six images (the H2 plan's deviation 1), not a property of this code. Line numbers are HEAD's (planning: 559fd7f with Tasks 1–5 applied); a moved line is fine, a missing one or a `0` count is a stop.
+
+The lines from the unit file on are the fix rounds' (PH3-19, PH3-23, 2026-10-27, at 8b9604d): the unit's `Type=simple`, `Restart=always` and 5 s (apt shows no binary that exits at startup, so operators check `systemctl status`); the scheduler's tick, a quarter of `periodic_refresh`, and `retryDue`, at which a due retry runs (the qualifier on "usually 5 to 15"); the default `cooldown` and `periodic_refresh`; the C7 gate that defers a record's content before its retry time and the unsigned confirmation after it (so a client's update after the retry time confirms too); an unsigned snapshot's zero coverage (`buildPackageHashes`), which never counts, so only a signed flat snapshot turns strict mode off; and the signing-key sentence in *Flat repositories*: the keyring's three directories, `keyring_dirs` and `require_pinned_signer`, the keyring loaded once, at startup, and only with adoption enabled (`buildAdopter`; the daemon handles INT and TERM, no `SIGHUP`), the two outcomes, the pin check, `adoption_run_failed` at WARN unless refused, the refusals (no gpg reason among them), and the retry section's sentence that a restart retries every failing suite.
 
 - [ ] **Step 2: Write the portal pin**
 
@@ -2740,12 +2789,12 @@ never adopted a flat repository, so one never made its host strict; now:
   repository not adopted yet (after an upgrade the host's repositories
   adopt one at a time) — is refused, where earlier releases passed it
   through.
-- A flat snapshot with incomplete coverage turns strict mode off for its
-  whole host, as an incomplete `dists/` snapshot does: a `Packages` stanza
-  without a SHA256 (`no_sha256`), say, or a signed `Release` that lists no
-  root `Packages` (`no_packages_members`). The adoption logs INFO
-  `package_coverage_incomplete` with the snapshot and the reason, and a
-  `.deb` then served unvouched on that host logs INFO
+- A signed flat snapshot with incomplete coverage turns strict mode off
+  for its whole host, as an incomplete `dists/` snapshot does: a
+  `Packages` stanza without a SHA256 (`no_sha256`), say, or a signed
+  `Release` that lists no root `Packages` (`no_packages_members`). The
+  adoption logs INFO `package_coverage_incomplete` with the snapshot and
+  the reason, and a `.deb` then served unvouched on that host logs INFO
   `unvouched_deb_passthrough_no_coverage` (at most once an hour per path)
   naming the snapshot as `incomplete_snapshot_id`.
 - The first install from a flat repository a client has just added to a
@@ -2767,6 +2816,7 @@ never adopted a flat repository, so one never made its host strict; now:
    since a firewall or an S3 permission error can hide a signature (a 403
    that later turns into 404s confirms after the shorter gap). Until then
    the status page shows "refused: unsigned_unconfirmed". A `Release`
+   generated anew for each request, or one that differs between
 ```
 
 `new`:
@@ -2776,13 +2826,16 @@ never adopted a flat repository, so one never made its host strict; now:
    that later turns into 404s confirms after the shorter gap). The
    confirming check is the first of the suite's retries (2 minutes,
    doubling, each ±25 %) that comes that long after the first
-   observation, so with the default `cooldown` a new unsigned repository
-   is adopted at least 5 minutes after its first `apt update` through the
-   cache — usually 5 to 15. Until then the status page shows "refused:
-   unsigned_unconfirmed". A `Release`
+   observation; a due retry runs at the scheduler's next tick, every
+   quarter of `periodic_refresh`, or at a client's `apt update` after it.
+   So with the default `cooldown` and `periodic_refresh` a new unsigned
+   repository is adopted at least 5 minutes after its first `apt update`
+   through the cache — usually 5 to 15. Until then the status page shows
+   "refused: unsigned_unconfirmed". A `Release` generated anew for each
+   request, or one that differs between
 ```
 
-- [ ] **Step 6: `docs/configuration.md`, *Flat repositories*: the captive portal's aftermath (H2 For H3 item 3)**
+- [ ] **Step 6: `docs/configuration.md`, *Flat repositories*: the captive portal's aftermath (H2 For H3 item 3); a signed flat repository's key on the cache host, and an unsigned `Release`'s adoption (fix round 1)**
 
 `old`:
 
@@ -2808,7 +2861,8 @@ triggers finds `InRelease` and `Release` answered 404 again (or, behind
 Amazon S3 or CloudFront, 403) and deletes them, so the next update is
 clean. The page cached as `Release.gpg` stays: apt never asks for it
 while the repository publishes no `Release`, but if the repository later
-publishes one, apt fetches `Release.gpg` beside it and prints a
+publishes one without an `InRelease`, apt fetches `Release.gpg` beside it
+and prints a
 signature error for the page (`Signed file isn't valid, got 'NODATA'`)
 until the cache adopts the repository — a signed one at its first check,
 an unsigned one after its confirmation (see *Anchor forms and unsigned
@@ -2816,6 +2870,47 @@ repositories*, safeguard 2). An adopted snapshot never serves that page:
 it answers `Release.gpg` with its own signature or, for an inline or
 unsigned snapshot, 404. `POST /forget` deletes it at once (*Forgetting a
 suite* under `[admin]` says when).
+```
+
+`old`:
+
+```markdown
+A signed or unsigned flat repository is adopted like any other (see
+*Anchor forms and unsigned repositories*). When its `Release` lists its
+```
+
+`new`:
+
+```markdown
+A signed or unsigned flat repository is adopted like any other (see
+*Anchor forms and unsigned repositories*). Releases before 1.1.0 never
+adopted a flat repository, so its signing key may be installed only on
+the clients (for `signed-by=`); a signed one now needs it on the cache
+host too (see *Trust and signer pins*): copy it to `/etc/apt/keyrings` or
+a directory of `keyring_dirs` and restart the daemon, which reads keys
+only at startup. Until then each adoption of the repository fails
+(outcome `gpg_failed`, or `unpinned_suite` under `require_pinned_signer`
+while no `[[trusted_signer]]` matches the host) and logs WARN
+`adoption_run_failed`, on the schedule of *How failed adoptions are
+retried*. When its `Release` lists its
+```
+
+`old`:
+
+```markdown
+(`rows_replaced`, `rows_deleted`), and the repository is adopted at the
+first check after it starts publishing an `InRelease` or `Release`. A flat
+repository the cache has seen signed (a record of a signature for its
+```
+
+`new`:
+
+```markdown
+(`rows_replaced`, `rows_deleted`), and the repository is adopted at the
+first check after it starts publishing an `InRelease` or a signed
+`Release` (an unsigned one after its confirmation: safeguard 2 of
+*Anchor forms and unsigned repositories*). A flat repository the cache
+has seen signed (a record of a signature for its
 ```
 
 - [ ] **Step 7: `docs/configuration.md`, *Anchor forms and unsigned repositories*: a binary `Release.gpg` (H2 For H3 item 4)**
@@ -2862,8 +2957,9 @@ is an unsigned repository waiting for its second observation — at least
 `max(cooldown, 5 min)` after the first, an hour when the confirming check
 sees a 401/403 on a signature file; the confirming check is the record's
 first retry that late (2 minutes, doubling, each ±25 %), so with the
-default `cooldown` the repository adopts usually 5 to 15 minutes after
-its first observation — and clears itself when it adopts;
+default `cooldown` and `periodic_refresh` the repository adopts
+usually 5 to 15 minutes after its first observation — and clears itself
+when it adopts;
 ```
 
 - [ ] **Step 9: `docs/log-fields.md`: `flip_held_ms` (H2 For H3 item 9; ruling R-H3-2)**
@@ -2904,7 +3000,11 @@ Upgrading the Debian package to 1.1.0 or later restarts a running daemon
 (`try-restart`: a stopped daemon stays stopped until you start it), so its
 first start after the upgrade, and what that start does below, begins as the
 package is upgraded; earlier packages left the old binary running until its
-next start.
+next start. After the upgrade, check `systemctl status apt-cacher-ultra` (or
+`journalctl -u apt-cacher-ultra`): apt does not show a new binary that exits
+at startup. The unit is `Type=simple`, so systemctl reports only a restart job
+that fails, not a daemon that exits once started, and `Restart=always` starts
+it again every 5 seconds.
 
 On its first start after an upgrade, the daemon audits every metadata snapshot
 ```
@@ -2922,11 +3022,18 @@ grep -c 'usually 5 to 15' docs/admin-ui-spec.md
 grep -c "Signed file isn't valid, got 'NODATA'" docs/configuration.md
 grep -c 'unsupported binary format' docs/configuration.md
 grep -c 'about 20000 at most' docs/log-fields.md
+grep -c 'After the upgrade, check `systemctl status apt-cacher-ultra` (or' docs/configuration.md
+grep -c 'and restart the daemon, which reads keys' docs/configuration.md
+grep -c 'So with the default `cooldown` and `periodic_refresh` a new unsigned' docs/configuration.md
+grep -c 'first check after it starts publishing an `InRelease` or a signed' docs/configuration.md
+grep -c 'publishes one without an `InRelease`, apt fetches `Release.gpg` beside it' docs/configuration.md
+grep -c '^- A signed flat snapshot with incomplete coverage turns strict mode off$' docs/configuration.md
+grep -c 'default `cooldown` and `periodic_refresh` the repository adopts$' docs/admin-ui-spec.md
 go test -count=1 -run 'TestEveryEventIsDocumented|TestSweptEventNames|TestLogMessagesAreSnakeCase|TestLogMethodsAreOnlyCalledDirectly' ./internal/observability/
 gofmt -l internal/handler; golangci-lint run ./internal/handler/...
 ```
 
-Expected: `1` from each of the eight greps, `ok` for `internal/observability`, no file from `gofmt -l`, and `0 issues.`
+Expected: `1` from each of the fifteen greps (the last seven are the fix rounds'), `ok` for `internal/observability`, no file from `gofmt -l`, and `0 issues.`
 
 - [ ] **Step 12: Commit**
 
@@ -2959,15 +3066,70 @@ it (portal_aftermath_test.go:65).
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
 ```
+As executed, Task 6 is three commits: the one above (cbc3a78); PH3-19's (3bc96b5), after Task 9: the advice to check `systemctl status` after the upgrade (Step 10); and, after the task's review, the docs fix round (6a1ba6a, ruling PH3-23): Steps 4, 5, 6 and 8 as they now read. Neither rewrote history, so the first commit's message keeps its one 92-character line (review M5).
+
+```bash
+git add docs/configuration.md
+git commit -F - <<'EOF'
+Docs: check the daemon after an upgrade; apt does not show a failed start
+
+docs/configuration.md, Upgrading an existing cache: after the package
+upgrade restarts the daemon, check systemctl status apt-cacher-ultra (or
+journalctl -u apt-cacher-ultra). apt does not show a new binary that
+exits at startup: the unit is Type=simple, so systemctl reports only a
+restart job that fails, and Restart=always starts the daemon again every
+5 seconds (packaging/systemd/apt-cacher-ultra.service lines 8, 12, 13;
+the postinst's AIDEV-NOTE, lines 21-26). The H3 controller's ruling
+PH3-19, from Task 4's re-review.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
+```bash
+git add docs/configuration.md docs/admin-ui-spec.md
+git commit -F - <<'EOF'
+Docs: flat repositories' keys on the cache host; review minors
+
+Task 6's review (ruling PH3-23) and the fix round's cross-cutting
+points, in docs/configuration.md and docs/admin-ui-spec.md:
+- Flat repositories: a signed one needs its signing key on the cache
+  host (releases before 1.1.0 never adopted one, so its key may be on
+  the clients only): copy it to /etc/apt/keyrings or a keyring_dirs
+  directory and restart, since keys are read only at startup; until
+  then each adoption fails (gpg_failed, or unpinned_suite under
+  require_pinned_signer) and logs WARN adoption_run_failed on the retry
+  schedule.
+- M1: "usually 5 to 15" holds with the default cooldown and
+  periodic_refresh: a due retry runs at the scheduler's tick (a quarter
+  of periodic_refresh) or at a client's update after it.
+- M2: a Release-less repository adopts at the first check after it
+  publishes an InRelease or a signed Release; an unsigned one after its
+  confirmation.
+- M3: "A signed flat snapshot" with incomplete coverage turns strict
+  mode off (an unsigned one never counts).
+- M4: apt fetches the portal's cached Release.gpg only when the
+  repository publishes a Release without an InRelease.
+
+Each claim's pre-flight is in the task's report: the unit, the tick and
+retryDue (scheduler.go:26, 442), the defaults, the keyring directories
+(keyring.go:44-46), keyring_dirs, the one load at startup (main.go:583,
+995; signals INT and TERM only), the outcomes (metrics.go:341, 343) and
+adoption_run_failed's level (freshness.go:687-691).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
 
 ---
 
 ### Task 7: README: repositories, suite reaping and `/forget`, the admin answers, testing
 
-Spec §8's README items — supported repository layouts (flat forms, the `/` and `./` twins, the host-root limitation, unsigned, Release-less and SHA512-only support), the adoption-enabled requirement, GC and `/forget` — and the carries marked *H3's*: the overview's *(E)* (unsigned and SHA512-only repositories, eager first adoption, `adopt_unsigned`'s threat notes), *(F)* (suite reaping and `POST /forget` beside *Recovering a degraded repository*, and `/forget` in the sentence that names `POST /reconcile`), *(G)* (flat repositories), H2's For H3 items 1 (testing, pointing at e2e/flat's triage subsection by name) and 2 (the unsigned confirmation's real duration), and the 1.1.0 `/reconcile` answers (400 and 413, which the README's example omits). The README stays an operator's document (design note 3): what is supported and how to use it, linking to `docs/configuration.md` for the rules. Its *Status* paragraph is the maintainer's and stays as it is.
+Spec §8's README items — supported repository layouts (flat forms, the `/` and `./` twins, the host-root limitation, unsigned, Release-less and SHA512-only support), the adoption-enabled requirement, GC and `/forget` — and the carries marked *H3's*: the overview's *(E)* (unsigned and SHA512-only repositories, eager first adoption, `adopt_unsigned`'s threat notes), *(F)* (suite reaping and `POST /forget` beside *Recovering a degraded repository*, and `/forget` in the sentence that names `POST /reconcile`), *(G)* (flat repositories), H2's For H3 items 1 (testing, pointing at e2e/flat's triage subsection by name) and 2 (the unsigned confirmation's real duration), and the 1.1.0 `/reconcile` answers (400 and 413, which the README's example omits). The README stays an operator's document (design note 3): what is supported and how to use it, linking to `docs/configuration.md` for the rules. Its *Status* paragraph is the maintainer's and stays as it is. As executed, the task's review (ruling PH3-22) added where the cache host's signing keys go, that `adopt_unsigned = false` also stops the Release-less refresh, the JSON form of the startup line's `gc_suite_idle_ttl`, that the reap retires snapshots (GC deletes them), the `/forget` body's count of signed-seen markers, "at least an hour" after a 401 or 403, `-sS` in the `/reconcile` example and the 401 answer, and the feature bullets' qualifier for signed repositories (Steps 2 and 4–6 as built).
 
 **Files:**
-- Modify: `README.md` (eight places)
+- Modify: `README.md` (ten places)
 
 **Interfaces:**
 - Consumes: the `docs/configuration.md` sections Task 6 finished (*Flat repositories*, *Anchor forms and unsigned repositories*, *Eager first adoption*, *Suite reaping*, *Forgetting a suite (`POST /forget`)*, the `[integrity]` section); `e2e/live/README.md` (Task 3); `e2e/flat/README.md`'s *Flake, environment or daemon bug?*.
@@ -2989,18 +3151,28 @@ grep -n 'grep -q ACU_E2E_ build/apt-cacher-ultra' .github/workflows/ci.yaml
 grep -n 'grep -q ACU_E2E_ build/apt-cacher-ultra' .github/workflows/release.yaml
 grep -n '"apt-cacher-ultra starting",\|"gc_suite_idle_ttl", cfg.GC.SuiteIdleTTL.Duration' cmd/apt-cacher-ultra/main.go
 grep -c 'Undecoded' internal/config/config.go
+grep -n 'case eligible && !c.adopter.AdoptsUnsigned():' internal/freshness/first_adoption.go
+grep -n '"gc_suite_idle_ttl", cfg.GC.SuiteIdleTTL.Duration\|return slog.New(slog.NewJSONHandler(w, opts))' cmd/apt-cacher-ultra/main.go
+grep -n 'its snapshots retired for snapshot GC' internal/config/config.go
+grep -n 'forgotten %s://%s%s; signed-seen markers deleted: %d' internal/admin/handlers.go
+grep -n 'deniedConfirmGap = time.Hour' internal/freshness/first_adoption.go
+grep -n 'http.Error(w, "auth required", http.StatusUnauthorized)' internal/admin/auth.go
+grep -n 'h = s.auth.middleware(h, ' internal/admin/server.go
+grep -n "AND ss.anchor_form     <> 'unsigned'" internal/cache/queries.go
+grep -n 'DefaultKeyringsDir         = ' internal/gpg/keyring.go
+grep -n 'KeyringDirs \[\]string `toml:"keyring_dirs"`' internal/config/config.go
 ```
 
-Expected: the seven `docs/configuration.md` headings (the README's anchors are GitHub's slugs of them: `#eager-first-adoption`, `#flat-repositories`, `#anchor-forms-and-unsigned-repositories`, `#suite-reaping`, `#forgetting-a-suite-post-forget`, `#integrity-corruption-checks`, `#admin-status-metrics-and-maintenance`); e2e/flat's triage heading (slug `#flake-environment-or-daemon-bug`); `e2e/live/README.md exists`; the 720 h default of `gc.suite_idle_ttl`; the reaper's hourly interval and its one-hour floor; `/reconcile`'s and `/forget`'s 400, 413 and 403 answers (`parseSuiteForm`, `requireMutationGuard`); `flat_host_root_unsupported` in the handler; CI's and the release workflow's `ACU_E2E_` guard; the startup line's `gc_suite_idle_ttl` key (the check an operator runs after setting it) and no `Undecoded` check in `internal/config` (a key in the wrong section is ignored without a word: the security review's H-1, open). Planning run, at HEAD (559fd7f with Tasks 1–6 applied):
+Expected: the seven `docs/configuration.md` headings (the README's anchors are GitHub's slugs of them: `#eager-first-adoption`, `#flat-repositories`, `#anchor-forms-and-unsigned-repositories`, `#suite-reaping`, `#forgetting-a-suite-post-forget`, `#integrity-corruption-checks`, `#admin-status-metrics-and-maintenance`); e2e/flat's triage heading (slug `#flake-environment-or-daemon-bug`); `e2e/live/README.md exists`; the 720 h default of `gc.suite_idle_ttl`; the reaper's hourly interval and its one-hour floor; `/reconcile`'s and `/forget`'s 400, 413 and 403 answers (`parseSuiteForm`, `requireMutationGuard`); `flat_host_root_unsupported` in the handler; CI's and the release workflow's `ACU_E2E_` guard; the startup line's `gc_suite_idle_ttl` key (the check an operator runs after setting it) and no `Undecoded` check in `internal/config` (a key in the wrong section is ignored without a word: the security review's H-1, open). As built (the planning run, 559fd7f with Tasks 1–6 applied, but for `docs/configuration.md`'s line numbers, which Task 6's fix rounds moved; the last eleven lines are the fix round's, at 6a1ba6a):
 
 ```
 274:### Eager first adoption
 330:### Flat repositories
-550:### Anchor forms and unsigned repositories
-825:## `[integrity]`: corruption checks
-942:### Suite reaping
-1067:## `[admin]`: status, metrics, and maintenance
-1120:### Forgetting a suite (`POST /forget`)
+562:### Anchor forms and unsigned repositories
+843:## `[integrity]`: corruption checks
+960:### Suite reaping
+1085:## `[admin]`: status, metrics, and maintenance
+1138:### Forgetting a suite (`POST /forget`)
 323:### Flake, environment or daemon bug?
 e2e/live/README.md exists
 804:		cfg.GC.SuiteIdleTTL.Duration = 720 * time.Hour
@@ -3021,13 +3193,24 @@ e2e/live/README.md exists
 350:	logger.Info("apt-cacher-ultra starting",
 394:		"gc_suite_idle_ttl", cfg.GC.SuiteIdleTTL.Duration,
 0
+358:			case eligible && !c.adopter.AdoptsUnsigned():
+394:		"gc_suite_idle_ttl", cfg.GC.SuiteIdleTTL.Duration,
+1707:		return slog.New(slog.NewJSONHandler(w, opts))
+469:	// url_path rows and its row, its snapshots retired for snapshot GC —
+746:	fmt.Fprintf(&b, "forgotten %s://%s%s; signed-seen markers deleted: %d", scheme, host, suite, res.MarkersDeleted)
+36:	deniedConfirmGap = time.Hour
+196:	http.Error(w, "auth required", http.StatusUnauthorized)
+455:		h = s.auth.middleware(h, func(reason string) {
+1031:   AND ss.anchor_form     <> 'unsigned'`
+45:	DefaultKeyringsDir         = "/etc/apt/keyrings"
+217:	KeyringDirs []string `toml:"keyring_dirs"`
 ```
 
-(Line numbers are HEAD's; a moved line is fine, a missing one is a stop. `parseSuiteForm` (716–735) and `requireMutationGuard` (789–802) serve both endpoints; 590 is `/reconcile`'s missing host or suite.)
+(Line numbers are HEAD's; a moved line is fine, a missing one is a stop. The fix round's lines back: `adopt_unsigned` off stops the Release-less refresh (`anchorlessDisabled`); the startup line's duration, which slog's JSON handler writes as nanoseconds (`"gc_suite_idle_ttl":0`; a probe of `newLogger` printed `gc_suite_idle_ttl=0s` in text and `"gc_suite_idle_ttl":0` in JSON); the reap retires snapshots for GC; the 202 body's count of signed-seen markers; the hour's gap; the 401 that `admin.htpasswd_file`'s middleware answers before any route; an unsigned snapshot vouches nothing; and where keys are read. `parseSuiteForm` (716–735) and `requireMutationGuard` (789–802) serve both endpoints; 590 is `/reconcile`'s missing host or suite.)
 
 The other facts the new text states are Task 6's pre-flight (the unsigned confirmation and its hour after a 401/403, strict mode) and `docs/configuration.md`'s own sections, which earlier phases checked: a suite reaped is tracked again at its next request (*Suite reaping*), `/forget` is the way out of `upstream_older`, `rollback_refused` and `unsigned_downgrade_refused`, but lifts the last only once no other suite of the path (its `/.` twin, or its copy under the other scheme) has a row, and its 202 body names the suite, the signed-path records deleted and any suite that kept them (*Forgetting a suite*; `forgottenText`, `internal/admin/handlers.go`), with adoption disabled suites are only checked for changes (`adoption.enabled`'s row), a Release-less flat repository is refreshed file by file and an HTML page never replaces an index (*Flat repositories*), and e2e/flat's times (its README's *Running it*: 24.5 minutes for all six; the H2 plan's For H3 item 1: about 45 at worst, cold).
 
-- [ ] **Step 2: The two feature bullets**
+- [ ] **Step 2: The feature bullets: two new, two qualified for signed repositories (fix round 1)**
 
 `old`:
 
@@ -3055,6 +3238,37 @@ The other facts the new text states are Task 6's pre-flight (the unsigned confir
 - Garbage collection — refcounted blobs are swept when no snapshot references them.
 - Suite reaping — a suite no client has asked for in 30 days is dropped with its cached index files (see
   [Suites no client uses](#suites-no-client-uses)).
+```
+
+`old`:
+
+```markdown
+- Atomic snapshot adoption — per-suite InRelease + all referenced Packages/by-hash blobs are staged, GPG-verified, and
+  flipped in a single SQLite transaction. The flip waits (bounded) until clients that received the old InRelease have
+  had `adoption.flip_quiet_period` to fetch its indexes, so the index requests an apt client sends within that period
+```
+
+`new`:
+
+```markdown
+- Atomic snapshot adoption — per-suite InRelease + all referenced Packages/by-hash blobs are staged, GPG-verified
+  (signed repositories; see [Repositories](#repositories)), and flipped in a single SQLite transaction. The flip
+  waits (bounded) until clients that received the old InRelease have had `adoption.flip_quiet_period` to fetch its
+  indexes, so the index requests an apt client sends within that period
+```
+
+`old`:
+
+```markdown
+- Hash validation — every metadata file is checked against InRelease, every .deb against Packages; mismatches are
+rejected.
+```
+
+`new`:
+
+```markdown
+- Hash validation — every metadata file is checked against InRelease, every .deb against Packages (signed
+  repositories; see [Repositories](#repositories)); mismatches are rejected.
 ```
 
 - [ ] **Step 3: `/forget` beside `/reconcile` in *Configuration***
@@ -3090,10 +3304,12 @@ network.
 ## Repositories
 
 Snapshot adoption (`[adoption] enabled = true`, after loading the
-repositories' signing keys) is what keeps metadata fresh: the cache checks
-each repository its clients use and serves every change as one coherent
-snapshot, adopted at the repository's first `apt update` through the cache
-when an adoption slot is free. It is off in the packaged configuration:
+repositories' signing keys on the cache host, in `/etc/apt/keyrings` or
+`adoption.keyring_dirs`; restart after adding one) is what keeps metadata
+fresh: the cache checks each repository its clients use and serves every
+change as one coherent snapshot, adopted at the repository's first
+`apt update` through the cache when an adoption slot is free. It is off
+in the packaged configuration:
 until you enable it, each metadata file is served as the cache first
 stored it, and suites are only checked for changes.
 
@@ -3108,17 +3324,21 @@ stored it, and suites are only checked for changes.
   `/` and `./` forms of one directory are tracked as two suites. A flat
   repository at the root of its host (`deb https://example.com/ ./`) is
   not supported: it is served from the cache but never refreshed, with a
-  WARN `flat_host_root_unsupported`.
+  WARN `flat_host_root_unsupported`. A signed flat repository's key is
+  often installed only on the clients (`signed-by=`): the cache host
+  needs it too, or its adoption fails (`gpg_failed`) and is retried.
 - **Unsigned repositories** (a `Release` with no signature, for
   `[trusted=yes]` clients) are adopted as unsigned snapshots, served
   coherently but never trusted: they vouch for no package. A new one is
   adopted once two checks have seen the same `Release` at least 5 minutes
-  apart (with the retry schedule, usually 5 to 15 minutes after its first
-  `apt update` through the cache; an hour when its host answers 401 or
-  403 for the missing signature file, as Amazon S3 does), and a
-  repository the cache has seen signed is never adopted unsigned. Read the [threat
+  apart (with the default `cooldown` and `periodic_refresh`, usually
+  5 to 15 minutes after its first `apt update` through the cache; at least
+  an hour when its host answers 401 or 403 for the missing signature
+  file, as Amazon S3 does), and a repository the cache has seen signed is
+  never adopted unsigned. Read the [threat
   notes](docs/configuration.md#anchor-forms-and-unsigned-repositories)
-  before serving them; `adoption.adopt_unsigned = false` turns this off.
+  before serving them; `adoption.adopt_unsigned = false` turns this off
+  (and the refresh below).
 - **Flat repositories that publish no `Release` at all** (Gemfury,
   goreleaser) are refreshed file by file: each cached index is
   revalidated with upstream, and an HTML page never replaces one.
@@ -3132,11 +3352,14 @@ mode](docs/configuration.md#integrity-corruption-checks)
 ## Inspecting the cache
 ```
 
-- [ ] **Step 5: `/reconcile`'s answers**
+- [ ] **Step 5: `/reconcile`'s answers, and its example without `-f` (fix round 1: `-f` hid the 400 and 403 hints)**
 
 `old`:
 
 ```text
+curl -fsS -X POST http://127.0.0.1:6789/reconcile -H 'X-ACU-Admin: 1' \
+    --data-urlencode 'host=packages.microsoft.com' \
+    --data-urlencode 'suite=/ubuntu/24.04/prod/dists/noble'
 # 202 Accepted = reconcile triggered (runs asynchronously)
 # 403 = the header is missing, or another host name without admin.htpasswd_file
 # 409 = busy, unknown suite, no current snapshot, or no free adoption slot
@@ -3145,9 +3368,14 @@ mode](docs/configuration.md#integrity-corruption-checks)
 `new`:
 
 ```text
+curl -sS -X POST http://127.0.0.1:6789/reconcile -H 'X-ACU-Admin: 1' \
+    --data-urlencode 'host=packages.microsoft.com' \
+    --data-urlencode 'suite=/ubuntu/24.04/prod/dists/noble'
 # 202 Accepted = reconcile triggered (runs asynchronously)
 # 400 = host or suite missing, a scheme other than http or https, a host
 #       holding scheme:// (pass the scheme in scheme), or a body that is not a form
+# 401 = admin.htpasswd_file is set and the credentials are missing or wrong
+#       (add -u user)
 # 403 = the header is missing, a browser request from another origin, or
 #       another host name without admin.htpasswd_file
 # 409 = busy, unknown suite, no current snapshot, or no free adoption slot
@@ -3173,15 +3401,17 @@ suite heals.
 
 A suite no client has asked for in `gc.suite_idle_ttl` (30 days by
 default) is reaped by a pass that runs every hour: it is no longer
-tracked, and its cached index files and snapshots are deleted. Its
-packages stay cached, without the version retention its snapshot gave
-them. A client that comes back makes it new again, fetched from upstream.
-The pass runs whatever `gc.enabled` says. An offline or archive cache that
+tracked, its cached index files are deleted and its snapshots retired
+(GC deletes them). Its packages stay cached, without the version
+retention its snapshot gave them. A client that comes back makes it new
+again, fetched from upstream. The pass runs whatever `gc.enabled` says.
+An offline or archive cache that
 must keep serving suites nobody asks for sets `suite_idle_ttl = "0s"` in
 the `[gc]` section — before upgrading from 1.0, whose suites count as idle
 from the last request before the upgrade ([Suite
 reaping](docs/configuration.md#suite-reaping)); the `apt-cacher-ultra
-starting` log line then shows `gc_suite_idle_ttl=0s` (a key in another
+starting` log line then shows `gc_suite_idle_ttl=0s`
+(`"gc_suite_idle_ttl":0` with `log.format = "json"`; a key in another
 section is ignored without a warning).
 
 ## Forgetting a suite
@@ -3202,13 +3432,16 @@ curl -sS -X POST http://127.0.0.1:6789/forget -H 'X-ACU-Admin: 1' \
     --data-urlencode 'scheme=https' \
     --data-urlencode 'host=packages.microsoft.com' \
     --data-urlencode 'suite=/ubuntu/24.04/prod/dists/noble'
-# 202 Accepted = forgotten; the body names the suite, the signed-path
-#                records deleted and any suite that kept them
+# 202 Accepted = forgotten; the body names the suite, counts the
+#                signed-seen markers (records that the path was seen
+#                signed) it deleted, and names any suite that kept them
+# 401 = admin.htpasswd_file is set and the credentials are missing or wrong
+#       (add -u user)
 # 409 = busy (try again) or no such suite
 ```
 
 [Forgetting a suite](docs/configuration.md#forgetting-a-suite-post-forget)
-lists every answer and what forgetting deletes.
+lists its other answers and what forgetting deletes.
 
 ## Build
 ````
@@ -3264,6 +3497,9 @@ Run:
 ```bash
 grep -n '^## ' README.md
 grep -c 'POST /reconcile` and `POST /forget`' README.md
+grep -c '^curl -sS -X POST http://127.0.0.1:6789/' README.md
+grep -c '^# 401 = admin.htpasswd_file is set and the credentials are missing or wrong$' README.md
+grep -c 'see \[Repositories\](#repositories))' README.md
 T=$(mktemp -d)
 cat > "$T/check_links.py" <<'EOF'
 #!/usr/bin/env python3
@@ -3321,7 +3557,7 @@ EOF
 python3 "$T/check_links.py" README.md | grep -c '^ok'; python3 "$T/check_links.py" README.md | grep '^BAD' || echo "no broken link"
 ```
 
-Expected: the sections in this order — `Status`, `Features`, `Quickstart`, `Configuration`, `Repositories`, `Inspecting the cache`, `Recovering a degraded repository`, `Suites no client uses`, `Forgetting a suite`, `Build`, `License`; `1`; `21` links checked `ok` (the planning run's count on the edited README); and `no broken link`. The checker resolves every repository link — relative, or `https://github.com/linsomniac/apt-cacher-ultra/blob/main/…` or `…/blob/1.1.0/…` — to a file and a heading slug of this tree; a link to a heading that is missing (a broken one, as a mutation in planning showed: `BAD  linkmut.md: docs/configuration.md#no-such-heading`) prints `BAD`.
+Expected: the sections in this order — `Status`, `Features`, `Quickstart`, `Configuration`, `Repositories`, `Inspecting the cache`, `Recovering a degraded repository`, `Suites no client uses`, `Forgetting a suite`, `Build`, `License`; `1`; then the fix round's `2` (both examples call curl without `-f`), `2` (both list the 401) and `2` (the two qualified feature bullets); `21` links checked `ok` (the planning run's count on the edited README); and `no broken link`. The checker resolves every repository link — relative, or `https://github.com/linsomniac/apt-cacher-ultra/blob/main/…` or `…/blob/1.1.0/…` — to a file and a heading slug of this tree; a link to a heading that is missing (a broken one, as a mutation in planning showed: `BAD  linkmut.md: docs/configuration.md#no-such-heading`) prints `BAD`.
 
 - [ ] **Step 9: Commit**
 
@@ -3345,12 +3581,47 @@ and the H2 plan's For H3 items 1 and 2.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
 ```
+As executed, Task 7 is two commits: the one above (d997467) and, after the task's review, its fix round (31cd2a2, ruling PH3-22): Steps 2 and 4–6 as they now read; Step 8 printed the eleven sections, `1`, `2`, `2`, `2`, 21 links `ok` and `no broken link`.
+
+```bash
+git add README.md
+git commit -F - <<'EOF'
+README: keys on the cache host, the unsigned wait's terms, admin answers
+
+Task 7's review (ruling PH3-22), M1-M9:
+- Repositories: load the signing keys on the cache host
+  (/etc/apt/keyrings or adoption.keyring_dirs; restart after adding
+  one), and a flat repository's key, often only on the clients, is
+  needed there too, or its adoption fails (gpg_failed) and is retried
+  (M8); adopt_unsigned = false also stops the Release-less refresh
+  (M1); the unsigned wait is "usually 5 to 15 minutes" with the default
+  cooldown and periodic_refresh, and at least an hour after a 401 or
+  403 (M5; PH3-23 M1); the M9 line rewrapped.
+- Suites no client uses: the reap deletes the index files and retires
+  the snapshots, which GC deletes (M3); the startup line shows
+  "gc_suite_idle_ttl":0 with log.format = "json" (slog writes a
+  duration as nanoseconds) (M2).
+- The /reconcile example drops curl's -f, which hid the 400 and 403
+  hints, and both examples list the 401 that admin.htpasswd_file adds;
+  /forget's 202 body counts the signed-seen markers it deleted (M4, M6).
+- The feature bullets on GPG verification and hash validation are
+  qualified to signed repositories (M7).
+
+Pre-flight in the task's report (first_adoption.go:358, the JSON probe
+of newLogger, config.go:469, handlers.go:746, auth.go:196,
+server.go:455, keyring.go:45, config.go:217). Step 8's check: the
+eleven sections, 21 links ok, none broken.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
 
 ---
 
 ### Task 8: The 1.1.0 release notes
 
-`docs/release-notes/1.1.0.md` (ruling R-H3-1; decided by ruling PH3-1), with every carry marked *H3's*: *Upgrade* — `gc.suite_idle_ttl` for offline and archive caches (the overview's *(F)* carry), the G-1 header and `Host` guard on `POST /reconcile` (*(G-1)*), `/reconcile`'s 400s (*(H1)*), the `require_signature = false` and suite-seed behaviour changes (*(H1)*), the legacy trust audit's corrupt-anchor deletion and deferred snapshots kept at every `gc.keep_displaced` value (the H1 plan's *For H3* with the overview's correction); *Logging* — the six removed 1.0.x messages with their replacements, the log-query note, the two repeating WARNs, the computed inventory of new events, fields, values and metrics since 1.0.x (design note 1; the H1 *For H3* lists names R-H3's and R-H6's renames use, which were never released, so the notes list new events by their names only), `e2e_commit_delay_enabled` marked test-binary-only (H2 For H3 item 6); the alert recipes (reaper, GC); the captive portal's aftermath, `Release.gpg` included (H2 For H3 item 3; Task 6 pinned and documented it); the e2e harness and the live smoke's results (Task 3; ruling R-H3-8); and, from the reviews and the maintainer's decisions, that all of it needs adoption enabled (review C-I1), who is refused on a newly strict flat host (C-I2), where `suite_idle_ttl` goes and how to see it took (C-I3), the suite caps for very large hosts (C-I6), the package upgrade's restart (Task 4; ruling PH3-8), Go 1.27 (Task 5; decision D2) and the credit the maintainer chose (D5). Design note 2 gives the structure. Links are absolute, to the release's tag (`…/blob/1.1.0/…`, ruling PH3-6), so they never drift and work whether or not the branch is merged; for a release candidate, the pasted copy's `blob/1.1.0/` becomes `blob/<rc tag>/` (`docs/open-decisions.md`, *Before the 1.1.0 release candidate*, gives the `sed` line). The link checker resolves them against this tree.
+`docs/release-notes/1.1.0.md` (ruling R-H3-1; decided by ruling PH3-1), with every carry marked *H3's*: *Upgrade* — `gc.suite_idle_ttl` for offline and archive caches (the overview's *(F)* carry), the G-1 header and `Host` guard on `POST /reconcile` (*(G-1)*), `/reconcile`'s 400s (*(H1)*), the `require_signature = false` and suite-seed behaviour changes (*(H1)*), the legacy trust audit's corrupt-anchor deletion and deferred snapshots kept at every `gc.keep_displaced` value (the H1 plan's *For H3* with the overview's correction); *Logging* — the six removed 1.0.x messages with their replacements, the log-query note, the two repeating WARNs, the computed inventory of new events, fields, values and metrics since 1.0.x (design note 1; the H1 *For H3* lists names R-H3's and R-H6's renames use, which were never released, so the notes list new events by their names only), `e2e_commit_delay_enabled` marked test-binary-only (H2 For H3 item 6); the alert recipes (reaper, GC); the captive portal's aftermath, `Release.gpg` included (H2 For H3 item 3; Task 6 pinned and documented it); the e2e harness and the live smoke's results (Task 3; ruling R-H3-8); and, from the reviews and the maintainer's decisions, that all of it needs adoption enabled (review C-I1), who is refused on a newly strict flat host (C-I2), where `suite_idle_ttl` goes and how to see it took (C-I3), the suite caps for very large hosts (C-I6), the package upgrade's restart (Task 4; ruling PH3-8), Go 1.27 (Task 5; decision D2) and the credit the maintainer chose (D5). Design note 2 gives the structure. Links are absolute, to the release's tag (`…/blob/1.1.0/…`, ruling PH3-6), so they never drift and work whether or not the branch is merged; for a release candidate, the pasted copy's `blob/1.1.0/` becomes `blob/<rc tag>/` (`docs/open-decisions.md`, *Before the 1.1.0 release candidate*, gives the `sed` line). The link checker resolves them against this tree. As executed, PH3-19 added the check of `systemctl status` after the upgrade and listed e2e/deb's phase 5 under *Testing*, and the task's review (ruling PH3-25) added that flat repositories need their signing keys on the cache host (I-1), moved `probe` from `freshness_check`'s forms to `freshness check failed`'s (I-2), and made the minors' corrections (M1–M4, M6, M7); Step 3's block is the file as built, and Step 4's "new values" count is 14.
 
 The H1 *For H3* list said `acu_clock_steps_detected_total` "now also counts the reaper's forward steps" and that `suite_reaped` "gains" fields; the overview's *(H1)* correction applies: both are new since 1.0.x, so the notes list them as new. It said R-H1 applies "with `gc.keep_displaced = 0`"; it applies at every value (the notes say "whatever `gc.keep_displaced` is").
 
@@ -3522,6 +3793,30 @@ for msg, key in PAIRS:
 sys.exit(1 if bad else 0)
 EOF
 python3 "$D/additive_keys.py" "$O" .
+grep -n 'func SuitePath(p string) string {' -A 4 $O/internal/proxy/classify.go | grep -c 'return ""'
+grep -n 'DefaultKeyringsDir         = \|KeyringDirs \[\]string `toml:"keyring_dirs"`\|RequirePinnedSigner bool `toml:"require_pinned_signer"`' internal/gpg/keyring.go internal/config/config.go
+grep -n 'return "unpinned_suite"\|return "gpg_failed"' internal/freshness/metrics.go
+grep -n 'if outcome == "refused" {\|c.logger.Log(context.Background(), level, "adoption_run_failed",' internal/freshness/freshness.go
+grep -n 'c.logger.Warn("adoption_failing_persistently",\|if n < 3 || n%3 != 0 {' internal/freshness/adoption_failure.go
+grep -n 'retryBaseDelay  = 2 \* time.Minute\|retryMaxDelay   = time.Hour' internal/freshness/retry.go
+grep -c 'c\.cache\.' internal/freshness/probe.go
+grep -n 'failCheck(ctx, out, cur, suite, nowUnix, "' internal/freshness/*.go | grep -v _test | sed -E 's/.*nowUnix, "([a-z]+)".*/\1/' | sort | uniq -c
+grep -n 'failCheck(ctx, out, cur, suite, nowUnix, formName(' internal/freshness/*.go | grep -c current_form.go
+grep -n '"form", form,' internal/freshness/check.go
+grep -c '"freshness check failed"' $O/internal/freshness/freshness.go
+grep -A5 '"freshness check failed"' $O/internal/freshness/freshness.go | grep '"form"' || true
+grep -n 'checkEnd{' internal/freshness/*.go | grep -v _test | grep -o 'form: [^,}]*' | sort | uniq -c
+grep -n 'ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),' internal/admin/server.go
+grep -c 'ErrorLog' $O/internal/admin/server.go
+grep -n 'c.logger.Warn("adoption_run_failed",' $O/internal/freshness/freshness.go
+grep -n 'if inline >= 2 && missing == inline {' internal/freshness/legacy_audit.go
+grep -n 'reaper, err := freshness.NewReaper(' cmd/apt-cacher-ultra/main.go
+grep -n 'if cfg.Adoption.Enabled {' cmd/apt-cacher-ultra/main.go
+grep -n 'type: config|noreplace' packaging/nfpm.yaml
+cmp -s $O/packaging/config/config.toml.default packaging/config/config.toml.default || echo "config.toml.default changed since 1.0.2"
+grep -c 'with `enabled = true` and a nonzero `url_path_ttl`, GC deletes' docs/configuration.md
+grep -n 'echo "\[deb-test\] phase 5: ' e2e/deb/test.sh | sed 's/^\([0-9]*\):echo "\[deb-test\] phase 5: /\1: /; s/"$//'
+grep -c 'expect_count abort-[a-z]* "install messages" 0' e2e/deb/test.sh
 ```
 
 Expected (the planning run, 559fd7f with Tasks 1–7 applied; line numbers are HEAD's and 1.0.2's, the order of a multi-pattern grep's lines may differ):
@@ -3611,9 +3906,60 @@ ok   apt-cacher-ultra starting: gc_suite_idle_ttl (calls at 1.0.2 1, at HEAD 1)
 ok   phase2 adoption enabled: adopt_unsigned (calls at 1.0.2 1, at HEAD 1)
 ok   phase2 adoption enabled: flip_quiet_period (calls at 1.0.2 1, at HEAD 1)
 ok   phase2 adoption enabled: max_duration (calls at 1.0.2 1, at HEAD 1)
+1
+internal/gpg/keyring.go:45:	DefaultKeyringsDir         = "/etc/apt/keyrings"
+internal/config/config.go:171:	RequirePinnedSigner bool `toml:"require_pinned_signer"`
+internal/config/config.go:217:	KeyringDirs []string `toml:"keyring_dirs"`
+341:		return "unpinned_suite"
+343:		return "gpg_failed"
+688:			if outcome == "refused" {
+691:			c.logger.Log(context.Background(), level, "adoption_run_failed",
+130:		c.logger.Warn("adoption_failing_persistently",
+183:	if n < 3 || n%3 != 0 {
+12:	retryBaseDelay  = 2 * time.Minute
+13:	retryMaxDelay   = time.Hour
+0
+      2 anchorless
+      3 detached
+      3 inline
+      4 probe
+      7 unsigned
+4
+317:		"form", form,
+2
+			"form", "detached",
+      2 form: "anchorless"
+      1 form: "detached"
+      1 form: formName(form)
+      3 form: formName(t.form)
+      2 form: "inline"
+      1 form: "unsigned"
+361:		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
+0
+401:			c.logger.Warn("adoption_run_failed",
+255:	if inline >= 2 && missing == inline {
+602:	reaper, err := freshness.NewReaper(reaperConfig(cfg, c, freshChecker, logger))
+582:	if cfg.Adoption.Enabled {
+45:    type: config|noreplace
+config.toml.default changed since 1.0.2
+1
+942: stop phase-4 daemon
+1028: purge the phase-1 install
+1031: fresh install of $old_version: no restart, the install message
+1039: upgrade to $new_version, unit enabled: one try-restart, no stop, no install message
+1051: a failed try-restart does not fail dpkg
+1062: policy-rc.d's 101 is honoured
+1076: abort-upgrade: one try-restart; a plain abort-remove: none
+1085: remove: stop and disable
+1093: reinstall after the remove: the install message
+1100: no systemd: no systemctl call, the install message
+1109: DPKG_ROOT set: no systemctl call, the install message
+2
 ```
 
 What each line backs, in the notes' order: the postinst's try-restart (Task 4); adoption off in the packaged config and the status page's "ADOPTION DISABLED — METADATA NOT REFRESHED"; the one-way migration and 1.0.x's refusal message; the database file and its WAL (the copy to keep); the audit's progress line per 100 snapshots and its two "Nothing was changed" pool refusals (an empty pool, or one that holds none of two or more queued anchors); the reaper's hourly interval, one-hour floor and 250 non-canonical or junk suites a run, the 720 h default, and the backfill that counts a suite with no request from 7 days before the upgrade (720 h − 7 d ≈ 23 days); the startup line's `gc_suite_idle_ttl` and no `Undecoded` check (a key in the wrong section is ignored without a word); `OPTIONS`' `Allow` (`/reconcile`'s and `/forget`'s 405s name it too: three lines; review E-M-3) (and 1.0.x's 413 for any unparseable body and its 409 text); the renamed `require_signature` WARN and 1.0.x's text; the suite seed inside the store's transaction and 1.0.x's WARN; the suite caps (a tenth per host), their startup WARN and the seed refusal's WARN; the plain-text `InRelease` rule (*Tracked suites*); the new keys' defaults (`check_notes.py` checks their names, not their values: review E-M-8); the replacements of the removed messages and the `unexpected success status <code>` error; `source_parse_failed`'s new and old texts; `adoption_member_skipped` at WARN in both releases (the first of each three is the `arch_not_in_allowlist` skip); the new `freshness_check` results counted by `acu_freshness_check_total{result}`, and the stale-suites WARN's `adopted_stale` without the paced suites it reports as `paced_stale`; the retry schedule, the four check workers, the 15 s strict wait, the idle connections kept; the GC gauge's `phase` label (`max()` in the alert covers both phases); Go 1.27 in CI and the release, `go 1.25.0` kept (Task 5). The tests (`17` `--- PASS` lines: each pattern matched a test, so a renamed one would lower the count — review E-M-6): the admin guard and answers (`TestMutatingEndpoints_*`: the header, cross-origin, rebinding hosts, `htpasswd_file`, 400s, one newline, `OPTIONS`), the reaper started whatever `gc.enabled` says, R-H1 at `keep_displaced` 0 and 1, R-H2's refetch, the I-1 and I-7 fixes, GC's startup panic, the `+`/`~` encoding, strict mode on flat hosts. The last block is `additive_keys.py`: each additive key the notes list on an existing line is carried by a call of that line at HEAD and by none at 1.0.2 (review C-M-6; it follows a call's `logAttrs...` slice back to its definition). The rest — the eager-adoption, unsigned, flat, flip and refusal rules the notes summarise, the hold's 20 s and the hour of a 401/403 confirmation (Task 6's pre-flight), and the two ERRORs that are disk faults (`docs/log-fields.md`'s rows) — is the docs Tasks 6 and 7 checked and link to; `e2e/live`'s results are Task 3's run.
+
+The block after `additive_keys.py`'s is the fix rounds' (PH3-19, PH3-25; at 31cd2a2): 1.0.2 tracked no suite outside `dists/` (`SuitePath` returns ""), so no flat repository was ever adopted; where keys are read and the pin key; the outcomes `gpg_failed` and `unpinned_suite`, `adoption_run_failed` at WARN unless refused, `adoption_failing_persistently` at the milestones 3, 6, 12 …, the backoff of 2 minutes to an hour; the probe writes no cached file (so a repository whose adoption fails stays as stale as on 1.0.x); `freshness check failed`'s forms (`probe` among them) and its one call site, which logs `form` always, where 1.0.2's two sites had it on the detached one only; `freshness_check`'s forms (no `probe`); the admin listener's `ErrorLog` at ERROR (1.0.2 had none, so net/http's lines went through the default logger at INFO); `adoption_run_failed` at WARN only in 1.0.2; the pool refusal's two or more snapshots; the reaper built whatever adoption says; the conffile and the changed packaged config; the reaper's effect on packages (`docs/configuration.md`); and phase 5's step names, with the abort steps' two `install messages` 0 checks.
 
 - [ ] **Step 3: Write `docs/release-notes/1.1.0.md`**
 
@@ -3632,7 +3978,8 @@ clients from straddling a snapshot switch, and drops suites no client uses.
 All of this needs snapshot adoption (`[adoption] enabled = true`, after
 loading your repositories' signing keys), which the packaged
 configuration leaves off. With adoption off, 1.1.0 serves metadata as
-1.0.x does: each `InRelease`, `Release` and index file — a flat
+1.0.x does (but for the suite reaper and the smaller changes below):
+each `InRelease`, `Release` and index file — a flat
 repository's included — is served as the cache first stored it, and
 suites are only checked for changes (the status page reads "ADOPTION
 DISABLED — METADATA NOT REFRESHED"). See
@@ -3652,7 +3999,11 @@ deletes idle suites whatever `gc.enabled` says, and a new header that
   the migration and the audit below begin as the package is upgraded, and
   the suite reaper an hour later: make the settings below before you
   upgrade. A stopped daemon stays stopped and does all this at its next
-  start. See [Upgrading an existing
+  start. After the upgrade, check `systemctl status apt-cacher-ultra` (or
+  `journalctl -u apt-cacher-ultra`): apt does not show a new binary that
+  exits at startup (the unit is `Type=simple`, so only a restart job that
+  fails is reported), and `Restart=always` starts it again every 5
+  seconds. See [Upgrading an existing
   cache](https://github.com/linsomniac/apt-cacher-ultra/blob/1.1.0/docs/configuration.md#upgrading-an-existing-cache).
 - **The database is migrated one way (schema 6 to 7), and audited.** At the
   first start the daemon migrates `<cache.dir>/cache.db`, then audits every
@@ -3663,9 +4014,10 @@ deletes idle suites whatever `gc.enabled` says, and a new header that
   binary supports (6); refusing to downgrade`): to keep a way back, stop the
   daemon and copy `cache.db` (and any `cache.db-wal` beside it) before
   upgrading. The daemon refuses to start, changing nothing, when the
-  cache's `pool/` directory is missing, unreadable or empty — or holds
-  none of the queued snapshots' files — while inline snapshots await the
-  audit: mount or restore it, or wipe the cache directory to start empty.
+  cache's `pool/` directory is missing, unreadable or empty — or, with
+  two or more inline snapshots queued, holds none of their files — while
+  inline snapshots await the audit: mount or restore it, or wipe the
+  cache directory to start empty.
   A snapshot whose stored `InRelease` is not a
   clean signed file, or whose pool file is missing or corrupt, is
   quarantined (WARN `legacy_snapshot_quarantined`): its suite is served
@@ -3686,12 +4038,15 @@ deletes idle suites whatever `gc.enabled` says, and a new header that
   however recently used, the rows 1.0.x created for paths this version no
   longer tracks and suites without a snapshot whose cached `InRelease`,
   `Release` and `Release.gpg` are all error pages (INFO `suite_reaped`,
-  `reason=non_canonical` or `junk`, up to 250 a run). An install that
-  relied on `gc.enabled = false` to keep everything needs the setting too.
-  A key in the wrong section is ignored without a warning: after the first
-  start, check that the `apt-cacher-ultra starting` line shows
-  `gc_suite_idle_ttl=0s`. A reaped suite comes back at its next request,
-  fetched from upstream. See [Suite
+  `reason=non_canonical` or `junk`, up to 250 a run). The reaper deletes
+  no package, but a reaped suite's packages lose the version retention its
+  snapshot gave them: with GC on and a nonzero `gc.url_path_ttl`, those no
+  client asked for within it go after `hold_packages.window`. An install
+  that relied on `gc.enabled = false` to keep everything needs the setting
+  too. A key in the wrong section is ignored without a warning: after the
+  first start, check that the `apt-cacher-ultra starting` line shows
+  `gc_suite_idle_ttl=0s` (`"gc_suite_idle_ttl":0` in JSON logs). A reaped
+  suite comes back at its next request, fetched from upstream. See [Suite
   reaping](https://github.com/linsomniac/apt-cacher-ultra/blob/1.1.0/docs/configuration.md#suite-reaping).
 - **`POST /reconcile` needs the header `X-ACU-Admin: 1`**, as the new
   `POST /forget` does: a script that calls it must add it (403 without). And
@@ -3735,8 +4090,8 @@ deletes idle suites whatever `gc.enabled` says, and a new header that
   adopt one after another, usually within a few minutes, each one's
   packages refused until its own adoption; later, the first install from a
   newly added flat repository is refused while its first adoption waits
-  for a slot. A flat snapshot with incomplete coverage turns strict mode
-  off for its whole host, as a `dists/` one does. See [strict
+  for a slot. A signed flat snapshot with incomplete coverage turns strict
+  mode off for its whole host, as a `dists/` one does. See [strict
   mode](https://github.com/linsomniac/apt-cacher-ultra/blob/1.1.0/docs/configuration.md#integrity-corruption-checks).
 - **Caches in front of a very large host: raise `freshness.max_suites`
   first.** The cache now tracks at most `freshness.max_suites` suites
@@ -3755,7 +4110,16 @@ deletes idle suites whatever `gc.enabled` says, and a new header that
   updates keep a slot of their own; `3` runs two at once. Snapshots adopted
   before the upgrade carry no SHA512 by-hash names: such requests get 404
   from the snapshot, and apt then fetches the file by name, until the
-  suite's next adoption.
+  suite's next adoption. 1.0.x never adopted a flat repository; 1.1.0
+  adopts every one your clients use, so first load their signing keys on
+  the cache host (`/etc/apt/keyrings` or `adoption.keyring_dirs`; the
+  daemon reads keys only at startup), and with
+  `adoption.require_pinned_signer = true` their `[[trusted_signer]]`
+  rules: otherwise each one's adoption fails (outcome `gpg_failed` or
+  `unpinned_suite`; WARN `adoption_run_failed` at every retry, up to
+  hourly, and `adoption_failing_persistently`), it stays as stale as on
+  1.0.x, and in strict mode its packages are refused once another
+  repository on its host has adopted.
 - **Smaller behaviour changes.** Upstream request lines with `+` or `~` in
   the path are now encoded exactly as apt encodes them. A few `dists/`
   paths apt never sends no longer get a suite: they are served but not
@@ -3766,7 +4130,9 @@ deletes idle suites whatever `gc.enabled` says, and a new header that
   too) no longer tracks a suite.
 - **New configuration keys**, each with the default shown; the packaged
   `config.toml` lists them with comments, and a key left out of yours takes
-  its default:
+  its default. An edited `config.toml` is a conffile: dpkg asks at the
+  upgrade whether to keep it, and keeping it (the default) puts the
+  packaged one beside it as `config.toml.dpkg-dist`:
 
   | Key | Default | Rule |
   |---|---|---|
@@ -3788,12 +4154,14 @@ deletes idle suites whatever `gc.enabled` says, and a new header that
   repositories](https://github.com/linsomniac/apt-cacher-ultra/blob/1.1.0/docs/configuration.md#flat-repositories).
 - **Unsigned repositories** are adopted as unsigned snapshots — served
   coherently, never trusted, never vouching — after two checks see the same
-  `Release` at least 5 minutes apart (usually 5 to 15 minutes after the
-  first `apt update`; an hour when its host answers 401 or 403 for the
-  missing signature file, as Amazon S3 does), and never once the cache has
-  seen the repository signed. **Release-less flat repositories** (Gemfury, goreleaser) are
-  refreshed file by file. **SHA512-only `Release` files** adopt, and by-hash
-  requests are answered for SHA256 and SHA512. Read the [threat
+  `Release` at least 5 minutes apart (with the default `cooldown` and
+  `periodic_refresh`, usually 5 to 15 minutes after the first
+  `apt update`; at least an hour when its host answers 401 or 403 for the
+  missing signature file, as Amazon S3 does), and never once the cache
+  has seen the repository signed. **Release-less flat repositories**
+  (Gemfury, goreleaser) are refreshed file by file. **SHA512-only
+  `Release` files** adopt, and by-hash requests are answered for SHA256
+  and SHA512. Read the [threat
   notes](https://github.com/linsomniac/apt-cacher-ultra/blob/1.1.0/docs/configuration.md#anchor-forms-and-unsigned-repositories) before
   serving unsigned repositories; `adoption.adopt_unsigned = false` turns
   them off.
@@ -3965,8 +4333,16 @@ binary never does, and `ACU_E2E_*` variables are not operator settings.
 - `freshness_check`: `result` gains `changed_deferred`, `changed_queued`,
   `first_adoption`, `first_adoption_queued`, `form_changed`,
   `anchor_absent`, `anchorless_refreshed` and `anchorless_unchanged`;
-  `form` gains `unsigned`, `probe` and `anchorless`; the anchorless results
-  carry `rows_replaced` and `rows_deleted`.
+  `form` gains `unsigned` and `anchorless`; the anchorless results carry
+  `rows_replaced` and `rows_deleted`.
+- `freshness check failed` now carries `form` on every line (1.0.x: only
+  the detached form's), with the new values `unsigned`, `probe` (the probe
+  of a suite without a snapshot) and `anchorless`.
+- Two existing lines change level: `adoption_run_failed` is INFO, not
+  WARN, when the attempt was refused (a refusal is a state, not a
+  failure; the refusals are new); and net/http's own lines on the admin
+  listener (`http: panic serving …`, say) are ERROR, where 1.0.x logged
+  them at INFO through the default logger.
 - The adoption outcome — `acu_adoption_total{outcome}`,
   `acu_adoption_duration_seconds{outcome}` and `recent_adoptions[].outcome`
   — gains `refused`, `release_date_in_future`, `timed_out` and `panicked`.
@@ -4034,8 +4410,14 @@ None carries a suite label.
   layout through the cache, about 25 minutes in sequence; CI runs one job
   per image. Fixtures only: it never reaches a live repository. `e2e/deb`,
   the package-install check, was updated for eager first adoption, and now
-  checks the package's install, upgrade (the restart above) and removal
-  against a stub `systemctl`.
+  checks the maintainer scripts against a stub `systemctl`: a fresh
+  install (the install message, no restart), the upgrade of an enabled
+  unit (one `try-restart`, no stop, no install message), a failed restart
+  (dpkg still succeeds), `policy-rc.d`'s refusal honoured, `abort-upgrade`
+  (one `try-restart`) and a plain `abort-remove` (none), neither with the
+  install message, the removal (stop and disable), a reinstall after it
+  (the install message), and no systemd or `DPKG_ROOT` set (no
+  `systemctl` call, the install message).
 - **`make e2e-live`** is the manual smoke against live flat repositories,
   run before 1.1.0 and before later releases that change the request path,
   adoption or vouching. On 2026-10-27, with adoption and strict mode on:
@@ -4272,13 +4654,13 @@ ok   metrics removed (none): 0
 ok   new config keys: 5
 ok   config keys removed (none): 0
 ok   admin JSON fields: 13
-ok   new values, each a literal only HEAD has: 15
+ok   new values, each a literal only HEAD has: 14
 ok   events in a level group (all but the test-binary one): 76
 14
 no broken link
 ```
 
-The checker has teeth (planning mutations): dropping `suite_touch_failed` and `acu_flip_barrier_active` from the notes printed `FAIL new events …: missing ['suite_touch_failed']` and `FAIL new metrics: missing ['acu_flip_barrier_active']`; listing `gc_panicked` under WARN printed `FAIL level of gc_panicked: listed WARN, documented ERROR`.
+(`14` as built: the planning run's 15 counted `probe`, which the fix round moved to `freshness check failed`'s own sentence, which no `gains` clause parses; review I-2.) The checker has teeth (planning mutations): dropping `suite_touch_failed` and `acu_flip_barrier_active` from the notes printed `FAIL new events …: missing ['suite_touch_failed']` and `FAIL new metrics: missing ['acu_flip_barrier_active']`; listing `gc_panicked` under WARN printed `FAIL level of gc_panicked: listed WARN, documented ERROR`.
 
 - [ ] **Step 5: Commit**
 
@@ -4313,16 +4695,82 @@ test (the task's pre-flight).
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
 ```
+As executed, Task 8 is three commits: the one above (4384cc9); PH3-19's (d746b87), after Task 9; and, after the task's review, its fix round (947ae03, ruling PH3-25), which also names e2e/deb's `DPKG_ROOT` step and the abort steps' silence (9766ad2). Step 3's block is the file as built. Step 4 on inventories rebuilt at 31cd2a2 (Step 1: `182`, `253`) printed the expected block above.
+
+```bash
+git add docs/release-notes/1.1.0.md
+git commit -F - <<'EOF'
+Release notes: check the daemon after the upgrade; e2e/deb's phase 5
+
+Before you upgrade: after the package upgrade restarts the daemon,
+check systemctl status apt-cacher-ultra (or journalctl -u
+apt-cacher-ultra), since apt does not show a new binary that exits at
+startup (Type=simple: only a restart job that fails is reported;
+Restart=always starts it again every 5 seconds).
+
+Testing: e2e/deb's phase 5 is listed as it now runs (e2e/deb/test.sh's
+phase-5 steps): a fresh install, the upgrade of an enabled unit, a
+failed restart, policy-rc.d, abort-upgrade and a plain abort-remove,
+the removal, a reinstall after it, and no systemd, against a stub
+systemctl. The H3 controller's ruling PH3-19, from Task 4's re-review.
+
+Task 8's checkers rerun: the inventories unchanged (77 events, 6
+removed, 21 metrics, 5 keys, 13 JSON fields, 15 values, 76 by level),
+14 links ok.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
+```bash
+git add docs/release-notes/1.1.0.md
+git commit -F - <<'EOF'
+Release notes: flat repositories' keys, probe's line, review minors
+
+Task 8's review (ruling PH3-25):
+- I-1: First adoptions after the upgrade says that 1.1.0 adopts every
+  flat repository clients use, so their signing keys (and, with
+  require_pinned_signer, their [[trusted_signer]] rules) must be on the
+  cache host first; otherwise each one's adoption fails (gpg_failed or
+  unpinned_suite; WARN adoption_run_failed at every retry and
+  adoption_failing_persistently), it stays stale, and in strict mode its
+  packages are refused once another repository on its host adopted.
+- I-2: probe is not a freshness_check form; freshness check failed now
+  carries form on every line, with unsigned, probe and anchorless.
+  check_notes.py's "new values" is 14 (probe is no longer in a "gains"
+  clause).
+- M1 the JSON form of gc_suite_idle_ttl; M2 the pool refusal needs two
+  or more queued snapshots; M3 adoption off still runs the suite reaper
+  and the smaller changes; M4 adoption_run_failed is INFO when refused,
+  and the admin listener's net/http lines are ERROR; M6 a reaped suite's
+  packages lose their snapshot retention; M7 an edited config.toml is a
+  conffile, so the new keys arrive in config.toml.dpkg-dist.
+- The unsigned wait: with the default cooldown and periodic_refresh, and
+  at least an hour after a 401 or 403 (PH3-23 M1); "A signed flat
+  snapshot" with incomplete coverage (PH3-23 M3).
+- Testing: phase 5's abort actions print no install message, and its
+  DPKG_ROOT step (9766ad2).
+
+Pre-flight in the task's report (1.0.2's SuitePath, the keyring and
+pin keys, the outcomes and levels, the failCheck forms, the admin
+ErrorLog, legacy_audit.go:255, the reaper built without adoption,
+nfpm.yaml's conffile, phase 5's step names). Task 8 Step 4 on
+inventories rebuilt at HEAD: 77/6/21/0/5/0/13/14/76, 14 links ok.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
 
 ---
 
 ### Task 9: Spec revision 13, `docs/open-decisions.md` and the overview
 
-The spec's revision 13 records H2's deviations 1 and 2 as built, H2's design notes 5 and 7, the commit-delay full-grep deviation (H2's For H3 item 5), the error grep as built, the live smoke in §7, and what H3 changes (C11's list not exhaustive, `flip_held_ms`, §8's two new documents, §9's H row), keeping the revision table's convention: the newest revision first in the `Date` line's parentheses. `docs/open-decisions.md` is the home that outlives H3 (ruling R-H3-3; confirmed by ruling PH3-2) for the H2 For H3 item 11 carries, the captive-portal `Release.gpg` follow-up (item 3), the pre-RC steps only the maintainer can take (H2 items 7 and 8, with the reviews' corrections: a pull request runs CI, the notes' links name the tag), the two repeating WARNs and the simulation near its budget (the overview's *(H1)* carries), `govulncheck` and the module bumps (the security review's H-3, an entry of its own: review V-M-10), and, under *Decided*, the maintainer's decisions of 2026-10-26/27 (D2: Go 1.27; D4: R-H5 and the writer's fail-fast, with the alternative kept; R-H6; D5: the credit; H-2: the restart on upgrade) and the controller's (PH3-1, PH3-2, e2e/live's cadence); each entry names the maintainer as owner, its evidence in the repository (not a review's ID) and a recommendation. The overview marks every *H3's* carry done with its task and points its decisions block at the new file.
+The spec's revision 13 records H2's deviations 1 and 2 as built, H2's design notes 5 and 7, the commit-delay full-grep deviation (H2's For H3 item 5), the error grep as built, the live smoke in §7, and what H3 changes (C11's list not exhaustive, `flip_held_ms`, §8's two new documents, §9's H row), keeping the revision table's convention: the newest revision first in the `Date` line's parentheses. `docs/open-decisions.md` is the home that outlives H3 (ruling R-H3-3; confirmed by ruling PH3-2) for the H2 For H3 item 11 carries, the captive-portal `Release.gpg` follow-up (item 3), the pre-RC steps only the maintainer can take (H2 items 7 and 8, with the reviews' corrections: a pull request runs CI, the notes' links name the tag), the two repeating WARNs and the simulation near its budget (the overview's *(H1)* carries), `govulncheck` and the module bumps (the security review's H-3, an entry of its own: review V-M-10), and, under *Decided*, the maintainer's decisions of 2026-10-26/27 (D2: Go 1.27; D4: R-H5 and the writer's fail-fast, with the alternative kept; R-H6; D5: the credit; H-2: the restart on upgrade) and the controller's (PH3-1, PH3-2, e2e/live's cadence); each entry names the maintainer as owner, its evidence in the repository (not a review's ID) and a recommendation. The overview marks every *H3's* carry done with its task and points its decisions block at the new file. As executed, PH3-16 added the grep that finds every Go pin, and the task's review (ruling PH3-24, with PH3-25 M5 and PH3-23 M4) confirmed R-H5 in spec §10 item 12 and the `Date` line, stated `flip_held_ms`'s bound in C8, completed the overview's decisions paragraph, and corrected `docs/open-decisions.md` (dates, evidence, `go.mod`'s `toolchain` line, the lint pin's wording, the module-bump decision before the RC, no pronoun for the maintainer, the paste step's unwrapped form); the writer's fail-fast decision is recorded at the writer by a comment-only `AIDEV-NOTE`.
 
 **Files:**
 - Create: `docs/open-decisions.md`
-- Modify: `docs/superpowers/specs/2026-09-27-flat-repositories-design.md` (the `Date` line, §7, §8, §9's H row, C11), `docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md` (the 16 *H3's* carries, the H3 row, the spec revision, the cross-phase interfaces, the decisions block)
+- Modify: `internal/cache/cache.go` (a comment),  `docs/superpowers/specs/2026-09-27-flat-repositories-design.md` (the `Date` line, §7, §8, §9's H row, C8, C11, §10 item 12), `docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md` (the 16 *H3's* carries, the H3 row, the spec revision, the cross-phase interfaces, the decisions block)
 
 **Interfaces:**
 - Consumes: Tasks 1–8's results (their names appear in the done markers); the live smoke's run (Task 3); `check_links.py` (Task 7 Step 8).
@@ -4352,6 +4800,17 @@ grep -n '^go \|cloudflare/circl \|golang.org/x/net \|golang.org/x/text ' go.mod
 grep -rl govulncheck .github || echo "no govulncheck in .github"
 test -e .github/dependabot.yml || echo "no .github/dependabot.yml"
 curl -fsS --max-time 30 'https://go.dev/dl/?mode=json' | python3 -c 'import json, sys; print(" ".join(r["version"] for r in json.load(sys.stdin)))'
+grep -c '^toolchain' go.mod
+grep -n '^go ' go.mod
+grep -n 'func TestLogMessagesAreSnakeCase' internal/observability/event_names_test.go
+grep -n '^## Credits$' docs/release-notes/1.1.0.md
+grep -c 'Venkat (@venkatamutyala) -- flat repository support is based on their PR #8' Contributors.md
+grep -n 'A manual check — before 1.1.0, and before later releases that change the' e2e/live/README.md
+grep -n 'version: v2.14.0' .github/workflows/ci.yaml
+grep -c 'v2.12.2 cannot read Go 1.27' .github/workflows/ci.yaml
+grep -n 'R-H5 — GD-5, decided for 1.1.0' docs/superpowers/plans/2026-09-28-flat-repositories-H1-sweep.md | cut -c1-60
+grep -c 'carries `flip_held_ms`' docs/superpowers/specs/2026-09-27-flat-repositories-design.md
+git show -s --format='%h %ad %s' --date=short 1d05129 e6c74d8 eadfd80
 ```
 
 Expected (planning run, 559fd7f with Tasks 1–8 applied):
@@ -4392,19 +4851,33 @@ e2e/Dockerfile.cache:7:FROM golang:1.27-alpine AS build
 no govulncheck in .github
 no .github/dependabot.yml
 go1.27.3 go1.26.10
+0
+3:go 1.25.0
+562:func TestLogMessagesAreSnakeCase(t *testing.T) {
+476:## Credits
+1
+3:A manual check — before 1.1.0, and before later releases that change the
+69:          version: v2.14.0
+1
+87:- **R-H5 — GD-5, decided for 1.1.0: keep the current beha
+1
+1d05129 2026-10-26 e2e/flat docs: triage, the stops' checks, the new control; For H3 additions (final review)
+e6c74d8 2026-10-23 Phase G final fix: docs — the final review's rulings and minors
+eadfd80 2026-10-24 Plan H1 (draft): the sweep of deferred minors and carry-forwards
 ```
 
-(The order of two-file greps' lines may differ. go.dev's list moves with Go's patch releases: what matters is that 1.25 is not on it. `aculan-deb-test:` is matched without `${ver}`, so the pattern means the same to every grep.) A line that differs is a stop: correct the entry that cites it.
+(The order of two-file greps' lines may differ. go.dev's list moves with Go's patch releases: what matters is that 1.25 is not on it. `aculan-deb-test:` is matched without `${ver}`, so the pattern means the same to every grep.) A line that differs is a stop: correct the entry that cites it. The lines after go.dev's are the fix round's (at 947ae03): no `toolchain` line in `go.mod` (the H-3 entry's open part); the evidence of R-H6, the credit and PH3-9; CI's lint pin and the export-data comment beside it; R-H5 in the H1 plan and the C8 sentence; and the commits that date the Go entry (the H2 final CI review's heads-up, 2026-10-26) and R-H5 (GD-5 2026-10-23; the H1 plan's ruling 2026-10-24).
 
-- [ ] **Step 2: Write `docs/open-decisions.md`**
+- [ ] **Step 2: Write `docs/open-decisions.md`, and the writer's `AIDEV-NOTE` it cites**
 
 ````markdown
 # Open decisions
 
 Decisions that outlive the work that raised them, each the maintainer's
 (Sean Reifschneider). An entry says what is open, its evidence, the
-recommendation and when it was raised. When he rules, the entry moves to
-*Decided* with the date and the ruling, and whoever does the work cites it.
+recommendation and when it was raised. When the maintainer rules, the
+entry moves to *Decided* with the date and the ruling, and whoever does
+the work cites it.
 The flat-repositories branch (phases A–H, 2026-09 to 2026-10) seeded this
 file; the decisions it made along the way are in its overview's decisions
 block (`docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md`).
@@ -4415,7 +4888,9 @@ flat-repositories spec](superpowers/specs/2026-09-27-flat-repositories-design.md
 ## Before the 1.1.0 release candidate
 
 Steps only the maintainer can take, since they need a push or a tag (delete
-this section once 1.1.0-rc1 is tagged):
+this section once 1.1.0-rc1 is tagged). Before the first, decide whether
+1.1.0 takes the module bumps (*Open*, the `govulncheck` entry): a bump is a
+commit, and the pull request's CI run should include it.
 
 1. **Open a pull request from `feature/flat-repos` to `main`; its CI run
    must be green in full** (raised 2026-10-26, the H2 plan's For H3 item
@@ -4450,6 +4925,11 @@ this section once 1.1.0-rc1 is tagged):
    the GitHub release. Their links name the `1.1.0` tag; for a release
    candidate, paste them with that tag replaced by the candidate's:
    `sed 's|/blob/1\.1\.0/|/blob/1.1.0-rc1/|g' docs/release-notes/1.1.0.md`.
+   The file is wrapped at about 72 columns: check the release editor's
+   *Preview*, and if GitHub breaks the lines where the file does, paste
+   the paragraphs unwrapped instead (lists, tables and headings kept):
+   `sed 's|/blob/1\.1\.0/|/blob/1.1.0-rc1/|g' docs/release-notes/1.1.0.md | perl -0777 -pe 's/([^\n|])\n *+(?![-|#\n]|\z)/$1 /g'`
+   (drop the `sed` for 1.1.0 itself).
 
 ## Open
 
@@ -4463,7 +4943,12 @@ this section once 1.1.0-rc1 is tagged):
   None of the workflows runs `govulncheck`, and there is no
   `.github/dependabot.yml`. Recommendation: decide before the RC whether
   1.1.0 takes the module bumps (`go get` of the three at `@latest`, then
-  the full gate); add a `govulncheck` step to CI either way.
+  the full gate); add a `govulncheck` step to CI either way. The review
+  also asks for a `toolchain` line in `go.mod` (there is none: a builder
+  whose Go is older than 1.25 downloads exactly go1.25.0, which gets no
+  fixes). Recommendation: leave it unset: it needs a bump at every Go
+  patch release, and it makes any older local Go download a toolchain,
+  while the release artifacts are built with the pinned Go 1.27 anyway.
 - **Two WARNs that repeat at every adoption become INFO** (raised
   2026-10-25, the H1 final ops review M-10): `source_parse_failed` for a
   `Sources` file whose every path was refused, and
@@ -4479,9 +4964,9 @@ this section once 1.1.0-rc1 is tagged):
   A captive portal's page cached as a Release-less repository's
   `Release.gpg` stays after the outage (`internal/freshness/anchorless.go`
   deletes only the cached `InRelease` and `Release`); harmless until the
-  repository publishes a `Release`, after which apt prints a signature
-  error until the cache adopts it (`docs/configuration.md`, *Flat
-  repositories*; pinned by
+  repository publishes a `Release` without an `InRelease`, after which apt
+  prints a signature error until the cache adopts it
+  (`docs/configuration.md`, *Flat repositories*; pinned by
   `TestServeHTTP_AnUnsignedSnapshotNeverServesACachedPortalPage`).
   Recommendation: do it after 1.1.0 — the anchors' delete loop takes a
   third name, judged by the existing `Release.gpg` check
@@ -4531,13 +5016,23 @@ this section once 1.1.0-rc1 is tagged):
 ## Decided
 
 - **The Go toolchain: Go 1.27** (the maintainer, 2026-10-26/27; raised
-  2026-09-08 by the security review's finding H-3 and 2026-10-25 by the
-  H2 plan's For H3 item 11). Go supports a release until two newer ones
-  exist, so Go 1.25 has had no fix since 1.27.0. CI, the release
+  2026-09-08 by the security review's finding H-3 and 2026-10-26 by the
+  H2 final CI review, the H2 plan's For H3 item 11). Go supports a
+  release until two newer ones exist, so Go 1.25 has had no fix since
+  1.27.0. CI, the release
   workflow and the four e2e Docker builds use Go 1.27; `go.mod` keeps
   `go 1.25.0`, the language version and GODEBUG defaults the code was
   tested with; CI's golangci-lint moved from v2.12.2, which cannot read
   Go 1.27's export data, to v2.14.0. Done in the H3 plan's Task 5.
+  For the next bump,
+  `grep -rn "go-version: '\|FROM golang:\|golang:1\.\|version: v2\." .github e2e`
+  finds every pin: the seven Go pins (`ci.yaml`'s two `go-version` lines,
+  `release.yaml`'s, and the `FROM golang:` lines of `e2e/flat`, `e2e/deb`,
+  `e2e/live` and `e2e/Dockerfile.cache`), CI's golangci-lint `version:`,
+  and the image named in `e2e/flat/README.md` and in
+  `e2e/Dockerfile.cache`'s header comment. The lint pin is coupled to the
+  Go version, so check it at every Go bump: v2.12.2 cannot read Go 1.27's
+  export data, v2.14.0 can.
 - **The package upgrade restarts a running daemon** (the maintainer,
   2026-10-27, for 1.1.0; raised 2026-09-08, the security review's finding
   H-2). `packaging/scripts/postinstall.sh` runs `deb-systemd-invoke
@@ -4547,8 +5042,10 @@ this section once 1.1.0-rc1 is tagged):
   plan's Task 4, pinned by e2e/deb's phase 5.
 - **R-H5 (GD-5) stands: an adopted unsigned flat suite whose `Release`
   disappears keeps its snapshot** (the maintainer, 2026-10-26; raised
-  2026-10-25). It shows "refused: anchor_absent" and logs
-  `adoption_refused_persistently` until `POST /forget` turns it into a
+  2026-10-23 as phase G's deferred minor GD-5, and put to the maintainer
+  2026-10-24 by the H1 plan's ruling R-H5). It shows "refused:
+  anchor_absent" and logs `adoption_refused_persistently` until
+  `POST /forget` turns it into a
   Release-less suite. Evidence: the flat-repositories spec, §10 item 12;
   the H1 plan's ruling R-H5; `docs/configuration.md`, *Flat
   repositories*, the end of the paragraph on repositories that publish no
@@ -4565,16 +5062,18 @@ this section once 1.1.0-rc1 is tagged):
   request-handling goroutines recover theirs.) Against, for the record: a
   panic that persisted data triggers repeats at every start (a crash
   loop, as the 2026-09 clearsign panic was); the alternative is a recover
-  that rolls back, fails that one write and reopens the connection.
-  Still to do: an `AIDEV-NOTE` at the writer that records this (phase H3
-  changed no production code).
+  that rolls back, fails that one write and reopens the connection. An
+  `AIDEV-NOTE` at the writer's loop records this decision.
 - **R-H6 stands: every prose message the flat-repositories branch added
   is a snake_case event** (the maintainer, 2026-10-27): all 43 were
-  renamed in phase H1, and none was ever released.
+  renamed in phase H1, and none was ever released. Evidence:
+  `TestLogMessagesAreSnakeCase` (`internal/observability/event_names_test.go`)
+  fails the build on a new prose message.
 - **The release notes' credit for PR #8** (the maintainer, 2026-10-26/27):
   "Thanks to Venkat (@venkatamutyala), whose PR #8 identified the
   flat-repository problem; the flat-repository support in this release
-  is based on it."
+  is based on it." Evidence: `docs/release-notes/1.1.0.md`, *Credits*,
+  and `Contributors.md`.
 - **The 1.1.0 release notes live in the tree**,
   `docs/release-notes/1.1.0.md`, pasted into the GitHub release;
   `release.yaml` is unchanged (the H3 controller's ruling PH3-1,
@@ -4583,8 +5082,36 @@ this section once 1.1.0-rc1 is tagged):
   controller's ruling PH3-2).
 - **`make e2e-live` runs before 1.1.0, and before later releases that
   change the request path, adoption or vouching** (the H3 controller's
-  ruling PH3-9, from that plan's review V-M-15).
+  ruling PH3-9, from that plan's review V-M-15). Evidence:
+  `e2e/live/README.md`, its first paragraph.
 ````
+
+The writer's decision is recorded where the code is (fix round 1, ruling PH3-24 M-9; a comment, no `recover`), in `internal/cache/cache.go`:
+
+`old`:
+
+```go
+	defer func() { _ = conn.Close() }()
+
+	for {
+```
+
+`new`:
+
+```go
+	defer func() { _ = conn.Close() }()
+
+	// AIDEV-NOTE: no recover in this goroutine, by the maintainer's
+	// decision of 2026-10-26 (docs/open-decisions.md, *Decided*: "The
+	// cache's writer stays fail-fast on a panic"). A panic inside a write
+	// op ends the process and systemd restarts it: a panic mid-transaction
+	// leaves this one write connection in an unknown state, and the
+	// restart rolls the transaction back. The rejected alternative —
+	// recover, roll back, fail that one write and reopen the connection —
+	// would avoid the crash loop of a panic that persisted data triggers
+	// at every start; change that entry before adding one here.
+	for {
+```
 
 - [ ] **Step 3: Spec revision 13**
 
@@ -4602,7 +5129,7 @@ root = pathlib.Path(".")
 SPEC = "docs/superpowers/specs/2026-09-27-flat-repositories-design.md"
 EDITS = [
     ("""- **Date:** 2026-09-27 (revision 12, 2026-10-24: phase H1, the sweep — """,
-     """- **Date:** 2026-09-27 (revision 13, 2026-10-26: phase H3, documentation and release — §7 records phase H2's end-to-end suite as built: apt never fetches Jitsi's binary `Release.gpg` (apt 2.2–3.2 refuse a binary detached signature, so the fixture serves an `InRelease` beside it and the cache's side is pinned in Go; H2 deviation 1); the 403 unsigned variant is not adopted within a run (its confirmation takes an hour), and the run checks it is still unadopted after a refusal written 305 s or more after its first observation (H2 deviation 2, as built); "within one cooldown" means carried by the client's own check, before the scheduler could have checked the suite (H2 design note 5); the unsigned first adoption lands at its record's first retry at least `max(cooldown, 5 min)` after the first observation, 5 to 15 minutes in practice (H2 design note 7, ruling R-H2-6); the 45 s commit runs every update under the full error grep, stricter than the scoped grep first planned (H2's third deviation); the error grep also counts signature errors and `E:`/`Error:` lines that name the signed host; and §7 gains the manual live-upstream smoke (`e2e/live`), run green during phase H3's planning against pkgs.k8s.io, NVIDIA CUDA, libnvidia-container, pkg.jenkins.io and download.sublimetext.com; C10's flat consequences are documented in `docs/configuration.md`; C11's metric list is not exhaustive (the 1.1.0 release notes list all 21 new metrics, computed from the code); `flip_held_ms` can exceed 20000 by the hold timer's lateness (ruling R-H3-2); §8 adds the 1.1.0 release notes and the maintainer's open decisions; §9's H row names H3's work; revision 12, 2026-10-24: phase H1, the sweep — """),
+     """- **Date:** 2026-09-27 (revision 13, 2026-10-26: phase H3, documentation and release — §7 records phase H2's end-to-end suite as built: apt never fetches Jitsi's binary `Release.gpg` (apt 2.2–3.2 refuse a binary detached signature, so the fixture serves an `InRelease` beside it and the cache's side is pinned in Go; H2 deviation 1); the 403 unsigned variant is not adopted within a run (its confirmation takes an hour), and the run checks it is still unadopted after a refusal written 305 s or more after its first observation (H2 deviation 2, as built); "within one cooldown" means carried by the client's own check, before the scheduler could have checked the suite (H2 design note 5); the unsigned first adoption lands at its record's first retry at least `max(cooldown, 5 min)` after the first observation, 5 to 15 minutes in practice (H2 design note 7, ruling R-H2-6); the 45 s commit runs every update under the full error grep, stricter than the scoped grep first planned (H2's third deviation); the error grep also counts signature errors and `E:`/`Error:` lines that name the signed host; and §7 gains the manual live-upstream smoke (`e2e/live`), run green during phase H3's planning against pkgs.k8s.io, NVIDIA CUDA, libnvidia-container, pkg.jenkins.io and download.sublimetext.com; C10's flat consequences are documented in `docs/configuration.md`; C11's metric list is not exhaustive (the 1.1.0 release notes list all 21 new metrics, computed from the code); `flip_held_ms` can exceed 20000 by the hold timer's lateness (ruling R-H3-2); §8 adds the 1.1.0 release notes and the maintainer's open decisions; §9's H row names H3's work; §10 item 12: the maintainer confirmed R-H5 (2026-10-26); revision 12, 2026-10-24: phase H1, the sweep — """),
     ("""`dists/` repo. Signed repos live on one host name, unsigned and Release-less""",
      """`dists/` repo. Jitsi's binary `Release.gpg` is never fetched: apt 2.2–3.2
 refuse a binary detached signature, so the fixture serves an `InRelease`
@@ -4668,6 +5195,16 @@ above is not exhaustive: the flip barrier's six counters (C8),
 `acu_serve_byhash_displaced_total{host}`, `acu_clock_steps_detected_total`
 and `acu_legacy_snapshots_quarantined_total` are new too; the 1.1.0 release
 notes list all 21, computed from the code. They are"""),
+    ("""    once its `Release` has stayed absent was decided for 1.1.0 by a
+    controller ruling, for the maintainer's confirmation: keep; revisit if
+    seen in the field""",
+     """    once its `Release` has stayed absent was decided for 1.1.0 by a
+    controller ruling, confirmed by the maintainer on 2026-10-26: keep;
+    revisit if seen in the field"""),
+    ("""and a held request's `request` line carries `flip_held_ms`. A flip waiting""",
+     """and a held request's `request` line carries `flip_held_ms` (about 20000
+at most: the hold's timer can fire a few milliseconds late, ruling
+R-H3-2). A flip waiting"""),
 ]
 
 p = root / SPEC
@@ -4682,7 +5219,7 @@ print(f"spec: {len(EDITS)} edits applied")
 EOF
 ```
 
-Expected: `spec: 7 edits applied`.
+Expected: `spec: 9 edits applied` (the last two, and the `Date` entry's R-H5 clause, are the fix round's: review I-1 and M-3).
 
 - [ ] **Step 4: The overview**
 
@@ -4737,7 +5274,7 @@ OTHER = [
 """,
      """**Decisions (spec-level):**
 
-The decisions that outlive the branch — the maintainer's of 2026-10-26/27 (Go 1.27; the package upgrade's restart, the security review's H-2; R-H5 and the cache writer's fail-fast on a panic confirmed; R-H6 confirmed) and the open ones (`govulncheck` and the module bumps, the post-1.1.0 carries of H2's For H3 list) — are in `docs/open-decisions.md` (phase H3, Task 9), the maintainer's list.
+The decisions that outlive the branch — the maintainer's of 2026-10-26/27 (Go 1.27; the package upgrade's restart, the security review's H-2; R-H5 and the cache writer's fail-fast on a panic confirmed; R-H6 confirmed) and the open ones (`govulncheck` and the module bumps, the post-1.1.0 carries of H2's For H3 list and of the H1 final reviews) — are in `docs/open-decisions.md` (phase H3, Task 9), the maintainer's list.
 """),
     ("""- *Decided for 1.1.0 by ruling R-H5 (phase H1), for the maintainer's confirmation: keep the behaviour; revisit if seen in the field.*""",
      """- *Decided for 1.1.0 by ruling R-H5 (phase H1), confirmed by the maintainer on 2026-10-26: keep the behaviour; revisit if seen in the field.*"""),
@@ -4831,9 +5368,44 @@ for name in sys.argv[1:]:
 sys.exit(1 if bad else 0)
 EOF
 python3 "$T/check_links.py" docs/open-decisions.md | grep -c '^ok'; python3 "$T/check_links.py" docs/open-decisions.md | grep '^BAD' || echo "no broken link"
+grep -n "maintainer's confirmation" docs/superpowers/specs/2026-09-27-flat-repositories-design.md | cut -c1-40
+grep -c 'no recover in this goroutine' internal/cache/cache.go; grep -c 'recover()' internal/cache/cache.go
+gofmt -l internal/cache/cache.go; go vet ./internal/cache/ && golangci-lint run ./internal/cache/...
+grep -n -w -i 'he\|him\|his\|himself' docs/open-decisions.md || echo "no pronoun"
+cat > "$T/paste_check.py" <<'EOF'
+#!/usr/bin/env python3
+"""Check docs/open-decisions.md's paste step (phase H3, ruling PH3-25 M5):
+run its two commands exactly as written, from the repository root, and
+check that the unwrapped paste, rendered with hard line breaks (as GitHub
+renders a release body), renders as the plain paste does with soft breaks,
+and that it has no soft break left. Needs markdown-it-py."""
+import re
+import subprocess
+import sys
+
+from markdown_it import MarkdownIt
+
+
+def html(text: str, breaks: bool) -> str:
+    md = MarkdownIt("commonmark", {"breaks": breaks}).enable("table")
+    return re.sub(r"\s+", " ", md.render(text)).strip()
+
+
+cmds = re.findall(r"`(sed 's\|/blob[^`]*)`", open("docs/open-decisions.md").read())
+if len(cmds) != 2:
+    sys.exit(f"want the two paste commands, found {len(cmds)}")
+plain, unwrapped = (subprocess.run(["bash", "-c", c], capture_output=True, text=True, check=True).stdout for c in cmds)
+same = html(plain, False) == html(unwrapped, True)
+flat = html(unwrapped, True) == html(unwrapped, False)
+print(f"same rendering: {same}")
+print(f"no soft break left: {flat}")
+print(f"lines: {plain.count(chr(10))} -> {unwrapped.count(chr(10))}")
+sys.exit(0 if same and flat else 1)
+EOF
+python3 "$T/paste_check.py"
 ```
 
-Expected: `0`, `15`, `1`, `1`, `9` (the *Open* entries) and `9` (the *Decided* ones), then `1` (the one Markdown link, to the spec) and `no broken link`. (Of the 16 carries 15 read *Done in H3 (Task …)*; the 16th, the simulation near its budget, reads *Listed in `docs/open-decisions.md` (H3 Task 9); Task 10 records the final measurement.*)
+Expected: `0`, `15`, `1`, `1`, `9` (the *Open* entries) and `9` (the *Decided* ones), then `1` (the one Markdown link, to the spec) and `no broken link`; then the fix round's: `3:- **Date:** 2026-09-27 (revision 13, 2` (revision 12's history alone still says "for the maintainer's confirmation"), `1` and `0`, nothing from `gofmt`, `0 issues.`, `no pronoun`, and the paste check's `same rendering: True`, `no soft break left: True` and `lines: 480 -> 124` (the unwrapped paste, rendered with GitHub's hard line breaks, renders as the file does; markdown-it-py renders both). (Of the 16 carries 15 read *Done in H3 (Task …)*; the 16th, the simulation near its budget, reads *Listed in `docs/open-decisions.md` (H3 Task 9); Task 10 records the final measurement.*)
 
 - [ ] **Step 6: Commit**
 
@@ -4854,7 +5426,7 @@ release notes and the open decisions in section 8.
 docs/open-decisions.md is the maintainer's list of what outlives the
 branch: the steps before the RC that need a push or a tag, what is
 open (govulncheck and the module bumps, the post-1.1.0 carries), each
-with its evidence and a recommendation, and what he decided on
+with its evidence and a recommendation, and what the maintainer decided on
 2026-10-26/27 (Go 1.27, the restart on upgrade, R-H5 and the writer's
 fail-fast with its alternative, R-H6, the credit), with the
 controller's rulings on the notes' home and this file's.
@@ -4864,6 +5436,61 @@ The overview marks every carry-forward that was H3's done, with its task.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
 ```
+As executed, Task 9 is three commits: the one above (37a2cf6, whose message says the same with a pronoun for the maintainer where the text above names the maintainer: ruling PH3-24 M-10); PH3-16's (e91cafe): the grep that finds every Go pin; and, after the task's review, its fix round (a3c24fe, rulings PH3-24 and PH3-25 M5): Steps 2–5 as they now read. Step 5 printed the expected output above; `go test -race ./...` 21 `ok`, `golangci-lint run ./...` `0 issues.`, `gofmt -l .` the five drift files.
+
+```bash
+git add docs/open-decisions.md
+git commit -F - <<'EOF'
+open-decisions: the grep that finds every Go pin for the next bump
+
+The Go toolchain entry now gives the grep that lists every pin a Go bump
+must move, and says CI's golangci-lint pin moves with it (v2.14 or later
+reads Go 1.27's export data; v2.12.2 cannot), so the next bump is a
+checklist (the H3 controller's ruling PH3-16, from Task 5's review). At
+this commit the grep prints ten lines: the seven Go pins (ci.yaml twice,
+release.yaml, the four e2e Dockerfiles), the lint pin, and two prose
+mentions of the image (e2e/flat/README.md, e2e/Dockerfile.cache's
+header).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
+```bash
+git add docs/open-decisions.md docs/superpowers/specs/2026-09-27-flat-repositories-design.md \
+    docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md internal/cache/cache.go
+git commit -F - <<'EOF'
+Open decisions, spec, overview: R-H5 confirmed; dates, evidence, the paste
+
+Task 9's review (ruling PH3-24) and PH3-25 M5:
+- I-1: spec section 10 item 12 records R-H5 as confirmed by the
+  maintainer on 2026-10-26, and revision 13's Date line says so; the
+  only "maintainer's confirmation" left is revision 12's history.
+- M-3: where C8 introduces flip_held_ms, the spec says it is about
+  20000 at most (the hold's timer can fire late; ruling R-H3-2).
+- M-8: the overview's decisions paragraph names the H1 final reviews'
+  carries among the open ones.
+- docs/open-decisions.md: the raised dates corrected (the Go entry
+  2026-10-26, the H2 final CI review; R-H5: GD-5 2026-10-23, put to the
+  maintainer 2026-10-24) (M-1); go.mod's toolchain line recorded as open
+  in the H-3 entry, recommended unset (M-2); the lint pin "check it at
+  every Go bump" (M-4); evidence for R-H6, the credit and PH3-9 (M-5);
+  the pre-RC list starts from the module-bump decision (M-6); the
+  writer's AIDEV-NOTE is in place, so its "Still to do" goes (M-9);
+  "When the maintainer rules" (M-10); the paste step checks GitHub's
+  Preview and gives the one-liner that unwraps the paragraphs (PH3-25
+  M5; checked by rendering: the unwrapped text with hard breaks renders
+  as the file does); the portal entry's Release.gpg error needs a
+  Release without an InRelease (PH3-23 M4).
+- internal/cache/cache.go: a comment-only AIDEV-NOTE at the writer's
+  loop records the fail-fast decision (no recover) and points at its
+  entry (M-9). gofmt, go vet and golangci-lint clean; go test -race
+  ./... 21 ok.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
 
 ---
 
@@ -5119,7 +5746,7 @@ EOF
 
 - [ ] **Step 10: The report to the maintainer**
 
-Report, briefly: the gate's results (Steps 2–4, with the three slowest simulations, `nproc`, the local golangci-lint version beside CI's pin, and the Go 1.27 run); the review's findings by severity and their rulings and commits; the live smoke's result on the final tree; and what is his — `docs/open-decisions.md`'s *Before the 1.1.0 release candidate* list (the pull request, the CI runs, the tag and the paste: nothing goes to GitHub without him) and its *Open* entries, `govulncheck` and the module bumps first.
+Report, briefly: the gate's results (Steps 2–4, with the three slowest simulations, `nproc`, the local golangci-lint version beside CI's pin, and the Go 1.27 run); the review's findings by severity and their rulings and commits; the live smoke's result on the final tree; and what is the maintainer's — `docs/open-decisions.md`'s *Before the 1.1.0 release candidate* list (the pull request, the CI runs, the tag and the paste: nothing goes to GitHub without the maintainer) and its *Open* entries, `govulncheck` and the module bumps first.
 
 ---
 
