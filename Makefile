@@ -60,7 +60,9 @@ e2e-flat:
 # adoption and strict mode on; about 5 minutes. It needs network access to
 # those five vendors, so it is run by hand before 1.1.0 and before later
 # releases that change the request path, adoption or vouching, never in CI.
-# E2E_LIVE_NAME names its image and container (default acu-e2e-live).
+# E2E_LIVE_NAME names its image and container (default acu-e2e-live); give
+# each checkout its own E2E_LIVE_NAME so concurrent runs do not collide (a
+# run removes a container of its name first, a running one too).
 e2e-live:
 	bash e2e/live/run.sh
 
