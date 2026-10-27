@@ -17,8 +17,9 @@
 # NoNewPrivileges, etc.) are NOT exercised. That coverage is the
 # job of step 4 (production deployment) per SPEC §14.
 #
-# Phase 5 checks the maintainer scripts' calls to systemd on a fresh
-# install, an upgrade and a removal, against a stub systemctl (its
+# Phase 5 checks the maintainer scripts' calls to systemd, and the
+# install hint, on a fresh install, an upgrade, dpkg's abort-* actions, a
+# removal and a reinstall after it, against a stub systemctl (its
 # AIDEV-NOTE says how).
 
 set -euo pipefail
@@ -910,21 +911,27 @@ echo "[deb-test] phase 4 (Phase 3 hot-prefetch) PASS"
 # ============================================================
 # Phase 5: the maintainer scripts under systemd (the 2026-09 security
 # review's H-2). A fresh install starts nothing and prints the install
-# message; an upgrade asks systemd for exactly one try-restart (a running
-# daemon moves to the new binary, a stopped one stays stopped), stops
-# nothing first and prints no install message; a failed restart does not
-# fail dpkg; policy-rc.d's "no" is honoured; a removal stops and disables
-# the unit.
+# message; an upgrade of the enabled unit asks systemd for exactly one
+# try-restart (a running daemon moves to the new binary, a stopped one
+# stays stopped), stops nothing first and prints no install message; a
+# failed restart does not fail dpkg; policy-rc.d's "no" is honoured;
+# abort-upgrade restarts too, a plain abort-remove does not; a removal
+# stops and disables the unit, and a reinstall after it prints the hint
+# again; without systemd the hint prints and systemctl is not called.
 #
 # AIDEV-NOTE: no systemd runs here (see the header), so this phase makes
 # the scripts see one: /run/systemd/system exists, and a systemctl stub
 # first on PATH records each call (its arguments, one line) and succeeds,
-# or fails a try-restart while $stubs/fail-try-restart exists. dpkg passes
-# its PATH on to the maintainer scripts, and deb-systemd-invoke looks
-# systemctl up on it, so the stub sees what systemd would be asked. The
-# image's /usr/sbin/policy-rc.d (exit 101: Docker's images forbid service
-# actions) is moved aside, except while the policy step checks that it is
-# honoured. UPGRADE_FROM names the package to upgrade from (by default
+# or fails a try-restart while $stubs/fail-try-restart exists. It keeps
+# the unit's enablement as systemd would: enable creates $stubs/enabled,
+# disable deletes it, and is-enabled succeeds only while it exists (the
+# postinst asks it before printing the install hint). dpkg passes its PATH
+# on to the maintainer scripts, and deb-systemd-invoke looks systemctl up
+# on it, so the stub sees what systemd would be asked. The image's
+# /usr/sbin/policy-rc.d (exit 101: Docker's images forbid service actions)
+# is moved aside, except while the policy step checks that it is honoured.
+# The abort-* and no-systemd steps run the installed postinst directly, as
+# dpkg would. UPGRADE_FROM names the package to upgrade from (by default
 # this tree's, the /tmp one phase 1 installed); the upgrade goes to
 # /upgrade's, the same binary packaged at a higher version (the
 # Dockerfile's build stage).
@@ -960,6 +967,11 @@ if [ "$1" = try-restart ] && [ -e /acu-stubs/fail-try-restart ]; then
     echo "systemctl stub: try-restart fails" >&2
     exit 1
 fi
+case $1 in
+    enable) touch /acu-stubs/enabled ;;
+    disable) rm -f /acu-stubs/enabled ;;
+    is-enabled) [ -e /acu-stubs/enabled ] || exit 1 ;;
+esac
 exit 0
 EOF
 chmod 0755 "$stubs/systemctl"
@@ -979,15 +991,28 @@ dpkg_step() {
     fi
 }
 
+# postinst_step NAME ARGS...: runs the installed package's postinst with
+# ARGS, as dpkg would, otherwise as dpkg_step.
+postinst_step() {
+    local name=$1
+    shift
+    : > "$calls"
+    if ! PATH="$stubs:$PATH" /var/lib/dpkg/info/apt-cacher-ultra.postinst "$@" > "/tmp/p5.$name.out" 2>&1; then
+        echo "FAIL: phase-5 $name: postinst $* failed:"
+        cat "/tmp/p5.$name.out"
+        exit 1
+    fi
+}
+
 # expect_count NAME WHAT WANT FILE PATTERN: FILE has WANT lines matching
 # the extended regex PATTERN, or the test fails naming WHAT and showing
-# the step's dpkg output and systemctl calls.
+# the step's output (dpkg's, or the postinst's) and systemctl calls.
 expect_count() {
     local name=$1 what=$2 want=$3 file=$4 pattern=$5 got
     got=$(grep -cE -- "$pattern" "$file" || true)
     if [[ "$got" -ne "$want" ]]; then
         echo "FAIL: phase-5 $name: $got $what, want $want"
-        echo "=== dpkg output ==="
+        echo "=== the step's output ==="
         cat "/tmp/p5.$name.out"
         echo "=== systemctl calls ==="
         cat "$calls"
@@ -1007,7 +1032,10 @@ dpkg_step install -i "$old_deb"
 expect_count install "start or restart calls" 0 "$calls" "$restarts"
 expect_count install "install messages" 1 /tmp/p5.install.out "$message"
 
-echo "[deb-test] phase 5: upgrade to $new_version: one try-restart, no stop, no install message"
+# The operator follows the hint: from here the stub's is-enabled succeeds.
+PATH="$stubs:$PATH" systemctl enable apt-cacher-ultra.service
+
+echo "[deb-test] phase 5: upgrade to $new_version, unit enabled: one try-restart, no stop, no install message"
 dpkg_step upgrade -i "$new_deb"
 expect_count upgrade "try-restart calls" 1 "$calls" '^try-restart apt-cacher-ultra\.service$'
 expect_count upgrade "start or restart calls" 1 "$calls" "$restarts"
@@ -1037,10 +1065,39 @@ mv /usr/sbin/policy-rc.d /usr/sbin/policy-rc.d.acu
 expect_count policy "start or restart calls" 0 "$calls" "$restarts"
 expect_count policy "policy-rc.d refusals" 1 /tmp/p5.policy.out 'policy-rc\.d returned 101'
 
+# dpkg runs the installed postinst with abort-upgrade NEW-VERSION when an
+# upgrade to NEW-VERSION fails, and with a plain abort-remove when a
+# removal's prerm fails. debhelper's snippet restarts only when $2 is set,
+# and a plain abort-remove has none.
+echo "[deb-test] phase 5: abort-upgrade: one try-restart; a plain abort-remove: none"
+postinst_step abort-upgrade abort-upgrade 9.9.9~e2e
+expect_count abort-upgrade "try-restart calls" 1 "$calls" '^try-restart apt-cacher-ultra\.service$'
+expect_count abort-upgrade "start or restart calls" 1 "$calls" "$restarts"
+expect_count abort-upgrade "install messages" 0 /tmp/p5.abort-upgrade.out "$message"
+postinst_step abort-remove abort-remove
+expect_count abort-remove "start or restart calls" 0 "$calls" "$restarts"
+
 echo "[deb-test] phase 5: remove: stop and disable"
 dpkg_step remove -r apt-cacher-ultra
 expect_count remove "stop calls" 1 "$calls" '^stop apt-cacher-ultra\.service$'
 expect_count remove "disable calls" 1 "$calls" '^disable apt-cacher-ultra\.service$'
+
+# A remove keeps the package's configuration (dpkg's config-files state),
+# so the reinstall is a configure with $2 set, as on an upgrade; the remove
+# disabled the unit, so the hint prints again.
+echo "[deb-test] phase 5: reinstall after the remove: the install message"
+dpkg_step reinstall -i "$new_deb"
+expect_count reinstall "install messages" 1 /tmp/p5.reinstall.out "$message"
+
+# Without systemd the postinst asks it nothing, so the hint prints even
+# though the stub would now answer "enabled".
+PATH="$stubs:$PATH" systemctl enable apt-cacher-ultra.service
+echo "[deb-test] phase 5: no systemd: no systemctl call, the install message"
+rmdir /run/systemd/system
+postinst_step no-systemd configure "$old_version"
+mkdir /run/systemd/system
+expect_count no-systemd "systemctl calls" 0 "$calls" '.'
+expect_count no-systemd "install messages" 1 /tmp/p5.no-systemd.out "$message"
 
 echo "[deb-test] phase 5 (maintainer scripts under systemd) PASS"
 echo "[deb-test] OVERALL PASS"
