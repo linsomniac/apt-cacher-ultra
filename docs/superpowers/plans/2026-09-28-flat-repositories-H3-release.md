@@ -274,7 +274,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
 ```
 
-As executed, Task 1 is two commits: the one above (c07e974) and, after the task's review, its one Minor (4fa2c78, execution ruling PH3-14): the AIDEV-NOTEs gained "and does not call t.Parallel", as Steps 2 and 3 now show them. The default logger is process-global, so a parallel test that swapped it would capture other tests' lines; neither package calls `t.Parallel` (`grep -rn 't\.Parallel' internal/fetch internal/metrics` prints nothing). Steps 4 and 5 print the same on the reworded files.
+As executed, Task 1 is two commits: the one above (c07e974) and, after the task's review, its one Minor (4fa2c78, execution ruling PH3-14): the AIDEV-NOTEs gained "and does not call t.Parallel", as Steps 2 and 3 now show them. The default logger is process-global, so a parallel test that swapped it would capture other tests' lines; neither package calls `t.Parallel` (`grep -rn 't\.Parallel()' internal/fetch internal/metrics` prints nothing). Steps 4 and 5 print the same on the reworded files.
 
 ```bash
 git add internal/fetch/main_test.go internal/metrics/main_test.go
@@ -4331,7 +4331,7 @@ DONE = [
      "*Done in H3 (Task 8: computed from the code at 1.0.2 and HEAD — 76 events, a test-binary one, 21 metrics; C11's list missed nine metrics).*"),
     ("and capture or silence the default logger in the metrics tests. ", "*Done in H3 (Task 1: one `TestMain` per package).*"),
     ("fixes all 17 callers. Failure path only; it never masks a pass. ",
-     "*Done in H3 (Task 2: the 17 tests whose only drain was their end — the twelve readiness waits', `reaper_wiring_test.go`'s second test, `main_test.go`'s three graceful-shutdown tests and `TestServe_ReturnsListenError` — start the daemon with `serveUntilCleanup`; every other daemon start drained in its own cleanup already).*"),
+     "*Done in H3 (Task 2: the 17 tests whose only drain was their end — the twelve readiness waits', `reaper_wiring_test.go`'s second test, `main_test.go`'s three graceful-shutdown tests and `TestServe_ReturnsListenError` — start the daemon with `serveUntilCleanup`; every other daemon start drained on its own already, in a cleanup or in `waitServing`).*"),
     ("as the signal; the release notes may warn operators who page on WARN. ",
      "*Done in H3 (Task 8 warns; the level change is open in `docs/open-decisions.md`, Task 9).*"),
     ("coarsening candidate if it crosses it, as C-38 was (parked item 17). ",
