@@ -276,6 +276,15 @@ func (c *Cache) writer() {
 	}
 	defer func() { _ = conn.Close() }()
 
+	// AIDEV-NOTE: no recover in this goroutine, by the maintainer's
+	// decision of 2026-10-26 (docs/open-decisions.md, *Decided*: "The
+	// cache's writer stays fail-fast on a panic"). A panic inside a write
+	// op ends the process and systemd restarts it: a panic mid-transaction
+	// leaves this one write connection in an unknown state, and the
+	// restart rolls the transaction back. The rejected alternative —
+	// recover, roll back, fail that one write and reopen the connection —
+	// would avoid the crash loop of a panic that persisted data triggers
+	// at every start; change that entry before adding one here.
 	for {
 		select {
 		case req := <-c.writes:

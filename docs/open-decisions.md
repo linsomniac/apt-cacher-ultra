@@ -2,8 +2,9 @@
 
 Decisions that outlive the work that raised them, each the maintainer's
 (Sean Reifschneider). An entry says what is open, its evidence, the
-recommendation and when it was raised. When he rules, the entry moves to
-*Decided* with the date and the ruling, and whoever does the work cites it.
+recommendation and when it was raised. When the maintainer rules, the
+entry moves to *Decided* with the date and the ruling, and whoever does
+the work cites it.
 The flat-repositories branch (phases A–H, 2026-09 to 2026-10) seeded this
 file; the decisions it made along the way are in its overview's decisions
 block (`docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md`).
@@ -14,7 +15,9 @@ flat-repositories spec](superpowers/specs/2026-09-27-flat-repositories-design.md
 ## Before the 1.1.0 release candidate
 
 Steps only the maintainer can take, since they need a push or a tag (delete
-this section once 1.1.0-rc1 is tagged):
+this section once 1.1.0-rc1 is tagged). Before the first, decide whether
+1.1.0 takes the module bumps (*Open*, the `govulncheck` entry): a bump is a
+commit, and the pull request's CI run should include it.
 
 1. **Open a pull request from `feature/flat-repos` to `main`; its CI run
    must be green in full** (raised 2026-10-26, the H2 plan's For H3 item
@@ -49,6 +52,11 @@ this section once 1.1.0-rc1 is tagged):
    the GitHub release. Their links name the `1.1.0` tag; for a release
    candidate, paste them with that tag replaced by the candidate's:
    `sed 's|/blob/1\.1\.0/|/blob/1.1.0-rc1/|g' docs/release-notes/1.1.0.md`.
+   The file is wrapped at about 72 columns: check the release editor's
+   *Preview*, and if GitHub breaks the lines where the file does, paste
+   the paragraphs unwrapped instead (lists, tables and headings kept):
+   `sed 's|/blob/1\.1\.0/|/blob/1.1.0-rc1/|g' docs/release-notes/1.1.0.md | perl -0777 -pe 's/([^\n|])\n *+(?![-|#\n]|\z)/$1 /g'`
+   (drop the `sed` for 1.1.0 itself).
 
 ## Open
 
@@ -62,7 +70,12 @@ this section once 1.1.0-rc1 is tagged):
   None of the workflows runs `govulncheck`, and there is no
   `.github/dependabot.yml`. Recommendation: decide before the RC whether
   1.1.0 takes the module bumps (`go get` of the three at `@latest`, then
-  the full gate); add a `govulncheck` step to CI either way.
+  the full gate); add a `govulncheck` step to CI either way. The review
+  also asks for a `toolchain` line in `go.mod` (there is none: a builder
+  whose Go is older than 1.25 downloads exactly go1.25.0, which gets no
+  fixes). Recommendation: leave it unset: it needs a bump at every Go
+  patch release, and it makes any older local Go download a toolchain,
+  while the release artifacts are built with the pinned Go 1.27 anyway.
 - **Two WARNs that repeat at every adoption become INFO** (raised
   2026-10-25, the H1 final ops review M-10): `source_parse_failed` for a
   `Sources` file whose every path was refused, and
@@ -78,9 +91,9 @@ this section once 1.1.0-rc1 is tagged):
   A captive portal's page cached as a Release-less repository's
   `Release.gpg` stays after the outage (`internal/freshness/anchorless.go`
   deletes only the cached `InRelease` and `Release`); harmless until the
-  repository publishes a `Release`, after which apt prints a signature
-  error until the cache adopts it (`docs/configuration.md`, *Flat
-  repositories*; pinned by
+  repository publishes a `Release` without an `InRelease`, after which apt
+  prints a signature error until the cache adopts it
+  (`docs/configuration.md`, *Flat repositories*; pinned by
   `TestServeHTTP_AnUnsignedSnapshotNeverServesACachedPortalPage`).
   Recommendation: do it after 1.1.0 — the anchors' delete loop takes a
   third name, judged by the existing `Release.gpg` check
@@ -130,9 +143,10 @@ this section once 1.1.0-rc1 is tagged):
 ## Decided
 
 - **The Go toolchain: Go 1.27** (the maintainer, 2026-10-26/27; raised
-  2026-09-08 by the security review's finding H-3 and 2026-10-25 by the
-  H2 plan's For H3 item 11). Go supports a release until two newer ones
-  exist, so Go 1.25 has had no fix since 1.27.0. CI, the release
+  2026-09-08 by the security review's finding H-3 and 2026-10-26 by the
+  H2 final CI review, the H2 plan's For H3 item 11). Go supports a
+  release until two newer ones exist, so Go 1.25 has had no fix since
+  1.27.0. CI, the release
   workflow and the four e2e Docker builds use Go 1.27; `go.mod` keeps
   `go 1.25.0`, the language version and GODEBUG defaults the code was
   tested with; CI's golangci-lint moved from v2.12.2, which cannot read
@@ -144,8 +158,8 @@ this section once 1.1.0-rc1 is tagged):
   `e2e/live` and `e2e/Dockerfile.cache`), CI's golangci-lint `version:`,
   and the image named in `e2e/flat/README.md` and in
   `e2e/Dockerfile.cache`'s header comment. The lint pin is coupled to the
-  Go version: golangci-lint must read the new toolchain's export data
-  (v2.14 or later for Go 1.27), so it moves with every Go bump.
+  Go version, so check it at every Go bump: v2.12.2 cannot read Go 1.27's
+  export data, v2.14.0 can.
 - **The package upgrade restarts a running daemon** (the maintainer,
   2026-10-27, for 1.1.0; raised 2026-09-08, the security review's finding
   H-2). `packaging/scripts/postinstall.sh` runs `deb-systemd-invoke
@@ -155,8 +169,10 @@ this section once 1.1.0-rc1 is tagged):
   plan's Task 4, pinned by e2e/deb's phase 5.
 - **R-H5 (GD-5) stands: an adopted unsigned flat suite whose `Release`
   disappears keeps its snapshot** (the maintainer, 2026-10-26; raised
-  2026-10-25). It shows "refused: anchor_absent" and logs
-  `adoption_refused_persistently` until `POST /forget` turns it into a
+  2026-10-23 as phase G's deferred minor GD-5, and put to the maintainer
+  2026-10-24 by the H1 plan's ruling R-H5). It shows "refused:
+  anchor_absent" and logs `adoption_refused_persistently` until
+  `POST /forget` turns it into a
   Release-less suite. Evidence: the flat-repositories spec, §10 item 12;
   the H1 plan's ruling R-H5; `docs/configuration.md`, *Flat
   repositories*, the end of the paragraph on repositories that publish no
@@ -173,16 +189,18 @@ this section once 1.1.0-rc1 is tagged):
   request-handling goroutines recover theirs.) Against, for the record: a
   panic that persisted data triggers repeats at every start (a crash
   loop, as the 2026-09 clearsign panic was); the alternative is a recover
-  that rolls back, fails that one write and reopens the connection.
-  Still to do: an `AIDEV-NOTE` at the writer that records this (phase H3
-  changed no production code).
+  that rolls back, fails that one write and reopens the connection. An
+  `AIDEV-NOTE` at the writer's loop records this decision.
 - **R-H6 stands: every prose message the flat-repositories branch added
   is a snake_case event** (the maintainer, 2026-10-27): all 43 were
-  renamed in phase H1, and none was ever released.
+  renamed in phase H1, and none was ever released. Evidence:
+  `TestLogMessagesAreSnakeCase` (`internal/observability/event_names_test.go`)
+  fails the build on a new prose message.
 - **The release notes' credit for PR #8** (the maintainer, 2026-10-26/27):
   "Thanks to Venkat (@venkatamutyala), whose PR #8 identified the
   flat-repository problem; the flat-repository support in this release
-  is based on it."
+  is based on it." Evidence: `docs/release-notes/1.1.0.md`, *Credits*,
+  and `Contributors.md`.
 - **The 1.1.0 release notes live in the tree**,
   `docs/release-notes/1.1.0.md`, pasted into the GitHub release;
   `release.yaml` is unchanged (the H3 controller's ruling PH3-1,
@@ -191,4 +209,5 @@ this section once 1.1.0-rc1 is tagged):
   controller's ruling PH3-2).
 - **`make e2e-live` runs before 1.1.0, and before later releases that
   change the request path, adoption or vouching** (the H3 controller's
-  ruling PH3-9, from that plan's review V-M-15).
+  ruling PH3-9, from that plan's review V-M-15). Evidence:
+  `e2e/live/README.md`, its first paragraph.
