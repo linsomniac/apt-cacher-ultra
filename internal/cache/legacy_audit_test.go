@@ -303,8 +303,9 @@ func TestListTrackedSuiteAnchors_OnlyTrackedSignedAnchorNames(t *testing.T) {
 // before any listener serves, so its query drives from suite_freshness (a
 // scan of the suites) and probes url_path by its unique key, once per
 // anchor name — never from url_path, which made the read grow with every
-// cached file times the host's suites (36.8 s for 5,000 suites over
-// 215,000 url_path rows). As ListUnadoptedSuiteAnchors' plan
+// cached file times the host's suites (32 s for 5,000 suites over
+// 220,000 url_path rows, against 0.06 s now: the AIDEV-NOTE on
+// trackedSuiteAnchorsSQL). As ListUnadoptedSuiteAnchors' plan
 // (TestListUnadoptedSuiteAnchors_ProbesURLPathByItsKey).
 func TestListTrackedSuiteAnchors_ProbesURLPathByItsKey(t *testing.T) {
 	c := openCache(t)

@@ -392,7 +392,9 @@ func (g *GC) Run(ctx context.Context) {
 	}
 	t := time.NewTimer(g.cfg.Interval)
 	defer t.Stop()
-	var retiredDue <-chan time.Time // nil: never; the first tick runs sub-job C first
+	// nil when gc.interval is an hour or less: no separate run, since the
+	// first periodic tick, within the hour, normally runs sub-job C itself.
+	var retiredDue <-chan time.Time
 	if g.cfg.Interval > retiredRunAfterStart {
 		rt := time.NewTimer(retiredRunAfterStart)
 		defer rt.Stop()

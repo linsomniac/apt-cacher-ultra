@@ -186,8 +186,9 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 		case hotFetchCancelled:
 			// fetchHotDeb returns hotFetchCancelled in two narrow
 			// cases: parent adoptionCtx cancelled (Canceled) or
-			// hostSem.Acquire raced with the budget firing
-			// (DeadlineExceeded before any fetch was initiated).
+			// hostSem.Acquire raced with a deadline firing — the
+			// budget's or adoption.max_duration's (DeadlineExceeded
+			// before any fetch was initiated).
 			// SPEC3 §10.2: adoption_hot_prefetch_partial fires ONLY on
 			// a deadline — hot_prefetch_budget or adoption.max_duration —
 			// but here entry i was never actually fetched, so partial
@@ -275,10 +276,11 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 	res, err := a.fetcher.Fetch(ctx, target, w)
 	if err != nil {
 		// Three-way disambiguation:
-		//   - ctx.Err() == DeadlineExceeded: budget elapse with this
-		//     deb in flight. SPEC3 §12.3 variant 1: "the hung fetch
-		//     was attempted but cancelled when prefetchCtx hit the
-		//     budget" → log hot_prefetch_deb_failed (with the wrapped
+		//   - ctx.Err() == DeadlineExceeded: the budget, or
+		//     adoption.max_duration (the parent's deadline), elapsed
+		//     with this deb in flight. SPEC3 §12.3 variant 1: "the
+		//     hung fetch was attempted but cancelled when prefetchCtx
+		//     hit the budget" → log hot_prefetch_deb_failed (with the wrapped
 		//     context-cancellation error) and bucket as failed. The
 		//     subsequent loop iteration's top check sees prefetchCtx
 		//     done and emits the once-fires partial event with paths
