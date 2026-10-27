@@ -33,6 +33,14 @@ import (
 func startAdminServer(t *testing.T, opts ...adminOpt) (*Server, string, func()) {
 	t.Helper()
 	s, ln, c := newAdminServer(t, opts...)
+	return s, "http://" + ln.Addr().String(), serveAdminServer(t, s, ln, c)
+}
+
+// serveAdminServer serves a server newAdminServer built and returns
+// startAdminServer's cleanup, for a test that changes the server before it
+// serves.
+func serveAdminServer(t *testing.T, s *Server, ln net.Listener, c *cache.Cache) func() {
+	t.Helper()
 	served := make(chan struct{})
 	go func() {
 		defer close(served)
@@ -56,7 +64,7 @@ func startAdminServer(t *testing.T, opts ...adminOpt) (*Server, string, func()) 
 		}
 		_ = c.Close()
 	}
-	return s, "http://" + ln.Addr().String(), cleanup
+	return cleanup
 }
 
 // newAdminServer constructs an admin Server over a real cache and gc.GC,

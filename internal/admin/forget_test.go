@@ -190,7 +190,29 @@ func TestEndpoint_Forget(t *testing.T) {
 	})
 	t.Run("a client that disconnects does not cut it short", func(t *testing.T) {
 		stub := newBlockingForgetter()
-		_, base, cleanup := startAdminServer(t, withForgetter(stub))
+		s, ln, c := newAdminServer(t, withForgetter(stub))
+		// AIDEV-NOTE: the handler sees net/http's request context through
+		// one this test cancels once net/http has cancelled the request's.
+		// That cancel returns only after every context derived from it has
+		// ended, so once gone closes, a forget whose context follows the
+		// request's has seen it end: no sleep, which passed whatever the
+		// handler did whenever net/http took longer than the sleep to
+		// notice the disconnect (final review R8 #6). net/http's
+		// StateClosed cannot stand in: it comes after the handler returns,
+		// and the handler waits for the forget.
+		gone := make(chan struct{})
+		inner := s.server.Handler
+		s.server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
+			defer cancel()
+			defer context.AfterFunc(r.Context(), func() {
+				cancel()
+				close(gone)
+			})()
+			inner.ServeHTTP(w, r.WithContext(ctx))
+		})
+		base := "http://" + ln.Addr().String()
+		cleanup := serveAdminServer(t, s, ln, c)
 		defer cleanup()
 		defer stub.unblock()
 		ctx, cancel := context.WithCancel(context.Background())
@@ -210,7 +232,11 @@ func TestEndpoint_Forget(t *testing.T) {
 		stub.waitEntered(t)
 		cancel() // the client gives up: its connection closes
 		<-sent
-		time.Sleep(200 * time.Millisecond) // net/http cancels a request's context once it sees the connection gone
+		select { // net/http cancels a request's context once it sees the connection gone
+		case <-gone:
+		case <-time.After(10 * time.Second):
+			t.Fatal("net/http did not cancel the request's context within 10 s of its client leaving")
+		}
 		stub.unblock()
 		if err := stub.result(); err != nil {
 			t.Fatalf("the forget's context ended (%v) when its client disconnected; want the work done", err)
