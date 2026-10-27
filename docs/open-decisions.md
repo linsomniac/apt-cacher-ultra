@@ -56,7 +56,8 @@ commit, and the pull request's CI run should include it.
    *Preview*, and if GitHub breaks the lines where the file does, paste
    the paragraphs unwrapped instead (lists, tables and headings kept):
    `sed 's|/blob/1\.1\.0/|/blob/1.1.0-rc1/|g' docs/release-notes/1.1.0.md | perl -0777 -pe 's/([^\n|])\n *+(?![-|#\n]|\z)/$1 /g'`
-   (drop the `sed` for 1.1.0 itself).
+   (for 1.1.0 itself, drop the `sed` and pass the file name to `perl`:
+   `perl -0777 -pe '…' docs/release-notes/1.1.0.md`).
 
 ## Open
 

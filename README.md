@@ -276,7 +276,9 @@ stored it, and suites are only checked for changes.
   not supported: it is served from the cache but never refreshed, with a
   WARN `flat_host_root_unsupported`. A signed flat repository's key is
   often installed only on the clients (`signed-by=`): the cache host
-  needs it too, or its adoption fails (`gpg_failed`) and is retried.
+  needs it too (unless `adoption.accept_any_signer = true` and no
+  `[[trusted_signer]]` names the host), or its adoption fails
+  (`gpg_failed`) and is retried.
 - **Unsigned repositories** (a `Release` with no signature, for
   `[trusted=yes]` clients) are adopted as unsigned snapshots, served
   coherently but never trusted: they vouch for no package. A new one is
