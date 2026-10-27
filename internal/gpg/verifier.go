@@ -380,9 +380,16 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 // bytes vs stored-bytes when the InRelease blob lands in the pool.
 // armor.Decode also strips, but for Release.gpg the stored bytes
 // (whatever they are) are served verbatim to apt clients on every
-// subsequent fetch, which re-verify against the same key. So
-// "verified bytes == stored bytes" holds trivially: whatever bytes
-// we accept here are the bytes apt will also accept downstream.
+// subsequent fetch, which re-verify against the same key. What this
+// enforces: both bodies non-empty, the suite's trust set (pins first),
+// and one signature packet that passes the trust check and verifies.
+// It does NOT accept only what apt accepts: the 2026-09 security review
+// found apt 3.3.2 rejecting shapes this accepts, all still open — bytes
+// or lines around the armor, two concatenated armor blocks and a binary
+// Release.gpg (VC-2; the binary form is documented), a forged `=CRC`
+// line (C-4), a second, bad signature from the same trusted key beside
+// a good one (VC-1: verifyAnyTrusted accepts on the first packet that
+// verifies), and weak digests or keys (C-3).
 func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef, releaseBytes, sigBytes []byte) ([]byte, error) {
 	_ = ctx
 
@@ -503,9 +510,15 @@ const clearsignBeginMarker = "-----BEGIN PGP SIGNED MESSAGE-----"
 //
 // AIDEV-NOTE: ruling R-D2 (phase D). A snapshot anchor is served to apt
 // clients, which reject an InRelease whose first line is not the marker
-// (leading whitespace or a blank line included), so adoption accepts
-// exactly what apt accepts — the same rule the handler's sniff applies
-// before a body earns a suite row or a signed-seen marker.
+// (leading whitespace or a blank line included), so adoption refuses that
+// too — the first-line rule the handler's sniff applies before a body
+// earns a suite row or a signed-seen marker. Enforced for the inline form:
+// that first line, nothing but whitespace after END, a decodable envelope,
+// and one trusted signature packet that verifies. That is still not
+// exactly what apt accepts: the 2026-09 security review's VC-2 (apt 3.3.2
+// rejects any line after END, an empty one included), C-4 (a forged
+// `=CRC` line before END) and VC-1 (a second, bad signature from the same
+// trusted key beside a good one) are accepted here and open.
 //
 // A body without the marker returns nil: the decode step rejects it with
 // ErrMissingSignature.

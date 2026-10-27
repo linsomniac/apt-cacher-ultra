@@ -1138,7 +1138,11 @@ adopt at once, safeguard 2); verifying clients reject it,
 default allow-all upstream policy with adoption enabled, a LAN client can make
 the cache adopt unsigned directories it controls; this is bounded by the
 per-host slot, the reserved slot, `max_duration`, the member cap and the suite
-caps. Operators who need more can set `adopt_unsigned = false` or narrow
+caps, but not in bytes: no response-body ceiling and transparent gzip (the
+2026-09 security review's A-2 and VA-3, open) leave each member as large as
+its server sends within the fetch timeout, and an adopted member stays while
+its snapshot is kept, until a reap or a forget (the final review's R6 #3).
+Operators who need more can set `adopt_unsigned = false` or narrow
 `upstream.allowed_host_regex`.
 
 ### C6. Package coverage for flat suites (D2)
