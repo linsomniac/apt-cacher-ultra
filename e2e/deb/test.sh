@@ -915,9 +915,10 @@ echo "[deb-test] phase 4 (Phase 3 hot-prefetch) PASS"
 # try-restart (a running daemon moves to the new binary, a stopped one
 # stays stopped), stops nothing first and prints no install message; a
 # failed restart does not fail dpkg; policy-rc.d's "no" is honoured;
-# abort-upgrade restarts too, a plain abort-remove does not; a removal
-# stops and disables the unit, and a reinstall after it prints the hint
-# again; without systemd the hint prints and systemctl is not called.
+# abort-upgrade restarts too, a plain abort-remove does not, and neither
+# prints the hint; a removal stops and disables the unit, and a reinstall
+# after it prints the hint again; without systemd, or with DPKG_ROOT set,
+# the hint prints and systemctl is not called.
 #
 # AIDEV-NOTE: no systemd runs here (see the header), so this phase makes
 # the scripts see one: /run/systemd/system exists, and a systemctl stub
@@ -930,10 +931,10 @@ echo "[deb-test] phase 4 (Phase 3 hot-prefetch) PASS"
 # on it, so the stub sees what systemd would be asked. The image's
 # /usr/sbin/policy-rc.d (exit 101: Docker's images forbid service actions)
 # is moved aside, except while the policy step checks that it is honoured.
-# The abort-* and no-systemd steps run the installed postinst directly, as
-# dpkg would. UPGRADE_FROM names the package to upgrade from (by default
-# this tree's, the /tmp one phase 1 installed); the upgrade goes to
-# /upgrade's, the same binary packaged at a higher version (the
+# The abort-*, no-systemd and DPKG_ROOT steps run the installed postinst
+# directly, as dpkg would. UPGRADE_FROM names the package to upgrade from
+# (by default this tree's, the /tmp one phase 1 installed); the upgrade
+# goes to /upgrade's, the same binary packaged at a higher version (the
 # Dockerfile's build stage).
 # ============================================================
 
@@ -1068,7 +1069,10 @@ expect_count policy "policy-rc.d refusals" 1 /tmp/p5.policy.out 'policy-rc\.d re
 # dpkg runs the installed postinst with abort-upgrade NEW-VERSION when an
 # upgrade to NEW-VERSION fails, and with a plain abort-remove when a
 # removal's prerm fails. debhelper's snippet restarts only when $2 is set,
-# and a plain abort-remove has none.
+# and a plain abort-remove has none. Neither prints the install hint.
+# The unit disabled, so that the abort-* actions' silence comes from the
+# hint's configure gate, not from is-enabled.
+PATH="$stubs:$PATH" systemctl disable apt-cacher-ultra.service
 echo "[deb-test] phase 5: abort-upgrade: one try-restart; a plain abort-remove: none"
 postinst_step abort-upgrade abort-upgrade 9.9.9~e2e
 expect_count abort-upgrade "try-restart calls" 1 "$calls" '^try-restart apt-cacher-ultra\.service$'
@@ -1076,6 +1080,7 @@ expect_count abort-upgrade "start or restart calls" 1 "$calls" "$restarts"
 expect_count abort-upgrade "install messages" 0 /tmp/p5.abort-upgrade.out "$message"
 postinst_step abort-remove abort-remove
 expect_count abort-remove "start or restart calls" 0 "$calls" "$restarts"
+expect_count abort-remove "install messages" 0 /tmp/p5.abort-remove.out "$message"
 
 echo "[deb-test] phase 5: remove: stop and disable"
 dpkg_step remove -r apt-cacher-ultra
@@ -1098,6 +1103,13 @@ postinst_step no-systemd configure "$old_version"
 mkdir /run/systemd/system
 expect_count no-systemd "systemctl calls" 0 "$calls" '.'
 expect_count no-systemd "install messages" 1 /tmp/p5.no-systemd.out "$message"
+
+# DPKG_ROOT set (dpkg --root: another system's root) is the guards' other
+# half: the same, with systemd running and the stub still "enabled".
+echo "[deb-test] phase 5: DPKG_ROOT set: no systemctl call, the install message"
+DPKG_ROOT=/acu-root postinst_step dpkg-root configure "$old_version"
+expect_count dpkg-root "systemctl calls" 0 "$calls" '.'
+expect_count dpkg-root "install messages" 1 /tmp/p5.dpkg-root.out "$message"
 
 echo "[deb-test] phase 5 (maintainer scripts under systemd) PASS"
 echo "[deb-test] OVERALL PASS"

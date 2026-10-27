@@ -38,7 +38,7 @@ fi
 
 # unit_enabled: true only where systemd runs (the guard above) and reports
 # the unit enabled. Called only as an if condition, so a systemctl that
-# answers "disabled" or "not-found" (exit 1) cannot trip set -e.
+# answers "disabled" or "not-found" (a non-zero exit) cannot trip set -e.
 unit_enabled() {
     [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ] &&
         systemctl is-enabled --quiet apt-cacher-ultra.service >/dev/null 2>&1
