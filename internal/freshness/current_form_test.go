@@ -146,6 +146,38 @@ func TestCheck_AbsentAnchorMovesLaterallyAfterTwoObservations(t *testing.T) {
 	}
 }
 
+// The final review's R8 #2: spec C4 Dispatch 1's confirmation pinned at
+// its edge. A second absent observation one second short of max(cooldown,
+// 5 min) after the first is recorded again (count 2) and runs no probe
+// tree; one at the gap runs the tree, which moves the suite laterally.
+func TestCheck_AbsentAnchorConfirmationGapEdge(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adopt()
+	r.up.setFail(rigAnchorURL, &fetch.StatusError{Code: 404})
+	r.up.setAt(rigReleaseURL, r.releaseText("v2", 0))
+	r.up.setAt(rigReleaseGPGURL, armoredSig("v2 sig"))
+	r.clock.advance(time.Minute)
+	t0 := r.clock.now().Unix()
+	r.check()
+	if row := r.row(); strOf(row.AdoptionFailReason) != cache.ReasonAnchorAbsent || i64Of(row.AdoptionFailFirstAt) != t0 {
+		t.Fatalf("first observation: record %q first %d, want anchor_absent at %d", strOf(row.AdoptionFailReason),
+			i64Of(row.AdoptionFailFirstAt), t0)
+	}
+	r.clock.advance(5*time.Minute - time.Second)
+	r.dueNow()
+	r.check()
+	if n, row := len(r.up.etagsSent(rigReleaseURL)), r.row(); n != 0 || row.AdoptionFailCount != 2 || i64Of(row.AdoptionFailFirstAt) != t0 {
+		t.Fatalf("4m59s apart: %d Release probes, record count %d first %d; want no tree, count 2, first %d",
+			n, row.AdoptionFailCount, i64Of(row.AdoptionFailFirstAt), t0)
+	}
+	r.clock.advance(time.Second)
+	r.dueNow()
+	r.check()
+	if snap := r.currentSnapshot(); lastResult(r) != "form_changed" || snap.Form != cache.FormDetached {
+		t.Fatalf("5 min apart: result %q snapshot %+v, want form_changed to detached", lastResult(r), snap)
+	}
+}
+
 // Spec C4: never unsigned from signed. A signed suite whose signatures
 // all disappear keeps its snapshot, stays visibly anchor_absent and is
 // re-probed on the C7 schedule — even with adoption.adopt_unsigned on.

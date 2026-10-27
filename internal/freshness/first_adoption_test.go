@@ -488,6 +488,59 @@ func TestCheckFirst_UnsignedAfterADeniedSignatureWaitsAnHour(t *testing.T) {
 	}
 }
 
+// dueNow makes the rig suite's failure record due at the rig clock's now,
+// so the next check observes upstream whatever the C7 schedule said.
+func (r *retryRig) dueNow() {
+	r.t.Helper()
+	if err := r.cache.SetAdoptionNextRetry(context.Background(), "http", rigHost, rigSuite, r.clock.now().Unix()); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
+// The final review's R8 #2: spec C5 safeguard 2's gaps pinned at their
+// edges. The same Release bytes observed one second short of the gap after
+// the first observation stay unconfirmed (recorded again, count 2); at the
+// gap they are adopted. The gap is max(cooldown, 5 min), and an hour when
+// a signature file answered 401 or 403.
+func TestCheckFirst_UnsignedConfirmationGapEdges(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		sigErr error
+		gap    time.Duration
+	}{
+		{"floor", nil, 5 * time.Minute},
+		{"denied signature", &fetch.StatusError{Code: 401}, time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRetryRig(t, 0)
+			r.adopter.adoptUnsigned = true
+			r.unsignedRelease("u1", tc.sigErr)
+			t0 := r.clock.now().Unix()
+			r.check()
+			if row := r.row(); strOf(row.AdoptionFailReason) != cache.ReasonUnsignedUnconfirmed || i64Of(row.AdoptionFailFirstAt) != t0 {
+				t.Fatalf("first observation: record %q first %d, want unsigned_unconfirmed at %d",
+					strOf(row.AdoptionFailReason), i64Of(row.AdoptionFailFirstAt), t0)
+			}
+			r.clock.advance(tc.gap - time.Second)
+			r.dueNow()
+			r.check()
+			if row := r.row(); row.CurrentSnapshotID != nil || strOf(row.AdoptionFailReason) != cache.ReasonUnsignedUnconfirmed ||
+				row.AdoptionFailCount != 2 || i64Of(row.AdoptionFailFirstAt) != t0 {
+				t.Fatalf("%v after the first observation: adopted %v, record %q/%d first %d; want unconfirmed, count 2, first %d",
+					tc.gap-time.Second, row.CurrentSnapshotID != nil, strOf(row.AdoptionFailReason), row.AdoptionFailCount,
+					i64Of(row.AdoptionFailFirstAt), t0)
+			}
+			r.clock.advance(time.Second)
+			r.dueNow()
+			r.check()
+			if snap := r.currentSnapshot(); snap == nil || snap.Form != cache.FormUnsigned {
+				t.Fatalf("%v after the first observation: snapshot %+v, record %q; want the unsigned adoption", tc.gap, snap,
+					strOf(r.row().AdoptionFailReason))
+			}
+		})
+	}
+}
+
 // Spec C5 safeguard 3 at eligibility: a suite whose base has a signed-seen
 // marker is refused before a slot is taken or anything downloaded, and the
 // refusal is a recorded state (changed_deferred, unsigned_downgrade_refused).
