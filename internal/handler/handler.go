@@ -1420,8 +1420,9 @@ func heldContext(r *http.Request, t *flipgate.Token) *http.Request {
 }
 
 // clientLeft answers a request whose context ended — its client left
-// while it waited in a flip hold; the gate did not register it — as a
-// client abort (503) and reports it; the caller logs client_canceled.
+// while it waited in a flip hold, or during anchorStart's registration
+// read; the gate did not register it — as a client abort (503) and
+// reports it; the caller logs client_canceled.
 // Serving it would only fail its snapshot read: a WARN and a 502 "hit"
 // line (design review M1, for the entry and the late registrations).
 func clientLeft(w http.ResponseWriter, r *http.Request) bool {
@@ -1452,8 +1453,9 @@ func clientLeft(w http.ResponseWriter, r *http.Request) bool {
 // could hand the client the old anchor after the flip. The wait's end on
 // h.lifecycleCtx is defence in depth: the daemon closes the gate at the
 // shutdown signal (design note 18), so no hold is left when the handler
-// closes. A request whose own context ends while it waits comes back
-// unregistered, and ServeHTTP answers it as a client abort. An HTTPS
+// closes. A request whose own context ends while it waits, or during the
+// read (final review R4 #3), comes back unregistered — a token whose Done
+// does nothing — and its caller answers it as a client abort. An HTTPS
 // request through the MITM pipeline keeps its inner context when its
 // client disconnects (internal/proxy/connect.go), so such a waiter stays
 // until the hold ends (at most HoldMax) and counts against the waiter cap
@@ -1471,7 +1473,10 @@ func (h *Handler) anchorStart(r *http.Request, req *proxy.Request) *flipgate.Tok
 	case err == nil && !exists:
 		return nil // an untracked suite creates no gate state
 	case err != nil && r.Context().Err() != nil:
-		return nil // the client left during the read
+		// The client left during the read: an unregistered token, as
+		// AnchorStart returns for one that leaves while it waits, so the
+		// caller answers it as a client abort (final review R4 #3).
+		return &flipgate.Token{}
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()

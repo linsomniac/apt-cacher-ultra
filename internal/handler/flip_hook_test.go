@@ -192,6 +192,38 @@ func TestServeHTTP_HeldClientThatLeavesIsAClientAbort(t *testing.T) {
 	})
 }
 
+// Final review R4 #3: a client that leaves during anchorStart's
+// registration read (the read fails on its ended context) is a client
+// abort as well — 503, request line client_canceled, no WARN — not a
+// request that goes on with its dead context and fails its snapshot read
+// (a WARN "suite_freshness lookup failed" and a 502 "hit" line).
+func TestServeHTTP_ClientThatLeavesDuringTheRegistrationReadIsAClientAbort(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logs := &syncLog{}
+		s := newFlipStackLogging(t, 10*time.Second, slog.New(slog.NewJSONHandler(logs, nil)))
+		const suite = "/u/dists/s"
+		s.adopt(suite, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		s.h.suiteExistsForTest = func(cache.SuiteKey) (bool, error) {
+			cancel() // the client leaves while the read runs
+			return false, context.Canceled
+		}
+		rec := httptest.NewRecorder()
+		s.h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+flipSimHost+suite+"/InRelease", nil).WithContext(ctx))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("status %d, want 503", rec.Code)
+		}
+		if warns := logRecords(logs, "", slog.LevelWarn); len(warns) != 0 {
+			t.Errorf("a client that left during the registration read logged %d WARN or worse, first %v", len(warns), warns[0])
+		}
+		lines := logRecords(logs, "request", slog.LevelInfo)
+		if len(lines) != 1 || lines[0]["outcome"] != "client_canceled" || lines[0]["status"] != float64(http.StatusServiceUnavailable) {
+			t.Fatalf("request lines %v, want one client_canceled (503)", lines)
+		}
+	})
+}
+
 // Final review, tests Minor 2 (operability): the request line of an anchor
 // request that waited in a hold carries flip_held_ms, so a slow apt update
 // is explained by the line itself; a request that did not wait has no such
