@@ -175,9 +175,11 @@ first_contact() {
         live_update "$c"
         say "$c: first update clean"
     done
-    # The control rests on pkgs.k8s.io answering 403 for a minor it does
-    # not publish (the README's "Maintenance"; the plan's pre-flight probes
-    # v1.0): apt prints "Failed to fetch", which APT_ERRORS catches.
+    # The control rests on pkgs.k8s.io not publishing the minor v1.0 (the
+    # README's "Maintenance"; the plan's pre-flight probes it). Today it
+    # answers 403 and apt prints "Failed to fetch", which APT_ERRORS
+    # catches; a 404 passes too (an "E:" line naming the host). The control
+    # fails only when apt prints no error line naming the host.
     APT_RUNS=$((APT_RUNS + 1))
     APT_LOG=/clients/control/update.$APT_RUNS.log
     capt control apt-get update > "$APT_LOG" 2>&1 || true

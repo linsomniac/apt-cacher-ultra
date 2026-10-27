@@ -67,9 +67,11 @@ then the daemon log's tail.
   vendor's own files: `no_sha256`, a stanza of the suite's `Packages` with
   a `Filename` but no `SHA256`; `no_packages_members`, a `Release` that
   lists no root `Packages*` file. Such a snapshot cannot vouch for every
-  package, which turns strict mode off for the whole host by design. Any
-  other reason, a reason the vendor's files do not show, or no line at all
-  is the cache's.
+  package, which turns strict mode off for the whole host by design. The
+  smoke then cannot pass on that host until the vendor's files change:
+  record the reason and the file, and run it again later. Any other
+  reason, a reason the vendor's files do not show, or no line at all is
+  the cache's.
 - **The cache:** anything else — an adoption that fails while upstream
   answers and the key is right, an update error a direct `apt update`
   does not show, a refusal of a package `Packages` declares, strict mode
@@ -86,12 +88,12 @@ The values to change sit at the top of `smoke.sh`:
   which must be `K8S_B`'s, the other `K8S_A`'s newest). Move them when one
   is retired: pkgs.k8s.io answers 403 for a minor it does not publish, so
   the first update fails with an error naming 403.
-- **The first control's premise:** that 403. The control's source is the
-  minor `v1.0`, which must stay unpublished and keep answering 403 (`curl
-  -sL -o /dev/null -w '%{http_code}'
-  https://pkgs.k8s.io/core:/stable:/v1.0/deb/InRelease`); if the answer
-  changes, the control fails naming it, and its comment and this line
-  change with it.
+- **The first control's premise:** the control's source is the minor
+  `v1.0`, which must stay unpublished. Today it answers 403 (`curl -sL -o
+  /dev/null -w '%{http_code}'
+  https://pkgs.k8s.io/core:/stable:/v1.0/deb/InRelease`); a 404 passes the
+  control too, which needs only an error line naming the host. The
+  control fails, naming v1.0, only when apt prints none.
 - **Forms** (`suite_expectations`): the form each suite adopts in
   (`inline`, or `detached` for pkg.jenkins.io); a vendor that adds or
   drops `InRelease` changes it, and `adoptions` then fails with "not
