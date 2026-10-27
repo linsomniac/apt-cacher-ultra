@@ -126,6 +126,79 @@ func TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs(t *testing.T) {
 	})
 }
 
+// The final review's R3 #2: a daemon restarted more often than
+// gc.interval (24 h by default, here) never reached a periodic tick, so
+// sub-job C never ran and a reaped or forgotten suite's retired snapshots
+// stayed for good. With gc.interval longer than an hour, Run deletes them
+// once an hour after the start. A retired snapshot survives the startup
+// pass (ruling PF-15) and a start that stops a second short of its hour,
+// and is deleted an hour into the next start, which logs
+// gc_retired_run_complete; no periodic tick ran (no periodic
+// gc_run_complete).
+func TestRun_DeletesRetiredSnapshotsAnHourAfterTheStart(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := openTestCache(t)
+		logger, buf := captureLogger()
+		db := dbOf(t, c)
+		ctx := context.Background()
+		id := adoptSnapshot(t, c, "http", "h", "/r/dists/x", putPoolBlob(t, c, "anchor"),
+			[]string{putPoolBlob(t, c, "member")})
+		key := cache.SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"}
+		if _, err := c.DeleteSuiteMetadata(ctx, key); err != nil { // the reaper's step 1: the seeded anchor row
+			t.Fatal(err)
+		}
+		if res, err := c.ForgetSuite(ctx, key, &id); err != nil || !res.Deleted {
+			t.Fatalf("ForgetSuite = %+v, %v", res, err)
+		}
+		cfg := Config{Cache: c, Logger: logger, Enabled: true, Interval: 24 * time.Hour, BatchSize: 100,
+			SnapshotBatchSize: 10, MaxTickDuration: time.Minute, BlobGrace: time.Minute, KeepDisplaced: 3,
+			PoolScanWorkers: 2, HeartbeatStaleGrace: 30 * time.Minute}
+		start := func(runFor time.Duration) {
+			t.Helper()
+			g, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := g.StartupPass(ctx); err != nil {
+				t.Fatal(err)
+			}
+			life, cancel := context.WithCancel(ctx)
+			done := make(chan struct{})
+			go func() { g.Run(life); close(done) }()
+			time.Sleep(runFor)
+			cancel()
+			<-done
+		}
+		start(time.Hour - time.Second)
+		if !snapshotRowExists(t, db, id) {
+			t.Fatal("the retired snapshot was deleted before an hour had passed")
+		}
+		start(time.Hour + time.Second)
+		if snapshotRowExists(t, db, id) {
+			t.Fatal("the retired snapshot survived the second start's first hour")
+		}
+		var retiredRuns []map[string]any
+		for _, l := range strings.Split(buf.String(), "\n") {
+			var line map[string]any
+			if l == "" || json.Unmarshal([]byte(l), &line) != nil {
+				continue
+			}
+			switch line["msg"] {
+			case "gc_retired_run_complete":
+				retiredRuns = append(retiredRuns, line)
+			case "gc_run_complete":
+				if line["phase"] != "startup" {
+					t.Errorf("a periodic tick ran: %v", line)
+				}
+			}
+		}
+		if len(retiredRuns) != 1 || retiredRuns[0]["level"] != "INFO" || retiredRuns[0]["retired_reaped"] != float64(1) ||
+			retiredRuns[0]["deadline_reached"] != false {
+			t.Fatalf("gc_retired_run_complete lines %v, want one at INFO: retired_reaped 1, deadline_reached false", retiredRuns)
+		}
+	})
+}
+
 // Deferred minor A-3: the GC's run stamps (gc_run_complete's
 // acu_gc_last_run_unixtime and LastRunSummary.AtUnixTime, at startup and
 // on a periodic tick) come from the shared wall clock, which simulations

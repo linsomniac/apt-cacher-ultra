@@ -271,9 +271,10 @@ func New(cfg Config) (*GC, error) {
 // cancelled. Returns the first error encountered; partial progress is
 // preserved (DB rows / pool files reaped before cancel are real). The
 // one-shot pass runs no snapshot-GC sub-job C (spec C9's retired
-// snapshots): the periodic ticks do, normally the first — a later one when
-// an earlier pass, this one's blob pass say, hits its deadline, since the
-// passes resume in rotation (ruling PF-15, runSnapshotPass).
+// snapshots): Run does, an hour after the start when gc.interval is longer
+// (retiredRun), and the periodic ticks, normally the first — a later one
+// when an earlier pass, this one's blob pass say, hits its deadline, since
+// the passes resume in rotation (ruling PF-15, runSnapshotPass).
 //
 // Order matters: pool scan runs first so its
 // `gc_pool_orphans_repaired` count reflects only pre-existing orphan
@@ -303,8 +304,9 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 		return fmt.Errorf("gc startup: pool scan: %w", err)
 	}
 
-	// Step 6: one-shot GC pass — without snapshot-GC sub-job C, which the
-	// periodic ticks run, normally the first (ruling PF-15: runSnapshotPass).
+	// Step 6: one-shot GC pass — without snapshot-GC sub-job C, which Run
+	// runs an hour after the start (retiredRun) and in the periodic ticks
+	// (ruling PF-15: runSnapshotPass).
 	passesDone = false
 	tick, err := g.runTick(ctx, phaseStartup)
 	passesDone = true
@@ -378,6 +380,9 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 // Each tick fires `gc.interval` after the previous tick completed. A
 // long tick cannot leave a pending timer firing that starts work again
 // immediately, even when an individual batch exceeds the tick budget.
+// When `gc.interval` is longer than an hour, Run also deletes the retired
+// snapshots once, an hour after the start (retiredRun; the final review's
+// R3 #2).
 //
 // When Enabled = false, returns immediately — the goroutine is not
 // started.
@@ -387,11 +392,23 @@ func (g *GC) Run(ctx context.Context) {
 	}
 	t := time.NewTimer(g.cfg.Interval)
 	defer t.Stop()
+	var retiredDue <-chan time.Time // nil: never; the first tick runs sub-job C first
+	if g.cfg.Interval > retiredRunAfterStart {
+		rt := time.NewTimer(retiredRunAfterStart)
+		defer rt.Stop()
+		retiredDue = rt.C
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-retiredDue:
+			retiredDue = nil
+			if ctx.Err() != nil {
+				return
+			}
+			g.retiredRun(ctx)
 		case <-t.C:
 			if ctx.Err() != nil {
 				return

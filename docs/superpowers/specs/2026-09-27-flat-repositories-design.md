@@ -1600,7 +1600,13 @@ panicked or failed its listing sets no gauge (phase H1). The guard's forward-ste
 `acu_clock_steps_detected_total` like every report. The gpg
 once-logger sets start over when a new key finds 10,000 entries.
 Snapshot GC gains sub-job C,
-in the periodic ticks only — the startup pass, which runs before the
+in the periodic ticks and, when `gc.interval` is longer than an hour, in
+a run of C alone an hour after each start (INFO `gc_retired_run_complete`,
+within `max_tick_duration`; the final review's R3 #2: a daemon restarted
+more often than `gc.interval` never reached a periodic tick, so its
+retired snapshots stayed for good; not an earlier first tick, which would
+repeat the startup pass's url_path and blob passes) — the startup pass,
+which runs before the
 listeners serve, skips it, since retired snapshots never serve and the
 backlog after a burst of reaps (some 70–100k `package_hash` rows per
 snapshot of a large suite) could keep the listeners closed up to
@@ -1751,7 +1757,8 @@ an adoption outcome), `suite_evicted`, `suite_caps_exceeded`,
 `legacy_trust_audit_progress`, `legacy_trust_audit_deferred`,
 `legacy_trust_audit_completed`; phase H1's `suite_reaper_run_complete`,
 `suite_not_forgotten` (DEBUG; WARN for `reason=changed`), `gc_panicked`, `legacy_anchor_discard_failed`,
-`reconcile_snapshot_read_failed` and `source_paths_skipped`, and the 43
+`reconcile_snapshot_read_failed` and `source_paths_skipped`; the final
+review's `gc_retired_run_complete` (R3 #2, C9 above); and the 43
 lines this branch added with prose messages, renamed to snake_case event
 names (`suite_onboarding_failed`, `suite_reaper_list_suites_failed`,
 `admin_forget_failed`, `freshness_anchorless_index_over_cap`,

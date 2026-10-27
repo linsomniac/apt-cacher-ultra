@@ -930,7 +930,7 @@ served an unvouched package.
 | `interval` | duration | `"24h"` | Delay after a GC tick completes before the next periodic tick. Must be positive; disable through `enabled`. |
 | `batch_size` | integer | `100` | Maximum URL-path/blob rows processed per GC batch. At least `1`. |
 | `snapshot_batch_size` | integer | `10` | Maximum snapshots removed per batch. Snapshot deletion can cascade through many member rows. At least `1`. |
-| `max_tick_duration` | duration | `"5m"` | Budget for startup/periodic GC passes, checked between batches; remaining work resumes later. The startup pass, which runs before the listeners serve, leaves the retired snapshots (of a reaped, evicted or forgotten suite, or one the upgrade's trust audit quarantined) to the periodic passes, normally the first one after the start (see *Suite reaping*); it deletes only a retired one never adopted whose heartbeat went stale, as it does any abandoned adoption candidate. Must be positive. |
+| `max_tick_duration` | duration | `"5m"` | Budget for startup/periodic GC passes, checked between batches; remaining work resumes later. The startup pass, which runs before the listeners serve, leaves the retired snapshots (of a reaped, evicted or forgotten suite, or one the upgrade's trust audit quarantined) to a run an hour after the start, when `interval` is longer than an hour, and to the periodic passes (see *Suite reaping*); it deletes only a retired one never adopted whose heartbeat went stale, as it does any abandoned adoption candidate. That run deletes only retired snapshots, within this budget too (INFO `gc_retired_run_complete`). Must be positive. |
 | `blob_grace` | duration | `"5m"` | Grace after a blob's reference count reaches zero before deletion. At least `"1s"`, and greater than twice `heartbeat_interval`. |
 | `keep_displaced` | integer | `3` | Recent displaced snapshots kept per suite for inspection. `0` retains none; must be nonnegative. A displaced snapshot the upgrade's trust audit has not judged yet (one whose pool file it could not read: see *Upgrading an existing cache*) is kept, and takes none of the `keep_displaced` places, until the audit decides it: it may be the suite's only evidence of a signature. Does not by itself retain superseded package binaries. Also bounds retained by-hash: a by-hash request the current snapshot lacks is served from the newest `keep_displaced` + 1 displaced snapshots of its suite, and `0` turns that off (see *Flip consistency*). |
 | `pool_scan_workers` | integer | `4` | Workers for the startup orphan-file scan. At least `1`. |
@@ -995,12 +995,15 @@ lose the version retention its snapshot gave them
 snapshots only; a package another suite's snapshot lists keeps that
 one's): with `enabled = true` and a nonzero `url_path_ttl`, GC deletes
 those no client asked for within `url_path_ttl`, after
-`hold_packages.window`, and their pool files after `blob_grace`. The
-next periodic GC passes delete the retired snapshots, and then the pool
-files nothing else uses, once `blob_grace` has passed — not the pass at
+`hold_packages.window`, and their pool files after `blob_grace`. GC
+deletes the retired snapshots an hour after each start (when `interval`
+is longer than an hour: a run of that work alone, INFO
+`gc_retired_run_complete`, so a daemon restarted more often than
+`interval` still deletes them) and at each periodic pass, and the next
+blob pass (the next start's, or the next periodic pass's) the pool files
+nothing else uses, once `blob_grace` has passed — not the pass at
 startup, which deletes only a never-adopted one whose heartbeat went
-stale, as it does any abandoned adoption candidate (after a restart the
-periodic passes delete them, normally the first one), so a restart
+stale, as it does any abandoned adoption candidate, so a restart
 after many reaps does not keep the listeners
 closed while they are deleted; with `enabled = false` suites are still
 reaped, but their snapshots and pool files stay until GC runs again.

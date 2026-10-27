@@ -20,8 +20,8 @@ import (
 
 // fakeStore is a gcStore whose snapshot batches find nothing (A ∪ B
 // drained) unless told to panic, whose sub-job C chunks report a reap and
-// more for chunksMore calls and then none, and whose HashKnown knows no
-// hash and panics for hashPanic.
+// more for chunksMore calls and then none (or panic, chunkPanics), and
+// whose HashKnown knows no hash and panics for hashPanic.
 type fakeStore struct {
 	mu          sync.Mutex
 	batchPanics int           // RunSnapshotGCBatch panics on this many first calls
@@ -29,6 +29,7 @@ type fakeStore struct {
 	chunkRows   []int         // maxRows of each RunRetiredSnapshotGCChunk call
 	chunkSleep  time.Duration // each chunk takes this long (virtual time in a bubble)
 	chunksMore  int
+	chunkPanics bool // RunRetiredSnapshotGCChunk panics
 	hashPanic   string
 }
 
@@ -47,6 +48,9 @@ func (f *fakeStore) RunRetiredSnapshotGCChunk(_ context.Context, maxRows int) (i
 	time.Sleep(f.chunkSleep)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.chunkPanics {
+		panic("retired chunk bug")
+	}
 	f.chunkRows = append(f.chunkRows, maxRows)
 	if len(f.chunkRows) > 1000 {
 		panic("runaway sub-job C loop")
@@ -167,6 +171,38 @@ func TestRun_RecoversATickPanicAndRunsTheNextTick(t *testing.T) {
 		}
 		if runs := gcEvents(t, buf, "gc_run_complete"); len(runs) != 2 {
 			t.Fatalf("%d gc_run_complete lines, want 2 (the ticks after the panic)", len(runs))
+		}
+	})
+}
+
+// The final review's R3 #2: a panic in the run that deletes the retired
+// snapshots an hour after the start is recovered and logged (gc_panicked,
+// where=retired, ERROR), and Run goes on: its first periodic tick still
+// comes at gc.interval.
+func TestRun_RecoversARetiredRunPanic(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logger, buf := captureLogger()
+		f := &fakeStore{chunkPanics: true}
+		g, _ := storeGC(t, f, 2, logger)
+		g.cfg.Interval = 24 * time.Hour
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { g.Run(ctx); close(done) }()
+		stop := func() { cancel(); <-done }
+		time.Sleep(time.Hour + time.Minute)
+		synctest.Wait()
+		ev := gcEvents(t, buf, "gc_panicked")
+		if len(ev) != 1 || ev[0]["level"] != "ERROR" || ev[0]["where"] != "retired" || ev[0]["panic"] != "retired chunk bug" {
+			stop()
+			t.Fatalf("gc_panicked lines %v, want one at ERROR, where=retired", ev)
+		}
+		f.mu.Lock()
+		f.chunkPanics = false
+		f.mu.Unlock()
+		time.Sleep(23 * time.Hour)
+		stop()
+		if runs := gcEvents(t, buf, "gc_run_complete"); len(runs) != 1 || runs[0]["phase"] != "periodic" {
+			t.Fatalf("gc_run_complete lines %v, want the first periodic tick's", runs)
 		}
 	})
 }

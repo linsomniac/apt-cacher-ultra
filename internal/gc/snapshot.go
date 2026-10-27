@@ -2,6 +2,7 @@ package gc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -31,7 +32,7 @@ type snapshotPassResult struct {
 // suites, and those the legacy trust audit quarantined — in chunks of at
 // most 10,000 rows per writer transaction; the startup pass (phase
 // phaseStartup) runs no sub-job C, and its periodic ticks do (ruling
-// PF-15).
+// PF-15), as does retiredRun, once, an hour after the start.
 //
 // AIDEV-NOTE: ruling PF-15 (final review concurrency m1). StartupPass runs
 // before any listener serves, and retired snapshots never serve, so
@@ -48,7 +49,10 @@ type snapshotPassResult struct {
 // second at the earliest; a periodic pass that hits its deadline defers C
 // the same way. Retired rows wait for that tick: normally one GC interval
 // after the startup pass, two or more when its blob pass hit its deadline.
-// They never serve meanwhile.
+// They never serve meanwhile. When gc.interval is longer than an hour,
+// retiredRun runs C once an hour after the start too, so a daemon
+// restarted more often than gc.interval still deletes them (the final
+// review's R3 #2; retiredRun's AIDEV-NOTE).
 //
 // Returns:
 //   - the cumulative counts (orphan, displaced, retired),
@@ -64,18 +68,7 @@ func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase stri
 		acc        snapshotPassResult
 		batchesRun int
 	)
-	expired := func() bool {
-		if time.Now().Before(deadline) {
-			return false
-		}
-		g.cfg.Logger.Info("gc_tick_deadline_reached",
-			"phase", phase,
-			"which", "snapshot",
-			"batches_completed", batchesRun,
-			"bytes_reclaimed_this_tick", int64(0),
-		)
-		return true
-	}
+	expired := g.snapshotDeadline(deadline, phase, &batchesRun)
 	for {
 		if err := ctx.Err(); err != nil {
 			return acc, false, nil
@@ -103,24 +96,95 @@ func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase stri
 	if phase == phaseStartup {
 		return acc, false, nil // no sub-job C before the listeners serve (ruling PF-15)
 	}
-	// Sub-job C (spec C9).
+	retired, deadlineHit, err := g.runSubJobC(ctx, expired, &batchesRun)
+	acc.retired += retired
+	return acc, deadlineHit, err
+}
+
+// snapshotDeadline returns the snapshot pass's deadline test: false before
+// deadline; after it, true, once gc_tick_deadline_reached is logged.
+func (g *GC) snapshotDeadline(deadline time.Time, phase string, batchesRun *int) func() bool {
+	return func() bool {
+		if time.Now().Before(deadline) {
+			return false
+		}
+		g.cfg.Logger.Info("gc_tick_deadline_reached",
+			"phase", phase,
+			"which", "snapshot",
+			"batches_completed", *batchesRun,
+			"bytes_reclaimed_this_tick", int64(0),
+		)
+		return true
+	}
+}
+
+// runSubJobC is snapshot GC sub-job C (spec C9): it deletes the retired
+// snapshots, one per writer transaction in bounded chunks, until none is
+// left, ctx ends, or expired reports the deadline (deadlineHit: backlog
+// left). The snapshot pass runs it after sub-jobs A and B; retiredRun runs
+// it alone, once, an hour after the start.
+func (g *GC) runSubJobC(ctx context.Context, expired func() bool, batchesRun *int) (retired int, deadlineHit bool, err error) {
 	for {
 		if err := ctx.Err(); err != nil {
-			return acc, false, nil
+			return retired, false, nil
 		}
 		if expired() {
-			return acc, true, nil
+			return retired, true, nil
 		}
 		// 0: the cache's own chunk (retiredChunkRows, 10,000 rows a
 		// transaction), never a larger number (deferred minor F-2).
 		reaped, more, err := g.store.RunRetiredSnapshotGCChunk(ctx, 0)
 		if err != nil {
-			return acc, false, fmt.Errorf("retired snapshot gc chunk: %w", err)
+			return retired, false, fmt.Errorf("retired snapshot gc chunk: %w", err)
 		}
-		batchesRun++
-		acc.retired += reaped
+		*batchesRun++
+		retired += reaped
 		if !more {
-			return acc, false, nil
+			return retired, false, nil
 		}
 	}
+}
+
+// retiredRunAfterStart is when, after the start, Run deletes the retired
+// snapshots once (retiredRun), if gc.interval is longer.
+const retiredRunAfterStart = time.Hour
+
+// phaseRetired labels retiredRun's gc_tick_deadline_reached line.
+const phaseRetired = "retired"
+
+// retiredRun runs sub-job C alone, once, retiredRunAfterStart after the
+// start (Run), within max_tick_duration, and logs INFO
+// gc_retired_run_complete. A panic is recovered (gc_panicked,
+// where=retired); the periodic ticks are not affected.
+//
+// AIDEV-NOTE: the final review's R3 #2. Sub-job C ran only in the periodic
+// ticks (the startup pass skips it, ruling PF-15), and the first tick comes
+// gc.interval (24 h by default) after the start, so a daemon restarted
+// more often — a laptop, a container recreated nightly, a host rebooted
+// daily — never deleted retired snapshots: their members, skipped members
+// and package_hash rows (some 70–100k a large suite's snapshot) and the
+// blobs those keep reachable stayed for good. Not an earlier first
+// periodic tick: a tick also runs the url_path pass, a full scan of
+// url_path with the version-aware mirror guard, and the blob pass, both of
+// which the startup pass ran an hour before — work a restart would then
+// pay twice. This run is only C, bounded and chunked as in a tick, on Run's
+// goroutine (never beside a tick). Its blobs are reclaimed by the next
+// blob pass: the next start's or the next periodic tick's.
+func (g *GC) retiredRun(ctx context.Context) {
+	defer g.recoverPanic("retired")
+	start := time.Now()
+	batchesRun := 0
+	retired, deadlineHit, err := g.runSubJobC(ctx,
+		g.snapshotDeadline(start.Add(g.cfg.MaxTickDuration), phaseRetired, &batchesRun), &batchesRun)
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		g.cfg.Logger.Warn("gc_tick_failed", "err", err)
+	}
+	if retired > 0 {
+		gcRetiredReapedTotal.Add(float64(retired))
+	}
+	g.cfg.Logger.Info("gc_retired_run_complete",
+		"retired_reaped", retired,
+		"deadline_reached", deadlineHit,
+		"duration_ms", time.Since(start).Milliseconds(),
+	)
 }
