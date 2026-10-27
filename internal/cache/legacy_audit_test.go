@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -295,5 +296,38 @@ func TestListTrackedSuiteAnchors_OnlyTrackedSignedAnchorNames(t *testing.T) {
 		if a.SuitePath != "/r/dists/t" || a.SeenAt != at {
 			t.Errorf("anchor %+v, want suite /r/dists/t seen at %d", a, at)
 		}
+	}
+}
+
+// The final review's R3 I-1: the startup marker pass runs at every start
+// before any listener serves, so its query drives from suite_freshness (a
+// scan of the suites) and probes url_path by its unique key, once per
+// anchor name — never from url_path, which made the read grow with every
+// cached file times the host's suites (36.8 s for 5,000 suites over
+// 215,000 url_path rows). As ListUnadoptedSuiteAnchors' plan
+// (TestListUnadoptedSuiteAnchors_ProbesURLPathByItsKey).
+func TestListTrackedSuiteAnchors_ProbesURLPathByItsKey(t *testing.T) {
+	c := openCache(t)
+	rows, err := c.db.QueryContext(context.Background(), "EXPLAIN QUERY PLAN "+trackedSuiteAnchorsSQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var plan []string
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(plan) != 2 || !strings.HasPrefix(plan[0], "SCAN sf") ||
+		plan[1] != "SEARCH u USING INDEX sqlite_autoindex_url_path_1 (canonical_scheme=? AND canonical_host=? AND path=?)" {
+		t.Fatalf("plan %q: want suite_freshness scanned first, then url_path searched by "+
+			"sqlite_autoindex_url_path_1 (canonical_scheme=? AND canonical_host=? AND path=?)", plan)
 	}
 }

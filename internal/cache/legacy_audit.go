@@ -346,19 +346,34 @@ type TrackedAnchor struct {
 	SeenAt          int64
 }
 
+// trackedSuiteAnchorsSQL is ListTrackedSuiteAnchors' query.
+//
+// AIDEV-NOTE: the final review's R3 I-1. CROSS JOIN makes SQLite drive
+// from suite_freshness and probe url_path's unique key once per anchor
+// name, as the cache_summary refresher's query and
+// unadoptedSuiteAnchorsSQL do. With a plain JOIN the only WHERE term,
+// u.blob_hash IS NOT NULL, made the planner drive from url_path through
+// idx_url_path_blob (every cached file) and range-scan the host's suites
+// for each: 32 s for 5,000 suites over 220,000 url_path rows, at every
+// start before any listener serves, against 0.06 s now. Production never
+// runs ANALYZE, so the plan is the same on every install; keep the CROSS
+// JOIN and the join's url_path terms bare columns
+// (TestListTrackedSuiteAnchors_ProbesURLPathByItsKey pins the plan).
+const trackedSuiteAnchorsSQL = `
+SELECT sf.canonical_scheme, sf.canonical_host, sf.suite_path, u.path, u.blob_hash,
+       MAX(COALESCE(u.last_requested_at, 0), COALESCE(u.last_fetched_at, 0))
+  FROM suite_freshness sf
+ CROSS JOIN url_path u
+    ON u.canonical_scheme = sf.canonical_scheme
+   AND u.canonical_host   = sf.canonical_host
+   AND u.path IN (sf.suite_path || '/InRelease', sf.suite_path || '/Release.gpg')
+ WHERE u.blob_hash IS NOT NULL`
+
 // ListTrackedSuiteAnchors returns every tracked suite's cached signed
 // anchor rows (spec C3 startup marker pass). Rows without a blob or a
 // stamp are skipped.
 func (c *Cache) ListTrackedSuiteAnchors(ctx context.Context) ([]TrackedAnchor, error) {
-	rows, err := c.db.QueryContext(ctx, `
-SELECT sf.canonical_scheme, sf.canonical_host, sf.suite_path, u.path, u.blob_hash,
-       MAX(COALESCE(u.last_requested_at, 0), COALESCE(u.last_fetched_at, 0))
-  FROM suite_freshness sf
-  JOIN url_path u
-    ON u.canonical_scheme = sf.canonical_scheme
-   AND u.canonical_host   = sf.canonical_host
-   AND u.path IN (sf.suite_path || '/InRelease', sf.suite_path || '/Release.gpg')
- WHERE u.blob_hash IS NOT NULL`)
+	rows, err := c.db.QueryContext(ctx, trackedSuiteAnchorsSQL)
 	if err != nil {
 		return nil, fmt.Errorf("ListTrackedSuiteAnchors: %w", err)
 	}
