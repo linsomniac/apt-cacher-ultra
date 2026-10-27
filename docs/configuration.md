@@ -782,11 +782,15 @@ suite's packages are refused while other suites on the same host have
 complete coverage, as for any unadopted suite. While inline snapshots are
 queued for the audit, the cache directory's `pool/` must be present: the
 daemon refuses to start, and changes nothing, when `pool/` is missing,
-unreadable or empty, or when two or more inline snapshots are queued and
-none of their pool files exists (a foreign pool). Mount or restore it, or
+unreadable or empty, or when it holds none of the queued inline snapshots'
+files and none of a sample of the files the current snapshots use, two or
+more files checked (a foreign or unmounted pool; snapshots that share an
+`InRelease` share its one file). Mount or restore it, or
 wipe the cache directory to start empty. Otherwise a missing pool file does
 not stop the daemon, even when it belongs to the only queued snapshot, as
-long as `pool/` is not empty: that snapshot is quarantined. A single pool
+long as `pool/` is not empty: that snapshot is quarantined. So is a
+snapshot whose file could not be read at an earlier start and was then
+removed, as long as the pool holds the current snapshots' files. A single pool
 file that cannot be read for another reason (permissions, I/O error) does
 not stop the daemon either: that snapshot keeps serving as before, a
 `legacy_trust_audit_deferred` error names it, and the next start retries it.

@@ -243,9 +243,10 @@ func TestRunLegacyTrustAudit_TwoSnapshotsSharingARottedAnchorInOneBatch(t *testi
 // deletes every row of the blob but leaves the file, since the second
 // snapshot, still queued, names it: removed then, a lost commit of the
 // second batch would leave that snapshot queued with its anchor missing,
-// and when every queued inline anchor is missing the next start refuses
-// ("is the pool mounted?"). The second snapshot's own audit finds the
-// file corrupt, quarantines it and removes the file.
+// judged anchor_missing at the next start, or a refused start ("is the
+// pool mounted?") when the pool holds none of the other files checked.
+// The second snapshot's own audit finds the file corrupt, quarantines it
+// and removes the file.
 func TestRunLegacyTrustAudit_TwoSnapshotsSharingARottedAnchorAcrossBatches(t *testing.T) {
 	env := newAdoptionTestEnv(t)
 	ctx := context.Background()

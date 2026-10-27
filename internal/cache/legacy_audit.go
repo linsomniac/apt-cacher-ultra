@@ -111,6 +111,41 @@ SELECT EXISTS (SELECT 1
 	return queued, nil
 }
 
+// PinnedBlobsOutsideAuditQueue returns up to limit hashes, in hash order,
+// of the pinned blobs (refcount > 0: a current snapshot's members) that no
+// snapshot queued in legacy_trust_audit names as its InRelease. A read:
+// the audit's pre-flight checks their pool files — blob GC never deletes a
+// blob whose refcount is positive — to tell a lost or foreign pool from
+// lost anchor files (the final review's R2 I-1).
+func (c *Cache) PinnedBlobsOutsideAuditQueue(ctx context.Context, limit int) ([]string, error) {
+	rows, err := c.db.QueryContext(ctx, `
+SELECT hash
+  FROM blob
+ WHERE refcount > 0
+   AND hash NOT IN (SELECT s.inrelease_hash
+                      FROM legacy_trust_audit q
+                      JOIN suite_snapshot s ON s.snapshot_id = q.snapshot_id
+                     WHERE s.inrelease_hash IS NOT NULL)
+ ORDER BY hash
+ LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("PinnedBlobsOutsideAuditQueue: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			return nil, fmt.Errorf("PinnedBlobsOutsideAuditQueue: scan: %w", err)
+		}
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("PinnedBlobsOutsideAuditQueue: %w", err)
+	}
+	return out, nil
+}
+
 // ApplyLegacyAuditDecisions applies one batch of audit decisions in ONE
 // writer transaction (spec §6.1) and reports, for each quarantined
 // snapshot, whether it was current and how many url_path rows of its

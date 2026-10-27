@@ -1931,14 +1931,23 @@ The v7 migration queues every adopted snapshot in `legacy_trust_audit`. At
 every start, after the migration and before the GC loops, the freshness
 checker and the HTTP listeners serve, `freshness.RunLegacyTrustAudit` drains
 the queue. **Pre-flight:** when the queue holds inline snapshots, the pool
-directory must be readable and non-empty, and when two or more inline anchors are queued
-at least one of them must exist; an unmounted, empty or foreign pool would
-otherwise make every anchor look missing, so startup refuses with a message
-naming the path and the two ways out (restore the pool, or wipe the cache)
-and changes nothing. A single queued inline anchor that is missing from a non-empty pool is
-quarantined (one lost pool file cannot be told from a lost mount, and
-refusing would leave no recovery short of wiping the cache); detached-only
-queues read no pool files. Each batch of up to 100 is decided in memory and
+directory must be readable and non-empty, and when every queued inline
+anchor file is missing (snapshots that share an `InRelease` share its one
+file), at least one of a sample of up to 16 pinned files outside the queue
+(blobs with a positive refcount that no queued snapshot names as its
+`InRelease`: blob GC never deletes them) must exist, whenever the anchor
+files and the sample are two or more files; an unmounted, empty or foreign
+pool would otherwise make every anchor look missing, so startup refuses
+with a message naming the path and the two ways out (restore the pool, or
+wipe the cache) and changes nothing. The sample is evidence the queue
+cannot exhaust: after the first start the queue holds only the deferred
+snapshots, whose unreadable files an operator may remove; with the pool
+mounted they are then quarantined `anchor_missing` (the final review's R2
+I-1, R5 #1). A single file checked — one queued anchor file, missing from
+a non-empty pool, and no other pinned file — is quarantined (one lost pool
+file cannot be told from a lost mount, and refusing would leave no
+recovery short of wiping the cache); detached-only queues read no pool
+files. Each batch of up to 100 is decided in memory and
 applied in **one writer transaction** (an INFO `legacy_trust_audit_progress`
 line per batch):
 
@@ -1989,8 +1998,9 @@ line per batch):
   an upstream still serving the same `InRelease` would otherwise be
   fetched onto, and served from, the rotted file (phase H1, review C-1).
   Never before the commit: a lost commit would leave the snapshots queued
-  with their anchors gone, and once every queued inline anchor is missing
-  the next start's pre-flight refuses to start (re-review N-1). A failed
+  with their anchors gone, judged `anchor_missing` at the next start, or a
+  refused start when the pool holds none of the other files the pre-flight
+  checks either (re-review N-1; the final review's R2 I-1). A failed
   removal is logged (ERROR `legacy_anchor_discard_failed`) and the
   quarantine stands. Residual: a crash between the commit and the removal
   leaves the corrupt file, with its rows deleted and the snapshot

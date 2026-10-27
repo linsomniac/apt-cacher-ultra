@@ -526,6 +526,225 @@ func TestRunLegacyTrustAudit_LoneMissingAnchorInNonEmptyPoolIsQuarantined(t *tes
 	}
 }
 
+// adoptAnchorOnly commits an inline snapshot for suite whose only member
+// is its InRelease blob, anchor: the one pool file it pins.
+func adoptAnchorOnly(t *testing.T, env *adoptionTestEnv, suite string, anchor []byte) int64 {
+	t.Helper()
+	ctx := context.Background()
+	ah, err := env.adopter.writeBlobBytes(ctx, anchor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _, err := env.cache.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{
+		CanonicalScheme: "http", CanonicalHost: "h", SuitePath: suite, InReleaseHash: &ah})
+	if err != nil {
+		t.Fatal(err)
+	}
+	members := []cache.SnapshotMember{{SnapshotID: id, Path: "InRelease", BlobHash: ah, DeclaredSHA256: ah}}
+	if err := env.cache.CommitAdoption(ctx, id, members, nil, nil, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// The final review's R2 I-1 and R5 #1: two queued snapshots that share one
+// InRelease (Debian's dists/stable and dists/bookworm serve the same
+// bytes; an http and an https suite of one repository do too) share one
+// content-addressed pool file. That file lost from a pool that is not
+// empty is one lost file, as for a lone missing anchor (spec §6.1): both
+// snapshots are quarantined anchor_missing and the start proceeds. Also
+// when the shared file is the only one the snapshots pin ("anchors only"),
+// so no other file of theirs shows the pool is mounted: the pre-flight
+// counts distinct files, not snapshots.
+func TestRunLegacyTrustAudit_OneLostFileSharedByTwoSnapshotsIsQuarantined(t *testing.T) {
+	for _, shape := range []string{"with members", "anchors only"} {
+		t.Run(shape, func(t *testing.T) {
+			ctx := context.Background()
+			env := newAdoptionTestEnv(t)
+			c := env.cache
+			anchor := clearsignForTest(t, realisticRelease())
+			var a, b int64
+			if shape == "with members" {
+				a = adoptLegacy(t, env, "/r/dists/stable", anchor, "/r/pool/a_1_amd64.deb")
+				b = adoptLegacy(t, env, "/r/dists/bookworm", anchor, "/r/pool/b_1_amd64.deb")
+			} else {
+				a = adoptAnchorOnly(t, env, "/r/dists/stable", anchor)
+				b = adoptAnchorOnly(t, env, "/r/dists/bookworm", anchor)
+				// A cached file no snapshot pins: the pool is not empty.
+				if _, err := env.adopter.writeBlobBytes(ctx, []byte("a cached package")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := c.ClearSignedSeenForTest(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.EnqueueLegacyTrustAudit(ctx, a, b); err != nil {
+				t.Fatal(err)
+			}
+			sa, err := c.GetSuiteSnapshot(ctx, a)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sb, err := c.GetSuiteSnapshot(ctx, b); err != nil || *sb.SingleAnchorHash != *sa.SingleAnchorHash {
+				t.Fatalf("fixture: snapshot %+v (%v), want the same InRelease blob as %d", sb, err, a)
+			}
+			if err := os.Remove(c.BlobPath(*sa.SingleAnchorHash)); err != nil { // the one lost file
+				t.Fatal(err)
+			}
+			logs := &lockedBuffer{}
+			res, err := RunLegacyTrustAudit(ctx, c, slog.New(slog.NewJSONHandler(logs, nil)))
+			if err != nil || res.Audited != 2 || res.Quarantined != 2 {
+				t.Fatalf("run = %+v (%v), want both snapshots quarantined and the start not refused", res, err)
+			}
+			recs := logRecords(t, logs, "legacy_snapshot_quarantined")
+			for _, rec := range recs {
+				if rec["reason"] != "anchor_missing" {
+					t.Errorf("quarantine %v, want reason anchor_missing", rec)
+				}
+			}
+			if len(recs) != 2 {
+				t.Errorf("%d legacy_snapshot_quarantined lines, want 2", len(recs))
+			}
+			for _, suite := range []string{"/r/dists/stable", "/r/dists/bookworm"} {
+				if cur := currentOf(t, c, suite); cur != nil {
+					t.Errorf("%s: quarantined snapshot still current: %d", suite, *cur)
+				}
+			}
+		})
+	}
+}
+
+// The final review's R2 I-1: the deferred residue. A first start defers the
+// snapshots whose anchors it cannot read (ERROR legacy_trust_audit_deferred,
+// "until the pool is fixed"), and the operator removes the unreadable files
+// (by hand, or fsck moves them). The queue then holds only those snapshots,
+// every anchor of theirs missing, but the pool is mounted: it holds the
+// files the current snapshots pin. The next start quarantines them
+// anchor_missing; it does not refuse ("is the pool mounted?") at this start
+// and every one after.
+func TestRunLegacyTrustAudit_RemovedDeferredResidueIsQuarantined(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file permissions")
+	}
+	ctx := context.Background()
+	f := buildLegacyFixture(t)
+	c := f.env.cache
+	var paths []string
+	for _, id := range []int64{f.clean, f.polluted} { // f.displacedBad shares f.polluted's anchor
+		s, err := c.GetSuiteSnapshot(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := c.BlobPath(*s.SingleAnchorHash)
+		if err := os.Chmod(p, 0); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, p)
+	}
+	res, err := RunLegacyTrustAudit(ctx, c, discardAuditLogger())
+	if err != nil || res.Deferred != 3 || res.Audited != 3 {
+		t.Fatalf("first start = %+v (%v), want 3 audited and 3 deferred", res, err)
+	}
+	for _, p := range paths {
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err = RunLegacyTrustAudit(ctx, c, discardAuditLogger())
+	if err != nil || res.Audited != 3 || res.Quarantined != 3 {
+		t.Fatalf("second start = %+v (%v), want the removed residue quarantined, not a refused start", res, err)
+	}
+	if items, err := c.LegacyAuditBatch(ctx, 0, 0); err != nil || len(items) != 0 {
+		t.Fatalf("queue = %+v (%v), want it drained", items, err)
+	}
+	for _, suite := range []string{"/r/dists/clean", "/r/dists/polluted"} {
+		if cur := currentOf(t, c, suite); cur != nil {
+			t.Errorf("%s: quarantined snapshot still current: %d", suite, *cur)
+		}
+	}
+}
+
+// Spec §6.1's pre-flight still refuses a pool that is not empty but holds
+// none of the queued inline anchor files and none of the files the current
+// snapshots pin — a foreign pool, or a bare mount point with stray files —
+// at the first start and after one that left a deferred residue alike,
+// here a residue of one snapshot: the residue's lost files do not make a
+// lost mount look like lost files. Nothing changes, and with the pool back
+// the audit runs.
+func TestRunLegacyTrustAudit_PreflightRefusesAForeignPool(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file permissions")
+	}
+	ctx := context.Background()
+	f := buildLegacyFixture(t)
+	c := f.env.cache
+	pool := filepath.Join(c.Dir(), "pool")
+	moved := pool + ".away"
+	swapIn := func() {
+		t.Helper()
+		if err := os.Rename(pool, moved); err != nil {
+			t.Fatal(err)
+		}
+		body := []byte("another cache's blob")
+		h := hashOf(body)
+		if err := os.MkdirAll(filepath.Join(pool, h[:2]), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(pool, h[:2], h), body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	swapOut := func() {
+		t.Helper()
+		if err := os.RemoveAll(pool); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(moved, pool); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refused := func(when string, queued int) {
+		t.Helper()
+		_, err := RunLegacyTrustAudit(ctx, c, discardAuditLogger())
+		if err == nil || !strings.Contains(err.Error(), pool) {
+			t.Fatalf("%s: audit err = %v, want a refusal naming %s", when, err, pool)
+		}
+		if cur := currentOf(t, c, "/r/dists/clean"); cur == nil || *cur != f.clean {
+			t.Fatalf("%s: a refused audit changed the current pointer: %v", when, cur)
+		}
+		if items, _ := c.LegacyAuditBatch(ctx, 0, 0); len(items) != queued {
+			t.Fatalf("%s: a refused audit changed the queue: %+v", when, items)
+		}
+	}
+	swapIn()
+	refused("first start", 6)
+	swapOut()
+
+	// A first start defers the snapshots whose anchors it cannot read.
+	s, err := c.GetSuiteSnapshot(ctx, f.clean)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := c.BlobPath(*s.SingleAnchorHash)
+	if err := os.Chmod(p, 0); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := RunLegacyTrustAudit(ctx, c, discardAuditLogger()); err != nil || res.Deferred != 1 {
+		t.Fatalf("start with an unreadable anchor = %+v (%v), want 1 deferred", res, err)
+	}
+	if err := os.Chmod(p, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A later start with a foreign pool: the residue's one anchor file is
+	// missing, but so is every file the current snapshots pin.
+	swapIn()
+	refused("after a deferred residue", 1)
+	swapOut()
+	if res, err := RunLegacyTrustAudit(ctx, c, discardAuditLogger()); err != nil || res.Audited != 1 || res.Signed != 1 {
+		t.Fatalf("audit after the pool returned = %+v (%v), want the deferred snapshot audited and kept", res, err)
+	}
+}
+
 // A single unreadable anchor defers only that snapshot: the run continues,
 // the snapshot stays current and queued, and the next start audits it.
 func TestRunLegacyTrustAudit_UnreadableAnchorIsDeferred(t *testing.T) {

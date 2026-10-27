@@ -152,22 +152,25 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 						// serves, never on the writer (PD-5), as the integrity
 						// scanner's DiscardFinalizedBlob does. Never before the
 						// commit: a lost commit would leave the snapshots queued
-						// with their anchors missing, and when every queued inline
-						// anchor is missing the next start's preflight refuses to
-						// start ("is the pool mounted?"). For the same reason it
-						// waits while another snapshot still queued names the file
-						// (an http and an https suite of one repository share it;
-						// the H1 final review's prod minor 3): removed now, a lost
-						// commit of that snapshot's later batch would leave it
-						// queued with its anchor missing. Its own audit then finds
-						// the file corrupt, quarantines it and removes the file; a
-						// queue read that fails keeps the file and logs the
-						// failure. A crash between the commit and this removal
-						// leaves the file, as a failed removal does: the rows are
-						// gone, so a changed upstream heals, and an unchanged one
-						// is healed by the eager re-adoption's rehash
-						// (writeBlobBytes) once a client asks with adoption
-						// enabled; the audit does not revisit it.
+						// with their anchors missing, judged anchor_missing at the
+						// next start, or — when the pool holds none of the other
+						// files the preflight checks either — a refused start ("is
+						// the pool mounted?"; the final review's R2 I-1 narrowed
+						// that refusal to a pool that is not there). For the same
+						// reason it waits while another snapshot still queued
+						// names the file (an http and an https suite of one
+						// repository share it; the H1 final review's prod minor
+						// 3): removed now, a lost commit of that snapshot's later
+						// batch would leave it queued with its anchor missing.
+						// Its own audit then finds the file corrupt, quarantines
+						// it and removes the file; a queue read that fails keeps
+						// the file and logs the failure. A crash between the
+						// commit and this removal leaves the file, as a failed
+						// removal does: the rows are gone, so a changed upstream
+						// heals, and an unchanged one is healed by the eager
+						// re-adoption's rehash (writeBlobBytes) once a client
+						// asks with adoption enabled; the audit does not revisit
+						// it.
 						hash := *decided[i].SingleAnchorHash
 						// A shutdown signal (ctx) must not keep a dequeued snapshot's rotted file.
 						queued, err := c.LegacyAuditQueueNamesAnchor(context.WithoutCancel(ctx), hash)
@@ -204,22 +207,48 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 	return res, nil
 }
 
+// legacyAuditPoolSample is how many pinned pool files outside the queue the
+// pre-flight checks once every queued inline anchor file is missing.
+const legacyAuditPoolSample = 16
+
 // preflightLegacyAudit refuses to audit against a pool that is not there.
 // An unmounted, empty or foreign pool makes every anchor look missing,
 // which would quarantine every snapshot (spec §6.1). Nothing is changed.
 // It loads the whole queue (ids and anchor hashes only; fine for 10^5
 // rows) because the decision needs every queued inline anchor.
+//
+// AIDEV-NOTE: the final review's R2 I-1 and R5 #1. The evidence is pool
+// FILES, not snapshots: queued snapshots that share an InRelease (an http
+// and an https suite of one repository, Debian's stable and its codename)
+// share its content-addressed file, so the anchors are deduplicated by
+// hash. And once every queued anchor file is missing, the files decide
+// with a sample of the pinned files outside the queue
+// (PinnedBlobsOutsideAuditQueue: blob GC never deletes them), which the
+// queue cannot exhaust: after the first start the queue holds only the
+// deferred residue, whose unreadable files an operator may remove. One of
+// those files present means a mounted pool that lost the anchors: they are
+// quarantined anchor_missing. Two or more files checked, none present,
+// means a lost or foreign pool: refuse. A single file checked (one anchor
+// file and nothing else pinned) cannot tell one lost file from a lost
+// mount, and refusing would leave no recovery short of wiping the cache:
+// it is quarantined.
 func preflightLegacyAudit(ctx context.Context, c *cache.Cache) error {
 	items, err := c.LegacyAuditBatch(ctx, 0, 0)
 	if err != nil {
 		return fmt.Errorf("legacy trust audit: %w", err)
 	}
+	queued := 0
+	seen := make(map[string]bool)
 	var anchors []string
 	for _, it := range items {
 		if it.Missing || it.Form != cache.FormInline || it.SingleAnchorHash == nil {
 			continue
 		}
-		anchors = append(anchors, c.BlobPath(*it.SingleAnchorHash))
+		queued++
+		if !seen[*it.SingleAnchorHash] {
+			seen[*it.SingleAnchorHash] = true
+			anchors = append(anchors, c.BlobPath(*it.SingleAnchorHash))
+		}
 	}
 	if len(anchors) == 0 {
 		// Spec §6.1: detached-only queues read no pool files.
@@ -238,24 +267,40 @@ func preflightLegacyAudit(ctx context.Context, c *cache.Cache) error {
 	// single anchor. A lone missing anchor in a NON-empty pool is still
 	// quarantined by the audit (spec §6.1).
 	if errors.Is(rerr, io.EOF) {
-		return fmt.Errorf("legacy trust audit: pool %s is empty but the audit queue holds inline snapshots (%d) — is the pool mounted? Mount or restore it and restart; to start without the pool, wipe the cache directory. Nothing was changed", pool, len(anchors))
+		return fmt.Errorf("legacy trust audit: pool %s is empty but the audit queue holds inline snapshots (%d) — is the pool mounted? Mount or restore it and restart; to start without the pool, wipe the cache directory. Nothing was changed", pool, queued)
 	}
 	if rerr != nil {
 		return fmt.Errorf("legacy trust audit: pool %s is not readable: %w (fix it and restart; nothing was changed)", pool, rerr)
 	}
-	inline, missing := len(anchors), 0
-	for _, p := range anchors {
-		// AIDEV-NOTE: only "does not exist" counts as missing. Any other
-		// stat error is an I/O fault, not evidence of a lost pool: it never
-		// refuses the start here, and the audit defers that one snapshot.
-		if _, err := os.Stat(p); errors.Is(err, fs.ErrNotExist) {
-			missing++
-		}
+	if anyPoolFileExists(anchors) {
+		return nil
 	}
-	if inline >= 2 && missing == inline {
-		return fmt.Errorf("legacy trust audit: none of the %d queued inline anchors exist under %s — is the pool mounted? Mount or restore it and restart; to start without the pool, wipe the cache directory. Nothing was changed", inline, pool)
+	pinned, err := c.PinnedBlobsOutsideAuditQueue(ctx, legacyAuditPoolSample)
+	if err != nil {
+		return fmt.Errorf("legacy trust audit: %w", err)
+	}
+	others := make([]string, len(pinned))
+	for i, h := range pinned {
+		others[i] = c.BlobPath(h)
+	}
+	if len(anchors)+len(others) >= 2 && !anyPoolFileExists(others) {
+		return fmt.Errorf("legacy trust audit: none of the %d files checked exists under %s (%d queued inline anchors, %d other files current snapshots use) — is the pool mounted? Mount or restore it and restart; to start without the pool, wipe the cache directory. Nothing was changed", len(anchors)+len(others), pool, len(anchors), len(others))
 	}
 	return nil
+}
+
+// anyPoolFileExists reports whether any of paths is not missing.
+//
+// AIDEV-NOTE: only "does not exist" counts as missing. Any other stat error
+// is an I/O fault, not evidence of a lost pool: it never refuses the start,
+// and the audit defers a snapshot whose anchor it cannot read.
+func anyPoolFileExists(paths []string) bool {
+	for _, p := range paths {
+		if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
+			return true
+		}
+	}
+	return false
 }
 
 // auditLegacySnapshotRecovered runs auditLegacySnapshot and turns a panic
