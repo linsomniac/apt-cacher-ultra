@@ -67,6 +67,21 @@ jobs:
           # data ("export data version 5 is greater than maximum supported
           # version 4").
           version: v2.14.0
+      # e2e/flat's test binary seam (cmd/apt-cacher-ultra/e2ehooks.go and
+      # its test) compiles only with this tag, so the run above skips it.
+      - name: golangci-lint (e2ehooks)
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.14.0
+          args: --build-tags e2ehooks ./cmd/...
+      # The e2e harnesses and the package's maintainer scripts, among them
+      # e2e/live/smoke.sh, which runs only by hand. -x follows each
+      # `source` (e2e/flat/lib.sh, for both harnesses); without it
+      # ShellCheck reports SC1091. It does not report an upper-case setting
+      # or a function a sourced file stops defining. ShellCheck comes with
+      # the runner image.
+      - name: shellcheck
+        run: shellcheck -x e2e/flat/*.sh e2e/live/*.sh e2e/deb/*.sh packaging/scripts/*.sh
 
   # SPEC §12.4 docker-compose end-to-end test. Slower lane (~2 min for
   # the docker build + apt-get update inside ubuntu:noble), but it's

@@ -10,10 +10,12 @@
 # and candidate, the settings CONFIG, DAEMON_LOG, PROXY, ADMIN, CURL and
 # APT_SIGNED_ERRORS, and the run state SCENARIO, FAILED, APT_RUNS, APT_LOG,
 # TIMINGS and POLL_TOOK; it overrides say, NGINX_LOG and APT_SIGNED_HOSTS.
-# It runs by hand, not in CI, so after changing any of these, lint it
-# (shellcheck -x e2e/live/*.sh), and run it (make e2e-live) when a
-# helper's behaviour changed. No line of this note may begin with the
-# word shellcheck: the linter reads such a comment as a directive.
+# It runs by hand, not in CI. CI's lint job runs ShellCheck with -x over
+# it and this file, but ShellCheck does not report an upper-case setting
+# or a function this file stops defining, so after renaming or removing
+# any of these, or changing a helper's behaviour, run it (make e2e-live).
+# No line of this note may begin with the word shellcheck: the linter
+# reads such a comment as a directive.
 #
 # AIDEV-NOTE: ruling R-H2-5 — every wait in this harness is poll (a bounded
 # poll on an observable: a log line, an HTTP answer, an apt result) with a
