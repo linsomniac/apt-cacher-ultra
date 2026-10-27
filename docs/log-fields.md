@@ -35,9 +35,9 @@ Fields that follow this pattern:
   waited in a flip hold (spec C8): how long it waited, in milliseconds
   (about 20000 at most: the hold's 20 s bound, whose timer can fire a few
   milliseconds late; part of `duration_ms`). A request waits when it
-  arrives, or right after it created its suite's row. Also on the
-  `client_canceled` line of a held request whose client left while it
-  waited.
+  arrives, or right after it created its suite's row or found it created
+  by another request after it arrived. Also on the `client_canceled` line
+  of a held request whose client left while it waited.
 
 Always-present fields (`method`, `url`, `canonical_host`, `path`,
 `outcome`, `status`, `bytes_sent`, `duration_ms`, `client_addr`) are

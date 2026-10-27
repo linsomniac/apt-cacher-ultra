@@ -422,7 +422,10 @@ func (h *Handler) markCachedSignedAnchors(ctx context.Context, key cache.SuiteKe
 // suite whose row this request created or found created after ServeHTTP's
 // anchorStart (phase C carry-forward: the serve that creates a row is
 // tracked like any other), and returns its token — nil when there is
-// nothing to register. ServeHTTP's deferred Done covers it.
+// nothing to register. ServeHTTP's deferred Done covers it. Its callers:
+// a creating miss, an onboarding hit, and tryCacheHit for a hit that found
+// the row created by another request (final review R4 #1); each
+// re-dispatches through the snapshot path after a registration.
 func (h *Handler) registerLate(r *http.Request, req *proxy.Request, sr *suiteReq) *flipgate.Token {
 	if sr.tok != nil || !sr.tracked {
 		return nil

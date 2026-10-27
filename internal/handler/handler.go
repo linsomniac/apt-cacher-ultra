@@ -488,8 +488,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if outcome == "" {
 			outcome = "hit"
 		}
-		// An onboarding hit's late registration may have waited too
-		// (heldContext of the entry token again is harmless).
+		// A hit's late registration (onboarding, or a row created after
+		// anchorStart's read) may have waited too (heldContext of the entry
+		// token again is harmless).
 		h.logRequestWithValidation(heldContext(r, sr.tok), req.CanonicalHost, req.Path, outcome, status, body, false, 0, start, validation)
 		return
 	}
@@ -540,7 +541,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // open(2), and one ServeContent — order-of-microseconds.
 func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time, sr *suiteReq) (served bool, outcome string, status int, bytesWritten int64, validation packageValidation) {
 	if req.IsMetadata && req.SuitePath != "" {
-		if served, status, body, handled, displaced := h.trySnapshotHit(w, r, req, start, sr); handled {
+		served, status, body, handled, displaced := h.trySnapshotHit(w, r, req, start, sr)
+		if !handled {
+			// Spec C8 (final review R4 #1): an anchor of a suite whose row
+			// appeared after ServeHTTP's anchorStart read it absent — another
+			// request's miss or onboarding created it in between — registers
+			// now, before its suite's snapshot pointer is read again or its
+			// url_path anchor is served, and re-dispatches through the
+			// snapshot path as a late registration always does (FW-4 (c)).
+			// registerLate does nothing for a registered serve, an untracked
+			// suite or a file the barrier does not hold.
+			if t := h.registerLate(r, req, sr); t != nil {
+				if clientLeft(w, r) {
+					return true, "client_canceled", http.StatusServiceUnavailable, 0, packageValidation{}
+				}
+				served, status, body, handled, displaced = h.trySnapshotHit(w, r, req, start, sr)
+			}
+		}
+		if handled {
 			return served, "", status, body, packageValidation{SnapshotDisplaced: displaced}
 		}
 	}
@@ -565,9 +583,11 @@ func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy
 // handled=true when the request was satisfied (served from a snapshot —
 // with displaced=true when that was one of the suite's displaced
 // snapshots, spec C8 retained by-hash — 404 not-in-snapshot, or 502
-// fail-closed). Returns handled=false only when the suite has not been
+// fail-closed). Returns handled=false when the suite has not been
 // adopted (no suite_freshness row, or current_snapshot_id IS NULL), in
-// which case the caller falls through to the Phase 1 url_path lookup.
+// which case the caller falls through to the Phase 1 url_path lookup, and
+// for an anchor serve of a tracked suite that is not registered with the
+// flip barrier yet, which tryCacheHit registers and calls it again for.
 //
 // AIDEV-NOTE: every failure mode after a suite has been confirmed
 // adopted (DB error on snapshot_member, etc.) must fail closed with a
@@ -607,6 +627,20 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 		return h.writeFailClosed(w, "suite lookup failed"), http.StatusBadGateway, 0, true, false
 	}
 	sr.tracked = true
+	// Spec C8 (final review R4 #1): an anchor serve of a tracked suite with
+	// no registration — the row appeared after ServeHTTP's anchorStart read
+	// it absent — must not use the pointer read before it registers: hand
+	// it back unhandled, and tryCacheHit registers it and re-dispatches.
+	//
+	// AIDEV-NOTE: every caller but tryCacheHit's first call registered the
+	// serve before it calls (the late registrations re-dispatch only with a
+	// token), so this returns unhandled once per request at most. Without
+	// it, a suite created and adopted in that window served its snapshot
+	// anchor unregistered, invisible to the next flip's barrier
+	// (TestServeHTTP_HitOfASuiteTrackedAfterAnchorStartRegistersLate).
+	if sr.tok == nil && h.barrierAnchor(req) {
+		return false, 0, 0, false, false
+	}
 	if suite.CurrentSnapshotID == nil {
 		// Suite known but never adopted — pre-Phase-2 regime.
 		return false, 0, 0, false, false
@@ -1461,10 +1495,7 @@ func clientLeft(w http.ResponseWriter, r *http.Request) bool {
 // until the hold ends (at most HoldMax) and counts against the waiter cap
 // meanwhile (design note 3).
 func (h *Handler) anchorStart(r *http.Request, req *proxy.Request) *flipgate.Token {
-	if !h.flipGate.Enabled() || !req.IsMetadata || req.SuitePath == "" {
-		return nil
-	}
-	if req.Path != req.SuitePath+inReleaseSuffix && req.Path != req.SuitePath+releaseSuffix {
+	if !h.barrierAnchor(req) {
 		return nil
 	}
 	h.existsReads.Add(1)
@@ -1483,6 +1514,16 @@ func (h *Handler) anchorStart(r *http.Request, req *proxy.Request) *flipgate.Tok
 	stop := context.AfterFunc(h.lifecycleCtx, cancel)
 	defer stop()
 	return h.flipGate.AnchorStart(ctx, flipgate.Key(req.CanonicalScheme, req.CanonicalHost, req.SuitePath))
+}
+
+// barrierAnchor reports whether req is an anchor serve spec C8's barrier
+// registers: <suite>/InRelease or <suite>/Release while the barrier is on
+// (Release.gpg is never held).
+func (h *Handler) barrierAnchor(req *proxy.Request) bool {
+	if !h.flipGate.Enabled() || !req.IsMetadata || req.SuitePath == "" {
+		return false
+	}
+	return req.Path == req.SuitePath+inReleaseSuffix || req.Path == req.SuitePath+releaseSuffix
 }
 
 // suiteExists is anchorStart's registration read: one indexed EXISTS

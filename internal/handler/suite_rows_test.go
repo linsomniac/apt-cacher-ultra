@@ -1003,6 +1003,116 @@ func TestServeHTTP_LateRegistrationClientThatLeftIsAClientAbort(t *testing.T) {
 	})
 }
 
+// Final review R4 #1: a hit on a suite whose row appeared after ServeHTTP's
+// anchorStart read it absent — another request's miss or onboarding created
+// it in between — registers late with the flip barrier and re-dispatches,
+// as an onboarding hit does, whether it then serves the suite's url_path
+// anchor (no snapshot yet) or a snapshot's. Here the suite's flip is in its
+// hold, its commit running: the request waits in the hold and is answered
+// once the commit is done. The seam answers the entry read "no row" and
+// every later read from the cache.
+func TestServeHTTP_HitOfASuiteTrackedAfterAnchorStartRegistersLate(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		adopted bool
+	}{{"url_path anchor", false}, {"snapshot anchor", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s := newFlipStack(t, 10*time.Second)
+				const suite = "/u/dists/s"
+				if tc.adopted {
+					s.adopt(suite, 1)
+				} else {
+					s.track(suite)
+					s.cacheRow(suite+"/InRelease", rowInRelease, wallclock.Unix())
+				}
+				ctx := context.Background()
+				reads := 0 // the request's goroutine alone reads
+				s.h.suiteExistsForTest = func(key cache.SuiteKey) (bool, error) {
+					if reads++; reads == 1 {
+						return false, nil // the entry read, just before the row's creation
+					}
+					return s.c.HasSuiteRow(ctx, key)
+				}
+				holds := s.gate.Stats().Holds
+				release := make(chan struct{})
+				committed := make(chan struct{})
+				go func() {
+					defer close(committed)
+					if _, err := s.gate.Flip(ctx, flipgate.Key("http", flipSimHost, suite), func() error {
+						<-release
+						return nil
+					}); err != nil {
+						t.Error(err)
+					}
+				}()
+				synctest.Wait() // the flip is in its hold, its commit running
+				if st := s.gate.Stats(); st.Holds != holds+1 {
+					t.Fatalf("holds = %d, want %d (setup: the flip holds)", st.Holds, holds+1)
+				}
+				done := make(chan int, 1)
+				go func() {
+					_, code := s.get(suite+"/InRelease", 0)
+					done <- code
+				}()
+				synctest.Wait()
+				select {
+				case code := <-done:
+					// Errorf: the flip still waits for its release below.
+					t.Errorf("served (status %d) during the flip's hold: the hit was never registered", code)
+					done <- code
+				default:
+				}
+				close(release)
+				<-committed
+				if code := <-done; code != http.StatusOK {
+					t.Fatalf("status %d after the hold, want 200", code)
+				}
+				if st := s.gate.Stats(); st.HeldRequests != 1 || reads != 2 {
+					t.Fatalf("held requests %d, registration reads %d; want 1 and 2 (the entry's, the late one's)", st.HeldRequests, reads)
+				}
+			})
+		})
+	}
+}
+
+// Final review R4 #1, the client that leaves: a hit registered late (its
+// suite's row appeared after anchorStart's read) whose client leaves while
+// it waits in the hold is a client abort, as on every late registration
+// (design review M1) — 503, request line client_canceled with
+// flip_held_ms, no WARN — not a re-dispatch that fails its snapshot read.
+func TestServeHTTP_HitRegisteredLateClientThatLeftIsAClientAbort(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logs := &syncLog{}
+		s := newFlipStackLogging(t, 10*time.Second, slog.New(slog.NewJSONHandler(logs, nil)))
+		const suite = "/u/dists/s"
+		release := heldSuite(t, s, suite)
+		entry := true
+		s.h.suiteExistsForTest = func(key cache.SuiteKey) (bool, error) {
+			if entry {
+				entry = false
+				return false, nil // the entry read, just before the row's creation
+			}
+			return s.c.HasSuiteRow(context.Background(), key)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(time.Second, cancel) // the client leaves a second into its late wait
+		rec := httptest.NewRecorder()
+		s.h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+flipSimHost+suite+"/InRelease", nil).WithContext(ctx))
+		release()
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("status %d, want 503", rec.Code)
+		}
+		if warns := logRecords(logs, "", slog.LevelWarn); len(warns) != 0 {
+			t.Errorf("a client that left during the late wait logged %d WARN or worse, first %v", len(warns), warns[0])
+		}
+		lines := logRecords(logs, "request", slog.LevelInfo)
+		if len(lines) != 1 || lines[0]["outcome"] != "client_canceled" || lines[0]["flip_held_ms"] != float64(1000) {
+			t.Fatalf("request lines %v, want one client_canceled line with flip_held_ms 1000", lines)
+		}
+	})
+}
+
 // cacheRow stores body as the url_path row of path on the flip stack's
 // host (no suite row, no marker), requested and fetched at at.
 func (s *flipStack) cacheRow(path string, body []byte, at int64) {
