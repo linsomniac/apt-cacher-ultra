@@ -15,7 +15,8 @@ import (
 // A test that checks a log line passes its own Options.Logger.
 //
 // AIDEV-NOTE: this is the package's only TestMain; a test that needs the
-// default logger's output sets slog.SetDefault itself and restores it.
+// default logger's output sets slog.SetDefault itself and restores it, and
+// does not call t.Parallel.
 func TestMain(m *testing.M) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	os.Exit(m.Run())
