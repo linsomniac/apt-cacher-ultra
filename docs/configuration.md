@@ -766,13 +766,16 @@ a missing file, or one too large for the audit to read
 pool file cannot be read at all is deferred, not judged: an ERROR
 `legacy_trust_audit_deferred` names it at every start, and it keeps its
 rows and files until the pool is fixed or the suite is reaped or
-forgotten (`POST /forget`). A suite quarantined for declarations outside its signature
-adopts again on its first freshness check, because its tampered copy never
-matches a clean upstream; one quarantined because its stored file was lost
-or corrupt adopts again once a client asks for it (with adoption enabled:
-eager first adoption; it does not wait for an upstream change), and may
-have no record that it was signed (see the threat notes in *Anchor forms
-and unsigned repositories*). A quarantined plain-text
+forgotten (`POST /forget`). With adoption enabled, a quarantined suite
+adopts again as a suite without a snapshot does (see *Eager first
+adoption*), whatever it was quarantined for and without comparing its
+stored copy with upstream: at its first check when a client fetched one of
+its anchor files in the 7 days before the upgrade, otherwise once a client
+asks for it again. A suite quarantined `anchor_corrupt`, whose cached
+copies the audit deleted, waits for that request. One quarantined because
+its stored file was lost or corrupt may have no record that it was signed
+(see the threat notes in *Anchor forms and unsigned repositories*). A
+quarantined plain-text
 suite adopts again in the unsigned form, through its `Release` (its
 plain-text "InRelease" counts as absent), once a client has asked for it
 and two checks have seen the same `Release` (see *Anchor forms and
@@ -781,14 +784,18 @@ snapshot vouches no package. In strict mode, a quarantined
 suite's packages are refused while other suites on the same host have
 complete coverage, as for any unadopted suite. While inline snapshots are
 queued for the audit, the cache directory's `pool/` must be present: the
-daemon refuses to start, and changes nothing, when `pool/` is missing,
-unreadable or empty, or when it holds none of the queued inline snapshots'
-files and none of a sample of the files the current snapshots use, two or
-more files checked (a foreign or unmounted pool; snapshots that share an
-`InRelease` share its one file). Mount or restore it, or
-wipe the cache directory to start empty. Otherwise a missing pool file does
-not stop the daemon, even when it belongs to the only queued snapshot, as
-long as `pool/` is not empty: that snapshot is quarantined. So is a
+daemon refuses to start when `pool/` is missing, unreadable or empty, or
+when it holds none of the queued inline snapshots' files and none of a
+sample of the files the current snapshots use, two or more files checked
+(a foreign or unmounted pool; snapshots that share an `InRelease` share
+its one file). Mount or restore it, or wipe the cache directory to start
+empty. The audit then changes nothing, but the migration before it has:
+the database is at schema 7, which 1.0.x refuses, so going back to 1.0.x
+means restoring the `cache.db` copied before the upgrade (the refusal
+says so). Otherwise a missing pool file does not stop the daemon, even
+when it belongs to the only queued snapshot, as long as the pool holds
+one of the files checked, or that file is the only one checked: that
+snapshot is quarantined. So is a
 snapshot whose file could not be read at an earlier start and was then
 removed, as long as the pool holds the current snapshots' files. A single pool
 file that cannot be read for another reason (permissions, I/O error) does
@@ -821,7 +828,11 @@ again (see *Eager first adoption*); with the default
 while signed updates keep their own slot. Snapshots adopted before the
 upgrade carry no SHA512 by-hash names: such requests are answered 404
 from the snapshot, and apt then fetches the file by its name, until the
-suite's next adoption.
+suite's next adoption. Releases before 1.1.0 never adopted a flat
+repository, whose signing key may be installed only on the clients: load
+it on the cache host before upgrading (and, under
+`require_pinned_signer`, add its `[[trusted_signer]]` rule), or each of
+its adoptions fails and is retried (see *Flat repositories*).
 
 ## `[hot_packages]`, `[hold_packages]`, and `[retention]`: package working set
 

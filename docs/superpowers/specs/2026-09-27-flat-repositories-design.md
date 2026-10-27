@@ -2053,15 +2053,19 @@ time out once (documented). After the queue drains, the **marker pass**
 and duration.
 
 A quarantined suite falls back to Phase 1 serving (its `url_path` anchor row
-is kept — after `anchor_corrupt`, deleted: R-H2 above) until it re-adopts. Re-adoption happens on the first check that
-observes anchor bytes different from the cached ones (phases A–D) or by
-eager first adoption (phase E). For an R-1 quarantine that is the first
-post-upgrade check: the cached anchor holds the tampered envelope, which a
-clean upstream does not serve, so the check sees *changed* and adopts the
-clean content with the fixed parser. An `anchor_missing`, `anchor_corrupt`
-or `anchor_oversized` quarantine of a suite whose upstream is unchanged, and
-a legacy plain-text suite, stay unadopted until upstream changes or phase E
-(a vendor that never republishes stays unadopted until then); with
+is kept — after `anchor_corrupt`, deleted: R-H2 above) until it re-adopts.
+A quarantine clears the suite's current snapshot, so, as built (phase E),
+every quarantined suite re-adopts as a suite without a snapshot does:
+through C4's Dispatch 3 (`checkFirst`), at its first check when a client
+asked for it within the interest window (after the upgrade: fetched one of
+its anchor files in the 7 days before it) and a client-created anchor row
+remains, otherwise once a client asks again — whatever the reason, and
+without comparing the cached anchor with upstream. An `anchor_corrupt`
+quarantine deleted its anchor rows, so that suite waits for a client's
+request (the final review's R5 #4 and R7 #3: phases A–D's rule, re-adoption
+on the first check that observes anchor bytes different from the cached
+ones, made an R-1 quarantine adopt at the first post-upgrade check and the
+others wait for an upstream change; it no longer applies). With
 `refuse_unvouched_debs = true` their `.deb`s are refused meanwhile whenever
 another current snapshot on the host has complete coverage (C10 treats them
 as unadopted) — documented at upgrade. A legacy plain-text repository then
@@ -2372,7 +2376,7 @@ item depends on a later phase.
 | Trust derived before this release (R-1 pollution, plain-text inline snapshots) survives the upgrade. | §6.1 startup audit quarantines them before serving; resumable; tests on a polluted v6 cache. |
 | The audit misclassifies clean snapshots and quarantines them. | Clean = decodable envelope whose raw and signed declarations agree (true of every real InRelease); tests use realistic multi-section envelopes; a quarantine only degrades the suite to Phase 1 serving until it re-adopts. |
 | One host's failing checks starve other suites. | Fair worker pool with per-host round-robin, healthy-first FIFO classes and a failure streak and backoff persisted across restarts; a stated latency bound pinned by simulation. |
-| The startup audit makes a whole fleet's proxy unavailable. | Only a database error or a missing/empty pool refuses to start; a single unreadable pool file defers that snapshot; the audit is one-time and batched. |
+| The startup audit makes a whole fleet's proxy unavailable. | Only a database error or a missing, empty or foreign pool refuses to start; a single unreadable pool file defers that snapshot; the audit is one-time and batched. |
 | Barrier stalls or times out clients. | Holds only in phase B, ≤ 20 s (< apt's 30 s), one hold at a time, bounded in-flight wait, waiter cap, cross-suite quiet in both phases; `0s` disables; counters. |
 | Suite reaping removes a live suite, or a returning suite cannot re-adopt. | 30-day TTL, touches from anchors/indexes/vouched `.deb`s, compare-and-delete, hourly cap, uptime floor, snapshot retirement; a false reap self-heals on the next request; tests pin it. |
 | New code paths leave a suite silently stuck (freeze-trap class). | An explicit, visible state for every refusal, `POST /forget`, liveness assertions in every simulation. |

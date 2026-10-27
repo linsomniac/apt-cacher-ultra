@@ -51,10 +51,10 @@ type legacyVerdict struct {
 // RunLegacyTrustAudit drains legacy_trust_audit, then records signed-seen
 // markers from tracked suites' cached signed anchors (spec §6.1, C3). main
 // runs it after cache.Open and before GC, the checker or any listener
-// serves. An error means the database failed or the pool is missing or
-// empty (preflightLegacyAudit; deferred minor A-27): the
-// caller refuses to start, nothing in the failed batch was applied, and the
-// audit resumes on the next start. A single unreadable anchor, or a panic
+// serves. An error means the database failed or the pool is missing,
+// empty or holds none of the files checked (preflightLegacyAudit; deferred
+// minor A-27): the caller refuses to start, nothing in the failed batch was
+// applied, and the audit resumes on the next start. A single unreadable anchor, or a panic
 // while auditing one snapshot, is not an error: that snapshot is deferred
 // (left queued, unchanged, ERROR logged). Every error it returns starts
 // "legacy trust audit:" — main's refusal line relies on it (deferred minors
