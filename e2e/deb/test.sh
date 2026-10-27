@@ -16,6 +16,10 @@
 # the unit (ProtectSystem=strict, ReadWritePaths, RestrictNamespaces,
 # NoNewPrivileges, etc.) are NOT exercised. That coverage is the
 # job of step 4 (production deployment) per SPEC §14.
+#
+# Phase 5 checks the maintainer scripts' calls to systemd on a fresh
+# install, an upgrade and a removal, against a stub systemctl (its
+# AIDEV-NOTE says how).
 
 set -euo pipefail
 
@@ -902,4 +906,141 @@ fi
 echo "[deb-test] phase 4 V2 .deb url_path: blob_hash=${v2_blob:0:12}.. last_fetched_at=$v2_lf request_count=$v2_rc"
 
 echo "[deb-test] phase 4 (Phase 3 hot-prefetch) PASS"
+
+# ============================================================
+# Phase 5: the maintainer scripts under systemd (the 2026-09 security
+# review's H-2). A fresh install starts nothing and prints the install
+# message; an upgrade asks systemd for exactly one try-restart (a running
+# daemon moves to the new binary, a stopped one stays stopped), stops
+# nothing first and prints no install message; a failed restart does not
+# fail dpkg; policy-rc.d's "no" is honoured; a removal stops and disables
+# the unit.
+#
+# AIDEV-NOTE: no systemd runs here (see the header), so this phase makes
+# the scripts see one: /run/systemd/system exists, and a systemctl stub
+# first on PATH records each call (its arguments, one line) and succeeds,
+# or fails a try-restart while $stubs/fail-try-restart exists. dpkg passes
+# its PATH on to the maintainer scripts, and deb-systemd-invoke looks
+# systemctl up on it, so the stub sees what systemd would be asked. The
+# image's /usr/sbin/policy-rc.d (exit 101: Docker's images forbid service
+# actions) is moved aside, except while the policy step checks that it is
+# honoured. UPGRADE_FROM names the package to upgrade from (by default
+# this tree's, the /tmp one phase 1 installed); the upgrade goes to
+# /upgrade's, the same binary packaged at a higher version (the
+# Dockerfile's build stage).
+# ============================================================
+
+echo
+echo "[deb-test] phase 5: stop phase-4 daemon"
+stop_daemon
+
+shopt -s nullglob
+upgrade_debs=(/upgrade/apt-cacher-ultra_*.deb)
+shopt -u nullglob
+if [[ ${#upgrade_debs[@]} -ne 1 ]]; then
+    echo "FAIL: expected 1 .deb in /upgrade, got ${#upgrade_debs[@]}: ${upgrade_debs[*]:-<none>}"
+    exit 1
+fi
+new_deb=${upgrade_debs[0]}
+old_deb=${UPGRADE_FROM:-${debs[0]}}
+new_version=$(dpkg-deb -f "$new_deb" Version)
+old_version=$(dpkg-deb -f "$old_deb" Version)
+if dpkg --compare-versions "$new_version" le "$old_version"; then
+    echo "FAIL: phase 5 would upgrade from $old_version to $new_version, which is not newer"
+    exit 1
+fi
+
+stubs=/acu-stubs
+calls=$stubs/calls
+mkdir -p "$stubs" /run/systemd/system
+cat > "$stubs/systemctl" <<'EOF'
+#!/bin/sh
+echo "$*" >> /acu-stubs/calls
+if [ "$1" = try-restart ] && [ -e /acu-stubs/fail-try-restart ]; then
+    echo "systemctl stub: try-restart fails" >&2
+    exit 1
+fi
+exit 0
+EOF
+chmod 0755 "$stubs/systemctl"
+mv /usr/sbin/policy-rc.d /usr/sbin/policy-rc.d.acu
+
+# dpkg_step NAME ARGS...: runs `dpkg ARGS` with the stub first on PATH and
+# an empty call record; its output goes to /tmp/p5.NAME.out, and a dpkg
+# failure fails the test with that output.
+dpkg_step() {
+    local name=$1
+    shift
+    : > "$calls"
+    if ! PATH="$stubs:$PATH" dpkg "$@" > "/tmp/p5.$name.out" 2>&1; then
+        echo "FAIL: phase-5 $name: dpkg $* failed:"
+        cat "/tmp/p5.$name.out"
+        exit 1
+    fi
+}
+
+# expect_count NAME WHAT WANT FILE PATTERN: FILE has WANT lines matching
+# the extended regex PATTERN, or the test fails naming WHAT and showing
+# the step's dpkg output and systemctl calls.
+expect_count() {
+    local name=$1 what=$2 want=$3 file=$4 pattern=$5 got
+    got=$(grep -cE -- "$pattern" "$file" || true)
+    if [[ "$got" -ne "$want" ]]; then
+        echo "FAIL: phase-5 $name: $got $what, want $want"
+        echo "=== dpkg output ==="
+        cat "/tmp/p5.$name.out"
+        echo "=== systemctl calls ==="
+        cat "$calls"
+        exit 1
+    fi
+}
+
+# Any call that starts or restarts a unit, after systemctl's options.
+restarts='^(--[a-z-]+ )*(start|restart|try-restart|reload-or-restart|try-reload-or-restart) '
+message='^apt-cacher-ultra installed\.$'
+
+echo "[deb-test] phase 5: purge the phase-1 install"
+dpkg_step purge --purge apt-cacher-ultra
+
+echo "[deb-test] phase 5: fresh install of $old_version: no restart, the install message"
+dpkg_step install -i "$old_deb"
+expect_count install "start or restart calls" 0 "$calls" "$restarts"
+expect_count install "install messages" 1 /tmp/p5.install.out "$message"
+
+echo "[deb-test] phase 5: upgrade to $new_version: one try-restart, no stop, no install message"
+dpkg_step upgrade -i "$new_deb"
+expect_count upgrade "try-restart calls" 1 "$calls" '^try-restart apt-cacher-ultra\.service$'
+expect_count upgrade "start or restart calls" 1 "$calls" "$restarts"
+expect_count upgrade "stop calls" 0 "$calls" '^(--[a-z-]+ )*stop '
+expect_count upgrade "install messages" 0 /tmp/p5.upgrade.out "$message"
+installed=$(dpkg-query -W -f='${Version}' apt-cacher-ultra)
+if [[ "$installed" != "$new_version" ]]; then
+    echo "FAIL: phase-5 upgrade: installed version is $installed, want $new_version"
+    exit 1
+fi
+
+echo "[deb-test] phase 5: a failed try-restart does not fail dpkg"
+touch "$stubs/fail-try-restart"
+dpkg_step failed-restart -i "$new_deb"
+rm "$stubs/fail-try-restart"
+expect_count failed-restart "try-restart calls" 1 "$calls" '^try-restart apt-cacher-ultra\.service$'
+status=$(dpkg-query -W -f='${Status}' apt-cacher-ultra)
+if [[ "$status" != "install ok installed" ]]; then
+    echo "FAIL: phase-5 failed-restart: package status is '$status', want 'install ok installed'"
+    exit 1
+fi
+
+echo "[deb-test] phase 5: policy-rc.d's 101 is honoured"
+mv /usr/sbin/policy-rc.d.acu /usr/sbin/policy-rc.d
+dpkg_step policy -i "$new_deb"
+mv /usr/sbin/policy-rc.d /usr/sbin/policy-rc.d.acu
+expect_count policy "start or restart calls" 0 "$calls" "$restarts"
+expect_count policy "policy-rc.d refusals" 1 /tmp/p5.policy.out 'policy-rc\.d returned 101'
+
+echo "[deb-test] phase 5: remove: stop and disable"
+dpkg_step remove -r apt-cacher-ultra
+expect_count remove "stop calls" 1 "$calls" '^stop apt-cacher-ultra\.service$'
+expect_count remove "disable calls" 1 "$calls" '^disable apt-cacher-ultra\.service$'
+
+echo "[deb-test] phase 5 (maintainer scripts under systemd) PASS"
 echo "[deb-test] OVERALL PASS"

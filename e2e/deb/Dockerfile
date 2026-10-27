@@ -16,7 +16,9 @@
 #                    package contract, run the daemon to bind :3142,
 #                    THEN restart it under an adoption-mode config,
 #                    drive a freshness fetch through the proxy, and
-#                    assert a snapshot was adopted.
+#                    assert a snapshot was adopted; then (phase 5)
+#                    purge, install and upgrade the package under a
+#                    stub systemctl.
 #
 # The test stage does not run systemd-as-PID-1 (that requires a
 # privileged container + cgroup mounts that vary across kernels and
@@ -53,6 +55,15 @@ RUN mkdir -p /out && VERSION=${VERSION} nfpm pkg \
     --packager deb \
     --config packaging/nfpm.yaml \
     --target /out/apt-cacher-ultra_${VERSION}_amd64.deb
+# The same binary packaged at a higher version, for test.sh's phase 5:
+# `dpkg -i` of it over the package above is an upgrade (the maintainer
+# scripts' upgrade path). Under /out/upgrade/, so the test stage's
+# /out/*.deb copy still finds exactly one package for /tmp.
+ARG UPGRADE_VERSION=0.0.1-e2e
+RUN mkdir -p /out/upgrade && VERSION=${UPGRADE_VERSION} nfpm pkg \
+    --packager deb \
+    --config packaging/nfpm.yaml \
+    --target /out/upgrade/apt-cacher-ultra_${UPGRADE_VERSION}_amd64.deb
 
 # repo-build: produce the signed-fixture inputs that the Phase 2
 # adoption smoke test consumes. Kept separate from `build` because
@@ -117,6 +128,7 @@ RUN apt-get update && \
         sqlite3 && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/*.deb /tmp/
+COPY --from=build /out/upgrade/*.deb /upgrade/
 # Fixture trees (V1 + V2) + signing key + fingerprint. The pubkey is
 # dropped at /etc/apt/trusted.gpg.d/ in test.sh (not here) so the test
 # script owns the install/uninstall cycle around the adoption smoke.
