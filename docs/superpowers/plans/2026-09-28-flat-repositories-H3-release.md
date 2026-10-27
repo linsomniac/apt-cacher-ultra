@@ -1498,15 +1498,16 @@ EOF
 
 ### Task 4: The package upgrade restarts a running daemon
 
-The 2026-09-08 security review's finding H-2 (review C-I4), which the maintainer decided to fix in 1.1.0 (2026-10-27; ruling PH3-8): `packaging/scripts/postinstall.sh` only reloads systemd, so after `apt-get upgrade` the old binary keeps running — `dpkg -l` says the new version — until a reboot or a crash, and the upgrade's migration, trust audit and reaper start at a moment the operator did not choose. `preremove.sh`'s comment says the new package's postinst restarts the service; it does not. This task makes the postinst do what `dh_installsystemd --no-start --restart-after-upgrade` generates (nfpm has no debhelper): on an upgrade, and on dpkg's `abort-*` actions, `deb-systemd-invoke try-restart` — a running daemon moves to the new binary, a stopped one stays stopped, a fresh install starts nothing — guarded by `/run/systemd/system`, never failing the package operation. The install message prints on a fresh install only. It comes before the documentation tasks, which describe it (Tasks 6, 8 and 9).
+The 2026-09-08 security review's finding H-2 (review C-I4), which the maintainer decided to fix in 1.1.0 (2026-10-27; ruling PH3-8): `packaging/scripts/postinstall.sh` only reloads systemd, so after `apt-get upgrade` the old binary keeps running — `dpkg -l` says the new version — until a reboot or a crash, and the upgrade's migration, trust audit and reaper start at a moment the operator did not choose. `preremove.sh`'s comment says the new package's postinst restarts the service; it does not. This task makes the postinst do what `dh_installsystemd --no-start --restart-after-upgrade` generates (nfpm has no debhelper): on an upgrade, and on dpkg's `abort-*` actions, `deb-systemd-invoke try-restart` — a running daemon moves to the new binary, a stopped one stays stopped, a fresh install starts nothing — guarded by `/run/systemd/system`, never failing the package operation. The install hint prints on `configure` unless the unit is enabled: on a fresh install and on a reinstall after a remove, not on the usual upgrade of an enabled unit (execution ruling PH3-17, after the task's review). It comes before the documentation tasks, which describe it (Tasks 6, 8 and 9).
 
 Design (planning research, 2026-10-27, on `ubuntu:24.04` and `ubuntu:26.04`, e2e/deb's images):
 
 - **`deb-systemd-invoke`, not `systemctl`.** `deb-systemd-invoke try-restart` first asks `/usr/sbin/policy-rc.d` (exit 101 forbids service actions — every Docker image of Ubuntu and Debian ships one — and container builds and chroots rely on it), then `exec`s `systemctl try-restart` as it is: only `start` and `restart` get its is-enabled check, so a running unit is restarted whether or not it is enabled, which suits a package that never enables its unit. It is what debhelper's snippet (`postinst-systemd-restartnostart`, Step 1) calls.
 - **No new dependency.** `deb-systemd-invoke` ships in `init-system-helpers`, `Essential: yes` on Ubuntu 22.04 to 26.04 and Debian 11 to 13 (versions 1.60 to 1.69, all six images probed), and current `dh_installsystemd` adds no `init-system-helpers` dependency either.
 - **Upgrading from 1.0.x.** dpkg runs the old package's prerm (`upgrade`), the new preinst, the old postrm (`upgrade`), then the new postinst (`configure <old version>`). 1.0.2's maintainer scripts are this tree's (Step 1's diff is empty): its prerm stops nothing on upgrade and its postrm only reloads systemd, so the daemon runs the old binary until the new postinst's try-restart. Step 7 runs that path with 1.0.2's own package.
-- **The proof without systemd.** e2e/deb runs no systemd (its header says why), so its new phase 5 makes the scripts see one: `/run/systemd/system` exists, and a `systemctl` stub first on `PATH` records each call. dpkg passes its `PATH` on to the maintainer scripts, and `deb-systemd-invoke` finds `systemctl` on it, so the stub sees what systemd would be asked (planning: it does, on both images). The image's `policy-rc.d` is moved aside except for the step that checks it is honoured.
-- **A reinstall after a remove (not a purge)** also passes the removed version as `$2` (dpkg's rule; planning: it does), as for debhelper's packages: nothing runs to restart, and no install message prints, though the remove disabled the unit. Recorded in the postinst's `AIDEV-NOTE`.
+- **The proof without systemd.** e2e/deb runs no systemd (its header says why), so its new phase 5 makes the scripts see one: `/run/systemd/system` exists, and a `systemctl` stub first on `PATH` records each call and keeps the unit's enablement (`enable`, `disable`, `is-enabled`) as systemd does. dpkg passes its `PATH` on to the maintainer scripts, and `deb-systemd-invoke` finds `systemctl` on it, so the stub sees what systemd would be asked (planning: it does, on both images). The image's `policy-rc.d` is moved aside except for the step that checks it is honoured.
+- **A reinstall after a remove (not a purge)** also passes the removed version as `$2` (dpkg's rule; planning: it does), as for debhelper's packages: the remove stopped and disabled the unit, so nothing runs to restart. The task's first commit printed the install hint on a fresh install only (`-z "$2"`), which left such an operator a stopped cache and no hint where 1.0.x printed it on every `configure` (the task's review); so the hint prints on `configure` unless `systemctl is-enabled --quiet` says the unit is enabled, asked only where systemd runs (the restart's guard: `DPKG_ROOT` unset, `/run/systemd/system` present), and without systemd it prints as 1.0.x's did (execution ruling PH3-17). Fix round 1 ran the cases under a real systemd (PID 1, a privileged `ubuntu:24.04` container): a fresh install prints the hint and starts nothing, the upgrade of an enabled unit restarts it and prints none, a reinstall of a running but disabled unit restarts it and prints the hint, `abort-upgrade` restarts and a plain `abort-remove` does not, and a reinstall after a remove prints the hint and starts nothing. Recorded in the postinst's `AIDEV-NOTE`s.
+- **What a failed restart shows.** The `|| :` keeps a failed restart from failing the package operation. systemctl reports only a failed restart *job* (the start rate limit, say): the unit is `Type=simple`, so a new binary that exits at startup completes the job, and dpkg prints nothing; it shows in `systemctl status` and `journalctl -u apt-cacher-ultra`, and `Restart=always` retries it every 5 s (the task's review, under a real systemd; the postinst's `AIDEV-NOTE` says so).
 
 **Files:**
 - Modify: `packaging/scripts/postinstall.sh` (rewritten), `packaging/scripts/preremove.sh` (its comment), `e2e/deb/Dockerfile` (a second package, at a higher version, for the upgrade), `e2e/deb/test.sh` (phase 5)
@@ -1631,8 +1632,9 @@ In `e2e/deb/test.sh`, the header:
 # NoNewPrivileges, etc.) are NOT exercised. That coverage is the
 # job of step 4 (production deployment) per SPEC §14.
 #
-# Phase 5 checks the maintainer scripts' calls to systemd on a fresh
-# install, an upgrade and a removal, against a stub systemctl (its
+# Phase 5 checks the maintainer scripts' calls to systemd, and the
+# install hint, on a fresh install, an upgrade, dpkg's abort-* actions, a
+# removal and a reinstall after it, against a stub systemctl (its
 # AIDEV-NOTE says how).
 ```
 
@@ -1653,21 +1655,27 @@ echo "[deb-test] phase 4 (Phase 3 hot-prefetch) PASS"
 # ============================================================
 # Phase 5: the maintainer scripts under systemd (the 2026-09 security
 # review's H-2). A fresh install starts nothing and prints the install
-# message; an upgrade asks systemd for exactly one try-restart (a running
-# daemon moves to the new binary, a stopped one stays stopped), stops
-# nothing first and prints no install message; a failed restart does not
-# fail dpkg; policy-rc.d's "no" is honoured; a removal stops and disables
-# the unit.
+# message; an upgrade of the enabled unit asks systemd for exactly one
+# try-restart (a running daemon moves to the new binary, a stopped one
+# stays stopped), stops nothing first and prints no install message; a
+# failed restart does not fail dpkg; policy-rc.d's "no" is honoured;
+# abort-upgrade restarts too, a plain abort-remove does not; a removal
+# stops and disables the unit, and a reinstall after it prints the hint
+# again; without systemd the hint prints and systemctl is not called.
 #
 # AIDEV-NOTE: no systemd runs here (see the header), so this phase makes
 # the scripts see one: /run/systemd/system exists, and a systemctl stub
 # first on PATH records each call (its arguments, one line) and succeeds,
-# or fails a try-restart while $stubs/fail-try-restart exists. dpkg passes
-# its PATH on to the maintainer scripts, and deb-systemd-invoke looks
-# systemctl up on it, so the stub sees what systemd would be asked. The
-# image's /usr/sbin/policy-rc.d (exit 101: Docker's images forbid service
-# actions) is moved aside, except while the policy step checks that it is
-# honoured. UPGRADE_FROM names the package to upgrade from (by default
+# or fails a try-restart while $stubs/fail-try-restart exists. It keeps
+# the unit's enablement as systemd would: enable creates $stubs/enabled,
+# disable deletes it, and is-enabled succeeds only while it exists (the
+# postinst asks it before printing the install hint). dpkg passes its PATH
+# on to the maintainer scripts, and deb-systemd-invoke looks systemctl up
+# on it, so the stub sees what systemd would be asked. The image's
+# /usr/sbin/policy-rc.d (exit 101: Docker's images forbid service actions)
+# is moved aside, except while the policy step checks that it is honoured.
+# The abort-* and no-systemd steps run the installed postinst directly, as
+# dpkg would. UPGRADE_FROM names the package to upgrade from (by default
 # this tree's, the /tmp one phase 1 installed); the upgrade goes to
 # /upgrade's, the same binary packaged at a higher version (the
 # Dockerfile's build stage).
@@ -1703,6 +1711,11 @@ if [ "$1" = try-restart ] && [ -e /acu-stubs/fail-try-restart ]; then
     echo "systemctl stub: try-restart fails" >&2
     exit 1
 fi
+case $1 in
+    enable) touch /acu-stubs/enabled ;;
+    disable) rm -f /acu-stubs/enabled ;;
+    is-enabled) [ -e /acu-stubs/enabled ] || exit 1 ;;
+esac
 exit 0
 EOF
 chmod 0755 "$stubs/systemctl"
@@ -1722,15 +1735,28 @@ dpkg_step() {
     fi
 }
 
+# postinst_step NAME ARGS...: runs the installed package's postinst with
+# ARGS, as dpkg would, otherwise as dpkg_step.
+postinst_step() {
+    local name=$1
+    shift
+    : > "$calls"
+    if ! PATH="$stubs:$PATH" /var/lib/dpkg/info/apt-cacher-ultra.postinst "$@" > "/tmp/p5.$name.out" 2>&1; then
+        echo "FAIL: phase-5 $name: postinst $* failed:"
+        cat "/tmp/p5.$name.out"
+        exit 1
+    fi
+}
+
 # expect_count NAME WHAT WANT FILE PATTERN: FILE has WANT lines matching
 # the extended regex PATTERN, or the test fails naming WHAT and showing
-# the step's dpkg output and systemctl calls.
+# the step's output (dpkg's, or the postinst's) and systemctl calls.
 expect_count() {
     local name=$1 what=$2 want=$3 file=$4 pattern=$5 got
     got=$(grep -cE -- "$pattern" "$file" || true)
     if [[ "$got" -ne "$want" ]]; then
         echo "FAIL: phase-5 $name: $got $what, want $want"
-        echo "=== dpkg output ==="
+        echo "=== the step's output ==="
         cat "/tmp/p5.$name.out"
         echo "=== systemctl calls ==="
         cat "$calls"
@@ -1750,7 +1776,10 @@ dpkg_step install -i "$old_deb"
 expect_count install "start or restart calls" 0 "$calls" "$restarts"
 expect_count install "install messages" 1 /tmp/p5.install.out "$message"
 
-echo "[deb-test] phase 5: upgrade to $new_version: one try-restart, no stop, no install message"
+# The operator follows the hint: from here the stub's is-enabled succeeds.
+PATH="$stubs:$PATH" systemctl enable apt-cacher-ultra.service
+
+echo "[deb-test] phase 5: upgrade to $new_version, unit enabled: one try-restart, no stop, no install message"
 dpkg_step upgrade -i "$new_deb"
 expect_count upgrade "try-restart calls" 1 "$calls" '^try-restart apt-cacher-ultra\.service$'
 expect_count upgrade "start or restart calls" 1 "$calls" "$restarts"
@@ -1780,16 +1809,45 @@ mv /usr/sbin/policy-rc.d /usr/sbin/policy-rc.d.acu
 expect_count policy "start or restart calls" 0 "$calls" "$restarts"
 expect_count policy "policy-rc.d refusals" 1 /tmp/p5.policy.out 'policy-rc\.d returned 101'
 
+# dpkg runs the installed postinst with abort-upgrade NEW-VERSION when an
+# upgrade to NEW-VERSION fails, and with a plain abort-remove when a
+# removal's prerm fails. debhelper's snippet restarts only when $2 is set,
+# and a plain abort-remove has none.
+echo "[deb-test] phase 5: abort-upgrade: one try-restart; a plain abort-remove: none"
+postinst_step abort-upgrade abort-upgrade 9.9.9~e2e
+expect_count abort-upgrade "try-restart calls" 1 "$calls" '^try-restart apt-cacher-ultra\.service$'
+expect_count abort-upgrade "start or restart calls" 1 "$calls" "$restarts"
+expect_count abort-upgrade "install messages" 0 /tmp/p5.abort-upgrade.out "$message"
+postinst_step abort-remove abort-remove
+expect_count abort-remove "start or restart calls" 0 "$calls" "$restarts"
+
 echo "[deb-test] phase 5: remove: stop and disable"
 dpkg_step remove -r apt-cacher-ultra
 expect_count remove "stop calls" 1 "$calls" '^stop apt-cacher-ultra\.service$'
 expect_count remove "disable calls" 1 "$calls" '^disable apt-cacher-ultra\.service$'
 
+# A remove keeps the package's configuration (dpkg's config-files state),
+# so the reinstall is a configure with $2 set, as on an upgrade; the remove
+# disabled the unit, so the hint prints again.
+echo "[deb-test] phase 5: reinstall after the remove: the install message"
+dpkg_step reinstall -i "$new_deb"
+expect_count reinstall "install messages" 1 /tmp/p5.reinstall.out "$message"
+
+# Without systemd the postinst asks it nothing, so the hint prints even
+# though the stub would now answer "enabled".
+PATH="$stubs:$PATH" systemctl enable apt-cacher-ultra.service
+echo "[deb-test] phase 5: no systemd: no systemctl call, the install message"
+rmdir /run/systemd/system
+postinst_step no-systemd configure "$old_version"
+mkdir /run/systemd/system
+expect_count no-systemd "systemctl calls" 0 "$calls" '.'
+expect_count no-systemd "install messages" 1 /tmp/p5.no-systemd.out "$message"
+
 echo "[deb-test] phase 5 (maintainer scripts under systemd) PASS"
 echo "[deb-test] OVERALL PASS"
 ```
 
-What each check pins: the fresh install (from a purge) calls no `start`/`restart`/`try-restart` and prints the install message once; the upgrade calls exactly one `try-restart apt-cacher-ultra.service`, no other start or restart and no `stop`, prints no install message, and leaves the new version installed; a `try-restart` that fails leaves dpkg's exit status 0 and the package `install ok installed`; with the image's `policy-rc.d` (exit 101) in place, no restart reaches `systemctl` and `deb-systemd-invoke`'s refusal is printed; a removal calls `stop` and `disable` once each (`preremove.sh`, unchanged). The `restarts` pattern allows `systemctl`'s leading options, so a `deb-systemd-invoke restart` (which calls `systemctl --quiet restart …`) would count too.
+What each check pins: the fresh install (from a purge) calls no `start`/`restart`/`try-restart` and prints the install message once; the operator then enables the unit (the stub's `enable`); the upgrade calls exactly one `try-restart apt-cacher-ultra.service`, no other start or restart and no `stop`, prints no install message (the unit is enabled), and leaves the new version installed; a `try-restart` that fails leaves dpkg's exit status 0 and the package `install ok installed`; with the image's `policy-rc.d` (exit 101) in place, no restart reaches `systemctl` and `deb-systemd-invoke`'s refusal is printed; the installed postinst, run as dpkg runs it when an upgrade fails (`abort-upgrade 9.9.9~e2e`), calls one `try-restart` and prints no install message, and with a plain `abort-remove` (no `$2`) restarts nothing; a removal calls `stop` and `disable` once each (`preremove.sh`, unchanged), and the reinstall after it prints the install message again (the remove disabled the unit); with `/run/systemd/system` absent and the unit enabled again, `configure` calls `systemctl` not at all and prints the install message. The `restarts` pattern allows `systemctl`'s leading options, so a `deb-systemd-invoke restart` (which calls `systemctl --quiet restart …`) would count too.
 
 - [ ] **Step 3: Run it to see it fail (the current postinst restarts nothing)**
 
@@ -1801,12 +1859,12 @@ Expected, for each image (planning, 2026-10-27: about 1 to 1.5 minutes an image 
 [deb-test] phase 5: stop phase-4 daemon
 [deb-test] phase 5: purge the phase-1 install
 [deb-test] phase 5: fresh install of 0.0.0~e2e: no restart, the install message
-[deb-test] phase 5: upgrade to 0.0.1~e2e: one try-restart, no stop, no install message
+[deb-test] phase 5: upgrade to 0.0.1~e2e, unit enabled: one try-restart, no stop, no install message
 FAIL: phase-5 upgrade: 0 try-restart calls, want 1
 [deb-test] ubuntu:24.04 FAIL (test)
 ```
 
-(and the same for `ubuntu:26.04`), then `[deb-test] OVERALL FAIL: 24.04:test 26.04:test`. The failure prints the step's dpkg output — with today's install message after `Setting up apt-cacher-ultra (0.0.1~e2e)`, which the upgrade will no longer print — and the stub's calls: `daemon-reload` twice (the old package's postrm and the new postinst), nothing else. nfpm turns the semantic versions `0.0.0-e2e` and `0.0.1-e2e` into the Debian versions `0.0.0~e2e` and `0.0.1~e2e`.
+(and the same for `ubuntu:26.04`), then `[deb-test] OVERALL FAIL: 24.04:test 26.04:test`. The failure prints the step's output — dpkg's, with today's install message after `Setting up apt-cacher-ultra (0.0.1~e2e)`, which the upgrade will no longer print — and the stub's calls: `daemon-reload` twice (the old package's postrm and the new postinst), nothing else. nfpm turns the semantic versions `0.0.0-e2e` and `0.0.1-e2e` into the Debian versions `0.0.0~e2e` and `0.0.1~e2e`.
 
 - [ ] **Step 4: The postinst, and preremove's comment**
 
@@ -1834,11 +1892,14 @@ chmod 0750 /var/cache/apt-cacher-ultra
 # or not it is enabled. It ships in init-system-helpers, Essential: yes on
 # every supported release (Ubuntu 22.04-26.04, Debian 11-13), so the
 # package needs no dependency for it. A failed restart never fails the
-# package operation: systemctl's error is printed, journalctl -u
-# apt-cacher-ultra says why, and the unit's Restart=always keeps trying.
-# A reinstall after a remove (not a purge) also passes $2, as with
-# debhelper: nothing is running to restart, and no message is printed,
-# though the remove disabled the unit.
+# package operation. systemctl reports only a failed restart job (the start
+# rate limit, say); a new binary that exits at startup is not seen here
+# (Type=simple: the job is done once the process is forked), only in
+# `systemctl status` / `journalctl -u apt-cacher-ultra`, and the unit's
+# Restart=always retries it every 5 s. A reinstall after a remove (not a
+# purge) also passes $2, as with debhelper: the remove stopped and disabled
+# the unit, so there is nothing to restart, and the install hint below
+# prints again.
 if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] || [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ]; then
     if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
         systemctl --system daemon-reload >/dev/null 2>&1 || :
@@ -1848,7 +1909,21 @@ if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] || [ "$1" = "abort-decon
     fi
 fi
 
-if [ "$1" = "configure" ] && [ -z "$2" ]; then
+# unit_enabled: true only where systemd runs (the guard above) and reports
+# the unit enabled. Called only as an if condition, so a systemctl that
+# answers "disabled" or "not-found" (exit 1) cannot trip set -e.
+unit_enabled() {
+    [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ] &&
+        systemctl is-enabled --quiet apt-cacher-ultra.service >/dev/null 2>&1
+}
+
+# AIDEV-NOTE: the install hint prints on configure unless the unit is
+# enabled: on a fresh install, and on a reinstall after a remove (whose
+# prerm disabled the unit; 1.0.x printed the hint on every configure), but
+# not on the usual upgrade of an enabled unit. Without systemd (a container,
+# a chroot, DPKG_ROOT) systemctl is not asked, so the hint prints, as
+# 1.0.x's did. Not on the abort-* actions: they install nothing.
+if [ "$1" = "configure" ] && ! unit_enabled; then
     cat <<'EOF'
 apt-cacher-ultra installed.
 Edit /etc/apt-cacher-ultra/config.toml, then:
@@ -1889,10 +1964,13 @@ Expected, for each image:
 [deb-test] phase 5: stop phase-4 daemon
 [deb-test] phase 5: purge the phase-1 install
 [deb-test] phase 5: fresh install of 0.0.0~e2e: no restart, the install message
-[deb-test] phase 5: upgrade to 0.0.1~e2e: one try-restart, no stop, no install message
+[deb-test] phase 5: upgrade to 0.0.1~e2e, unit enabled: one try-restart, no stop, no install message
 [deb-test] phase 5: a failed try-restart does not fail dpkg
 [deb-test] phase 5: policy-rc.d's 101 is honoured
+[deb-test] phase 5: abort-upgrade: one try-restart; a plain abort-remove: none
 [deb-test] phase 5: remove: stop and disable
+[deb-test] phase 5: reinstall after the remove: the install message
+[deb-test] phase 5: no systemd: no systemctl call, the install message
 [deb-test] phase 5 (maintainer scripts under systemd) PASS
 [deb-test] OVERALL PASS
 [deb-test] ubuntu:24.04 PASS
@@ -1902,15 +1980,18 @@ Expected, for each image:
 
 - [ ] **Step 6: Its mutants**
 
-Each mutant (one at a time, reverted after) fails phase 5 with Step 3's command, at the line shown (the test prints the step's dpkg output and calls after it):
+Each mutant (one at a time) fails phase 5 with Step 3's command, at the line shown (the test prints the step's output and calls after it). Run each in its own scratch copy of the tree (`rsync -a --exclude=.git` of the worktree into the scratchpad, the one line changed there, `make deb-test` run from the copy), so the worktree never holds a mutant:
 
-| Mutant of `postinstall.sh` | Fails with |
-|---|---|
-| the restart line replaced by `:` (deleting it leaves an empty `then`, a syntax error dpkg reports at the first install) | `FAIL: phase-5 upgrade: 0 try-restart calls, want 1` |
-| `systemctl try-restart` in place of `deb-systemd-invoke try-restart` | `FAIL: phase-5 policy: 1 start or restart calls, want 0` |
-| the install message unconditional (its `if` reduced to `if [ "$1" = "configure" ]; then`) | `FAIL: phase-5 upgrade: 1 install messages, want 0` |
+| Mutant of `postinstall.sh` | Images | Fails with |
+|---|---|---|
+| the restart line replaced by `:` (deleting it leaves an empty `then`, a syntax error dpkg reports at the first install) | both | `FAIL: phase-5 upgrade: 0 try-restart calls, want 1` |
+| `systemctl try-restart` in place of `deb-systemd-invoke try-restart` | 24.04 | `FAIL: phase-5 policy: 1 start or restart calls, want 0` |
+| the `abort-*` actions dropped from the restart's condition (`if [ "$1" = "configure" ]; then`) | both | `FAIL: phase-5 abort-upgrade: 0 try-restart calls, want 1` |
+| the hint's condition as the task's first commit had it (`if [ "$1" = "configure" ] && [ -z "$2" ]; then`) | both | `FAIL: phase-5 reinstall: 0 install messages, want 1` |
+| the hint on every `configure` (`if [ "$1" = "configure" ]; then`) | 24.04 | `FAIL: phase-5 upgrade: 1 install messages, want 0` |
+| `unit_enabled` without the systemd guard (only its `systemctl is-enabled` line) | 24.04 | `FAIL: phase-5 no-systemd: 1 systemctl calls, want 0` |
 
-The first is the ruling's red, run on both images (planning: both failed as shown); the other two need only `UBUNTU_VERSIONS=24.04` (planning: as shown). Restore the file; `git diff --no-ext-diff packaging/` then shows only Step 4's change.
+The first is the ruling's red; it and the third and fourth (fix round 1, ruling PH3-17) ran on both images and failed as shown on each, the others on `UBUNTU_VERSIONS=24.04`, as shown. `git diff --no-ext-diff packaging/` shows only Step 4's change.
 
 - [ ] **Step 7: The upgrade from 1.0.2, with its own package**
 
@@ -1935,10 +2016,13 @@ Expected:
 [deb-test] phase 5: stop phase-4 daemon
 [deb-test] phase 5: purge the phase-1 install
 [deb-test] phase 5: fresh install of 1.0.2: no restart, the install message
-[deb-test] phase 5: upgrade to 1.1.0~e2e: one try-restart, no stop, no install message
+[deb-test] phase 5: upgrade to 1.1.0~e2e, unit enabled: one try-restart, no stop, no install message
 [deb-test] phase 5: a failed try-restart does not fail dpkg
 [deb-test] phase 5: policy-rc.d's 101 is honoured
+[deb-test] phase 5: abort-upgrade: one try-restart; a plain abort-remove: none
 [deb-test] phase 5: remove: stop and disable
+[deb-test] phase 5: reinstall after the remove: the install message
+[deb-test] phase 5: no systemd: no systemctl call, the install message
 [deb-test] phase 5 (maintainer scripts under systemd) PASS
 [deb-test] OVERALL PASS
 ```
@@ -1979,6 +2063,44 @@ nothing else, a failing restart leaves dpkg green, policy-rc.d's 101 is
 honoured, and a removal stops and disables. Red without the restart
 line on ubuntu:24.04 and 26.04, green after; the upgrade from 1.0.2's
 own package passes the same phase.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
+As executed, Task 4 is two commits: the one above (3e4bb80) and, after the task's review, its fix round 1 (bbfbd28, execution ruling PH3-17): the install hint unless the unit is enabled, the `AIDEV-NOTE` on what a failed restart shows, and phase 5's `abort-*`, reinstall and no-systemd steps, as Steps 2 and 4 now show them. Steps 3, 5, 6 and 7's expected outputs are the as-built runs (fix round 1, 2026-10-27).
+
+```bash
+git add packaging/scripts/postinstall.sh e2e/deb/test.sh
+git commit -F - <<'EOF'
+Package: the install hint unless the unit is enabled; phase 5 covers abort-*
+
+Task 4's review (fix round 1, ruling PH3-17):
+
+- The postinst printed its install hint only on a fresh install, so a
+  reinstall after apt remove (not purge), whose prerm disabled the unit,
+  left a stopped cache and no hint, where 1.0.x printed it on every
+  configure. It now prints on configure unless the unit is enabled:
+  where systemd runs, `systemctl is-enabled --quiet` decides (inside the
+  if, so set -e is safe); without systemd it prints, as 1.0.x's did. The
+  usual upgrade of an enabled unit stays silent.
+- The AIDEV-NOTE said a failed restart's error is printed. systemctl
+  reports only a failed restart job; a new binary that exits at startup
+  (Type=simple) shows only in systemctl status and journalctl, and
+  Restart=always retries it.
+- e2e/deb's phase 5 never exercised the abort-* actions. It now runs the
+  installed postinst with abort-upgrade (one try-restart) and a plain
+  abort-remove (none), checks the hint after a remove and reinstall and
+  without systemd (no systemctl call), and its stub keeps the unit's
+  enablement (enable, disable, is-enabled) as systemd does.
+
+Red, each in a scratch copy: the abort-* actions dropped from the
+restart condition (abort-upgrade: 0 try-restart calls, want 1) and Task
+4's hint condition (reinstall: 0 install messages, want 1), on ubuntu
+24.04 and 26.04; the hint ignoring is-enabled, and is-enabled asked
+without systemd, on 24.04; Task 4's two restart mutants still fail.
+Green on both images, and from 1.0.2's own package. Under a real
+systemd (PID 1, 24.04) the same cases behave as the stub models them.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
