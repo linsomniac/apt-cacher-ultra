@@ -1123,8 +1123,12 @@ host name in `listen`. That stops DNS rebinding against them: a web
 page whose own name is made to resolve to the listener's address. Call
 them by IP address (`http://127.0.0.1:6789/…`), as `localhost`, or by
 the host name in `listen`. Behind a reverse proxy that forwards the
-client's `Host`, set `htpasswd_file` or have the proxy send
-`Host: 127.0.0.1`. The status page, `/metrics`, `/healthz` and the
+client's `Host`, set `htpasswd_file`, or have the proxy send
+`Host: 127.0.0.1` only where a rebinding page cannot reach it: behind
+TLS at the proxy (a page under another name fails the certificate
+check), or in a server block that matches the proxy's own name — never
+in a default or catch-all one, which would pass a rebinding page's
+requests on as if they named the address. The status page, `/metrics`, `/healthz` and the
 profiling routes have no `Host` check, so a Prometheus server may scrape
 by name, and without `htpasswd_file` a rebinding page can still read
 them.
@@ -1203,7 +1207,8 @@ the mutating endpoints' checks described under
 [`[admin]`](#admin-status-metrics-and-maintenance): the header
 `X-ACU-Admin: 1`, no browser request from another origin, and, without
 `htpasswd_file`, an IP address, `localhost` or `listen`'s host name as
-the host. From `curl` and scripts, that means sending the header:
+the host. From `curl` and scripts, that means sending the header, and,
+with `htpasswd_file` set, the credentials (`-u user`):
 
 ```sh
 curl -sS --fail-with-body -X POST http://127.0.0.1:6789/forget -H 'X-ACU-Admin: 1' \
@@ -1214,6 +1219,7 @@ curl -sS --fail-with-body -X POST http://127.0.0.1:6789/forget -H 'X-ACU-Admin: 
 #   names the suite, the signed-path records deleted and the suites that kept them
 # 400 = host or suite missing, a scheme other than http or https, a host
 #   holding scheme:// (pass the scheme in scheme), or a body that is not a form
+# 401 = htpasswd_file is set and the credentials are missing or wrong (add -u user)
 # 413 = a body over 8 KiB
 # 403 = the header is missing, a browser request from another origin, or,
 #   without htpasswd_file, a host name other than localhost or listen's (use the address)

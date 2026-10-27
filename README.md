@@ -342,15 +342,17 @@ gap), two ways:
   snapshot. Nothing to do; this is on by default (`[adoption].repair_skipped_members`).
 - **On demand** — force an immediate reconcile of one suite through the admin
   listener (default `127.0.0.1:6789`; protect it with `admin.htpasswd_file`
-  and/or the bind address). `host` and `suite` are the canonical host and suite
-  path as they appear in the daemon's `adoption_success` / freshness logs;
-  `scheme` is optional (default `https`). The request needs the header
+  and/or the bind address). Pass the scheme, host and suite path the status
+  page shows: its Host column reads `scheme://host`, so the part before `://`
+  is `scheme` (optional, default `https`; Debian's and Ubuntu's default
+  sources are `http`) and the rest is `host`. The request needs the header
   `X-ACU-Admin: 1` and, without `admin.htpasswd_file`, must name the listener
   by IP address, as `localhost` or by the host name in `admin.listen` (see
   [the admin listener's checks](docs/configuration.md#admin-status-metrics-and-maintenance)):
 
 ```sh
 curl -sS -X POST http://127.0.0.1:6789/reconcile -H 'X-ACU-Admin: 1' \
+    --data-urlencode 'scheme=https' \
     --data-urlencode 'host=packages.microsoft.com' \
     --data-urlencode 'suite=/ubuntu/24.04/prod/dists/noble'
 # 202 Accepted = reconcile triggered (runs asynchronously)
@@ -360,7 +362,8 @@ curl -sS -X POST http://127.0.0.1:6789/reconcile -H 'X-ACU-Admin: 1' \
 #       (add -u user)
 # 403 = the header is missing, a browser request from another origin, or
 #       another host name without admin.htpasswd_file
-# 409 = busy, unknown suite, no current snapshot, or no free adoption slot
+# 409 = busy, adoption disabled, unknown suite (check the scheme), no current
+#       snapshot, or no free adoption slot
 # 413 = a body over 8 KiB
 ```
 
