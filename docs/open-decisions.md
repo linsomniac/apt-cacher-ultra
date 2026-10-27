@@ -137,6 +137,15 @@ this section once 1.1.0-rc1 is tagged):
   `go 1.25.0`, the language version and GODEBUG defaults the code was
   tested with; CI's golangci-lint moved from v2.12.2, which cannot read
   Go 1.27's export data, to v2.14.0. Done in the H3 plan's Task 5.
+  For the next bump,
+  `grep -rn "go-version: '\|FROM golang:\|golang:1\.\|version: v2\." .github e2e`
+  finds every pin: the seven Go pins (`ci.yaml`'s two `go-version` lines,
+  `release.yaml`'s, and the `FROM golang:` lines of `e2e/flat`, `e2e/deb`,
+  `e2e/live` and `e2e/Dockerfile.cache`), CI's golangci-lint `version:`,
+  and the image named in `e2e/flat/README.md` and in
+  `e2e/Dockerfile.cache`'s header comment. The lint pin is coupled to the
+  Go version: golangci-lint must read the new toolchain's export data
+  (v2.14 or later for Go 1.27), so it moves with every Go bump.
 - **The package upgrade restarts a running daemon** (the maintainer,
   2026-10-27, for 1.1.0; raised 2026-09-08, the security review's finding
   H-2). `packaging/scripts/postinstall.sh` runs `deb-systemd-invoke
