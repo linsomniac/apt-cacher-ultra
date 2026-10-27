@@ -49,7 +49,7 @@ name.
 
 The output names the step that failed and prints what it saw: apt's
 output, the suites' status entries, or a strict control's coverage lines,
-then the daemon log's tail.
+then the daemon log's tail, its `admin_request` lines left out.
 
 - **The vendor:** a key that does not download or no longer signs (apt
   prints `NO_PUBKEY`, and the daemon's adoption fails its signature

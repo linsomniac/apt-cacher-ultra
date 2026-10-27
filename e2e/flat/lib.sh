@@ -114,10 +114,27 @@ show_logs() {
         echo "=== the daemon log's first panic, conflict or crash lines (panics_in_log)"
         printf '%s\n' "$p"
     fi
-    echo "=== daemon log tail ($DAEMON_LOG)"
-    tail -n 80 "$DAEMON_LOG" 2>/dev/null | sed -E 's/ client_addr=[^ ]+//' || true
+    echo "=== daemon log tail ($DAEMON_LOG; admin_request lines left out)"
+    daemon_log_tail 80 "$DAEMON_LOG" 2>/dev/null | sed -E 's/ client_addr=[^ ]+//' || true
     echo "=== nginx access log tail ($NGINX_LOG)"
     tail -n 30 "$NGINX_LOG" 2>/dev/null || true
+}
+
+# daemon_log_tail N LOG: the last N lines of the daemon log LOG that are not
+# admin_request lines, then how many admin_request lines it left out of the
+# span those N cover. The harnesses poll the status page once or twice a
+# second, and each fetch logs an admin_request line at INFO, so a plain tail
+# after a bounded wait is mostly those (final review R8 #3); the scenario
+# marks (e2e_harness) stay.
+daemon_log_tail() {
+    awk -v n="$1" '
+        (" " $0 " ") ~ / msg=admin_request / { admin++; next }
+        { buf[kept % n] = $0; before[kept % n] = admin; kept++ }
+        END {
+            first = kept > n ? kept - n : 0
+            for (i = first; i < kept; i++) print buf[i % n]
+            printf "=== %d admin_request line(s) left out of that tail\n", admin - (kept ? before[first % n] : 0)
+        }' "$2"
 }
 
 # scenario NAME DESCRIPTION: starts a scenario; log assertions that pass

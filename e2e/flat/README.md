@@ -208,8 +208,9 @@ Every wait is bounded:
 Every curl has a time limit: 10 s, or 35 s for an anchor through the
 proxy, which a flip can hold for 20 s. A failure prints the scenario,
 whether the daemon is still running, the daemon log's first panic or
-crash lines if it has any, the last 80 lines of the daemon's log and the
-last 30 of nginx's access log. An unexpected exit, such as a `set -e`
+crash lines if it has any, the last 80 lines of the daemon's log but its
+`admin_request` lines (with how many it left out) and the last 30 of
+nginx's access log. An unexpected exit, such as a `set -e`
 exit, also prints the failing command and its call chain.
 
 The daemon runs as four processes in turn: from setup to `commit-delay`,
@@ -284,8 +285,9 @@ The failure message names the scenario. It then prints:
   reads as whatever poll or update was running);
 - the daemon log's first panic, conflict or crash lines, if it has any,
   since a long crash trace can push its `panic:` line out of the tail;
-- the last 80 lines of the daemon's log and the last 30 of nginx's access
-  log.
+- the last 80 lines of the daemon's log, leaving out its `admin_request`
+  lines (each status poll logs one; a count says how many), and the last
+  30 of nginx's access log.
 
 An unexpected exit also prints the failing command and its call chain,
 each function with the file and line that called it. The command is the
