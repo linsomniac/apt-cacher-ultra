@@ -1721,7 +1721,11 @@ At most 64 waiters per host, each waiting request counting (coalesced
 requests for one `.deb` included); beyond that the refusal is immediate —
 unless nothing is in flight any more, which is checked first: a request
 that arrives as the host's last adoption ends, while its waiters still
-unwind, re-runs its lookup (phase H1, deferred minor E-58).
+unwind, re-runs its lookup (phase H1, deferred minor E-58). With nothing
+in flight, both paths still re-run the lookup once, at once and without
+waiting, before refusing: an adoption that committed the vouching rows and
+ended between the lookup and the in-flight check is seen by then, since
+its count ends after its commit (final review R1 #2).
 
 Documented consequences: a client fetching N unvouched packages one
 after another during a long adoption waits up to 15 s for each (M-11); an

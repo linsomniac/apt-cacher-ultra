@@ -17,12 +17,14 @@ import (
 
 // fakeAdoptions is a handler.AdoptionWaiter: inFlight answers
 // AdoptionsInFlight (asks counts the calls: one per strict-mode refusal
-// the miss path's runFetch considers); WaitHostAdoptions records the
+// the miss path's runFetch considers), after it runs asked (an adoption
+// that ends just before the count is read); WaitHostAdoptions records the
 // request's age, runs during (the adoption that finishes while the request
 // waits) and returns ok.
 type fakeAdoptions struct {
 	inFlight bool
 	ok       bool
+	asked    func()
 	during   func()
 	waits    atomic.Int32
 	asks     atomic.Int32
@@ -30,7 +32,13 @@ type fakeAdoptions struct {
 	ages     []time.Duration // time.Since(start) at each wait
 }
 
-func (f *fakeAdoptions) AdoptionsInFlight(string) bool { f.asks.Add(1); return f.inFlight }
+func (f *fakeAdoptions) AdoptionsInFlight(string) bool {
+	f.asks.Add(1)
+	if f.asked != nil {
+		f.asked()
+	}
+	return f.inFlight
+}
 
 func (f *fakeAdoptions) WaitHostAdoptions(_ context.Context, _ string, start time.Time) bool {
 	f.mu.Lock()
@@ -198,6 +206,46 @@ func TestServeHTTP_StrictHitWaitsForAnAdoptionInFlight(t *testing.T) {
 	}
 	if a.waits.Load() != 1 {
 		t.Fatalf("waited %d times, want 1", a.waits.Load())
+	}
+}
+
+// Final review R1 #2: an adoption that commits the rows vouching for a
+// .deb and ends between the strict-mode lookup and the in-flight pre-check
+// (here, just before the pre-check reads the count) leaves nothing to wait
+// for (E-59), so the request looks up once more, without waiting, before
+// it refuses: the adoption's count ends after its commit, so the second
+// lookup sees the rows. On the hit path and on the miss path's check
+// before the download.
+func TestServeHTTP_StrictRefusalLooksUpOnceMoreWhenTheAdoptionJustEnded(t *testing.T) {
+	for _, path := range []string{"hit", "miss"} {
+		t.Run(path, func(t *testing.T) {
+			a := &fakeAdoptions{}
+			h, logs, srvURL, scheme, canon := strictWaitRig(t, a)
+			deb := []byte("upstream bytes") // the rig's upstream body
+			if path == "hit" {
+				deb = []byte("a cached .deb")
+				blob := writeBlob(t, h, deb)
+				if err := h.cache.PutURLPath(context.Background(), cache.URLPath{CanonicalScheme: scheme, CanonicalHost: canon,
+					Path: waitDebPath, BlobHash: &blob, UpstreamURL: srvURL + waitDebPath}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var once sync.Once
+			a.asked = func() {
+				once.Do(func() { commitVouching(t, h, scheme, canon, "/dists/new", waitDebPath, sha256Hex(deb)) })
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, proxyReq("GET", srvURL, waitDebPath))
+			if rec.Code != http.StatusOK || rec.Body.String() != string(deb) {
+				t.Fatalf("status %d body %q, want the .deb a snapshot committed before the refusal vouches", rec.Code, rec.Body.String())
+			}
+			if n := a.waits.Load(); n != 0 {
+				t.Fatalf("waited %d times, want 0 (nothing in flight)", n)
+			}
+			if n := len(logs.find("unvouched_deb_refused")); n != 0 {
+				t.Fatalf("%d unvouched_deb_refused events, want 0", n)
+			}
+		})
 	}
 }
 

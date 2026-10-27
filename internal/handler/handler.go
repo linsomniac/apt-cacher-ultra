@@ -1052,7 +1052,8 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 // refusal first wait for the host's signed adoptions in flight and run
 // the lookup once more (spec C10: at most 15 s and at most 25 s since the
 // request started at start, at most 64 waiters per host, beyond which the
-// refusal is immediate). A request whose context ended during the wait
+// refusal is immediate) — with none in flight, run it once more at once
+// (final review R1 #2). A request whose context ended during the wait
 // is answered 503 with outcome client_canceled (design note 31).
 func (h *Handler) checkPackageHashWait(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string, start time.Time, mayWait bool) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
 	rows, err := h.cache.DeclaredHashesForPath(r.Context(),
@@ -1104,7 +1105,23 @@ func (h *Handler) checkPackageHashWait(w http.ResponseWriter, r *http.Request, r
 			clientLeft(w, r)
 			return true, "client_canceled", http.StatusServiceUnavailable, 0, false, packageValidation{}
 		case strictRefuse:
-			if mayWait && h.adoptions != nil && h.adoptions.AdoptionsInFlight(req.CanonicalHost) {
+			if mayWait && h.adoptions != nil {
+				if !h.adoptions.AdoptionsInFlight(req.CanonicalHost) {
+					// Final review R1 #2: nothing to wait for (E-59), but
+					// an adoption may have committed the rows that vouch
+					// for this .deb and ended since the lookup above: look
+					// up once more, at once, before refusing.
+					//
+					// AIDEV-NOTE: this relies on an adoption's in-flight
+					// count ending after its commit (freshness inflight.go),
+					// so a count that reads zero here comes after any
+					// commit it covered. One more pair of reads per refusal
+					// with nothing in flight; mayWait=false: no wait and no
+					// third lookup. A context that ended meanwhile is
+					// answered client_canceled by the lookups themselves
+					// (FW-5 (a)), never failed open.
+					return h.checkPackageHashWait(w, r, req, blobHash, start, false)
+				}
 				waited := h.adoptions.WaitHostAdoptions(r.Context(), req.CanonicalHost, start)
 				// A client that left during the wait gets no retry, as on
 				// the miss path (design note 31): 503, client_canceled.
@@ -2013,44 +2030,9 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 	// strict-mode refusal that has to wait for a host slot is fine:
 	// strict mode is opt-in and the 502 carries Retry-After: 60.
 	if !req.IsMetadata {
-		rows, derr := h.cache.DeclaredHashesForPath(ctx,
-			req.CanonicalScheme, req.CanonicalHost, req.Path)
-		if derr == nil {
-			distinct := distinctDeclared(rows)
-			if len(distinct) >= 2 {
-				h.logger.Error("package_hash_conflict",
-					"canonical_host", req.CanonicalHost,
-					"path", req.Path,
-					"fetched", false,
-					"declared", declaredAttrs(rows),
-				)
-				return sfResult{err: ErrPackageHashConflict}
-			}
-			// SPEC3 §6.1 strict mode fires only on .deb paths; the
-			// predicate must not refuse source tarballs, udebs, etc.
-			// that legitimately have no package_hash row.
-			if len(distinct) == 0 && isDebPath(req.Path) {
-				switch sm, snapID, count := h.classifyStrictMode(ctx,
-					req.CanonicalScheme, req.CanonicalHost); sm {
-				case strictRefuse:
-					// Spec C10: with a signed adoption in flight on the
-					// host, end this attempt (releasing the host slot)
-					// and let serveCacheMiss wait outside singleflight.
-					if h.adoptions != nil && h.adoptions.AdoptionsInFlight(req.CanonicalHost) {
-						return sfResult{err: errUnvouchedRetryable, snapshotCount: count}
-					}
-					h.logUnvouchedRefused(req, count)
-					return sfResult{err: ErrUnvouchedDebRefused}
-				case strictPassthrough:
-					h.logUnvouchedPassthrough(req.CanonicalHost, req.Path, snapID)
-				}
-			}
+		if res, end := h.prefetchCheck(ctx, req, true); end {
+			return res
 		}
-		// derr != nil → fall through; the post-fetch lookup will
-		// retry. Do not pre-emit a Warn line here; if the same DB is
-		// flaky it will surface in the post-fetch path's structured
-		// log instead, with one line per failed validation rather
-		// than two.
 	}
 
 	bw, err := h.cache.NewTempBlob()
@@ -2296,6 +2278,63 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 		unproven:       stored.Create.Outcome == cache.SuiteCreated && stored.Create.Unproven,
 		fetchedAt:      now,
 	}
+}
+
+// prefetchCheck is runFetch's check before the download of a non-metadata
+// file: it ends the attempt (end, with res) on a package_hash conflict, or
+// when strict mode refuses an unvouched .deb. mayWait, as on the hit path
+// (checkPackageHashWait), lets a refusal first end the attempt
+// errUnvouchedRetryable while a signed adoption is in flight on the host,
+// for serveCacheMiss to wait for outside singleflight (spec C10), or, with
+// none in flight, run the check once more at once (final review R1 #2);
+// that second check neither waits nor checks again.
+func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request, mayWait bool) (res sfResult, end bool) {
+	rows, derr := h.cache.DeclaredHashesForPath(ctx,
+		req.CanonicalScheme, req.CanonicalHost, req.Path)
+	if derr != nil {
+		// Fall through; the post-fetch lookup will retry. Do not pre-emit a
+		// Warn line here; if the same DB is flaky it will surface in the
+		// post-fetch path's structured log instead, with one line per
+		// failed validation rather than two.
+		return sfResult{}, false
+	}
+	distinct := distinctDeclared(rows)
+	if len(distinct) >= 2 {
+		h.logger.Error("package_hash_conflict",
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+			"fetched", false,
+			"declared", declaredAttrs(rows),
+		)
+		return sfResult{err: ErrPackageHashConflict}, true
+	}
+	// SPEC3 §6.1 strict mode fires only on .deb paths; the predicate must
+	// not refuse source tarballs, udebs, etc. that legitimately have no
+	// package_hash row.
+	if len(distinct) != 0 || !isDebPath(req.Path) {
+		return sfResult{}, false
+	}
+	switch sm, snapID, count := h.classifyStrictMode(ctx,
+		req.CanonicalScheme, req.CanonicalHost); sm {
+	case strictRefuse:
+		if mayWait && h.adoptions != nil {
+			// Spec C10: with a signed adoption in flight on the host, end
+			// this attempt (releasing the host slot) and let serveCacheMiss
+			// wait outside singleflight.
+			if h.adoptions.AdoptionsInFlight(req.CanonicalHost) {
+				return sfResult{err: errUnvouchedRetryable, snapshotCount: count}, true
+			}
+			// Final review R1 #2: an adoption that committed the rows
+			// vouching for this .deb may have ended since the lookup above
+			// (its count ends after its commit): check once more, at once.
+			return h.prefetchCheck(ctx, req, false)
+		}
+		h.logUnvouchedRefused(req, count)
+		return sfResult{err: ErrUnvouchedDebRefused}, true
+	case strictPassthrough:
+		h.logUnvouchedPassthrough(req.CanonicalHost, req.Path, snapID)
+	}
+	return sfResult{}, false
 }
 
 // inReleaseSuffix is the path suffix that identifies the InRelease
