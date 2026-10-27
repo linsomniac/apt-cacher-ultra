@@ -21,13 +21,27 @@ import (
 // done costs it nothing. When the test failed and serve had returned
 // before any cancel (a bind or configuration error, say), the cleanup logs
 // serve's error: a readiness failure then says why the daemon never
-// answered.
+// answered. A test that passed logs nothing, even when serve returned
+// before any cancel (TestServe_ReturnsListenError's does, by design).
 //
-// AIDEV-NOTE: the 14 cmd tests that cancel their daemon only at their end
-// (12 readiness waits, main_test.go's two shutdown tests) start it with this
-// helper; the six whose own t.Cleanup cancels and waits, and
-// upstream_proxy_test.go, keep their pattern. TestServeUntilCleanup pins it
-// through a fake testing.TB whose cleanups it runs as a t.Fatal would.
+// AIDEV-NOTE: every cmd test that runs serveListeners in a goroutine drains
+// it on every exit. The 17 with no drain of their own (defer cancel(), the
+// result read last) start it with this helper: the 12 with a readiness
+// wait, reaper_wiring_test.go's
+// TestServeListeners_StartsTheReaperWhateverGCSays, and main_test.go's
+// three TestServe_GracefulShutdown_* tests and TestServe_ReturnsListenError.
+// The others keep their own: a t.Cleanup, registered right after the
+// start, that cancels and waits, on serveDone in ca_constraints_log_test.go,
+// ca_lifecycle_log_test.go, disabled_mode_parity_daemon_test.go,
+// legacy_audit_wiring_test.go, reaper_wiring_test.go's
+// TestServe_ForgetIsWired, status_tls_mitm_integration_test.go and
+// upstream_proxy_test.go, or on a WaitGroup in main_test.go's EndToEnd and
+// DisallowedHost tests, upstream_invalid_cert_test.go and
+// upstream_redirect_test.go; suite_caps_wiring_test.go and
+// shutdown_drain_test.go cancel and wait right after waitServing, which
+// drains on its own timeout. A new daemon test starts with this helper.
+// TestServeUntilCleanup pins it through a fake testing.TB whose cleanups
+// it runs as a t.Fatal would.
 func serveUntilCleanup(t testing.TB, ctx context.Context, cancel context.CancelFunc,
 	serve func(context.Context) error) <-chan error {
 	t.Helper()
@@ -87,7 +101,8 @@ func (f *fakeTB) runCleanups() {
 // TestServeUntilCleanup pins serveUntilCleanup: a test that fails before
 // its end leaves a daemon that its cleanup cancels and waits for; a test
 // that read done at its end costs the cleanup nothing; and a daemon that
-// returned before any cancel has its error logged when the test failed.
+// returned before any cancel has its error logged when the test failed,
+// and only then.
 func TestServeUntilCleanup(t *testing.T) {
 	// slowServe is a daemon that serves until ctx is cancelled, then takes
 	// 200 ms to stop, and sets stopped when it has.
@@ -143,6 +158,20 @@ func TestServeUntilCleanup(t *testing.T) {
 		ft.runCleanups()
 		if len(ft.logs) != 1 || !strings.Contains(ft.logs[0], "returned before any cancel: listen tcp") {
 			t.Fatalf("logs %q; want serve's error, once", ft.logs)
+		}
+	})
+
+	t.Run("a passing test whose daemon returned before any cancel", func(t *testing.T) {
+		ft := &fakeTB{TB: t}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := serveUntilCleanup(ft, ctx, cancel, func(context.Context) error {
+			return errors.New("http: accept tcp 127.0.0.1:1: use of closed network connection")
+		})
+		<-done // as TestServe_ReturnsListenError reads it
+		ft.runCleanups()
+		if len(ft.errs) != 0 || len(ft.logs) != 0 {
+			t.Fatalf("errors %q, logs %q; want none", ft.errs, ft.logs)
 		}
 	})
 }

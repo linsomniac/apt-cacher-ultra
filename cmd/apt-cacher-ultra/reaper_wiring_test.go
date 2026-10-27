@@ -118,8 +118,9 @@ func TestServeListeners_StartsTheReaperWhateverGCSays(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- serveListeners(ctx, cfg, silentBuildLogger(), ln, nil, nil, nil) }()
+	serveDone := serveUntilCleanup(t, ctx, cancel, func(ctx context.Context) error {
+		return serveListeners(ctx, cfg, silentBuildLogger(), ln, nil, nil, nil)
+	})
 	select {
 	case r := <-started:
 		if r == nil {

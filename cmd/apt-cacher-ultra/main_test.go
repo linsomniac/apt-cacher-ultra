@@ -240,13 +240,9 @@ func TestServe_GracefulShutdown_DrainsInflight(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	var serveErr error
-	go func() {
-		defer wg.Done()
-		serveErr = serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
-	}()
+	serveDone := serveUntilCleanup(t, ctx, cancel, func(ctx context.Context) error {
+		return serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
+	})
 
 	// Kick off the slow request from another goroutine.
 	respCh := make(chan struct {
@@ -298,9 +294,8 @@ func TestServe_GracefulShutdown_DrainsInflight(t *testing.T) {
 		t.Fatalf("client never got response during graceful drain")
 	}
 
-	wg.Wait()
-	if serveErr != nil {
-		t.Fatalf("serveListeners: %v", serveErr)
+	if err := <-serveDone; err != nil {
+		t.Fatalf("serveListeners: %v", err)
 	}
 }
 
@@ -388,10 +383,9 @@ func TestServe_ReturnsListenError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	done := make(chan error, 1)
-	go func() {
-		done <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
-	}()
+	done := serveUntilCleanup(t, ctx, cancel, func(ctx context.Context) error {
+		return serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
+	})
 
 	// Give the goroutine a moment to enter Serve(), then close the listener
 	// out from under it. Serve() will return a "use of closed network
