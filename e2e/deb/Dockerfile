@@ -38,7 +38,7 @@
 ARG UBUNTU_VERSION=24.04
 ARG VERSION=0.0.0-e2e
 
-FROM golang:1.25-bookworm AS build
+FROM golang:1.27-bookworm AS build
 ARG VERSION
 WORKDIR /src
 COPY go.mod go.sum ./

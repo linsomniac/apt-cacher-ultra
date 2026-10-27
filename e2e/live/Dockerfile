@@ -17,7 +17,7 @@
 #
 # Build context is the repo root:
 #   docker build -f e2e/live/Dockerfile -t acu-e2e-live .
-FROM golang:1.25-bookworm AS build
+FROM golang:1.27-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

@@ -18,7 +18,7 @@
 #       -t acu-e2e-flat:debian-12 .
 ARG CLIENT_IMAGE=debian:12
 
-FROM golang:1.25-bookworm AS build
+FROM golang:1.27-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

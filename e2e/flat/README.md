@@ -36,7 +36,7 @@ The images and their apt, as of October 2026:
 
 It needs Docker on an amd64 host, and network access to:
 
-- Docker Hub (`golang:1.25-bookworm`, `debian:bookworm-slim`, the client
+- Docker Hub (`golang:1.27-bookworm`, `debian:bookworm-slim`, the client
   images);
 - the distribution mirrors the image builds install from
   (`deb.debian.org`, `archive.debian.org`, `archive.ubuntu.com`,

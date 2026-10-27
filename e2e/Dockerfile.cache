@@ -1,10 +1,10 @@
 # apt-cacher-ultra image for the SPEC §12.4 e2e harness. Builds the
-# binary from the current source tree in a golang:1.25-alpine stage and
+# binary from the current source tree in a golang:1.27-alpine stage and
 # ships it on alpine with the e2e config baked at /etc/apt-cacher-ultra/.
 #
 # Build context must be the repo root (compose handles this):
 #   docker build -f e2e/Dockerfile.cache -t aculan-cache .
-FROM golang:1.25-alpine AS build
+FROM golang:1.27-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

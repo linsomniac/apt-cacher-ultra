@@ -38,7 +38,7 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.25'
+          go-version: '1.27'
           cache: true
 
       # Validate the tag name against a strict semver-ish regex BEFORE
