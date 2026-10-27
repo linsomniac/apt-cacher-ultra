@@ -174,7 +174,26 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 	// anchor_form (snap.Form). Otherwise (no adopter: the Phase 1
 	// observation) default to inline; the inline path triggers a detached
 	// fallback on 404.
-	form := c.detectForm(ctx, cur)
+	//
+	// AIDEV-NOTE: the final review's R1 #1. A failed read of the current
+	// snapshot is a local fault, as ruling PG-24 makes checkFirst's: no
+	// request, nothing written (no failCheck either: it says nothing about
+	// upstream), and the next check reads again. Taken for "inline", as it
+	// was, it sent a detached or unsigned suite down the inline path, which
+	// records anchor_absent when a stale cached InRelease row answers 404,
+	// or reconstructs an InRelease row the suite never had.
+	form, err := c.detectForm(ctx, cur)
+	if err != nil {
+		if !c.endedByShutdown(ctx, suite, "read current snapshot", err) {
+			c.logger.Warn("freshness_read_current_snapshot_failed",
+				"err", err,
+				"snapshot_id", *cur.CurrentSnapshotID,
+				"canonical_host", host,
+				"suite_path", suitePath,
+			)
+		}
+		return
+	}
 	switch form {
 	case adoptionFormUnsigned:
 		out.req, out.repair = c.checkUnsigned(ctx, fetchCtx, out, cur, suite, now, nowUnix)
@@ -195,18 +214,22 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 // detectForm reads the suite's current snapshot (if any) and returns
 // its anchor_form (snap.Form): inline, detached or unsigned. First-ever
 // suites (cur.CurrentSnapshotID == nil; only without an adopter, see
-// checkFirst) and snapshots that fail to load default to inline; the
-// inline-path fallback handles the boot-strap case for detached-only
-// upstreams.
-func (c *Checker) detectForm(ctx context.Context, cur *cache.SuiteFreshness) adoptionForm {
+// checkFirst) and snapshots whose stored form adoption does not know
+// default to inline; the inline-path fallback handles the boot-strap case
+// for detached-only upstreams. A snapshot that fails to load is an error
+// (the final review's R1 #1: never a guess at the form).
+func (c *Checker) detectForm(ctx context.Context, cur *cache.SuiteFreshness) (adoptionForm, error) {
 	if cur.CurrentSnapshotID == nil {
-		return adoptionFormInline
+		return adoptionFormInline, nil
 	}
 	snap, err := c.cache.GetSuiteSnapshot(ctx, *cur.CurrentSnapshotID)
-	if form, ok := formOfSnapshot(snap); err == nil && ok {
-		return form
+	if err != nil {
+		return 0, err
 	}
-	return adoptionFormInline
+	if form, ok := formOfSnapshot(snap); ok {
+		return form, nil
+	}
+	return adoptionFormInline, nil
 }
 
 // checkEnd is how an answered check ended, for finishCheck: the

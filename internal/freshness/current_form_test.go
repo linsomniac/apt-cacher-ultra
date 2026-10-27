@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	mrand "math/rand/v2"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -1748,6 +1749,75 @@ func TestCheck_AnchorFoundAgainFailsOnASnapshotReadError(t *testing.T) {
 		*row.CurrentSnapshotID != snap.SnapshotID {
 		t.Fatalf("attempts %d, row %+v; want no attempt, the streak at 1 and snapshot %d still current",
 			r.ver.calls()-calls, row, snap.SnapshotID)
+	}
+}
+
+// The final review's R1 #1: a fault reading the current snapshot at the
+// start of an adopted suite's check, to learn its form, is a local fault,
+// as ruling PG-24 makes checkFirst's anchor-row read: logged at WARN, no
+// upstream request and no write; the next check, the fault gone, runs as
+// usual. Before, it sent a detached suite down the inline path: a cached
+// InRelease row that upstream answers 404 recorded anchor_absent (visible,
+// and pacing the suite), and without such a row the check wrote a
+// reconstructed InRelease row (and its WARN and counter).
+func TestCheck_CurrentSnapshotReadFaultIsALocalFault(t *testing.T) {
+	for _, cached := range []bool{true, false} {
+		t.Run(fmt.Sprintf("cached InRelease row %v", cached), func(t *testing.T) {
+			r := newRetryRig(t, 0)
+			r.adoptDetached()
+			ctx := context.Background()
+			inRelease := rigSuite + "/InRelease"
+			if cached { // an InRelease the suite served before it moved to the detached form
+				stale := testHex64
+				if err := r.cache.PutBlob(ctx, stale, 1); err != nil {
+					t.Fatal(err)
+				}
+				if err := r.cache.PutURLPath(ctx, cache.URLPath{CanonicalScheme: "http", CanonicalHost: rigHost, Path: inRelease,
+					BlobHash: &stale, UpstreamURL: rigAnchorURL, IsMetadata: true}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r.up.setFail(rigAnchorURL, &fetch.StatusError{Code: 404})
+			fc := &snapReadFailCache{Cache: r.cache}
+			fc.fail.Store(true)
+			var logs lockedBuffer
+			chk, err := New(Config{Cache: fc, Fetcher: r.up, HostLimiter: hostsem.New(8), Refresh: 15 * time.Minute,
+				Adopter: r.adopter, Logger: slog.New(slog.NewJSONHandler(&logs, nil)), now: r.clock.now, rand: func() float64 { return 0.5 }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.clock.advance(time.Hour)
+			urls := []string{rigAnchorURL, rigReleaseURL, rigReleaseGPGURL}
+			sent := map[string]int{}
+			for _, u := range urls {
+				sent[u] = len(r.up.etagsSent(u))
+			}
+			before := r.row() // the whole row: no column may change
+			chk.Check(ctx, "http", rigHost, rigSuite)
+			chk.WaitForAdoptions()
+			if row := r.row(); !reflect.DeepEqual(row, before) {
+				t.Fatalf("the read fault wrote the row (record %q): %+v, want it unchanged: %+v",
+					strOf(row.AdoptionFailReason), row, before)
+			}
+			if _, err := r.cache.LookupURL(ctx, "http", rigHost, inRelease); cached == errors.Is(err, cache.ErrNotFound) {
+				t.Fatalf("InRelease row lookup: %v; want it %s", err, map[bool]string{true: "kept", false: "not written"}[cached])
+			}
+			for _, u := range urls {
+				if n := len(r.up.etagsSent(u)) - sent[u]; n != 0 {
+					t.Fatalf("%d upstream requests to %s, want none", n, u)
+				}
+			}
+			warns := logRecords(t, &logs, "freshness_read_current_snapshot_failed")
+			if len(warns) != 1 || warns[0]["level"] != "WARN" || warns[0]["snapshot_id"] != float64(*before.CurrentSnapshotID) {
+				t.Fatalf("WARN records %v, want one naming snapshot %d", warns, *before.CurrentSnapshotID)
+			}
+			fc.fail.Store(false)
+			chk.Check(ctx, "http", rigHost, rigSuite)
+			chk.WaitForAdoptions()
+			if n := len(r.up.etagsSent(rigReleaseURL)) - sent[rigReleaseURL]; n != 1 || lastResult(r) == "anchor_absent" {
+				t.Fatalf("the next check: %d Release requests, result %q; want the detached check's one request", n, lastResult(r))
+			}
+		})
 	}
 }
 
