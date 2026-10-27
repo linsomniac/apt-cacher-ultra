@@ -723,7 +723,11 @@ Upgrading the Debian package to 1.1.0 or later restarts a running daemon
 (`try-restart`: a stopped daemon stays stopped until you start it), so its
 first start after the upgrade, and what that start does below, begins as the
 package is upgraded; earlier packages left the old binary running until its
-next start.
+next start. After the upgrade, check `systemctl status apt-cacher-ultra` (or
+`journalctl -u apt-cacher-ultra`): apt does not show a new binary that exits
+at startup. The unit is `Type=simple`, so systemctl reports only a restart job
+that fails, not a daemon that exits once started, and `Restart=always` starts
+it again every 5 seconds.
 
 On its first start after an upgrade, the daemon audits every metadata snapshot
 adopted by earlier versions before it serves anything (a large cache can take
