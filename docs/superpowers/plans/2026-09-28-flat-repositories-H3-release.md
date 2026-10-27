@@ -2329,7 +2329,7 @@ Expected:
 370:	timer := time.NewTimer(g.holdMax)
 387:	t.held = now.Sub(joined)
 2
-31:            deb-systemd-invoke try-restart apt-cacher-ultra.service >/dev/null || :
+34:            deb-systemd-invoke try-restart apt-cacher-ultra.service >/dev/null || :
 1 ^| `adopt_unsigned` |
 1 ^| `flip_quiet_period` |
 1 ^| `max_duration` |
@@ -3264,7 +3264,7 @@ python3 "$D/additive_keys.py" "$O" .
 Expected (the planning run, 559fd7f with Tasks 1–7 applied; line numbers are HEAD's and 1.0.2's, the order of a multi-pattern grep's lines may differ):
 
 ```
-31:            deb-systemd-invoke try-restart apt-cacher-ultra.service >/dev/null || :
+34:            deb-systemd-invoke try-restart apt-cacher-ultra.service >/dev/null || :
 71:enabled               = false
 1
 internal/cache/schema.go:18:const CurrentSchemaVersion = 7
@@ -4101,7 +4101,7 @@ internal/aptpath/sniff.go:44:func SniffReleaseGPG(head []byte) bool {
 227:		"acu_adoption_members_skipped_total",
 285:		"acu_adoption_sources_parsed_total",
 1
-31:            deb-systemd-invoke try-restart apt-cacher-ultra.service >/dev/null || :
+34:            deb-systemd-invoke try-restart apt-cacher-ultra.service >/dev/null || :
 3:on:
 4-  push:
 5-    branches: [master, main]
@@ -4871,7 +4871,7 @@ Report, briefly: the gate's results (Steps 2–4, with the three slowest simulat
   - A comment line in `lib.sh` that begins with the word `shellcheck` is read as a directive (the smoke's lint then fails, SC1094): the `AIDEV-NOTE` Task 3 adds there is worded around it, and says so.
   - Deleting the postinst's restart line leaves an empty `then`, a syntax error dpkg reports at the first install; Task 4's mutant replaces it with `:`.
   - `preremove.sh` stops and disables with `systemctl` directly, not `deb-systemd-invoke` (debhelper's prerm honours `policy-rc.d`); harmless here, since the `/run/systemd/system` guard skips both where no systemd runs, and the ruling asked only for its comment.
-  - A reinstall after a remove (not a purge) passes the removed version to the postinst, as for debhelper's packages: nothing restarts, and no install message prints although the remove disabled the unit (the postinst's `AIDEV-NOTE`).
+  - A reinstall after a remove (not a purge) passes the removed version to the postinst, as for debhelper's packages: nothing restarts. *(Superseded in execution, ruling PH3-17: the install hint now prints whenever the unit is not enabled, so this case prints it, as 1.0.x did; Task 4's text.)*
   - `grep -n '"aculan-deb-test:${ver}"'` matches nothing under ugrep (a shell where `grep` is ugrep reads `$` differently): Task 9 matches `aculan-deb-test:`.
 - **Outside H3's scope, recorded:** the 2026-09-08 security review's report the brief cites, `docs/security-review-findings.md`, is untracked: it exists only in the main checkout (`/home/sean/projects/apt-cacher-ultra/docs/security-review-findings.md`), so the final review reads it there (Task 10, R6); its findings H-3 (the toolchain, done in Task 5; `govulncheck` and the module bumps, open) and H-2 (the restart, done in Task 4) are this plan's. `docs/admin-ui-spec.md` links `../SPEC5.md`, a file the repository never had (broken on 1.0.2 already; Task 10 Step 3 leaves it out). pkg.jenkins.io now signs with `jenkins.io-2026.key`; the smoke uses it.
 
