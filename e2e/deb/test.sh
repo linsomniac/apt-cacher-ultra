@@ -1007,11 +1007,17 @@ postinst_step() {
 
 # expect_count NAME WHAT WANT FILE PATTERN: FILE has WANT lines matching
 # the extended regex PATTERN, or the test fails naming WHAT and showing
-# the step's output (dpkg's, or the postinst's) and systemctl calls.
+# the step's output (dpkg's, or the postinst's) and systemctl calls. A
+# missing FILE fails too: grep -c prints nothing for it, which a want of 0
+# would otherwise pass.
 expect_count() {
     local name=$1 what=$2 want=$3 file=$4 pattern=$5 got
-    got=$(grep -cE -- "$pattern" "$file" || true)
-    if [[ "$got" -ne "$want" ]]; then
+    if [[ -f $file ]]; then
+        got=$(grep -cE -- "$pattern" "$file" || true)
+    else
+        got="no file $file, so no"
+    fi
+    if [[ "$got" != "$want" ]]; then
         echo "FAIL: phase-5 $name: $got $what, want $want"
         echo "=== the step's output ==="
         cat "/tmp/p5.$name.out"
@@ -1070,8 +1076,8 @@ expect_count policy "policy-rc.d refusals" 1 /tmp/p5.policy.out 'policy-rc\.d re
 # upgrade to NEW-VERSION fails, and with a plain abort-remove when a
 # removal's prerm fails. debhelper's snippet restarts only when $2 is set,
 # and a plain abort-remove has none. Neither prints the install hint.
-# The unit disabled, so that the abort-* actions' silence comes from the
-# hint's configure gate, not from is-enabled.
+# The unit is disabled first, so that the abort-* actions' silence comes
+# from the hint's configure gate, not from is-enabled.
 PATH="$stubs:$PATH" systemctl disable apt-cacher-ultra.service
 echo "[deb-test] phase 5: abort-upgrade: one try-restart; a plain abort-remove: none"
 postinst_step abort-upgrade abort-upgrade 9.9.9~e2e
@@ -1082,6 +1088,10 @@ postinst_step abort-remove abort-remove
 expect_count abort-remove "start or restart calls" 0 "$calls" "$restarts"
 expect_count abort-remove "install messages" 0 /tmp/p5.abort-remove.out "$message"
 
+# The operator's unit is enabled again before the remove, so that the
+# reinstall's hint below shows the remove's disable (an enabled unit
+# would get none).
+PATH="$stubs:$PATH" systemctl enable apt-cacher-ultra.service
 echo "[deb-test] phase 5: remove: stop and disable"
 dpkg_step remove -r apt-cacher-ultra
 expect_count remove "stop calls" 1 "$calls" '^stop apt-cacher-ultra\.service$'

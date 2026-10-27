@@ -185,7 +185,7 @@ first_contact() {
     capt control apt-get update > "$APT_LOG" 2>&1 || true
     [[ -n $(apt_errors "$APT_LOG") ]] || {
         sed 's/^/    | /' "$APT_LOG"
-        fail "the control's update (minor v1.0, which pkgs.k8s.io answers with 403) printed no error apt_errors catches"
+        fail "the control's update (minor v1.0, which pkgs.k8s.io does not publish) printed no error apt_errors catches"
     }
     # A signature error (NO_PUBKEY, a bad signature) prints only "GPG
     # error" and "is not signed" lines, which only APT_SIGNED_HOSTS sees:
@@ -193,7 +193,7 @@ first_contact() {
     # line, were it a 404) must match this smoke's APT_SIGNED_HOSTS too.
     [[ -n $(grep -E -- "$APT_SIGNED_HOSTS" "$APT_LOG" | grep -E -- "$APT_SIGNED_ERRORS" || true) ]] || {
         sed 's/^/    | /' "$APT_LOG"
-        fail "APT_SIGNED_HOSTS missed the control's error lines (above; minor v1.0, which pkgs.k8s.io answers with 403): a signature error on these hosts would pass unseen"
+        fail "APT_SIGNED_HOSTS missed the control's error lines (above; minor v1.0, which pkgs.k8s.io does not publish): a signature error on these hosts would pass unseen"
     }
     say "control: the error grep catches the missing minor's error"
     APT_RUNS=$((APT_RUNS + 1))
