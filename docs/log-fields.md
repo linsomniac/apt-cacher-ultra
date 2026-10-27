@@ -33,7 +33,8 @@ Fields that follow this pattern:
   `X-Cache-Snapshot` names that snapshot.
 - `flip_held_ms` — emitted only when an `InRelease`/`Release` request
   waited in a flip hold (spec C8): how long it waited, in milliseconds
-  (at most 20000; part of `duration_ms`). A request waits when it
+  (about 20000 at most: the hold's 20 s bound, whose timer can fire a few
+  milliseconds late; part of `duration_ms`). A request waits when it
   arrives, or right after it created its suite's row. Also on the
   `client_canceled` line of a held request whose client left while it
   waited.

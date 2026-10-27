@@ -436,6 +436,26 @@ captive portal's page that a client's miss cached as a plain
 (`anchorless_unchanged`) during the outage. Flat repositories rarely
 publish a plain `Contents-*`.
 
+After an outage that answered every file with an HTML page (a captive
+portal, a vendor's maintenance page), a Release-less repository's
+clients can see one more error. A client's update during the outage
+caches the page as the repository's `InRelease`, `Release` and
+`Release.gpg` (a miss stores what upstream answers; apt reports the page
+as an invalid signed file, as it would fetching directly). The first
+`apt update` after the outage can still get those pages; the check it
+triggers finds `InRelease` and `Release` answered 404 again (or, behind
+Amazon S3 or CloudFront, 403) and deletes them, so the next update is
+clean. The page cached as `Release.gpg` stays: apt never asks for it
+while the repository publishes no `Release`, but if the repository later
+publishes one, apt fetches `Release.gpg` beside it and prints a
+signature error for the page (`Signed file isn't valid, got 'NODATA'`)
+until the cache adopts the repository — a signed one at its first check,
+an unsigned one after its confirmation (see *Anchor forms and unsigned
+repositories*, safeguard 2). An adopted snapshot never serves that page:
+it answers `Release.gpg` with its own signature or, for an inline or
+unsigned snapshot, 404. `POST /forget` deletes it at once (*Forgetting a
+suite* under `[admin]` says when).
+
 Three limits of every flat repository, signed or not. Its Translation
 files (apt names them after the language alone: `en`, `en.xz`), its
 `Contents-*.diff/Index`, `<index>.diff/by-hash/…` and pdiff patch files,
@@ -596,8 +616,13 @@ Unsigned adoption has five safeguards:
    `Release` at least `max(cooldown, 5 minutes)` apart — an hour apart when
    `InRelease` or `Release.gpg` answers 401 or 403 at the confirming check,
    since a firewall or an S3 permission error can hide a signature (a 403
-   that later turns into 404s confirms after the shorter gap). Until then
-   the status page shows "refused: unsigned_unconfirmed". A `Release`
+   that later turns into 404s confirms after the shorter gap). The
+   confirming check is the first of the suite's retries (2 minutes,
+   doubling, each ±25 %) that comes that long after the first
+   observation, so with the default `cooldown` a new unsigned repository
+   is adopted at least 5 minutes after its first `apt update` through the
+   cache — usually 5 to 15. Until then the status page shows "refused:
+   unsigned_unconfirmed". A `Release`
    generated anew for each request, or one that differs between
    load-balanced backends, never shows the same bytes twice and stays
    unconfirmed; it is asked for again at its retry times (2 minutes,
@@ -663,6 +688,13 @@ optional file that lists only a SHA512 hash and fails its integrity check
 is not retried by automatic repair; the reconcile on unchanged checks
 still heals the index files apt requests.
 
+A `Release.gpg` in binary form (not ASCII-armored) is accepted: the cache
+adopts a repository that publishes `Release` with such a signature. apt
+2.2 to 3.2 refuse it, through the cache or directly ("Detached signature
+file … is in unsupported binary format"), so such a repository is
+unusable unless it also publishes an `InRelease`, which apt then uses
+instead (Jitsi's repository does).
+
 ### Architecture and member availability
 
 Both architecture lists accept at most 32 entries, each matching
@@ -686,6 +718,12 @@ every optional `404`/`410` artifact; manual reconciliation is available through
 [`POST /reconcile`](../README.md#recovering-a-degraded-repository).
 
 ### Upgrading an existing cache
+
+Upgrading the Debian package to 1.1.0 or later restarts a running daemon
+(`try-restart`: a stopped daemon stays stopped until you start it), so its
+first start after the upgrade, and what that start does below, begins as the
+package is upgraded; earlier packages left the old binary running until its
+next start.
 
 On its first start after an upgrade, the daemon audits every metadata snapshot
 adopted by earlier versions before it serves anything (a large cache can take
@@ -822,6 +860,35 @@ strict mode off for its whole host. A `.deb` whose name begins like an
 index file (a package named `icons-foo`, a flat repository's
 `Packages_1.0_all.deb`) is a package all the same: vouched, checked and
 refused like any other.
+
+Flat repositories follow the same host-wide rule. Releases before 1.1.0
+never adopted a flat repository, so one never made its host strict; now:
+
+- A host that serves only flat repositories is strict as soon as one of
+  them has a signed snapshot, as long as every signed snapshot on the
+  host has complete coverage: a `.deb` there that no signed snapshot's
+  `Packages` declares — a file the vendor serves beside the repository
+  without listing it, a package of an unsigned repository, or one of a
+  repository not adopted yet (after an upgrade the host's repositories
+  adopt one at a time) — is refused, where earlier releases passed it
+  through.
+- A flat snapshot with incomplete coverage turns strict mode off for its
+  whole host, as an incomplete `dists/` snapshot does: a `Packages` stanza
+  without a SHA256 (`no_sha256`), say, or a signed `Release` that lists no
+  root `Packages` (`no_packages_members`). The adoption logs INFO
+  `package_coverage_incomplete` with the snapshot and the reason, and a
+  `.deb` then served unvouched on that host logs INFO
+  `unvouched_deb_passthrough_no_coverage` (at most once an hour per path)
+  naming the snapshot as `incomplete_snapshot_id`.
+- The first install from a flat repository a client has just added to a
+  strict host — a new Kubernetes minor on pkgs.k8s.io, say — waits up to
+  15 seconds while that repository's first adoption runs, and is refused
+  while the adoption is still waiting for a slot; an attempt after the
+  adoption has committed succeeds.
+- A flat repository refreshed without a `Release` has no snapshot (see
+  *Flat repositories* under `[freshness]`): it never changes its host's
+  posture, and on a strict host its packages are refused like any
+  unvouched package.
 
 Strict mode fails open on a database error: when the cache cannot read a
 package's vouching hashes or its host's snapshot coverage, the `.deb` is

@@ -390,9 +390,12 @@ shown as such (that queue is the scheduler's, in memory). The JSON carries the p
 they are (`check_fail_count`, `last_check_unixtime`), not this text.
 
 **Unsigned and absent-anchor refusals (phase E).** `unsigned_unconfirmed`
-is an unsigned repository waiting for its second observation
-(`max(cooldown, 5 min)` after the first, an hour when the confirming check
-sees a 401/403 on a signature file) and clears itself when it adopts;
+is an unsigned repository waiting for its second observation — at least
+`max(cooldown, 5 min)` after the first, an hour when the confirming check
+sees a 401/403 on a signature file; the confirming check is the record's
+first retry that late (2 minutes, doubling, each ±25 %), so with the
+default `cooldown` the repository adopts usually 5 to 15 minutes after
+its first observation — and clears itself when it adopts;
 `unsigned_downgrade_refused` (the suite was seen signed) lasts until
 upstream serves a signature the cache adopts, or the suite is forgotten
 (`POST /forget`, an admin endpoint outside this page: see
