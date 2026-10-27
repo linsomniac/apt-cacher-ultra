@@ -794,12 +794,13 @@ for u in https://pkgs.k8s.io/core:/stable:/v1.36/deb/InRelease https://pkgs.k8s.
     https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/InRelease \
     https://nvidia.github.io/libnvidia-container/stable/deb/amd64/InRelease \
     https://pkg.jenkins.io/debian-stable/binary/InRelease https://pkg.jenkins.io/debian-stable/binary/Release.gpg \
-    https://download.sublimetext.com/apt/stable/InRelease https://download.sublimetext.com/apt/acu-no-such/InRelease; do
+    https://download.sublimetext.com/apt/stable/InRelease https://download.sublimetext.com/apt/acu-no-such/InRelease \
+    https://pkgs.k8s.io/core:/stable:/v1.0/deb/InRelease; do
     printf '%s %s\n' "$(curl -sL -o /dev/null -w '%{http_code}' --max-time 30 "$u")" "$u"
 done
 ```
 
-Expected: `20`, `6`, then `200` for every URL but Jenkins' `InRelease`, which is `404` (a detached-only repository), and the host-root control's `apt/acu-no-such/InRelease`, `404` too (a suite that does not exist). A different answer is the vendor's change: update the smoke's values (the README's *Maintenance*) before going on, and say so in the commit.
+Expected: `20`, `6`, then `200` for every URL but Jenkins' `InRelease`, which is `404` (a detached-only repository), the host-root control's `apt/acu-no-such/InRelease`, `404` too (a suite that does not exist), and the first control's `v1.0/deb/InRelease`, `403` (a minor pkgs.k8s.io does not publish: the control's premise, which the README's *Maintenance* names). A different answer is the vendor's change: update the smoke's values (the README's *Maintenance*) before going on, and say so in the commit.
 
 - [ ] **Step 2: Write `e2e/live/Dockerfile`**
 
@@ -916,6 +917,8 @@ set -euo pipefail
 # lib.sh's settings that differ here: no nginx, and the five live hosts
 # as apt names them through the http://HTTPS/// convention (a host-root
 # source, Sublime's, has a space after the host: lib.sh's AIDEV-NOTE).
+# live_update checks that every source line of every client's update
+# matches it, so each host's alternative is proven on every run.
 NGINX_LOG=/dev/null
 KEYS=/etc/acu-e2e/keys
 APT_SIGNED_HOSTS='HTTPS///(pkgs\.k8s\.io|developer\.download\.nvidia\.com|nvidia\.github\.io|pkg\.jenkins\.io|download\.sublimetext\.com)[/ ]'
@@ -938,9 +941,10 @@ on_exit() {
 trap on_exit EXIT
 trap 'fail "interrupted by a signal"' INT TERM
 
-# The repositories. The k8s minors are any two pkgs.k8s.io publishes; the
-# keys are the ones each vendor's install instructions name (README,
-# "Maintenance").
+# The repositories. The k8s minors are two pkgs.k8s.io publishes, K8S_A
+# the older (installs takes the newest kubectl, which must be K8S_B's, on
+# one client and K8S_A's on the other); the keys are the ones each
+# vendor's install instructions name (README, "Maintenance").
 K8S_A=v1.36
 K8S_B=v1.37
 K8S_KEY=https://pkgs.k8s.io/core:/stable:/$K8S_B/deb/Release.key
@@ -1041,27 +1045,51 @@ setup() {
 
 CLIENTS=(k8s-slash k8s-dot cuda nvidia jenkins sublime)
 
+# live_update NAME: apt_update on client NAME, then every source line apt
+# printed (Hit, Get, Ign, Err) must match APT_SIGNED_HOSTS, and there must
+# be one: the two controls prove the filter's two forms on two hosts, this
+# proves each host's alternative, which a typo would otherwise break
+# unseen (a signature error on that host would pass the error grep).
+live_update() {
+    local lines missed hosts
+    apt_update "$1"
+    lines=$(grep -E -- '^(Hit|Get|Ign|Err):[0-9]+ http://HTTPS///' "$APT_LOG" || true)
+    [[ -n $lines ]] || {
+        sed 's/^/    | /' "$APT_LOG"
+        fail "client $1's update printed no Hit, Get, Ign or Err line for an http://HTTPS/// source (above)"
+    }
+    missed=$(grep -vE -- "$APT_SIGNED_HOSTS" <<< "$lines" || true)
+    [[ -z $missed ]] || {
+        printf '%s\n' "$missed" | sed 's/^/    | /'
+        hosts=$(grep -oE 'HTTPS///[^/ ]+' <<< "$missed" | sed 's|^HTTPS///||' | sort -u | paste -sd ' ' - || true)
+        fail "APT_SIGNED_HOSTS misses client $1's source lines for $hosts (above): a signature error there would pass unseen"
+    }
+}
+
 first_contact() {
     scenario first-contact "every client's first apt-get update, clean"
     local c
     for c in "${CLIENTS[@]}"; do
-        apt_update "$c"
+        live_update "$c"
         say "$c: first update clean"
     done
+    # The control rests on pkgs.k8s.io answering 403 for a minor it does
+    # not publish (the README's "Maintenance"; the plan's pre-flight probes
+    # v1.0): apt prints "Failed to fetch", which APT_ERRORS catches.
     APT_RUNS=$((APT_RUNS + 1))
     APT_LOG=/clients/control/update.$APT_RUNS.log
     capt control apt-get update > "$APT_LOG" 2>&1 || true
     [[ -n $(apt_errors "$APT_LOG") ]] || {
         sed 's/^/    | /' "$APT_LOG"
-        fail "the control's update (a minor that does not exist) printed no error apt_errors catches"
+        fail "the control's update (minor v1.0, which pkgs.k8s.io answers with 403) printed no error apt_errors catches"
     }
-    # APT_ERRORS alone catches the 403 ("Failed to fetch"); a signature
-    # error (NO_PUBKEY, a bad signature) prints only "GPG error" and "is
-    # not signed" lines, which only APT_SIGNED_HOSTS sees: so the control's
-    # "is not signed" line must match this smoke's APT_SIGNED_HOSTS too.
-    [[ -n $(grep -E -- "$APT_SIGNED_HOSTS" "$APT_LOG" | grep -E -- 'is not signed' || true) ]] || {
+    # A signature error (NO_PUBKEY, a bad signature) prints only "GPG
+    # error" and "is not signed" lines, which only APT_SIGNED_HOSTS sees:
+    # so the control's error lines (the 403's "is not signed"; an "E:"
+    # line, were it a 404) must match this smoke's APT_SIGNED_HOSTS too.
+    [[ -n $(grep -E -- "$APT_SIGNED_HOSTS" "$APT_LOG" | grep -E -- "$APT_SIGNED_ERRORS" || true) ]] || {
         sed 's/^/    | /' "$APT_LOG"
-        fail "APT_SIGNED_HOSTS missed the control's 'is not signed' line (above): a signature error on these hosts would pass unseen"
+        fail "APT_SIGNED_HOSTS missed the control's error lines (above; minor v1.0, which pkgs.k8s.io answers with 403): a signature error on these hosts would pass unseen"
     }
     say "control: the error grep catches the missing minor's error"
     APT_RUNS=$((APT_RUNS + 1))
@@ -1094,8 +1122,10 @@ adoptions() {
     scenario adoptions "every suite adopts, in its upstream's form"
     poll_quietly "$ADOPT_LIMIT" all_adopted || {
         say "the suites' status entries:"
+        # A diagnostic: a daemon that does not answer must not end the run
+        # (set -e) before fail names the failure.
         "${CURL[@]}" -fsS "$ADMIN/?format=json" | jq -c '.suites[] |
-            {host, suite_path, anchor_form, current_snapshot_id, adoption_fail_reason, check_fail_count}'
+            {host, suite_path, anchor_form, current_snapshot_id, adoption_fail_reason, check_fail_count}' || true
         fail "not every suite adopted in its form within ${ADOPT_LIMIT}s"
     }
     say "all $(suite_expectations | wc -l) suites adopted, ${POLL_TOOK}s after first contact"
@@ -1112,7 +1142,7 @@ updates() {
     scenario updates "every client's apt-get update from the snapshots, clean"
     local c
     for c in "${CLIENTS[@]}"; do
-        apt_update "$c"
+        live_update "$c"
         say "$c: update clean"
     done
     passed
@@ -1130,13 +1160,33 @@ STRICT_CONTROLS=(
     download.sublimetext.com/files/acu-live-control_1.0_amd64.deb
 )
 
+# show_coverage HOST: HOST's package_coverage_incomplete lines (each names
+# the suite, the snapshot and the reason) from the whole daemon log, or
+# that there are none. Coverage is logged when a suite adopts, minutes
+# before the strict step, so the log tail a failure prints no longer holds
+# it. The README's "A failure: the cache, or the vendor?" says which
+# reasons are the vendor's.
+show_coverage() {
+    local lines
+    lines=$(log_lines 0 "$(event package_coverage_incomplete)" "$(kv canonical_host "$1")")
+    if [[ -n $lines ]]; then
+        say "the daemon's package_coverage_incomplete lines for $1 (the whole log):"
+        printf '%s\n' "$lines" | sed 's/^/    | /'
+    else
+        say "no package_coverage_incomplete line for $1 in the whole daemon log"
+    fi
+}
+
 strict_controls() {
     scenario strict "strict mode refuses an undeclared .deb on every host"
     local u code
     for u in "${STRICT_CONTROLS[@]}"; do
         code=$("${CURL[@]}" -sS --path-as-is -o /dev/null -w '%{http_code}' \
             -x "$PROXY" "http://HTTPS///$u" || true)
-        [[ $code == 502 ]] || fail "http://HTTPS///$u answered $code, want 502 (strict mode off for its host?)"
+        [[ $code == 502 ]] || {
+            show_coverage "${u%%/*}"
+            fail "http://HTTPS///$u answered $code, want 502 (strict mode off for its host? the coverage lines above)"
+        }
         log_has 0 "$(event unvouched_deb_refused)" "$(kv path "/${u#*/}")" ||
             fail "no unvouched_deb_refused line for /${u#*/}"
         say "refused, as strict mode should: ${u%%/*}"
@@ -1147,7 +1197,8 @@ strict_controls() {
 # live_install NAME PACKAGE [VERSION]: installs PACKAGE (VERSION, or the
 # candidate) on client NAME through the cache, requires dpkg to report it
 # installed at that version and the daemon to have served its .deb vouched
-# (validated_hash=true), then purges it.
+# (validated_hash=true, package_name=PACKAGE: not a dependency's), then
+# purges it.
 live_install() {
     local name=$1 pkg=$2 ver=${3:-} mark spec got
     [[ -n $ver ]] || ver=$(candidate "$name" "$pkg")
@@ -1164,12 +1215,12 @@ live_install() {
     got=$(dpkg-query -W -f='${Status} ${Version}' "$pkg" 2> /dev/null || true)
     [[ $got == "install ok installed $ver" ]] ||
         fail "client $name: dpkg reports '$got' for $pkg, want 'install ok installed $ver'"
-    log_has "$mark" "$(event request)" '\.deb( |$)' 'validated_hash=true' || {
+    log_has "$mark" "$(event request)" '\.deb( |$)' 'validated_hash=true' "$(kv package_name "$pkg")" || {
         log_lines "$mark" "$(event request)" '\.deb' | sed 's/^/    | /'
-        fail "client $name: the daemon served no vouched .deb (validated_hash=true) for $spec"
+        fail "client $name: the daemon served no vouched .deb (validated_hash=true, package_name=$pkg) for $spec"
     }
     say "$name: installed $spec, its .deb vouched ($(log_lines "$mark" "$(event request)" '\.deb' \
-        'validated_hash=true' | grep -oE ' path=[^ ]+' | head -n 1 | sed 's/^ //'))"
+        'validated_hash=true' "$(kv package_name "$pkg")" | grep -oE ' path=[^ ]+' | head -n 1 | sed 's/^ //'))"
     dpkg --purge "$pkg" > /dev/null 2>&1 || fail "dpkg --purge $pkg failed"
 }
 
@@ -1177,9 +1228,11 @@ installs() {
     scenario installs "one package per repository, its .deb vouched"
     local older
     live_install k8s-slash kubectl
-    # The other source form installs from the other minor.
+    # The other source form installs from the other minor. awk reads all
+    # of madison's output: an early exit could end apt-cache with SIGPIPE,
+    # which pipefail would see (e2e/flat's design note 18).
     older=$(capt k8s-dot apt-cache madison kubectl |
-        awk -v m="${K8S_A#v}." '$3 ~ "^" m {print $3; exit}')
+        awk -v m="${K8S_A#v}." '!v && $3 ~ "^" m {v = $3} END {print v}')
     [[ -n $older ]] || fail "client k8s-dot lists no kubectl of $K8S_A"
     live_install k8s-dot kubectl "$older"
     live_install cuda cuda-toolkit-12-config-common
@@ -1187,6 +1240,16 @@ installs() {
     live_install jenkins jenkins
     live_install sublime sublime-merge
     passed
+}
+
+# no_panics [WHEN]: fails on any panic or hash-conflict line in the whole
+# daemon log, printing the first 20 (the head may end the pipe early: a
+# diagnostic, so || true).
+no_panics() {
+    [[ -z $(panics_in_log) ]] || {
+        panics_in_log | head -n 20 | sed 's/^/    | /' || true
+        fail "the daemon logged a panic or a hash conflict${1:+ $1} (above)"
+    }
 }
 
 whole_run() {
@@ -1197,11 +1260,11 @@ whole_run() {
         printf '%s\n' "$refused" | sed 's/^/    | /'
         fail "unvouched_deb_refused for a package the smoke installed (above)"
     }
-    [[ -z $(panics_in_log) ]] || {
-        panics_in_log | head -n 20 | sed 's/^/    | /'
-        fail "the daemon logged a panic or a hash conflict (above)"
-    }
+    no_panics
     stop_daemon "the end"
+    # A panic recovered while the daemon shut down is logged after the scan
+    # above (stop_daemon catches only an unrecovered one, by exit status).
+    no_panics "while it stopped"
     passed
 }
 
@@ -1250,47 +1313,69 @@ it waiting for the scheduler's tick (`periodic_refresh / 4`, 225 s by
 default) that admits the first adoptions a client's check found no free
 slot for. Ctrl-C stops it.
 
+A run removes any container of its name first, a running one too, so two
+runs with the same `E2E_LIVE_NAME` collide: give each checkout its own
+name.
+
 ## What it checks
 
 | Step | What it proves |
 |---|---|
 | `setup` | The vendors' keys (fetched from the vendors, for the clients and the daemon) and the daemon start; each client is an apt state directory with its own sources. |
-| `first-contact` | Every client's first `apt-get update` through the cache is clean under e2e/flat's error grep (`apt_errors`: failures, timeouts, hash mismatches, and any signature error or `E:`/`Error:` line naming one of the five hosts). A control source — a Kubernetes minor that does not exist, answered 403 — must print an error the grep catches, and its "is not signed" line must match the smoke's signed-host filter; a second control, a Sublime-shaped (host-root) source at a suite that does not exist, answered 404, must be caught by that filter alone. |
+| `first-contact` | Every client's first `apt-get update` through the cache is clean under e2e/flat's error grep (`apt_errors`: failures, timeouts, hash mismatches, and any signature error or `E:`/`Error:` line naming one of the five hosts), and every source line it prints (`Hit`, `Get`, `Ign`, `Err`) matches the smoke's signed-host filter, so each host's part of the filter is proven. A control source — a Kubernetes minor that does not exist, answered 403 — must print an error the grep catches, and its error lines must match the signed-host filter; a second control, a Sublime-shaped (host-root) source at a suite that does not exist, answered 404, must be caught by that filter alone. |
 | `adoptions` | Every suite adopts, in the form its upstream publishes (inline, or detached for pkg.jenkins.io), and logs `adoption_success`: both source forms of two Kubernetes minors (four suites), CUDA, libnvidia-container (a SHA512-only `Release`), Jenkins and Sublime Text (a host-root base). |
-| `updates` | Every client's next `apt-get update`, from the snapshots, is clean. |
+| `updates` | Every client's next `apt-get update`, from the snapshots, is clean, its source lines again all matching the filter. |
 | `strict` | On each of the five hosts, a `.deb` no `Packages` declares is refused (502, `unvouched_deb_refused`) before any upstream request: strict mode is on, so the installs below happen under it. |
-| `installs` | One package per repository installs through the cache, and the daemon served its `.deb` vouched (`validated_hash=true`): `kubectl` from each Kubernetes minor (one per source form), `cuda-toolkit-12-config-common` (CUDA's `./` Filenames), `nvidia-container-toolkit-base` (libnvidia-container's `./` Filenames), `jenkins` (Filenames one level above its `Release`) and `sublime-merge` (Filenames at the host root). |
-| `whole-run` | No `unvouched_deb_refused` but the controls', no panic or hash conflict in the log, and a clean stop. |
+| `installs` | One package per repository installs through the cache, and the daemon served that package's `.deb` vouched (`validated_hash=true` and its `package_name`): `kubectl` from each Kubernetes minor (one per source form), `cuda-toolkit-12-config-common` (CUDA's `./` Filenames), `nvidia-container-toolkit-base` (libnvidia-container's `./` Filenames), `jenkins` (Filenames one level above its `Release`) and `sublime-merge` (Filenames at the host root). |
+| `whole-run` | No `unvouched_deb_refused` but the controls', no panic or hash conflict in the log, a clean stop, and no panic logged during it. |
 
 ## A failure: the cache, or the vendor?
 
 The output names the step that failed and prints what it saw: apt's
-output, or the suites' status entries, then the daemon log's tail.
+output, the suites' status entries, or a strict control's coverage lines,
+then the daemon log's tail.
 
 - **The vendor:** a key that does not download or no longer signs (apt
   prints `NO_PUBKEY`, and the daemon's adoption fails its signature
-  check), a minor or package that is gone (`no candidate`), or a server
-  that answers 5xx or not at all (`Failed to fetch`). So is a strict
-  control answered 403 or 404 instead of 502 while the daemon's log has
-  INFO `package_coverage_incomplete` for its host: one of the vendor's
-  snapshots lacks a SHA256 or a root `Packages`, which turns strict mode
-  off for the whole host by design. Check the vendor directly (`curl
-  -fsSIL https://pkgs.k8s.io/core:/stable:/v1.37/deb/InRelease`:
+  check), a retired Kubernetes minor (the first update fails with an error
+  naming 403), a package that is gone (`no candidate`), or a server that
+  answers 5xx or not at all (`Failed to fetch`). Check the vendor directly
+  (`curl -fsSIL https://pkgs.k8s.io/core:/stable:/v1.37/deb/InRelease`:
   pkgs.k8s.io redirects every path, so only `-L` makes a missing file
   fail); fix the smoke's values (*Maintenance*) or run it again later.
+- **A strict control answered 403 or 404 instead of 502:** strict mode
+  was off for its host. Before it fails, the smoke prints the host's
+  `package_coverage_incomplete` lines from the whole daemon log (each
+  names the suite, the snapshot and a `reason`), or says there are none.
+  It is the vendor's only when the logged reason is visible in the
+  vendor's own files: `no_sha256`, a stanza of the suite's `Packages` with
+  a `Filename` but no `SHA256`; `no_packages_members`, a `Release` that
+  lists no root `Packages*` file. Such a snapshot cannot vouch for every
+  package, which turns strict mode off for the whole host by design. Any
+  other reason, a reason the vendor's files do not show, or no line at all
+  is the cache's.
 - **The cache:** anything else — an adoption that fails while upstream
   answers and the key is right, an update error a direct `apt update`
-  does not show, a refusal of a package `Packages` declares, a panic. That
-  is a finding: reproduce it in a Go test or in `e2e/flat`, fix it there,
-  and never change the smoke to pass around it.
+  does not show, a refusal of a package `Packages` declares, strict mode
+  off for a host whose files give it no reason, a panic. That is a
+  finding: reproduce it in a Go test or in `e2e/flat`, fix it there, and
+  never change the smoke to pass around it.
 
 ## Maintenance
 
 The values to change sit at the top of `smoke.sh`:
 
-- **Kubernetes minors** (`K8S_A`, `K8S_B`): any two pkgs.k8s.io
-  publishes (it answers 403 for one it does not); move them when one is
-  retired.
+- **Kubernetes minors** (`K8S_A`, `K8S_B`): two minors pkgs.k8s.io
+  publishes, `K8S_A` the older (one client installs the newest `kubectl`,
+  which must be `K8S_B`'s, the other `K8S_A`'s newest). Move them when one
+  is retired: pkgs.k8s.io answers 403 for a minor it does not publish, so
+  the first update fails with an error naming 403.
+- **The first control's premise:** that 403. The control's source is the
+  minor `v1.0`, which must stay unpublished and keep answering 403 (`curl
+  -sL -o /dev/null -w '%{http_code}'
+  https://pkgs.k8s.io/core:/stable:/v1.0/deb/InRelease`); if the answer
+  changes, the control fails naming it, and its comment and this line
+  change with it.
 - **Forms** (`suite_expectations`): the form each suite adopts in
   (`inline`, or `detached` for pkg.jenkins.io); a vendor that adds or
   drops `InRelease` changes it, and `adoptions` then fails with "not
@@ -1349,7 +1434,9 @@ e2e-flat:
 # adoption and strict mode on; about 5 minutes. It needs network access to
 # those five vendors, so it is run by hand before 1.1.0 and before later
 # releases that change the request path, adoption or vouching, never in CI.
-# E2E_LIVE_NAME names its image and container (default acu-e2e-live).
+# E2E_LIVE_NAME names its image and container (default acu-e2e-live); give
+# each checkout its own E2E_LIVE_NAME so concurrent runs do not collide (a
+# run removes a container of its name first, a running one too).
 e2e-live:
 	bash e2e/live/run.sh
 ```
@@ -1395,71 +1482,129 @@ Expected: `clean` (shellcheck prints nothing for either directory). `lib.sh`'s c
 - [ ] **Step 8: Run the smoke**
 
 Run: `make e2e-live 2>&1 | tee "$(mktemp)" | grep -E '^\[e2e-live'`
-Expected (the planning run of these files, 2026-10-27 14:00 UTC; snapshot ids and `package_hash_count`s vary with the order of adoptions and what the vendors publish):
+Expected (the run of these files at fix round 1's commit d5a06ba, 2026-10-27 18:16 UTC; snapshot ids and `package_hash_count`s vary with the order of adoptions and what the vendors publish):
 
 ```
 [e2e-live    0s] === scenario setup: keys, config, the daemon, the clients
-[e2e-live    0s] apt 2.6.1; started 2026-10-27 14:00:41 UTC
-[e2e-live    2s] starting the daemon
-[e2e-live    3s] --- scenario setup passed (3s)
-[e2e-live    3s] === scenario first-contact: every client's first apt-get update, clean
-[e2e-live    3s] k8s-slash: first update clean
-[e2e-live    4s] k8s-dot: first update clean
-[e2e-live    4s] cuda: first update clean
-[e2e-live    4s] nvidia: first update clean
-[e2e-live    5s] jenkins: first update clean
-[e2e-live    6s] sublime: first update clean
-[e2e-live    6s] control: the error grep catches the missing minor's error
-[e2e-live    6s] control-root: the signed-host filter catches a host-root source's error
-[e2e-live    6s] --- scenario first-contact passed (3s)
-[e2e-live    6s] === scenario adoptions: every suite adopts, in its upstream's form
-[e2e-live  229s] all 8 suites adopted, 223s after first contact
-[e2e-live  229s]   pkgs.k8s.io/core:/stable:/v1.36/deb: inline, snapshot 1, package_hash_count=84
-[e2e-live  229s]   pkgs.k8s.io/core:/stable:/v1.36/deb/.: inline, snapshot 3, package_hash_count=84
-[e2e-live  229s]   pkgs.k8s.io/core:/stable:/v1.37/deb: inline, snapshot 2, package_hash_count=36
-[e2e-live  229s]   pkgs.k8s.io/core:/stable:/v1.37/deb/.: inline, snapshot 4, package_hash_count=36
-[e2e-live  229s]   developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64: inline, snapshot 5, package_hash_count=9758
-[e2e-live  229s]   nvidia.github.io/libnvidia-container/stable/deb/amd64: inline, snapshot 7, package_hash_count=170
-[e2e-live  229s]   pkg.jenkins.io/debian-stable/binary: detached, snapshot 6, package_hash_count=180
-[e2e-live  229s]   download.sublimetext.com/apt/stable: inline, snapshot 8, package_hash_count=78
-[e2e-live  229s] --- scenario adoptions passed (223s)
-[e2e-live  229s] === scenario updates: every client's apt-get update from the snapshots, clean
-[e2e-live  229s] k8s-slash: update clean
-[e2e-live  229s] k8s-dot: update clean
-[e2e-live  229s] cuda: update clean
-[e2e-live  229s] nvidia: update clean
-[e2e-live  229s] jenkins: update clean
-[e2e-live  229s] sublime: update clean
-[e2e-live  229s] --- scenario updates passed (0s)
-[e2e-live  229s] === scenario strict: strict mode refuses an undeclared .deb on every host
-[e2e-live  229s] refused, as strict mode should: pkgs.k8s.io
-[e2e-live  229s] refused, as strict mode should: developer.download.nvidia.com
-[e2e-live  229s] refused, as strict mode should: nvidia.github.io
-[e2e-live  229s] refused, as strict mode should: pkg.jenkins.io
-[e2e-live  229s] refused, as strict mode should: download.sublimetext.com
-[e2e-live  229s] --- scenario strict passed (0s)
-[e2e-live  229s] === scenario installs: one package per repository, its .deb vouched
-[e2e-live  230s] k8s-slash: installed kubectl=1.37.1-1.1, its .deb vouched (path=/core:/stable:/v1.37/deb/amd64/kubectl_1.37.1-1.1_amd64.deb)
-[e2e-live  231s] k8s-dot: installed kubectl=1.36.5-1.1, its .deb vouched (path=/core:/stable:/v1.36/deb/amd64/kubectl_1.36.5-1.1_amd64.deb)
-[e2e-live  232s] cuda: installed cuda-toolkit-12-config-common=12.9.79-1, its .deb vouched (path=/compute/cuda/repos/debian12/x86_64/./cuda-toolkit-12-config-common_12.9.79-1_all.deb)
+[e2e-live    0s] apt 2.6.1; started 2026-10-27 18:16:04 UTC
+[e2e-live    1s] starting the daemon
+[e2e-live    1s] --- scenario setup passed (1s)
+[e2e-live    1s] === scenario first-contact: every client's first apt-get update, clean
+[e2e-live    1s] k8s-slash: first update clean
+[e2e-live    1s] k8s-dot: first update clean
+[e2e-live    2s] cuda: first update clean
+[e2e-live    3s] nvidia: first update clean
+[e2e-live    3s] jenkins: first update clean
+[e2e-live    3s] sublime: first update clean
+[e2e-live    4s] control: the error grep catches the missing minor's error
+[e2e-live    4s] control-root: the signed-host filter catches a host-root source's error
+[e2e-live    4s] --- scenario first-contact passed (3s)
+[e2e-live    4s] === scenario adoptions: every suite adopts, in its upstream's form
+[e2e-live  227s] all 8 suites adopted, 223s after first contact
+[e2e-live  227s]   pkgs.k8s.io/core:/stable:/v1.36/deb: inline, snapshot 1, package_hash_count=84
+[e2e-live  227s]   pkgs.k8s.io/core:/stable:/v1.36/deb/.: inline, snapshot 2, package_hash_count=84
+[e2e-live  227s]   pkgs.k8s.io/core:/stable:/v1.37/deb: inline, snapshot 8, package_hash_count=36
+[e2e-live  227s]   pkgs.k8s.io/core:/stable:/v1.37/deb/.: inline, snapshot 3, package_hash_count=36
+[e2e-live  227s]   developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64: inline, snapshot 4, package_hash_count=9763
+[e2e-live  227s]   nvidia.github.io/libnvidia-container/stable/deb/amd64: inline, snapshot 5, package_hash_count=170
+[e2e-live  227s]   pkg.jenkins.io/debian-stable/binary: detached, snapshot 6, package_hash_count=180
+[e2e-live  227s]   download.sublimetext.com/apt/stable: inline, snapshot 7, package_hash_count=78
+[e2e-live  227s] --- scenario adoptions passed (223s)
+[e2e-live  227s] === scenario updates: every client's apt-get update from the snapshots, clean
+[e2e-live  227s] k8s-slash: update clean
+[e2e-live  228s] k8s-dot: update clean
+[e2e-live  228s] cuda: update clean
+[e2e-live  228s] nvidia: update clean
+[e2e-live  228s] jenkins: update clean
+[e2e-live  228s] sublime: update clean
+[e2e-live  228s] --- scenario updates passed (1s)
+[e2e-live  228s] === scenario strict: strict mode refuses an undeclared .deb on every host
+[e2e-live  228s] refused, as strict mode should: pkgs.k8s.io
+[e2e-live  228s] refused, as strict mode should: developer.download.nvidia.com
+[e2e-live  228s] refused, as strict mode should: nvidia.github.io
+[e2e-live  228s] refused, as strict mode should: pkg.jenkins.io
+[e2e-live  228s] refused, as strict mode should: download.sublimetext.com
+[e2e-live  228s] --- scenario strict passed (0s)
+[e2e-live  228s] === scenario installs: one package per repository, its .deb vouched
+[e2e-live  229s] k8s-slash: installed kubectl=1.37.1-1.1, its .deb vouched (path=/core:/stable:/v1.37/deb/amd64/kubectl_1.37.1-1.1_amd64.deb)
+[e2e-live  230s] k8s-dot: installed kubectl=1.36.5-1.1, its .deb vouched (path=/core:/stable:/v1.36/deb/amd64/kubectl_1.36.5-1.1_amd64.deb)
+[e2e-live  231s] cuda: installed cuda-toolkit-12-config-common=12.9.79-1, its .deb vouched (path=/compute/cuda/repos/debian12/x86_64/./cuda-toolkit-12-config-common_12.9.79-1_all.deb)
 [e2e-live  233s] nvidia: installed nvidia-container-toolkit-base=1.20.1-1, its .deb vouched (path=/libnvidia-container/stable/deb/amd64/./nvidia-container-toolkit-base_1.20.1-1_amd64.deb)
-[e2e-live  235s] jenkins: installed jenkins=2.580.1, its .deb vouched (path=/debian-stable/binary/jenkins_2.580.1_all.deb)
+[e2e-live  236s] jenkins: installed jenkins=2.580.1, its .deb vouched (path=/debian-stable/binary/jenkins_2.580.1_all.deb)
 [e2e-live  237s] sublime: installed sublime-merge=2132, its .deb vouched (path=/files/sublime-merge_build-2132_amd64.deb)
-[e2e-live  237s] --- scenario installs passed (8s)
-[e2e-live  237s] === scenario whole-run: no refusal but the controls', no panic
-[e2e-live  237s] stopping the daemon (the end)
-[e2e-live  238s] --- scenario whole-run passed (1s)
-[e2e-live  238s] timings: setup 3s first-contact 3s adoptions 223s updates 0s strict 0s installs 8s whole-run 1s
-[e2e-live  238s] PASS: live smoke, finished 2026-10-27 14:04:39 UTC
-[e2e-live] PASS (build 17s, smoke 238s)
+[e2e-live  238s] --- scenario installs passed (10s)
+[e2e-live  238s] === scenario whole-run: no refusal but the controls', no panic
+[e2e-live  238s] stopping the daemon (the end)
+[e2e-live  239s] --- scenario whole-run passed (1s)
+[e2e-live  239s] timings: setup 1s first-contact 3s adoptions 223s updates 1s strict 0s installs 10s whole-run 1s
+[e2e-live  239s] PASS: live smoke, finished 2026-10-27 18:20:03 UTC
+[e2e-live] PASS (build 20s, smoke 239s)
 ```
 
-The first draft's planning runs (2026-10-26, 19:00 and 19:21 UTC, without the host-root control) passed the same way: adoptions 221 and 224 s, smoke 245 and 240 s, build 51 and 20 s. A failure here is triaged as the README's *A failure: the cache, or the vendor?* says: a vendor's change is fixed in the smoke's values; anything the cache does is a finding for the controller, never worked around (ruling R-H2-4).
+The checks fix round 1 added print nothing when they pass, so a passing run's lines are those of the task's first commit, which passed the same way (2026-10-27: the planning run at 14:00 UTC, adoptions 223 s, smoke 238 s; the execution run at 16:28 UTC, adoptions 222 s, smoke 240 s), as did the first draft's planning runs (2026-10-26, 19:00 and 19:21 UTC, without the host-root control: adoptions 221 and 224 s, smoke 245 and 240 s, build 51 and 20 s). A failure here is triaged as the README's *A failure: the cache, or the vendor?* says: a vendor's change is fixed in the smoke's values; anything the cache does is a finding for the controller, never worked around (ruling R-H2-4).
 
-- [ ] **Step 9: The strict step has teeth**
+- [ ] **Step 9: The strict step and the filter have teeth**
 
-Mutant (scratch only, revert after): in `smoke.sh`'s `write_config`, `refuse_unvouched_debs = true` → `false`. Run Step 8's command.
-Expected: FAIL in the `strict` scenario, at its first control: `[e2e-live  228s] FAIL in scenario 'strict': http://HTTPS///pkgs.k8s.io/core:/stable:/v1.37/deb/amd64/acu-live-control_1.0_amd64.deb answered 403, want 502 (strict mode off for its host?)` (planning runs: smoke 230 s on 2026-10-26 and 228 s on 2026-10-27), followed by the daemon log's tail. Restore the line; `git diff --no-ext-diff e2e/live/smoke.sh` prints nothing once it is committed (Step 10).
+Each mutant runs in its own scratch copy of the tree (`rsync -a --exclude=.git` of the worktree into the scratchpad, the one line changed there, Step 8's command run from the copy with its own `E2E_LIVE_NAME`), so the worktree never holds one:
+
+- In `smoke.sh`'s `write_config`, `refuse_unvouched_debs = true` → `false`. Expected: FAIL in the `strict` scenario, at its first control, after the host's coverage section (none: strict mode is simply off), then the daemon log's tail:
+
+  ```
+  [e2e-live  229s] no package_coverage_incomplete line for pkgs.k8s.io in the whole daemon log
+  [e2e-live  229s] FAIL in scenario 'strict': http://HTTPS///pkgs.k8s.io/core:/stable:/v1.37/deb/amd64/acu-live-control_1.0_amd64.deb answered 403, want 502 (strict mode off for its host? the coverage lines above)
+  [e2e-live] FAIL (smoke; build 27s, smoke 231s)
+  ```
+
+  (fix round 1's run; the first commit's files failed at the same line without the coverage section: smoke 230 s on 2026-10-26, 228 and 230 s on 2026-10-27).
+- In `APT_SIGNED_HOSTS`, `nvidia\.github\.io` → `nvidia\.example\.io` (one host's alternative broken). Expected: FAIL at first contact, on that host's client, after its source lines:
+
+  ```
+      | Get:1 http://HTTPS///nvidia.github.io/libnvidia-container/stable/deb/amd64  InRelease [1477 B]
+      | Get:2 http://HTTPS///nvidia.github.io/libnvidia-container/stable/deb/amd64  Packages [28.0 kB]
+  [e2e-live    3s] FAIL in scenario 'first-contact': APT_SIGNED_HOSTS misses client nvidia's source lines for nvidia.github.io (above): a signature error there would pass unseen
+  ```
+
+- `K8S_A=v1.36` → `v1.0` (a retired minor; the README's triage): FAIL at first contact, `apt-get update on client k8s-slash printed an error (above)`, the apt output above it naming the 403 (`E: Failed to fetch http://HTTPS///pkgs.k8s.io/core:/stable:/v1.0/deb/InRelease  403  Forbidden [IP: 127.0.0.1 3142]`).
+
+`show_coverage`'s other branch, a host with coverage lines, which no live run reaches while the vendors' snapshots are complete: run it as `smoke.sh` defines it against a log that has some (from the repository root):
+
+```bash
+S=/tmp/claude-1000/-home-sean-projects-apt-cacher-ultra/99c125aa-f038-423f-88d6-3cb913c207d4/scratchpad/h3-live-check
+rm -rf "$S"; mkdir -p "$S"
+cat > "$S/check.sh" << 'EOF'
+#!/bin/bash
+# show_coverage, as smoke.sh defines it, against a log with coverage lines.
+set -euo pipefail
+. e2e/flat/lib.sh
+DAEMON_LOG=$1/daemon.log
+say() { printf '[check] %s\n' "$*"; }
+eval "$(sed -n '/^show_coverage() {$/,/^}$/p' e2e/live/smoke.sh)"
+declare -F show_coverage > /dev/null
+cat > "$DAEMON_LOG" << 'LOG'
+level=INFO msg=adoption_success canonical_host=pkgs.k8s.io suite_path=/core:/stable:/v1.37/deb snapshot_id=4 package_hash_count=36
+level=INFO msg=package_coverage_incomplete canonical_host=pkgs.k8s.io suite_path=/core:/stable:/v1.37/deb snapshot_id=4 reason=no_sha256 no_sha256_stanzas=2
+level=INFO msg=package_coverage_incomplete canonical_host=pkgs.k8s.io.example suite_path=/x snapshot_id=9 reason=no_sha256 no_sha256_stanzas=1
+level=INFO msg=package_coverage_incomplete canonical_host=developer.download.nvidia.com suite_path=/compute/cuda/repos/debian12/x86_64 snapshot_id=5 reason=no_packages_members
+level=INFO msg=admin_request method=GET path=/ status=200
+LOG
+for h in pkgs.k8s.io developer.download.nvidia.com download.sublimetext.com; do
+    show_coverage "$h"
+done
+EOF
+bash "$S/check.sh" "$S"
+```
+
+Expected: its host's lines only (`canonical_host=pkgs.k8s.io.example` is not `pkgs.k8s.io`), and the "none" line for a host without any:
+
+```
+[check] the daemon's package_coverage_incomplete lines for pkgs.k8s.io (the whole log):
+    | level=INFO msg=package_coverage_incomplete canonical_host=pkgs.k8s.io suite_path=/core:/stable:/v1.37/deb snapshot_id=4 reason=no_sha256 no_sha256_stanzas=2
+[check] the daemon's package_coverage_incomplete lines for developer.download.nvidia.com (the whole log):
+    | level=INFO msg=package_coverage_incomplete canonical_host=developer.download.nvidia.com suite_path=/compute/cuda/repos/debian12/x86_64 snapshot_id=5 reason=no_packages_members
+[check] no package_coverage_incomplete line for download.sublimetext.com in the whole daemon log
+```
+
+`git diff --no-ext-diff e2e/live/smoke.sh` prints nothing once it is committed (Step 10).
 
 - [ ] **Step 10: Commit**
 
@@ -1489,6 +1634,52 @@ Planning runs, 2026-10-26 (two) and 2026-10-27 (with both controls):
 all passed, all 8 suites adopted in 221 to 224 s (the scheduler's
 tick), smoke 238 to 245 s. With refuse_unvouched_debs off the strict
 step fails at its first control.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
+As executed, Task 3 is two commits: the one above (a593d94) and, after the task's review, its fix round 1 (d5a06ba, execution ruling PH3-18): a strict control's failure prints its host's coverage lines and the README's strict triage is conditional on the vendor's files (I-1); the first control greps `APT_SIGNED_ERRORS` and its premise is named (M-1); every client update's source lines must match `APT_SIGNED_HOSTS` (M-2); `|| true` on two diagnostics (M-3); `package_name` in the vouched check (M-4); a panic scan after the final stop (M-5); the README's minors and retired-minor wording (M-6); the concurrent-run sentence (M-7); and the madison `awk` reading all its input (M-9) — as Steps 1, 4, 5 and 6 now show them. Steps 8 and 9's expected outputs are the as-built runs. M-8 (the `nginx access log tail (/dev/null)` header) was declined: it would touch e2e/flat's `lib.sh`.
+
+```bash
+git add e2e/live/smoke.sh e2e/live/README.md Makefile
+git commit -F - <<'EOF'
+e2e/live: a strict failure shows its coverage; every host's filter proven
+
+Task 3's review (fix round 1, ruling PH3-18):
+
+- I-1: a strict control answered other than 502 now prints, before it
+  fails, its host's package_coverage_incomplete lines from the whole
+  daemon log (suite, snapshot, reason), or that there are none: the log
+  tail a failure prints no longer holds them. The README's triage says
+  such a failure is the vendor's only when the logged reason is visible
+  in the vendor's own files (no_sha256: a Packages stanza with a
+  Filename but no SHA256; no_packages_members: a Release that lists no
+  root Packages*), and otherwise the cache's (R-H2-4).
+- M-1: the first control greps APT_SIGNED_ERRORS, as the host-root one
+  does, and its messages and the README's Maintenance name the premise
+  (pkgs.k8s.io answers 403 for a minor it does not publish).
+- M-2: after each client's update, every Hit/Get/Ign/Err line for an
+  http://HTTPS/// source must match APT_SIGNED_HOSTS, and there must be
+  one, so each of the five hosts' alternatives is proven on every run.
+- M-3: the adoptions' status dump and the panic head are diagnostics:
+  `|| true`, so set -e cannot pre-empt the named failure.
+- M-4: the vouched check and its line name the package installed
+  (package_name), not any .deb since the mark.
+- M-5: the log is scanned for panics again after the final stop.
+- M-6: README: a retired minor fails as an update error naming 403;
+  K8S_A is the older of the two minors.
+- M-7: the Makefile and the README say to give each checkout its own
+  E2E_LIVE_NAME.
+- M-9: the madison awk reads all its input (no early exit for pipefail).
+
+Red, each in a scratch copy: nvidia.github.io's alternative broken in
+APT_SIGNED_HOSTS fails first-contact naming it; refuse_unvouched_debs
+off prints the coverage section ("no package_coverage_incomplete line
+for pkgs.k8s.io in the whole daemon log") before the strict failure;
+K8S_A=v1.0 fails the first update with apt's "403  Forbidden".
+show_coverage, run on a log with coverage lines, prints its host's
+only. shellcheck -x clean.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
