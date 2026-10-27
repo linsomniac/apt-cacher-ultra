@@ -1073,9 +1073,11 @@ first_contact() {
         live_update "$c"
         say "$c: first update clean"
     done
-    # The control rests on pkgs.k8s.io answering 403 for a minor it does
-    # not publish (the README's "Maintenance"; the plan's pre-flight probes
-    # v1.0): apt prints "Failed to fetch", which APT_ERRORS catches.
+    # The control rests on pkgs.k8s.io not publishing the minor v1.0 (the
+    # README's "Maintenance"; the plan's pre-flight probes it). Today it
+    # answers 403 and apt prints "Failed to fetch", which APT_ERRORS
+    # catches; a 404 passes too (an "E:" line naming the host). The control
+    # fails only when apt prints no error line naming the host.
     APT_RUNS=$((APT_RUNS + 1))
     APT_LOG=/clients/control/update.$APT_RUNS.log
     capt control apt-get update > "$APT_LOG" 2>&1 || true
@@ -1351,9 +1353,11 @@ then the daemon log's tail.
   vendor's own files: `no_sha256`, a stanza of the suite's `Packages` with
   a `Filename` but no `SHA256`; `no_packages_members`, a `Release` that
   lists no root `Packages*` file. Such a snapshot cannot vouch for every
-  package, which turns strict mode off for the whole host by design. Any
-  other reason, a reason the vendor's files do not show, or no line at all
-  is the cache's.
+  package, which turns strict mode off for the whole host by design. The
+  smoke then cannot pass on that host until the vendor's files change:
+  record the reason and the file, and run it again later. Any other
+  reason, a reason the vendor's files do not show, or no line at all is
+  the cache's.
 - **The cache:** anything else — an adoption that fails while upstream
   answers and the key is right, an update error a direct `apt update`
   does not show, a refusal of a package `Packages` declares, strict mode
@@ -1370,12 +1374,12 @@ The values to change sit at the top of `smoke.sh`:
   which must be `K8S_B`'s, the other `K8S_A`'s newest). Move them when one
   is retired: pkgs.k8s.io answers 403 for a minor it does not publish, so
   the first update fails with an error naming 403.
-- **The first control's premise:** that 403. The control's source is the
-  minor `v1.0`, which must stay unpublished and keep answering 403 (`curl
-  -sL -o /dev/null -w '%{http_code}'
-  https://pkgs.k8s.io/core:/stable:/v1.0/deb/InRelease`); if the answer
-  changes, the control fails naming it, and its comment and this line
-  change with it.
+- **The first control's premise:** the control's source is the minor
+  `v1.0`, which must stay unpublished. Today it answers 403 (`curl -sL -o
+  /dev/null -w '%{http_code}'
+  https://pkgs.k8s.io/core:/stable:/v1.0/deb/InRelease`); a 404 passes the
+  control too, which needs only an error line naming the host. The
+  control fails, naming v1.0, only when apt prints none.
 - **Forms** (`suite_expectations`): the form each suite adopts in
   (`inline`, or `detached` for pkg.jenkins.io); a vendor that adds or
   drops `InRelease` changes it, and `adoptions` then fails with "not
@@ -1639,7 +1643,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
 ```
 
-As executed, Task 3 is two commits: the one above (a593d94) and, after the task's review, its fix round 1 (d5a06ba, execution ruling PH3-18): a strict control's failure prints its host's coverage lines and the README's strict triage is conditional on the vendor's files (I-1); the first control greps `APT_SIGNED_ERRORS` and its premise is named (M-1); every client update's source lines must match `APT_SIGNED_HOSTS` (M-2); `|| true` on two diagnostics (M-3); `package_name` in the vouched check (M-4); a panic scan after the final stop (M-5); the README's minors and retired-minor wording (M-6); the concurrent-run sentence (M-7); and the madison `awk` reading all its input (M-9) — as Steps 1, 4, 5 and 6 now show them. Steps 8 and 9's expected outputs are the as-built runs. M-8 (the `nginx access log tail (/dev/null)` header) was declined: it would touch e2e/flat's `lib.sh`.
+As executed, Task 3 is three commits: the one above (a593d94); after the task's review, its fix round 1 (d5a06ba, execution ruling PH3-18): a strict control's failure prints its host's coverage lines and the README's strict triage is conditional on the vendor's files (I-1); the first control greps `APT_SIGNED_ERRORS` and its premise is named (M-1); every client update's source lines must match `APT_SIGNED_HOSTS` (M-2); `|| true` on two diagnostics (M-3); `package_name` in the vouched check (M-4); a panic scan after the final stop (M-5); the README's minors and retired-minor wording (M-6); the concurrent-run sentence (M-7); and the madison `awk` reading all its input (M-9) — as Steps 1, 4, 5 and 6 now show them. Steps 8 and 9's expected outputs are the as-built runs. M-8 (the `nginx access log tail (/dev/null)` header) was declined: it would touch e2e/flat's `lib.sh`. After the re-review, its fix round 2 (ee8c894, execution ruling PH3-21) changed wording only: the README's *Maintenance* says v1.0 must stay unpublished, that it answers 403 today and that a 404 passes the control too (N-1; `smoke.sh`'s comment on the control says the same), and its strict bullet gives the vendor case's action (N-2), as Steps 4 and 5 show them. Step 1 keeps `403` as the pre-flight's record.
 
 ```bash
 git add e2e/live/smoke.sh e2e/live/README.md Makefile
@@ -1680,6 +1684,28 @@ for pkgs.k8s.io in the whole daemon log") before the strict failure;
 K8S_A=v1.0 fails the first update with apt's "403  Forbidden".
 show_coverage, run on a log with coverage lines, prints its host's
 only. shellcheck -x clean.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
+```bash
+git add e2e/live/README.md e2e/live/smoke.sh
+git commit -F - <<'EOF'
+e2e/live: the first control's premise and the strict vendor case's action
+
+Task 3's re-review (ruling PH3-21), README wording and one comment:
+
+- N-1: since the first control greps APT_SIGNED_ERRORS, a 404 for v1.0
+  passes it too (an error line naming the host is enough). The README's
+  Maintenance now says v1.0 must stay unpublished, that it answers 403
+  today, that a 404 passes, and that the control fails, naming v1.0,
+  only when apt prints no such line; smoke.sh's comment says the same.
+- N-2: the strict bullet's vendor case now says what to do: the smoke
+  cannot pass on that host until the vendor's files change, so record
+  the reason and the file, and run it again later.
+
+No behaviour change; shellcheck -x clean.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -1850,9 +1876,10 @@ echo "[deb-test] phase 4 (Phase 3 hot-prefetch) PASS"
 # try-restart (a running daemon moves to the new binary, a stopped one
 # stays stopped), stops nothing first and prints no install message; a
 # failed restart does not fail dpkg; policy-rc.d's "no" is honoured;
-# abort-upgrade restarts too, a plain abort-remove does not; a removal
-# stops and disables the unit, and a reinstall after it prints the hint
-# again; without systemd the hint prints and systemctl is not called.
+# abort-upgrade restarts too, a plain abort-remove does not, and neither
+# prints the hint; a removal stops and disables the unit, and a reinstall
+# after it prints the hint again; without systemd, or with DPKG_ROOT set,
+# the hint prints and systemctl is not called.
 #
 # AIDEV-NOTE: no systemd runs here (see the header), so this phase makes
 # the scripts see one: /run/systemd/system exists, and a systemctl stub
@@ -1865,10 +1892,10 @@ echo "[deb-test] phase 4 (Phase 3 hot-prefetch) PASS"
 # on it, so the stub sees what systemd would be asked. The image's
 # /usr/sbin/policy-rc.d (exit 101: Docker's images forbid service actions)
 # is moved aside, except while the policy step checks that it is honoured.
-# The abort-* and no-systemd steps run the installed postinst directly, as
-# dpkg would. UPGRADE_FROM names the package to upgrade from (by default
-# this tree's, the /tmp one phase 1 installed); the upgrade goes to
-# /upgrade's, the same binary packaged at a higher version (the
+# The abort-*, no-systemd and DPKG_ROOT steps run the installed postinst
+# directly, as dpkg would. UPGRADE_FROM names the package to upgrade from
+# (by default this tree's, the /tmp one phase 1 installed); the upgrade
+# goes to /upgrade's, the same binary packaged at a higher version (the
 # Dockerfile's build stage).
 # ============================================================
 
@@ -2003,7 +2030,10 @@ expect_count policy "policy-rc.d refusals" 1 /tmp/p5.policy.out 'policy-rc\.d re
 # dpkg runs the installed postinst with abort-upgrade NEW-VERSION when an
 # upgrade to NEW-VERSION fails, and with a plain abort-remove when a
 # removal's prerm fails. debhelper's snippet restarts only when $2 is set,
-# and a plain abort-remove has none.
+# and a plain abort-remove has none. Neither prints the install hint.
+# The unit disabled, so that the abort-* actions' silence comes from the
+# hint's configure gate, not from is-enabled.
+PATH="$stubs:$PATH" systemctl disable apt-cacher-ultra.service
 echo "[deb-test] phase 5: abort-upgrade: one try-restart; a plain abort-remove: none"
 postinst_step abort-upgrade abort-upgrade 9.9.9~e2e
 expect_count abort-upgrade "try-restart calls" 1 "$calls" '^try-restart apt-cacher-ultra\.service$'
@@ -2011,6 +2041,7 @@ expect_count abort-upgrade "start or restart calls" 1 "$calls" "$restarts"
 expect_count abort-upgrade "install messages" 0 /tmp/p5.abort-upgrade.out "$message"
 postinst_step abort-remove abort-remove
 expect_count abort-remove "start or restart calls" 0 "$calls" "$restarts"
+expect_count abort-remove "install messages" 0 /tmp/p5.abort-remove.out "$message"
 
 echo "[deb-test] phase 5: remove: stop and disable"
 dpkg_step remove -r apt-cacher-ultra
@@ -2034,11 +2065,18 @@ mkdir /run/systemd/system
 expect_count no-systemd "systemctl calls" 0 "$calls" '.'
 expect_count no-systemd "install messages" 1 /tmp/p5.no-systemd.out "$message"
 
+# DPKG_ROOT set (dpkg --root: another system's root) is the guards' other
+# half: the same, with systemd running and the stub still "enabled".
+echo "[deb-test] phase 5: DPKG_ROOT set: no systemctl call, the install message"
+DPKG_ROOT=/acu-root postinst_step dpkg-root configure "$old_version"
+expect_count dpkg-root "systemctl calls" 0 "$calls" '.'
+expect_count dpkg-root "install messages" 1 /tmp/p5.dpkg-root.out "$message"
+
 echo "[deb-test] phase 5 (maintainer scripts under systemd) PASS"
 echo "[deb-test] OVERALL PASS"
 ```
 
-What each check pins: the fresh install (from a purge) calls no `start`/`restart`/`try-restart` and prints the install message once; the operator then enables the unit (the stub's `enable`); the upgrade calls exactly one `try-restart apt-cacher-ultra.service`, no other start or restart and no `stop`, prints no install message (the unit is enabled), and leaves the new version installed; a `try-restart` that fails leaves dpkg's exit status 0 and the package `install ok installed`; with the image's `policy-rc.d` (exit 101) in place, no restart reaches `systemctl` and `deb-systemd-invoke`'s refusal is printed; the installed postinst, run as dpkg runs it when an upgrade fails (`abort-upgrade 9.9.9~e2e`), calls one `try-restart` and prints no install message, and with a plain `abort-remove` (no `$2`) restarts nothing; a removal calls `stop` and `disable` once each (`preremove.sh`, unchanged), and the reinstall after it prints the install message again (the remove disabled the unit); with `/run/systemd/system` absent and the unit enabled again, `configure` calls `systemctl` not at all and prints the install message. The `restarts` pattern allows `systemctl`'s leading options, so a `deb-systemd-invoke restart` (which calls `systemctl --quiet restart …`) would count too.
+What each check pins: the fresh install (from a purge) calls no `start`/`restart`/`try-restart` and prints the install message once; the operator then enables the unit (the stub's `enable`); the upgrade calls exactly one `try-restart apt-cacher-ultra.service`, no other start or restart and no `stop`, prints no install message (the unit is enabled), and leaves the new version installed; a `try-restart` that fails leaves dpkg's exit status 0 and the package `install ok installed`; with the image's `policy-rc.d` (exit 101) in place, no restart reaches `systemctl` and `deb-systemd-invoke`'s refusal is printed; with the unit disabled (so that only the hint's `configure` gate keeps them silent), the installed postinst, run as dpkg runs it when an upgrade fails (`abort-upgrade 9.9.9~e2e`), calls one `try-restart`, and with a plain `abort-remove` (no `$2`) restarts nothing, neither printing the install message; a removal calls `stop` and `disable` once each (`preremove.sh`, unchanged), and the reinstall after it prints the install message again (the remove disabled the unit); with `/run/systemd/system` absent and the unit enabled again, `configure` calls `systemctl` not at all and prints the install message, and so it does with `DPKG_ROOT` set (systemd running, the unit enabled). The `restarts` pattern allows `systemctl`'s leading options, so a `deb-systemd-invoke restart` (which calls `systemctl --quiet restart …`) would count too.
 
 - [ ] **Step 3: Run it to see it fail (the current postinst restarts nothing)**
 
@@ -2102,7 +2140,7 @@ fi
 
 # unit_enabled: true only where systemd runs (the guard above) and reports
 # the unit enabled. Called only as an if condition, so a systemctl that
-# answers "disabled" or "not-found" (exit 1) cannot trip set -e.
+# answers "disabled" or "not-found" (a non-zero exit) cannot trip set -e.
 unit_enabled() {
     [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ] &&
         systemctl is-enabled --quiet apt-cacher-ultra.service >/dev/null 2>&1
@@ -2162,6 +2200,7 @@ Expected, for each image:
 [deb-test] phase 5: remove: stop and disable
 [deb-test] phase 5: reinstall after the remove: the install message
 [deb-test] phase 5: no systemd: no systemctl call, the install message
+[deb-test] phase 5: DPKG_ROOT set: no systemctl call, the install message
 [deb-test] phase 5 (maintainer scripts under systemd) PASS
 [deb-test] OVERALL PASS
 [deb-test] ubuntu:24.04 PASS
@@ -2181,8 +2220,11 @@ Each mutant (one at a time) fails phase 5 with Step 3's command, at the line sho
 | the hint's condition as the task's first commit had it (`if [ "$1" = "configure" ] && [ -z "$2" ]; then`) | both | `FAIL: phase-5 reinstall: 0 install messages, want 1` |
 | the hint on every `configure` (`if [ "$1" = "configure" ]; then`) | 24.04 | `FAIL: phase-5 upgrade: 1 install messages, want 0` |
 | `unit_enabled` without the systemd guard (only its `systemctl is-enabled` line) | 24.04 | `FAIL: phase-5 no-systemd: 1 systemctl calls, want 0` |
+| the hint on any action, its `configure` gate dropped (`if ! unit_enabled; then`) | 24.04 | `FAIL: phase-5 abort-upgrade: 1 install messages, want 0` |
+| `DPKG_ROOT` dropped from `unit_enabled`'s guard (`[ -d /run/systemd/system ] &&`) | 24.04 | `FAIL: phase-5 dpkg-root: 1 systemctl calls, want 0` |
+| `DPKG_ROOT` dropped from the restart's guard (`if [ -d /run/systemd/system ]; then`) | 24.04 | `FAIL: phase-5 dpkg-root: 2 systemctl calls, want 0` |
 
-The first is the ruling's red; it and the third and fourth (fix round 1, ruling PH3-17) ran on both images and failed as shown on each, the others on `UBUNTU_VERSIONS=24.04`, as shown. `git diff --no-ext-diff packaging/` shows only Step 4's change.
+The first is the ruling's red; it and the third and fourth (fix round 1, ruling PH3-17) ran on both images and failed as shown on each, the others on `UBUNTU_VERSIONS=24.04`, as shown. The last three are fix round 2's (ruling PH3-20), run with phase 5 as Step 2 shows it; the first six fail at steps that round left as they were. `git diff --no-ext-diff packaging/` shows only Step 4's change.
 
 - [ ] **Step 7: The upgrade from 1.0.2, with its own package**
 
@@ -2214,6 +2256,7 @@ Expected:
 [deb-test] phase 5: remove: stop and disable
 [deb-test] phase 5: reinstall after the remove: the install message
 [deb-test] phase 5: no systemd: no systemctl call, the install message
+[deb-test] phase 5: DPKG_ROOT set: no systemctl call, the install message
 [deb-test] phase 5 (maintainer scripts under systemd) PASS
 [deb-test] OVERALL PASS
 ```
@@ -2259,7 +2302,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
 ```
 
-As executed, Task 4 is two commits: the one above (3e4bb80) and, after the task's review, its fix round 1 (bbfbd28, execution ruling PH3-17): the install hint unless the unit is enabled, the `AIDEV-NOTE` on what a failed restart shows, and phase 5's `abort-*`, reinstall and no-systemd steps, as Steps 2 and 4 now show them. Steps 3, 5, 6 and 7's expected outputs are the as-built runs (fix round 1, 2026-10-27).
+As executed, Task 4 is three commits: the one above (3e4bb80); after the task's review, its fix round 1 (bbfbd28, execution ruling PH3-17): the install hint unless the unit is enabled, the `AIDEV-NOTE` on what a failed restart shows, and phase 5's `abort-*`, reinstall and no-systemd steps; and after the re-review, its fix round 2 (9766ad2, ruling PH3-20): the unit disabled before the abort step, with abort-remove's message check, so that the hint's `configure` gate is pinned; the `DPKG_ROOT` step; and the comment's "a non-zero exit" — as Steps 2 and 4 now show them. Steps 3, 5, 6 and 7's expected outputs are the as-built runs (fix rounds 1 and 2, 2026-10-27; Step 3's red fails before any step fix round 2 changed).
 
 ```bash
 git add packaging/scripts/postinstall.sh e2e/deb/test.sh
@@ -2292,6 +2335,35 @@ restart condition (abort-upgrade: 0 try-restart calls, want 1) and Task
 without systemd, on 24.04; Task 4's two restart mutants still fail.
 Green on both images, and from 1.0.2's own package. Under a real
 systemd (PID 1, 24.04) the same cases behave as the stub models them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+EOF
+```
+
+```bash
+git add e2e/deb/test.sh packaging/scripts/postinstall.sh
+git commit -F - <<'EOF'
+e2e/deb: phase 5 pins the hint's configure gate and DPKG_ROOT
+
+Task 4's re-review (fix round 2, ruling PH3-20):
+
+- The abort-* actions' silence came from is-enabled, not from the
+  hint's configure gate: the stub's unit was enabled there. The unit is
+  now disabled before the abort step, and a plain abort-remove is
+  checked for no install message too.
+- The DPKG_ROOT half of the guards was untested: a new last step runs
+  the installed postinst's configure with DPKG_ROOT set (systemd
+  running, the stub "enabled") and expects no systemctl call and the
+  install message.
+- postinstall.sh's comment gave not-found's exit as 1; systemctl's
+  is-enabled exits 4 for it. It now says "a non-zero exit".
+
+Red, each in a scratch copy, on ubuntu:24.04: the hint on any action
+(`if ! unit_enabled; then`) fails "abort-upgrade: 1 install messages,
+want 0"; DPKG_ROOT dropped from unit_enabled fails "dpkg-root: 1
+systemctl calls, want 0", and from the restart's guard "dpkg-root: 2
+systemctl calls, want 0". Green on 24.04 and 26.04, and from 1.0.2's
+own package.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
