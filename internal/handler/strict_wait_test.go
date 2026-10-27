@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 )
 
@@ -244,6 +245,85 @@ func TestServeHTTP_StrictRefusalLooksUpOnceMoreWhenTheAdoptionJustEnded(t *testi
 			}
 			if n := len(logs.find("unvouched_deb_refused")); n != 0 {
 				t.Fatalf("%d unvouched_deb_refused events, want 0", n)
+			}
+		})
+	}
+}
+
+// firstFetchHook is a Fetcher that runs before once, ahead of its first
+// fetch (the window between a miss's two package_hash reads).
+type firstFetchHook struct {
+	Fetcher
+	once   sync.Once
+	before func()
+}
+
+func (f *firstFetchHook) Fetch(ctx context.Context, tg *fetch.Target, dst fetch.FetchDst) (*fetch.FetchResult, error) {
+	f.once.Do(f.before)
+	return f.Fetcher.Fetch(ctx, tg, dst)
+}
+
+// Final review R4 #2: on the miss path a package_hash read that fails
+// before the download logs WARN package_hash_prefetch_lookup_failed (each
+// read strict mode fails open on is logged), and the read after the
+// download makes strict mode's decision instead of skipping it. Here the
+// table is unreadable until the upstream answers: the first read fails,
+// the second finds no row on a strict host, and the .deb is refused as it
+// would have been before the download (502, Retry-After 60), not served
+// silently. With a signed adoption in flight that refusal waits for it,
+// as before a download, and the retry serves the .deb it vouched for.
+func TestServeHTTP_StrictMissDecidesAfterAFailedPrefetchRead(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		inFlight bool
+		want     int
+	}{
+		{"nothing in flight: refused", false, http.StatusBadGateway},
+		{"an adoption in flight: waited for", true, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &fakeAdoptions{inFlight: tc.inFlight, ok: true}
+			h, logs, srvURL, scheme, canon := strictWaitRig(t, a)
+			a.during = func() {
+				commitVouching(t, h, scheme, canon, "/dists/new", waitDebPath, sha256Hex([]byte("upstream bytes")))
+				a.inFlight = false
+			}
+			db, err := sql.Open("sqlite", filepath.Join(h.cache.Dir(), "cache.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = db.Close() }()
+			if _, err := db.Exec(`ALTER TABLE package_hash RENAME TO package_hash_unreadable`); err != nil {
+				t.Fatal(err)
+			}
+			h.fetch = &firstFetchHook{Fetcher: h.fetch, before: func() {
+				if _, err := db.Exec(`ALTER TABLE package_hash_unreadable RENAME TO package_hash`); err != nil {
+					t.Errorf("restore package_hash: %v", err)
+				}
+			}}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, proxyReq("GET", srvURL, waitDebPath))
+			if rec.Code != tc.want {
+				t.Fatalf("status %d body %q, want %d", rec.Code, rec.Body.String(), tc.want)
+			}
+			if warns := logs.find("package_hash_prefetch_lookup_failed"); len(warns) != 1 || warns[0]["level"] != "WARN" {
+				t.Fatalf("package_hash_prefetch_lookup_failed lines %v, want one WARN", warns)
+			}
+			refused, lines := logs.find("unvouched_deb_refused"), logs.find("request")
+			if tc.inFlight {
+				if rec.Body.String() != "upstream bytes" || len(refused) != 0 || a.waits.Load() != 1 {
+					t.Fatalf("body %q, %d refusals, %d waits; want the vouched .deb after one wait", rec.Body.String(), len(refused), a.waits.Load())
+				}
+				return
+			}
+			if rec.Header().Get("Retry-After") != "60" || len(refused) != 1 || a.waits.Load() != 0 {
+				t.Fatalf("Retry-After %q, %d refusals, %d waits; want the strict refusal, logged once, no wait",
+					rec.Header().Get("Retry-After"), len(refused), a.waits.Load())
+			}
+			// The line says the upstream was asked: the refusal came after
+			// the download.
+			if len(lines) != 1 || lines[0]["outcome"] != "unvouched_deb_refused" || lines[0]["upstream_status"] != float64(http.StatusOK) {
+				t.Fatalf("request lines %v, want one unvouched_deb_refused line with upstream_status 200", lines)
 			}
 		})
 	}

@@ -2029,10 +2029,17 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 	// reads from many distinct .deb misses on one allowed host. A
 	// strict-mode refusal that has to wait for a host slot is fine:
 	// strict mode is opt-in and the 502 carries Retry-After: 60.
+	//
+	// prefetchUnread: this check could not read the vouching hashes, so
+	// strict mode decides on the read after the download (final review
+	// R4 #2).
+	prefetchUnread := false
 	if !req.IsMetadata {
-		if res, end := h.prefetchCheck(ctx, req, true); end {
+		res, end, unread := h.prefetchCheck(ctx, req, true)
+		if end {
 			return res
 		}
+		prefetchUnread = unread
 	}
 
 	bw, err := h.cache.NewTempBlob()
@@ -2099,6 +2106,14 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 					"canonical_host", req.CanonicalHost,
 					"path", req.Path,
 				)
+				// Final review R4 #2: strict mode's decision, which the
+				// check before the download could not make, is made here.
+				if prefetchUnread && isDebPath(req.Path) {
+					if res, end := h.strictAfterDownload(ctx, req); end {
+						res.status = fres.Status
+						return res
+					}
+				}
 				var ferr2 error
 				hash, ferr2 = bw.Finalize(fres.ContentLength)
 				if ferr2 != nil {
@@ -2287,16 +2302,24 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 // errUnvouchedRetryable while a signed adoption is in flight on the host,
 // for serveCacheMiss to wait for outside singleflight (spec C10), or, with
 // none in flight, run the check once more at once (final review R1 #2);
-// that second check neither waits nor checks again.
-func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request, mayWait bool) (res sfResult, end bool) {
+// that second check neither waits nor checks again. unread: the vouching
+// hashes could not be read (logged WARN), so runFetch's read after the
+// download makes strict mode's decision (strictAfterDownload).
+func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request, mayWait bool) (res sfResult, end, unread bool) {
 	rows, derr := h.cache.DeclaredHashesForPath(ctx,
 		req.CanonicalScheme, req.CanonicalHost, req.Path)
 	if derr != nil {
-		// Fall through; the post-fetch lookup will retry. Do not pre-emit a
-		// Warn line here; if the same DB is flaky it will surface in the
-		// post-fetch path's structured log instead, with one line per
-		// failed validation rather than two.
-		return sfResult{}, false
+		// Final review R4 #2: logged, as every read strict mode fails open
+		// on is (this one was silent, and with the read after the download
+		// finding no row an unvouched .deb was served on a strict host
+		// with nothing above DEBUG). The download goes ahead; the read
+		// after it validates the bytes and decides strict mode.
+		h.logger.Warn("package_hash_prefetch_lookup_failed",
+			"err", derr,
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+		)
+		return sfResult{}, false, true
 	}
 	distinct := distinctDeclared(rows)
 	if len(distinct) >= 2 {
@@ -2306,13 +2329,13 @@ func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request, mayWait
 			"fetched", false,
 			"declared", declaredAttrs(rows),
 		)
-		return sfResult{err: ErrPackageHashConflict}, true
+		return sfResult{err: ErrPackageHashConflict}, true, false
 	}
 	// SPEC3 §6.1 strict mode fires only on .deb paths; the predicate must
 	// not refuse source tarballs, udebs, etc. that legitimately have no
 	// package_hash row.
 	if len(distinct) != 0 || !isDebPath(req.Path) {
-		return sfResult{}, false
+		return sfResult{}, false, false
 	}
 	switch sm, snapID, count := h.classifyStrictMode(ctx,
 		req.CanonicalScheme, req.CanonicalHost); sm {
@@ -2322,12 +2345,40 @@ func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request, mayWait
 			// this attempt (releasing the host slot) and let serveCacheMiss
 			// wait outside singleflight.
 			if h.adoptions.AdoptionsInFlight(req.CanonicalHost) {
-				return sfResult{err: errUnvouchedRetryable, snapshotCount: count}, true
+				return sfResult{err: errUnvouchedRetryable, snapshotCount: count}, true, false
 			}
 			// Final review R1 #2: an adoption that committed the rows
 			// vouching for this .deb may have ended since the lookup above
 			// (its count ends after its commit): check once more, at once.
 			return h.prefetchCheck(ctx, req, false)
+		}
+		h.logUnvouchedRefused(req, count)
+		return sfResult{err: ErrUnvouchedDebRefused}, true, false
+	case strictPassthrough:
+		h.logUnvouchedPassthrough(req.CanonicalHost, req.Path, snapID)
+	}
+	return sfResult{}, false, false
+}
+
+// strictAfterDownload is strict mode's decision for a downloaded .deb no
+// current snapshot vouches for, after prefetchCheck could not read the
+// vouching hashes (final review R4 #2): the decision prefetchCheck makes,
+// on runFetch's read after the download — the attempt ends (end, with res)
+// refused, or errUnvouchedRetryable while a signed adoption is in flight on
+// the host (serveCacheMiss waits and retries the miss once; the retry
+// checks before its download again).
+//
+// AIDEV-NOTE: no second lookup here (prefetchCheck's R1 #2 re-run): the
+// race it closes — an adoption committing and ending between the lookup
+// and the in-flight check — would need the read before the download to
+// have failed too; its cost is one refusal, Retry-After 60. A failure of
+// both reads fails open: the post-download read's WARN path serves.
+func (h *Handler) strictAfterDownload(ctx context.Context, req *proxy.Request) (res sfResult, end bool) {
+	switch sm, snapID, count := h.classifyStrictMode(ctx,
+		req.CanonicalScheme, req.CanonicalHost); sm {
+	case strictRefuse:
+		if h.adoptions != nil && h.adoptions.AdoptionsInFlight(req.CanonicalHost) {
+			return sfResult{err: errUnvouchedRetryable, snapshotCount: count}, true
 		}
 		h.logUnvouchedRefused(req, count)
 		return sfResult{err: ErrUnvouchedDebRefused}, true
@@ -2438,10 +2489,11 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		// matches the conflict-case shape; outcome
 		// "unvouched_deb_refused" pivots in the per-request line. The
 		// detailed log was already emitted in runFetch where the
-		// strict-mode predicate fired.
+		// strict-mode predicate fired. A refusal decided after a download
+		// (strictAfterDownload) carries its upstream status.
 		w.Header().Set("Retry-After", "60")
 		http.Error(w, "unvouched .deb refused (strict mode)", http.StatusBadGateway)
-		h.logRequest(r, req.CanonicalHost, req.Path, "unvouched_deb_refused", http.StatusBadGateway, 0, false, 0, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "unvouched_deb_refused", http.StatusBadGateway, 0, res.status > 0, res.status, start)
 		return
 	case errors.Is(err, fetch.ErrInvalidURL):
 		// URL parse / scheme / host-mismatch failure — fired before

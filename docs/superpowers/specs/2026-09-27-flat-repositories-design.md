@@ -1745,7 +1745,12 @@ fault does not refuse every `.deb`; a lookup that failed because the
 request's context ended is no database error and is answered 503
 (`client_canceled`) on the hit path, never served (phase E final fix wave,
 FW-5: a MITM tunnel's Drain cancels the inner request while its writer
-stays live).
+stays live). On the miss path a failed `package_hash` read before the
+download (WARN `package_hash_prefetch_lookup_failed`) does not skip strict
+mode: the read after the download decides, as the first would have —
+refused, or waited for while a signed adoption is in flight, without the
+second lookup — and only a failure of both reads fails open (final review
+R4 #2).
 
 ### C11. Observability and configuration
 
