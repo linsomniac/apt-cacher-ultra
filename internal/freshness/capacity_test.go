@@ -3,6 +3,7 @@ package freshness
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -433,6 +434,202 @@ func TestAdoption_MaxDurationBoundsAStalledAdoption(t *testing.T) {
 			t.Fatalf("slots leaked: %d/%d", g, h)
 		}
 	})
+}
+
+// stallOnFetcher serves the canned bodies of fakeFetcher, except that a
+// fetch of stall waits for its context to end (an upstream slower than
+// adoption.max_duration); like the real client, it fails any fetch under a
+// context that has ended.
+type stallOnFetcher struct {
+	*fakeFetcher
+	stall string
+}
+
+func (f *stallOnFetcher) Fetch(ctx context.Context, target *fetch.Target, dst fetch.FetchDst) (*fetch.FetchResult, error) {
+	if target.URL == f.stall {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return f.fakeFetcher.Fetch(ctx, target, dst)
+}
+
+// trailingOptionalRelease is a signed rig Release whose IndexTarget
+// (main/binary-amd64/Packages) comes first and its optional members
+// (i18n Translations, never IndexTargets) after it, in that order, and a
+// fetcher that serves them all but stalls on the first optional one.
+func trailingOptionalRelease(t *testing.T, optional int) ([]byte, *stallOnFetcher) {
+	t.Helper()
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": testHex64})
+	f := newFakeFetcher()
+	f.put(rigPkgsURL, pkgs)
+	var sb strings.Builder
+	sb.WriteString("Origin: Test\nSuite: x\nSHA256:\n")
+	fmt.Fprintf(&sb, " %s %d main/binary-amd64/Packages\n", shaOf(pkgs), len(pkgs))
+	for i := range optional {
+		body := []byte(fmt.Sprintf("Package: foo\nDescription-l%d: foo\n", i))
+		p := fmt.Sprintf("main/i18n/Translation-l%d", i)
+		fmt.Fprintf(&sb, " %s %d %s\n", shaOf(body), len(body), p)
+		f.put("http://"+rigHost+rigSuite+"/"+p, body)
+	}
+	return simtest.ClearsignedFixture(sb.String()),
+		&stallOnFetcher{fakeFetcher: f, stall: "http://" + rigHost + rigSuite + "/main/i18n/Translation-l0"}
+}
+
+// The final review's R2 I-2: adoption.max_duration passing while the member
+// pipeline fetches the optional members after the last IndexTarget ends the
+// attempt timed_out. Before, each remaining optional member was skipped as
+// an integrity failure (WARN adoption_member_skipped, a repair record) and
+// the snapshot committed as a success: an operator alerting on timed_out
+// never learnt max_duration was too short.
+func TestAdoption_DeadlineInTrailingOptionalMembersIsTimedOut(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := simtest.OpenCache(t)
+		seedStaleAnchorAt(t, c, rigHost, rigSuite)
+		rel, members := trailingOptionalRelease(t, 1)
+		logs := &lockedBuffer{}
+		logger := slog.New(slog.NewJSONHandler(logs, nil))
+		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
+			HostLimiter: hostsem.New(8), MaxDuration: 20 * time.Minute,
+			TolerateOptionalMemberFailures: true, RepairSkippedMembers: true, Logger: logger,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		chk, err := New(Config{Cache: c, Fetcher: &changedUpstream{body: rel}, HostLimiter: hostsem.New(8),
+			Adopter: ad, Logger: logger})
+		if err != nil {
+			t.Fatal(err)
+		}
+		chk.Check(context.Background(), "http", rigHost, rigSuite)
+		chk.WaitForAdoptions()
+		sf, err := c.GetSuiteFreshness(context.Background(), "http", rigHost, rigSuite)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sf.CurrentSnapshotID != nil || strOf(sf.AdoptionFailReason) != "timed_out" {
+			t.Fatalf("committed %v, record reason %q; want no commit and timed_out", sf.CurrentSnapshotID != nil,
+				strOf(sf.AdoptionFailReason))
+		}
+		if recs := logRecords(t, logs, "adoption_member_skipped"); len(recs) != 0 {
+			t.Fatalf("adoption_member_skipped lines %v, want none", recs)
+		}
+	})
+}
+
+// The final review's R2 I-2, at shutdown: the lifetime context ending while
+// the member pipeline fetches optional members abandons the attempt (INFO
+// adoption_abandoned_at_shutdown) without a WARN adoption_member_skipped
+// for each remaining member (an Ubuntu suite has hundreds; design note 18:
+// a shutdown pages nobody), and commits nothing.
+func TestAdoption_ShutdownInOptionalMembersSkipsNoMember(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := simtest.OpenCache(t)
+		seedStaleAnchorAt(t, c, rigHost, rigSuite)
+		rel, members := trailingOptionalRelease(t, 5)
+		logs := &lockedBuffer{}
+		logger := slog.New(slog.NewJSONHandler(logs, nil))
+		ad, err := NewAdopter(AdoptionConfig{Cache: c, Fetcher: members, Verifier: passThroughVerifier{},
+			HostLimiter: hostsem.New(8), MaxDuration: 20 * time.Minute,
+			TolerateOptionalMemberFailures: true, RepairSkippedMembers: true, Logger: logger,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		life, stop := context.WithCancel(context.Background())
+		defer stop()
+		chk, err := New(Config{Cache: c, Fetcher: &changedUpstream{body: rel}, HostLimiter: hostsem.New(8),
+			Adopter: ad, LifetimeCtx: life, Logger: logger})
+		if err != nil {
+			t.Fatal(err)
+		}
+		chk.Check(context.Background(), "http", rigHost, rigSuite)
+		synctest.Wait() // the adoption waits in the first optional member's fetch
+		stop()
+		chk.WaitForAdoptions()
+		for _, level := range []string{"WARN", "ERROR"} {
+			for _, line := range strings.Split(logs.String(), "\n") {
+				if strings.Contains(line, `"level":"`+level+`"`) {
+					t.Errorf("logged at %s during a shutdown: %s", level, line)
+				}
+			}
+		}
+		if recs := logRecords(t, logs, "adoption_abandoned_at_shutdown"); len(recs) != 1 {
+			t.Errorf("adoption_abandoned_at_shutdown lines %v, want one", recs)
+		}
+		sf, err := c.GetSuiteFreshness(context.Background(), "http", rigHost, rigSuite)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sf.CurrentSnapshotID != nil || sf.AdoptionFailCount != 0 {
+			t.Fatalf("current %v, failure count %d after a shutdown; want no commit and no record",
+				sf.CurrentSnapshotID, sf.AdoptionFailCount)
+		}
+	})
+}
+
+// cancelAfterFetcher answers as fakeFetcher does and cancels once it has
+// answered after: a shutdown arriving as that member's fetch ends.
+type cancelAfterFetcher struct {
+	*fakeFetcher
+	after  string
+	cancel context.CancelFunc
+}
+
+func (f *cancelAfterFetcher) Fetch(ctx context.Context, target *fetch.Target, dst fetch.FetchDst) (*fetch.FetchResult, error) {
+	res, err := f.fakeFetcher.Fetch(ctx, target, dst)
+	if target.URL == f.after {
+		f.cancel()
+	}
+	return res, err
+}
+
+// The final review's R2 I-2: the member loop itself stops once its context
+// has ended. Here the shutdown arrives as a member's fetch ends in a 404,
+// a skip that writes nothing and so returns no error: no later member is
+// filtered (WARN adoption_member_skipped, arch_not_in_allowlist), fetched
+// or skipped, and nothing commits.
+func TestAdoption_EndedContextStopsTheMemberLoop(t *testing.T) {
+	env := newAdoptionTestEnv(t)
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": testHex64})
+	env.fetcher.put(base+"main/binary-amd64/Packages", pkgs)
+	env.fetcher.fail404(base + "main/i18n/Translation-de")
+	tr, arm := []byte("Package: foo\nDescription-de: foo\n"), []byte("Package: bar\n")
+	var sb strings.Builder
+	sb.WriteString("Origin: Test\nSuite: noble\nSHA256:\n")
+	fmt.Fprintf(&sb, " %s %d main/binary-amd64/Packages\n", shaOf(pkgs), len(pkgs))
+	fmt.Fprintf(&sb, " %s %d main/i18n/Translation-de\n", shaOf(tr), len(tr))
+	fmt.Fprintf(&sb, " %s %d main/binary-arm64/Packages\n", shaOf(arm), len(arm))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	logs := &lockedBuffer{}
+	ad, err := NewAdopter(AdoptionConfig{Cache: env.cache, Verifier: passThroughVerifier{}, HostLimiter: hostsem.New(8),
+		Fetcher:       &cancelAfterFetcher{fakeFetcher: env.fetcher, after: base + "main/i18n/Translation-de", cancel: cancel},
+		Architectures: []string{"amd64"}, TolerateOptionalMemberFailures: true,
+		Logger: slog.New(slog.NewJSONHandler(logs, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = ad.runShared(ctx, env.suite, &adoptionPayload{form: adoptionFormInline, inlineBytes: []byte(sb.String()), stop: ctx}, "", "")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runShared = %v, want the shutdown (context.Canceled)", err)
+	}
+	for _, rec := range logRecords(t, logs, "adoption_member_skipped") {
+		if rec["path"] != "main/i18n/Translation-de" {
+			t.Errorf("adoption_member_skipped %v after the context ended, want only the 404 that ended with it", rec)
+		}
+	}
+	sf, err := env.cache.GetSuiteFreshness(context.Background(), "http", env.suite.CanonicalHost, env.suite.SuitePath)
+	if err == nil && sf.CurrentSnapshotID != nil {
+		t.Fatalf("current snapshot %d after the context ended, want none", *sf.CurrentSnapshotID)
+	}
+	if err != nil && !errors.Is(err, cache.ErrNotFound) {
+		t.Fatal(err)
+	}
 }
 
 // Spec C4: CommitAdoption runs under context.WithoutCancel, so the

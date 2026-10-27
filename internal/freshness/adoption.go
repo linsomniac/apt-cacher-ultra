@@ -1387,6 +1387,18 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		requiredGroupFetched = make(map[string]bool)
 	}
 	for _, m := range members {
+		// AIDEV-NOTE: the final review's R2 I-2. An ended context —
+		// adoption.max_duration or shutdown — ends the pipeline here, and
+		// the tolerance below never takes a fetch it cut short for an
+		// optional member's integrity failure. Otherwise every remaining
+		// optional member was skipped (a WARN adoption_member_skipped and a
+		// repair record each) and, the commit running under WithoutCancel,
+		// a deadline committed a degraded snapshot as a success. The error
+		// carries the context's: spawnAdoption makes a deadline timed_out
+		// and a shutdown adoption_abandoned_at_shutdown.
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%w: member pipeline: %w", ErrAdoptionMemberFetchFailed, err)
+		}
 		// SPEC6_5 §7.2: per-arch / per-source index filter. Inert when
 		// the allowlist is empty (Phase 6 default). Skipped members never
 		// reach upstream — saves bandwidth and pool disk on caches whose
@@ -1443,8 +1455,9 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			// served — apt 404s it, exactly as on the 404-skip path.
 			// IndexTarget members stay fatal regardless (isIndexTarget),
 			// and a local DB fault (ErrAdoptionDBFailed) is never
-			// tolerated — only upstream member fetch/mismatch failures.
-			if a.tolerateOptionalMembers && !isIndexTarget(suite.SuitePath, m.Path) &&
+			// tolerated — only upstream member fetch/mismatch failures, and
+			// never once ctx has ended (the AIDEV-NOTE above the loop).
+			if a.tolerateOptionalMembers && ctx.Err() == nil && !isIndexTarget(suite.SuitePath, m.Path) &&
 				(errors.Is(err, ErrAdoptionMemberFetchFailed) || errors.Is(err, ErrAdoptionMemberMismatch)) {
 				detail := ""
 				var me *AdoptionMemberError
