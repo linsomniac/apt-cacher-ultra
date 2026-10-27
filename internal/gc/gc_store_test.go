@@ -207,6 +207,38 @@ func TestRun_RecoversARetiredRunPanic(t *testing.T) {
 	})
 }
 
+// The final review's R3 re-review: the run that deletes the retired
+// snapshots an hour after the start stops at max_tick_duration (1 min
+// here), whatever the backlog: with chunks of 30 s, two chunks, one
+// gc_tick_deadline_reached with phase=retired, and gc_retired_run_complete
+// with deadline_reached; nothing more before the first periodic tick.
+func TestRun_RetiredRunStopsAtMaxTickDuration(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logger, buf := captureLogger()
+		f := &fakeStore{chunkSleep: 30 * time.Second, chunksMore: 500}
+		g, _ := storeGC(t, f, 2, logger)
+		g.cfg.Interval = 24 * time.Hour
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { g.Run(ctx); close(done) }()
+		time.Sleep(2 * time.Hour)
+		synctest.Wait()
+		f.mu.Lock()
+		calls := len(f.chunkRows)
+		f.mu.Unlock()
+		cancel()
+		<-done
+		runs := gcEvents(t, buf, "gc_retired_run_complete")
+		if calls != 2 || len(runs) != 1 || runs[0]["deadline_reached"] != true || runs[0]["retired_reaped"] != float64(2) {
+			t.Fatalf("chunk calls %d, gc_retired_run_complete lines %v: want 2 chunks and one line with "+
+				"deadline_reached true and retired_reaped 2", calls, runs)
+		}
+		if dl := gcEvents(t, buf, "gc_tick_deadline_reached"); len(dl) != 1 || dl[0]["phase"] != phaseRetired {
+			t.Fatalf("gc_tick_deadline_reached lines %v, want one with phase=retired", dl)
+		}
+	})
+}
+
 // Review M-1 of the H1 plan: a pass that panics on every tick — here the
 // snapshot pass's batch — moves the rotation past itself, so the blob pass
 // after it still runs: the tick after the panic is the blob pass's, and
