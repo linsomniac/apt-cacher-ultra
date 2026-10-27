@@ -28,15 +28,16 @@ client configs work unchanged.
 - TLS MITM (optional) — local CA signs per-host leaf certs so HTTPS repos (e.g. download.docker.com) can be cached,
 - Availability-first caching — cache hits never block on upstream; snapshot is served when upstream is down/slow
   rather than failing.
-- Atomic snapshot adoption — per-suite InRelease + all referenced Packages/by-hash blobs are staged, GPG-verified, and
-  flipped in a single SQLite transaction. The flip waits (bounded) until clients that received the old InRelease have
-  had `adoption.flip_quiet_period` to fetch its indexes, so the index requests an apt client sends within that period
+- Atomic snapshot adoption — per-suite InRelease + all referenced Packages/by-hash blobs are staged, GPG-verified
+  (signed repositories; see [Repositories](#repositories)), and flipped in a single SQLite transaction. The flip
+  waits (bounded) until clients that received the old InRelease have had `adoption.flip_quiet_period` to fetch its
+  indexes, so the index requests an apt client sends within that period
   of its InRelease match it (by-hash requests are served from the displaced snapshot even later); the residuals (a
   client whose old InRelease is still being sent 15 s into a hold, or finished less than `flip_quiet_period` before then, a commit slower than the 20 s hold, a switch that waits
   60 s for its turn to hold, responses slower than apt's own timeout, more than 256 held requests) each have a
   counter and are documented in [Flip consistency](docs/configuration.md#flip-consistency).
-- Hash validation — every metadata file is checked against InRelease, every .deb against Packages; mismatches are
-rejected.
+- Hash validation — every metadata file is checked against InRelease, every .deb against Packages (signed
+  repositories; see [Repositories](#repositories)); mismatches are rejected.
 - by-hash dedup — indices stored by content hash, deduplicated across suites.
 - Singleflight coalescing — N concurrent clients requesting the same uncached file produce one upstream fetch.
 - Resumable upstream fetches — HTTP Range used to resume on transient failure.
@@ -253,10 +254,12 @@ connection. To access HTTPS repositories directly, explicitly set
 ## Repositories
 
 Snapshot adoption (`[adoption] enabled = true`, after loading the
-repositories' signing keys) is what keeps metadata fresh: the cache checks
-each repository its clients use and serves every change as one coherent
-snapshot, adopted at the repository's first `apt update` through the cache
-when an adoption slot is free. It is off in the packaged configuration:
+repositories' signing keys on the cache host, in `/etc/apt/keyrings` or
+`adoption.keyring_dirs`; restart after adding one) is what keeps metadata
+fresh: the cache checks each repository its clients use and serves every
+change as one coherent snapshot, adopted at the repository's first
+`apt update` through the cache when an adoption slot is free. It is off
+in the packaged configuration:
 until you enable it, each metadata file is served as the cache first
 stored it, and suites are only checked for changes.
 
@@ -271,17 +274,21 @@ stored it, and suites are only checked for changes.
   `/` and `./` forms of one directory are tracked as two suites. A flat
   repository at the root of its host (`deb https://example.com/ ./`) is
   not supported: it is served from the cache but never refreshed, with a
-  WARN `flat_host_root_unsupported`.
+  WARN `flat_host_root_unsupported`. A signed flat repository's key is
+  often installed only on the clients (`signed-by=`): the cache host
+  needs it too, or its adoption fails (`gpg_failed`) and is retried.
 - **Unsigned repositories** (a `Release` with no signature, for
   `[trusted=yes]` clients) are adopted as unsigned snapshots, served
   coherently but never trusted: they vouch for no package. A new one is
   adopted once two checks have seen the same `Release` at least 5 minutes
-  apart (with the retry schedule, usually 5 to 15 minutes after its first
-  `apt update` through the cache; an hour when its host answers 401 or
-  403 for the missing signature file, as Amazon S3 does), and a
-  repository the cache has seen signed is never adopted unsigned. Read the [threat
+  apart (with the default `cooldown` and `periodic_refresh`, usually
+  5 to 15 minutes after its first `apt update` through the cache; at least
+  an hour when its host answers 401 or 403 for the missing signature
+  file, as Amazon S3 does), and a repository the cache has seen signed is
+  never adopted unsigned. Read the [threat
   notes](docs/configuration.md#anchor-forms-and-unsigned-repositories)
-  before serving them; `adoption.adopt_unsigned = false` turns this off.
+  before serving them; `adoption.adopt_unsigned = false` turns this off
+  (and the refresh below).
 - **Flat repositories that publish no `Release` at all** (Gemfury,
   goreleaser) are refreshed file by file: each cached index is
   revalidated with upstream, and an HTML page never replaces one.
@@ -341,12 +348,14 @@ gap), two ways:
   [the admin listener's checks](docs/configuration.md#admin-status-metrics-and-maintenance)):
 
 ```sh
-curl -fsS -X POST http://127.0.0.1:6789/reconcile -H 'X-ACU-Admin: 1' \
+curl -sS -X POST http://127.0.0.1:6789/reconcile -H 'X-ACU-Admin: 1' \
     --data-urlencode 'host=packages.microsoft.com' \
     --data-urlencode 'suite=/ubuntu/24.04/prod/dists/noble'
 # 202 Accepted = reconcile triggered (runs asynchronously)
 # 400 = host or suite missing, a scheme other than http or https, a host
 #       holding scheme:// (pass the scheme in scheme), or a body that is not a form
+# 401 = admin.htpasswd_file is set and the credentials are missing or wrong
+#       (add -u user)
 # 403 = the header is missing, a browser request from another origin, or
 #       another host name without admin.htpasswd_file
 # 409 = busy, unknown suite, no current snapshot, or no free adoption slot
@@ -362,15 +371,17 @@ suite heals.
 
 A suite no client has asked for in `gc.suite_idle_ttl` (30 days by
 default) is reaped by a pass that runs every hour: it is no longer
-tracked, and its cached index files and snapshots are deleted. Its
-packages stay cached, without the version retention its snapshot gave
-them. A client that comes back makes it new again, fetched from upstream.
-The pass runs whatever `gc.enabled` says. An offline or archive cache that
+tracked, its cached index files are deleted and its snapshots retired
+(GC deletes them). Its packages stay cached, without the version
+retention its snapshot gave them. A client that comes back makes it new
+again, fetched from upstream. The pass runs whatever `gc.enabled` says.
+An offline or archive cache that
 must keep serving suites nobody asks for sets `suite_idle_ttl = "0s"` in
 the `[gc]` section — before upgrading from 1.0, whose suites count as idle
 from the last request before the upgrade ([Suite
 reaping](docs/configuration.md#suite-reaping)); the `apt-cacher-ultra
-starting` log line then shows `gc_suite_idle_ttl=0s` (a key in another
+starting` log line then shows `gc_suite_idle_ttl=0s`
+(`"gc_suite_idle_ttl":0` with `log.format = "json"`; a key in another
 section is ignored without a warning).
 
 ## Forgetting a suite
@@ -391,13 +402,16 @@ curl -sS -X POST http://127.0.0.1:6789/forget -H 'X-ACU-Admin: 1' \
     --data-urlencode 'scheme=https' \
     --data-urlencode 'host=packages.microsoft.com' \
     --data-urlencode 'suite=/ubuntu/24.04/prod/dists/noble'
-# 202 Accepted = forgotten; the body names the suite, the signed-path
-#                records deleted and any suite that kept them
+# 202 Accepted = forgotten; the body names the suite, counts the
+#                signed-seen markers (records that the path was seen
+#                signed) it deleted, and names any suite that kept them
+# 401 = admin.htpasswd_file is set and the credentials are missing or wrong
+#       (add -u user)
 # 409 = busy (try again) or no such suite
 ```
 
 [Forgetting a suite](docs/configuration.md#forgetting-a-suite-post-forget)
-lists every answer and what forgetting deletes.
+lists its other answers and what forgetting deletes.
 
 ## Build
 
