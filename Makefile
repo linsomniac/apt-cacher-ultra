@@ -1,4 +1,4 @@
-.PHONY: build test test-race lint fmt deb e2e e2e-flat deb-test apt-repo-test clean
+.PHONY: build test test-race lint fmt deb e2e e2e-flat e2e-live deb-test apt-repo-test clean
 
 GO        ?= go
 BIN       := apt-cacher-ultra
@@ -53,6 +53,16 @@ e2e:
 # image and container name prefix) so concurrent runs do not collide.
 e2e-flat:
 	bash e2e/flat/run.sh
+
+# The manual live-upstream smoke (e2e/live/README.md): a release-built
+# daemon and real apt clients against pkgs.k8s.io, NVIDIA CUDA,
+# libnvidia-container, pkg.jenkins.io and download.sublimetext.com, with
+# adoption and strict mode on; about 5 minutes. It needs network access to
+# those five vendors, so it is run by hand before 1.1.0 and before later
+# releases that change the request path, adoption or vouching, never in CI.
+# E2E_LIVE_NAME names its image and container (default acu-e2e-live).
+e2e-live:
+	bash e2e/live/run.sh
 
 # SPEC §14 step 3 .deb install validation: build the .deb in a
 # golang stage, then install on each Ubuntu LTS target and verify

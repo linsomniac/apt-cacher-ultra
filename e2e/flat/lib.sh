@@ -3,6 +3,18 @@
 # inside the test container: nginx (the upstream), the daemon and the apt
 # clients share it.
 #
+# AIDEV-NOTE: e2e/live/smoke.sh, the manual live smoke, sources this file
+# too. It uses the helpers scenario, passed, fail, show_logs, poll_quietly,
+# log_mark, log_lines, log_has, event, kv, suite_kv, panics_in_log,
+# start_daemon, stop_daemon, suite, client, capt, apt_update, apt_errors
+# and candidate, the settings CONFIG, DAEMON_LOG, PROXY, ADMIN, CURL and
+# APT_SIGNED_ERRORS, and the run state SCENARIO, FAILED, APT_RUNS, APT_LOG,
+# TIMINGS and POLL_TOOK; it overrides say, NGINX_LOG and APT_SIGNED_HOSTS.
+# It runs by hand, not in CI, so after changing any of these, lint it
+# (shellcheck -x e2e/live/*.sh), and run it (make e2e-live) when a
+# helper's behaviour changed. No line of this note may begin with the
+# word shellcheck: the linter reads such a comment as a directive.
+#
 # AIDEV-NOTE: ruling R-H2-5 — every wait in this harness is poll (a bounded
 # poll on an observable: a log line, an HTTP answer, an apt result) with a
 # failure message; no bare sleep stands in for a condition. fail, and an
