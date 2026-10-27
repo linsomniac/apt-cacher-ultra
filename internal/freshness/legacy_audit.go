@@ -207,13 +207,24 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 	return res, nil
 }
 
+// legacyAuditRefusalTail ends every pre-flight refusal.
+//
+// AIDEV-NOTE: the final review's R5 #2 / R7 #2. main runs the audit after
+// cache.Open, which has already committed the v7 migration, so a refusal
+// changes nothing of the audit's own but the database is no longer one
+// 1.0.x opens ("schema version 7 is newer than this binary supports"): an
+// operator who rolls the package back needs the cache.db copy the release
+// notes tell them to take before upgrading.
+const legacyAuditRefusalTail = "The audit changed nothing, but the database is already migrated to schema 7, which 1.0.x refuses: to go back to 1.0.x, restore the cache.db copied before the upgrade."
+
 // legacyAuditPoolSample is how many pinned pool files outside the queue the
 // pre-flight checks once every queued inline anchor file is missing.
 const legacyAuditPoolSample = 16
 
 // preflightLegacyAudit refuses to audit against a pool that is not there.
 // An unmounted, empty or foreign pool makes every anchor look missing,
-// which would quarantine every snapshot (spec §6.1). Nothing is changed.
+// which would quarantine every snapshot (spec §6.1). The audit changes
+// nothing, though the migration has (legacyAuditRefusalTail).
 // It loads the whole queue (ids and anchor hashes only; fine for 10^5
 // rows) because the decision needs every queued inline anchor.
 //
@@ -257,7 +268,7 @@ func preflightLegacyAudit(ctx context.Context, c *cache.Cache) error {
 	pool := filepath.Join(c.Dir(), "pool")
 	f, err := os.Open(pool)
 	if err != nil {
-		return fmt.Errorf("legacy trust audit: pool %s is not readable: %w (fix it and restart; nothing was changed)", pool, err)
+		return fmt.Errorf("legacy trust audit: pool %s is not readable: %w. Fix it and restart. %s", pool, err, legacyAuditRefusalTail)
 	}
 	_, rerr := f.Readdirnames(1)
 	_ = f.Close()
@@ -267,10 +278,10 @@ func preflightLegacyAudit(ctx context.Context, c *cache.Cache) error {
 	// single anchor. A lone missing anchor in a NON-empty pool is still
 	// quarantined by the audit (spec §6.1).
 	if errors.Is(rerr, io.EOF) {
-		return fmt.Errorf("legacy trust audit: pool %s is empty but the audit queue holds inline snapshots (%d) — is the pool mounted? Mount or restore it and restart; to start without the pool, wipe the cache directory. Nothing was changed", pool, queued)
+		return fmt.Errorf("legacy trust audit: pool %s is empty but the audit queue holds inline snapshots (%d) — is the pool mounted? Mount or restore it and restart; to start without the pool, wipe the cache directory. %s", pool, queued, legacyAuditRefusalTail)
 	}
 	if rerr != nil {
-		return fmt.Errorf("legacy trust audit: pool %s is not readable: %w (fix it and restart; nothing was changed)", pool, rerr)
+		return fmt.Errorf("legacy trust audit: pool %s is not readable: %w. Fix it and restart. %s", pool, rerr, legacyAuditRefusalTail)
 	}
 	if anyPoolFileExists(anchors) {
 		return nil
@@ -284,7 +295,7 @@ func preflightLegacyAudit(ctx context.Context, c *cache.Cache) error {
 		others[i] = c.BlobPath(h)
 	}
 	if len(anchors)+len(others) >= 2 && !anyPoolFileExists(others) {
-		return fmt.Errorf("legacy trust audit: none of the %d files checked exists under %s (%d queued inline anchors, %d other files current snapshots use) — is the pool mounted? Mount or restore it and restart; to start without the pool, wipe the cache directory. Nothing was changed", len(anchors)+len(others), pool, len(anchors), len(others))
+		return fmt.Errorf("legacy trust audit: none of the %d files checked exists under %s (%d queued inline anchors, %d other files current snapshots use) — is the pool mounted? Mount or restore it and restart; to start without the pool, wipe the cache directory. %s", len(anchors)+len(others), pool, len(anchors), len(others), legacyAuditRefusalTail)
 	}
 	return nil
 }

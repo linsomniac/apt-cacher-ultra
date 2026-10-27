@@ -454,6 +454,56 @@ func TestRunLegacyTrustAudit_PreflightRefusesMissingOrEmptyPool(t *testing.T) {
 	}
 }
 
+// The final review's R5 #2 / R7 #2: the pre-flight refuses after the
+// migration has committed (cache.Open migrates, then the audit runs), so
+// "nothing was changed" was untrue for an operator who rolls the package
+// back: every refusal says the audit changed nothing, that the database
+// is already at schema 7, which 1.0.x refuses, and how to go back.
+func TestRunLegacyTrustAudit_RefusalsSayTheSchemaIsMigrated(t *testing.T) {
+	f := buildLegacyFixture(t)
+	ctx := context.Background()
+	c := f.env.cache
+	pool := filepath.Join(c.Dir(), "pool")
+	moved := pool + ".away"
+	if err := os.Rename(pool, moved); err != nil {
+		t.Fatal(err)
+	}
+	foreign := filepath.Join(pool, "ab", strings.Repeat("ab", 32))
+	for _, tc := range []struct {
+		name  string
+		setup func() error
+	}{
+		{"missing", func() error { return nil }},
+		{"not a directory", func() error { return os.WriteFile(pool, nil, 0o644) }},
+		{"empty", func() error { return os.Mkdir(pool, 0o755) }},
+		{"foreign", func() error {
+			if err := os.MkdirAll(filepath.Dir(foreign), 0o755); err != nil {
+				return err
+			}
+			return os.WriteFile(foreign, []byte("another cache's blob"), 0o644)
+		}},
+	} {
+		if err := tc.setup(); err != nil {
+			t.Fatal(err)
+		}
+		_, err := RunLegacyTrustAudit(ctx, c, discardAuditLogger())
+		if err == nil || !strings.Contains(err.Error(), legacyAuditRefusalTail) || strings.Contains(strings.ToLower(err.Error()), "nothing was changed") {
+			t.Errorf("%s pool: err = %v, want a refusal ending %q", tc.name, err, legacyAuditRefusalTail)
+		}
+		if err := os.RemoveAll(pool); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, want := range []string{"changed nothing", "schema 7", "1.0.x", "restore the cache.db"} {
+		if !strings.Contains(legacyAuditRefusalTail, want) {
+			t.Errorf("refusal tail %q does not say %q", legacyAuditRefusalTail, want)
+		}
+	}
+	if err := os.Rename(moved, pool); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // oneQueuedInline is a pre-v7 cache with exactly one queued snapshot: a
 // clean, current inline one.
 func oneQueuedInline(t *testing.T) (*cache.Cache, int64) {

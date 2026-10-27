@@ -1939,15 +1939,18 @@ file), at least one of a sample of up to 16 pinned files outside the queue
 files and the sample are two or more files; an unmounted, empty or foreign
 pool would otherwise make every anchor look missing, so startup refuses
 with a message naming the path and the two ways out (restore the pool, or
-wipe the cache) and changes nothing. The sample is evidence the queue
-cannot exhaust: after the first start the queue holds only the deferred
-snapshots, whose unreadable files an operator may remove; with the pool
-mounted they are then quarantined `anchor_missing` (the final review's R2
-I-1, R5 #1). A single file checked — one queued anchor file, missing from
-a non-empty pool, and no other pinned file — is quarantined (one lost pool
-file cannot be told from a lost mount, and refusing would leave no
-recovery short of wiping the cache); detached-only queues read no pool
-files. Each batch of up to 100 is decided in memory and
+wipe the cache), and the audit changes nothing — though the migration,
+which runs first, has: the message says the database is already at schema
+7, which 1.0.x refuses, so going back means restoring the `cache.db`
+copied before the upgrade (the final review's R5 #2, R7 #2). The sample
+is evidence the queue cannot exhaust: after the first start the queue
+holds only the deferred snapshots, whose unreadable files an operator may
+remove; with the pool mounted they are then quarantined `anchor_missing`
+(the final review's R2 I-1, R5 #1). A single file checked — one queued
+anchor file, missing from a non-empty pool, and no other pinned file — is
+quarantined (one lost pool file cannot be told from a lost mount, and
+refusing would leave no recovery short of wiping the cache);
+detached-only queues read no pool files. Each batch of up to 100 is decided in memory and
 applied in **one writer transaction** (an INFO `legacy_trust_audit_progress`
 line per batch):
 
