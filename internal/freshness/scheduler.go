@@ -484,7 +484,10 @@ func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
 // tick and its check ends busy (a TryLock, no GET); a detached suite
 // whose Release.gpg fetch keeps failing is re-fetched every tick; and a
 // failed adoption whose record could not be written is re-attempted every
-// tick — all bounded by the tick interval.
+// tick — all bounded by the tick interval. Its limit: a suite with a
+// record is never pendingChange, so new content a client check found
+// queued under a not-due record waits for staleness, the record's retry
+// or a later client check (spec C4's bound; the final review's R1 #3).
 func (c *Checker) pendingChange(s cache.SuiteFreshness) bool {
 	return c.adopter != nil && s.InReleaseChangeSeenAt != nil && s.AdoptionFailCount == 0
 }

@@ -833,7 +833,13 @@ ends the wait (an *unknown* end sends the suite through the
 failing class and its backoff). Waiting state is in memory: after a restart
 the first tick rebuilds it from the stale `last_success_at` (one GET per
 queued suite). A client-triggered check that is refused leaves the suite
-due; the next tick parks it. Client-triggered checks may take a freed slot
+due; the next tick parks it — unless the suite holds a failure record whose
+retry is not due (an earlier content's `gpg_failed`, say): persisted state
+cannot tell the record's own content from new content a client check found
+queued, so such a suite is parked only once it goes stale
+(`periodic_refresh`), at the record's retry time (up to an hour, ±25 %), or
+by a later client check that wins a slot (the final review's R1 #3; an
+in-memory mark that would park it at once is an open decision). Client-triggered checks may take a freed slot
 before the scheduler's offer; they are the same work. When `max_concurrent_adoptions ≥ 2`, the last free
 global slot is reserved for suites that have a signed current snapshot
 (security updates are never starved by first or unsigned adoptions). The
