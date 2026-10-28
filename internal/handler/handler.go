@@ -1052,9 +1052,10 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 // refusal first wait for the host's signed adoptions in flight and run
 // the lookup once more (spec C10: at most 15 s and at most 25 s since the
 // request started at start, at most 64 waiters per host, beyond which the
-// refusal is immediate) — with none in flight, run it once more at once
-// (final review R1 #2). A request whose context ended during the wait
-// is answered 503 with outcome client_canceled (design note 31).
+// refusal is immediate) — with none in flight, read the declared hashes
+// once more at once (recheckRefusal, final review R1 #2). A request whose
+// context ended during the wait is answered 503 with outcome
+// client_canceled (design note 31).
 func (h *Handler) checkPackageHashWait(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string, start time.Time, mayWait bool) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
 	rows, err := h.cache.DeclaredHashesForPath(r.Context(),
 		req.CanonicalScheme, req.CanonicalHost, req.Path)
@@ -1110,17 +1111,8 @@ func (h *Handler) checkPackageHashWait(w http.ResponseWriter, r *http.Request, r
 					// Final review R1 #2: nothing to wait for (E-59), but
 					// an adoption may have committed the rows that vouch
 					// for this .deb and ended since the lookup above: look
-					// up once more, at once, before refusing.
-					//
-					// AIDEV-NOTE: this relies on an adoption's in-flight
-					// count ending after its commit (freshness inflight.go),
-					// so a count that reads zero here comes after any
-					// commit it covered. One more pair of reads per refusal
-					// with nothing in flight; mayWait=false: no wait and no
-					// third lookup. A context that ended meanwhile is
-					// answered client_canceled by the lookups themselves
-					// (FW-5 (a)), never failed open.
-					return h.checkPackageHashWait(w, r, req, blobHash, start, false)
+					// once more, at once, before refusing.
+					return h.recheckRefusal(w, r, req, blobHash, count)
 				}
 				waited := h.adoptions.WaitHostAdoptions(r.Context(), req.CanonicalHost, start)
 				// A client that left during the wait gets no retry, as on
@@ -1135,6 +1127,12 @@ func (h *Handler) checkPackageHashWait(w http.ResponseWriter, r *http.Request, r
 				if clientLeft(w, r) {
 					return true, "client_canceled", http.StatusServiceUnavailable, 0, false, packageValidation{}
 				}
+				// AIDEV-NOTE: the re-run after the wait decides afresh,
+				// both reads included, so a database fault in it fails
+				// open, as on a first lookup (phase E as built). The
+				// re-check with nothing in flight (recheckRefusal) does
+				// not: there a fault keeps the refusal (final review R1
+				// re-review #1, which left this re-run as it is).
 				if waited {
 					return h.checkPackageHashWait(w, r, req, blobHash, start, false)
 				}
@@ -1147,7 +1145,18 @@ func (h *Handler) checkPackageHashWait(w http.ResponseWriter, r *http.Request, r
 		default:
 			return false, "", 0, 0, false, packageValidation{}
 		}
-	case 1:
+	default:
+		return h.checkDeclared(w, req, blobHash, rows)
+	}
+}
+
+// checkDeclared is checkPackageHash's answer for a .deb hit whose path
+// current snapshots declare (rows holds at least one declaration): the
+// hit served validated, the row evicted for the miss path on a mismatch,
+// or a 502 on a conflict.
+func (h *Handler) checkDeclared(w http.ResponseWriter, req *proxy.Request, blobHash string, rows []cache.DeclaredHash) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
+	distinct := distinctDeclared(rows)
+	if len(distinct) == 1 {
 		if distinct[0] == blobHash {
 			// SPEC6_5 §10.3: serve-time validation match. Capture the
 			// matching row's package_name (Phase 3 v3) for the §2.3
@@ -1180,22 +1189,54 @@ func (h *Handler) checkPackageHashWait(w http.ResponseWriter, r *http.Request, r
 			"snapshot_id", rows[0].SnapshotID,
 		)
 		return false, "", 0, 0, true, packageValidation{}
-	default:
-		// Two or more distinct hashes: snapshots disagree. SPEC2 §6.1
-		// step 6 / §6.2 share fail-closed behavior — 502 + Retry-After
-		// 60 + log package_hash_conflict. Serving an arbitrary one of
-		// the conflicting hashes is worse than refusing.
-		serveHashValidatedTotal.Inc(classifyPath(req.Path), "mismatch")
-		w.Header().Set("Retry-After", "60")
-		http.Error(w, "package hash conflict", http.StatusBadGateway)
-		h.logger.Error("package_hash_conflict",
+	}
+	// Two or more distinct hashes: snapshots disagree. SPEC2 §6.1
+	// step 6 / §6.2 share fail-closed behavior — 502 + Retry-After
+	// 60 + log package_hash_conflict. Serving an arbitrary one of
+	// the conflicting hashes is worse than refusing.
+	serveHashValidatedTotal.Inc(classifyPath(req.Path), "mismatch")
+	w.Header().Set("Retry-After", "60")
+	http.Error(w, "package hash conflict", http.StatusBadGateway)
+	h.logger.Error("package_hash_conflict",
+		"canonical_host", req.CanonicalHost,
+		"path", req.Path,
+		"row_blob_hash", blobHash,
+		"declared", declaredAttrs(rows),
+	)
+	return true, "package_hash_conflict", http.StatusBadGateway, 0, false, packageValidation{}
+}
+
+// recheckRefusal is the hit path's second look before a strict-mode
+// refusal with no signed adoption in flight on the host (final review
+// R1 #2): one more package_hash read, at once. Rows it finds are checked as
+// on any hit (checkDeclared): an adoption committed them and ended since
+// the first read. Anything else keeps the refusal already decided — count
+// is its current_snapshot_count — and the host's coverage is not read
+// again. A request whose context ended is answered client_canceled.
+//
+// AIDEV-NOTE: this relies on an adoption's in-flight count ending after its
+// commit (freshness inflight.go), so a count that reads zero comes after
+// any commit it covered. A read fault here keeps the refusal, logged WARN:
+// re-running the whole check (as R1 #2's fix first did) failed open on a
+// fault of either read and served the .deb the first look had refused
+// (final review R1 re-review #1). One more read per such refusal.
+func (h *Handler) recheckRefusal(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string, count int) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
+	rows, err := h.cache.DeclaredHashesForPath(r.Context(),
+		req.CanonicalScheme, req.CanonicalHost, req.Path)
+	switch {
+	case err != nil && clientLeft(w, r):
+		return true, "client_canceled", http.StatusServiceUnavailable, 0, false, packageValidation{}
+	case err != nil:
+		h.logger.Warn("package_hash lookup failed",
+			"err", err,
 			"canonical_host", req.CanonicalHost,
 			"path", req.Path,
-			"row_blob_hash", blobHash,
-			"declared", declaredAttrs(rows),
 		)
-		return true, "package_hash_conflict", http.StatusBadGateway, 0, false, packageValidation{}
+	case len(rows) > 0:
+		return h.checkDeclared(w, req, blobHash, rows)
 	}
+	st, body := h.refuseUnvouchedDeb(w, req.CanonicalHost, req.Path, count)
+	return true, "unvouched_deb_refused", st, body, false, packageValidation{}
 }
 
 // firstPackageName returns the PackageName of the first DeclaredHash
@@ -2035,7 +2076,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 	// R4 #2).
 	prefetchUnread := false
 	if !req.IsMetadata {
-		res, end, unread := h.prefetchCheck(ctx, req, true)
+		res, end, unread := h.prefetchCheck(ctx, req)
 		if end {
 			return res
 		}
@@ -2297,15 +2338,15 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 
 // prefetchCheck is runFetch's check before the download of a non-metadata
 // file: it ends the attempt (end, with res) on a package_hash conflict, or
-// when strict mode refuses an unvouched .deb. mayWait, as on the hit path
-// (checkPackageHashWait), lets a refusal first end the attempt
+// when strict mode refuses an unvouched .deb. As on the hit path
+// (checkPackageHashWait), a refusal first ends the attempt
 // errUnvouchedRetryable while a signed adoption is in flight on the host,
 // for serveCacheMiss to wait for outside singleflight (spec C10), or, with
-// none in flight, run the check once more at once (final review R1 #2);
-// that second check neither waits nor checks again. unread: the vouching
-// hashes could not be read (logged WARN), so runFetch's read after the
-// download makes strict mode's decision (strictAfterDownload).
-func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request, mayWait bool) (res sfResult, end, unread bool) {
+// none in flight, takes a second look at once (prefetchRecheck, final
+// review R1 #2). unread: the vouching hashes could not be read (logged
+// WARN), so runFetch's read after the download makes strict mode's
+// decision (strictAfterDownload).
+func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request) (res sfResult, end, unread bool) {
 	rows, derr := h.cache.DeclaredHashesForPath(ctx,
 		req.CanonicalScheme, req.CanonicalHost, req.Path)
 	if derr != nil {
@@ -2340,7 +2381,7 @@ func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request, mayWait
 	switch sm, snapID, count := h.classifyStrictMode(ctx,
 		req.CanonicalScheme, req.CanonicalHost); sm {
 	case strictRefuse:
-		if mayWait && h.adoptions != nil {
+		if h.adoptions != nil {
 			// Spec C10: with a signed adoption in flight on the host, end
 			// this attempt (releasing the host slot) and let serveCacheMiss
 			// wait outside singleflight.
@@ -2349,8 +2390,9 @@ func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request, mayWait
 			}
 			// Final review R1 #2: an adoption that committed the rows
 			// vouching for this .deb may have ended since the lookup above
-			// (its count ends after its commit): check once more, at once.
-			return h.prefetchCheck(ctx, req, false)
+			// (its count ends after its commit): look once more, at once.
+			res, end = h.prefetchRecheck(ctx, req, count)
+			return res, end, false
 		}
 		h.logUnvouchedRefused(req, count)
 		return sfResult{err: ErrUnvouchedDebRefused}, true, false
@@ -2358,6 +2400,35 @@ func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request, mayWait
 		h.logUnvouchedPassthrough(req.CanonicalHost, req.Path, snapID)
 	}
 	return sfResult{}, false, false
+}
+
+// prefetchRecheck is the miss path's second look before a strict-mode
+// refusal with no signed adoption in flight on the host, recheckRefusal's
+// twin (final review R1 #2): one more package_hash read, at once. Rows it
+// finds let the download go ahead (end false): the read after it validates
+// the bytes, and refuses a conflict. Anything else keeps the refusal
+// already decided — count is its current_snapshot_count — and nothing is
+// downloaded; the host's coverage is not read again.
+//
+// AIDEV-NOTE: a read fault here keeps the refusal, logged WARN. Re-running
+// the whole check (as R1 #2's fix first did) failed open on a coverage-read
+// fault and deferred a package_hash-read fault to the reads after the
+// download, which could fail open too (final review R1 re-review #1).
+func (h *Handler) prefetchRecheck(ctx context.Context, req *proxy.Request, count int) (res sfResult, end bool) {
+	rows, err := h.cache.DeclaredHashesForPath(ctx,
+		req.CanonicalScheme, req.CanonicalHost, req.Path)
+	switch {
+	case err != nil:
+		h.logger.Warn("package_hash_prefetch_lookup_failed",
+			"err", err,
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+		)
+	case len(rows) > 0:
+		return sfResult{}, false
+	}
+	h.logUnvouchedRefused(req, count)
+	return sfResult{err: ErrUnvouchedDebRefused}, true
 }
 
 // strictAfterDownload is strict mode's decision for a downloaded .deb no
@@ -2368,7 +2439,7 @@ func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request, mayWait
 // the host (serveCacheMiss waits and retries the miss once; the retry
 // checks before its download again).
 //
-// AIDEV-NOTE: no second lookup here (prefetchCheck's R1 #2 re-run): the
+// AIDEV-NOTE: no second look here (prefetchRecheck, R1 #2): the
 // race it closes — an adoption committing and ending between the lookup
 // and the in-flight check — would need the read before the download to
 // have failed too; its cost is one refusal, Retry-After 60. A failure of

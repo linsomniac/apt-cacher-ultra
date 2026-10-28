@@ -329,6 +329,67 @@ func TestServeHTTP_StrictMissDecidesAfterAFailedPrefetchRead(t *testing.T) {
 	}
 }
 
+// Final review R1 re-review #1: a read fault in the second look strict
+// mode takes before a refusal with nothing in flight (R1 #2) never
+// overturns the refusal the first look decided — neither a package_hash
+// read fault nor a fault of the host's coverage read, which the second look
+// does not make again. The fault starts as the in-flight check reads the
+// count, so only the second look meets it: the .deb is refused (502,
+// Retry-After 60, logged once) on both paths, and nothing is downloaded.
+func TestServeHTTP_StrictRecheckReadFaultKeepsTheRefusal(t *testing.T) {
+	faults := map[string]string{
+		"package_hash read": `ALTER TABLE package_hash RENAME TO package_hash_unreadable`,
+		"coverage read":     `ALTER TABLE suite_snapshot RENAME COLUMN package_coverage_complete TO package_coverage_unreadable`,
+	}
+	warnings := map[string]string{"hit": "package_hash lookup failed", "miss": "package_hash_prefetch_lookup_failed"}
+	for _, path := range []string{"hit", "miss"} {
+		for _, fault := range []string{"package_hash read", "coverage read"} {
+			t.Run(path+", "+fault, func(t *testing.T) {
+				a := &fakeAdoptions{}
+				h, logs, srvURL, scheme, canon := strictWaitRig(t, a)
+				deb := []byte("a cached .deb")
+				if path == "hit" {
+					blob := writeBlob(t, h, deb)
+					if err := h.cache.PutURLPath(context.Background(), cache.URLPath{CanonicalScheme: scheme, CanonicalHost: canon,
+						Path: waitDebPath, BlobHash: &blob, UpstreamURL: srvURL + waitDebPath}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				var downloaded atomic.Bool
+				h.fetch = &firstFetchHook{Fetcher: h.fetch, before: func() { downloaded.Store(true) }}
+				db, err := sql.Open("sqlite", filepath.Join(h.cache.Dir(), "cache.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = db.Close() }()
+				var once sync.Once
+				a.asked = func() {
+					once.Do(func() {
+						if _, err := db.Exec(faults[fault]); err != nil {
+							t.Errorf("inject the %s fault: %v", fault, err)
+						}
+					})
+				}
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, proxyReq("GET", srvURL, waitDebPath))
+				if rec.Code != http.StatusBadGateway || rec.Header().Get("Retry-After") != "60" {
+					t.Fatalf("status %d body %q, want the refusal the first look decided", rec.Code, rec.Body.String())
+				}
+				if n := len(logs.find("unvouched_deb_refused")); n != 1 {
+					t.Fatalf("%d unvouched_deb_refused events, want 1", n)
+				}
+				if downloaded.Load() {
+					t.Fatal("the upstream was asked for the refused .deb")
+				}
+				wantWarns := map[string]int{"package_hash read": 1}[fault]
+				if warns := logs.find(warnings[path]); len(warns) != wantWarns {
+					t.Fatalf("%d %s lines, want %d", len(warns), warnings[path], wantWarns)
+				}
+			})
+		}
+	}
+}
+
 // Spec C10: no wait without an adoption in flight; beyond 64 waiters per
 // host (the waiter says no) the refusal is immediate; and a .deb still
 // unvouched after the wait is refused, its refusal logged once.

@@ -1733,10 +1733,14 @@ requests for one `.deb` included); beyond that the refusal is immediate —
 unless nothing is in flight any more, which is checked first: a request
 that arrives as the host's last adoption ends, while its waiters still
 unwind, re-runs its lookup (phase H1, deferred minor E-58). With nothing
-in flight, both paths still re-run the lookup once, at once and without
-waiting, before refusing: an adoption that committed the vouching rows and
-ended between the lookup and the in-flight check is seen by then, since
-its count ends after its commit (final review R1 #2).
+in flight, both paths still read the `package_hash` rows once more, at once
+and without waiting, before refusing: an adoption that committed the
+vouching rows and ended between the lookup and the in-flight check is seen
+by then, since its count ends after its commit (final review R1 #2). Only
+rows found there change the answer; a read fault in that second read, or
+no row, keeps the refusal, and the host's coverage is not read again (R1
+re-review #1: re-running the whole check failed open on a fault of either
+read).
 
 Documented consequences: a client fetching N unvouched packages one
 after another during a long adoption waits up to 15 s for each (M-11); an
@@ -1761,7 +1765,10 @@ download (WARN `package_hash_prefetch_lookup_failed`) does not skip strict
 mode: the read after the download decides, as the first would have —
 refused, or waited for while a signed adoption is in flight, without the
 second lookup — and only a failure of both reads fails open (final review
-R4 #2).
+R4 #2). A fault never overturns a refusal already decided: the second
+read before a refusal with nothing in flight keeps the refusal when it
+fails (above). The re-run after a wait decides afresh, as a first lookup
+does, and fails open on a fault.
 
 ### C11. Observability and configuration
 
