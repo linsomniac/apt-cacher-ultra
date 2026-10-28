@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -19,17 +20,24 @@ import (
 )
 
 // fakeStore is a gcStore whose snapshot batches find nothing (A ∪ B
-// drained) unless told to panic, whose sub-job C chunks report a reap and
-// more for chunksMore calls and then none (or panic, chunkPanics), and
-// whose HashKnown knows no hash and panics for hashPanic.
+// drained) unless told to panic (batchPanics) or fail (batchErrs), whose
+// sub-job C chunks report a reap and more for chunksMore calls and then
+// none (or panic, chunkPanics, or fail, chunkErrs), and whose HashKnown
+// knows no hash and panics for hashPanic. A batch or chunk call checks
+// for its panic first, then calls its hook (batchHook, chunkHook), then
+// fails or answers.
 type fakeStore struct {
 	mu          sync.Mutex
 	batchPanics int           // RunSnapshotGCBatch panics on this many first calls
+	batchErrs   int           // RunSnapshotGCBatch fails on this many calls after the batchPanics ones
+	batchHook   func()        // called at the start of every RunSnapshotGCBatch call
 	batches     int           // RunSnapshotGCBatch calls
 	chunkRows   []int         // maxRows of each RunRetiredSnapshotGCChunk call
 	chunkSleep  time.Duration // each chunk takes this long (virtual time in a bubble)
 	chunksMore  int
-	chunkPanics bool // RunRetiredSnapshotGCChunk panics
+	chunkPanics bool   // RunRetiredSnapshotGCChunk panics
+	chunkErrs   bool   // RunRetiredSnapshotGCChunk fails
+	chunkHook   func() // called at the start of every RunRetiredSnapshotGCChunk call
 	hashPanic   string
 }
 
@@ -41,6 +49,12 @@ func (f *fakeStore) RunSnapshotGCBatch(context.Context, int, int64, int) (cache.
 	if n <= f.batchPanics {
 		panic("snapshot batch bug")
 	}
+	if f.batchHook != nil {
+		f.batchHook()
+	}
+	if n <= f.batchPanics+f.batchErrs {
+		return cache.SnapshotGCBatchResult{}, errors.New("snapshot batch fault")
+	}
 	return cache.SnapshotGCBatchResult{}, nil
 }
 
@@ -50,6 +64,12 @@ func (f *fakeStore) RunRetiredSnapshotGCChunk(_ context.Context, maxRows int) (i
 	defer f.mu.Unlock()
 	if f.chunkPanics {
 		panic("retired chunk bug")
+	}
+	if f.chunkHook != nil {
+		f.chunkHook()
+	}
+	if f.chunkErrs {
+		return 0, false, errors.New("retired chunk fault")
 	}
 	f.chunkRows = append(f.chunkRows, maxRows)
 	if len(f.chunkRows) > 1000 {
@@ -439,5 +459,179 @@ func TestSkipPanickedPass_MovesPastEachPass(t *testing.T) {
 		if g.nextPass != tc.at {
 			t.Errorf("a finished tick at pass %d: the rotation moved to %d", tc.at, g.nextPass)
 		}
+	}
+}
+
+// The H3 final review R3 #5: a pass that fails at every tick (a fault
+// limited to its tables) moves the rotation on as a panicking one does, so
+// the blob pass keeps reclaiming disk while the fault waits for its fix.
+func TestPeriodicTick_AFailingPassDoesNotStarveTheNext(t *testing.T) {
+	logger, buf := captureLogger()
+	f := &fakeStore{batchErrs: 1000}
+	g, _ := storeGC(t, f, 2, logger)
+	ctx := context.Background()
+	g.periodicTick(ctx) // the url-path pass (off: no TTL), then the snapshot pass fails
+	if g.nextPass != blobPass {
+		t.Fatalf("after a failed snapshot pass the rotation is at pass %d, want the blob pass (%d)", g.nextPass, blobPass)
+	}
+	g.periodicTick(ctx) // the blob pass
+	if g.nextPass != urlPathPass {
+		t.Fatalf("after the blob pass the rotation is at pass %d, want the url-path pass (%d)", g.nextPass, urlPathPass)
+	}
+	g.periodicTick(ctx) // the snapshot pass fails again
+	if n := len(gcEvents(t, buf, "gc_tick_failed")); n != 2 {
+		t.Fatalf("%d gc_tick_failed lines, want 2 (the snapshot pass, twice)", n)
+	}
+}
+
+// A pass stopped because the GC's context ended (shutdown) keeps the
+// rotation where it is, and logs no gc_tick_failed: it did not fail.
+func TestPeriodicTick_AnEndedContextKeepsTheRotation(t *testing.T) {
+	logger, buf := captureLogger()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := &fakeStore{batchErrs: 1000, batchHook: cancel}
+	g, _ := storeGC(t, f, 2, logger)
+	g.periodicTick(ctx)
+	if g.nextPass != snapshotPass {
+		t.Fatalf("after a pass stopped by its context the rotation is at pass %d, want the snapshot pass (%d)", g.nextPass, snapshotPass)
+	}
+	if n := len(gcEvents(t, buf, "gc_tick_failed")); n != 0 {
+		t.Fatalf("%d gc_tick_failed lines, want 0", n)
+	}
+}
+
+// The startup pass's runTick moves the rotation past a failed pass too, and
+// still returns the failure (main logs it).
+func TestStartupPass_AFailingPassMovesTheRotation(t *testing.T) {
+	logger, _ := captureLogger()
+	g, _ := storeGC(t, &fakeStore{batchErrs: 1}, 2, logger)
+	if err := g.StartupPass(context.Background()); err == nil {
+		t.Fatal("StartupPass returned nil, want the snapshot pass's failure")
+	}
+	if g.nextPass != blobPass {
+		t.Fatalf("the rotation is at pass %d, want the blob pass (%d)", g.nextPass, blobPass)
+	}
+}
+
+// The H3 final review R3 #5, every pass, in the style of
+// TestSkipPanickedPass_MovesPastEachPass: a pass that failed while the
+// GC's context lived moves the rotation past itself — url-path to
+// snapshot, snapshot to blob, blob back to url-path — and one stopped by
+// an ended context (a shutdown) leaves it as it is; either way passFailed
+// returns the pass's error, for runTick's caller to log or return.
+func TestPassFailed_MovesPastEachPassUnlessTheContextEnded(t *testing.T) {
+	ended, cancel := context.WithCancel(context.Background())
+	cancel()
+	g := &GC{}
+	for _, tc := range []struct {
+		at    pass
+		ended bool // the GC's context has ended (a shutdown)
+		want  pass
+	}{
+		{urlPathPass, false, snapshotPass},
+		{snapshotPass, false, blobPass},
+		{blobPass, false, urlPathPass},
+		{urlPathPass, true, urlPathPass},
+		{snapshotPass, true, snapshotPass},
+		{blobPass, true, blobPass},
+	} {
+		ctx := context.Background()
+		if tc.ended {
+			ctx = ended
+		}
+		fault := errors.New("x")
+		g.nextPass = tc.at
+		if err := g.passFailed(ctx, fault); !errors.Is(err, fault) {
+			t.Errorf("pass %d failed (context ended: %v): passFailed returned %v, want the pass's error", tc.at, tc.ended, err)
+		}
+		if g.nextPass != tc.want {
+			t.Errorf("pass %d failed (context ended: %v): the rotation is at %d, want %d", tc.at, tc.ended, g.nextPass, tc.want)
+		}
+	}
+}
+
+// The H3 final review R3 #5, the url-path pass's return in runTick (the
+// rig of TestPeriodicTick_AFailingPassDoesNotStarveTheNext reaches only
+// the snapshot pass's): on a real cache whose url_path table is renamed
+// away, the way the handler tests break one table, the url-path pass
+// fails, and one tick moves the rotation to the snapshot pass.
+func TestPeriodicTick_AFailingURLPathPassMovesToTheSnapshotPass(t *testing.T) {
+	logger, buf := captureLogger()
+	g, c := storeGC(t, nil, 2, logger)
+	g.store = c // the real cache behind the seam too, as New sets it
+	g.cfg.URLPathTTL = time.Hour
+	if _, err := dbOf(t, c).Exec(`ALTER TABLE url_path RENAME TO url_path_unreadable`); err != nil {
+		t.Fatal(err)
+	}
+	g.periodicTick(context.Background())
+	ev := gcEvents(t, buf, "gc_tick_failed")
+	if len(ev) != 1 {
+		t.Fatalf("gc_tick_failed lines %v, want one (the url-path pass's)", ev)
+	}
+	if msg, _ := ev[0]["err"].(string); !strings.Contains(msg, "url_path gc batch") {
+		t.Fatalf("gc_tick_failed err %q, want the url-path batch's failure", msg)
+	}
+	if g.nextPass != snapshotPass {
+		t.Fatalf("after a failed url-path pass the rotation is at pass %d, want the snapshot pass (%d)", g.nextPass, snapshotPass)
+	}
+}
+
+// The H3 final review R3 #5, the blob pass's return in runTick: on a real
+// cache whose blob table is renamed away, a tick that resumes at the blob
+// pass fails there, and the rotation moves back to the url-path pass, so
+// the next tick runs the passes before it first.
+func TestPeriodicTick_AFailingBlobPassMovesToTheURLPathPass(t *testing.T) {
+	logger, buf := captureLogger()
+	g, c := storeGC(t, nil, 2, logger)
+	g.store = c // the real cache behind the seam too, as New sets it
+	if _, err := dbOf(t, c).Exec(`ALTER TABLE blob RENAME TO blob_unreadable`); err != nil {
+		t.Fatal(err)
+	}
+	g.nextPass = blobPass
+	g.periodicTick(context.Background())
+	ev := gcEvents(t, buf, "gc_tick_failed")
+	if len(ev) != 1 {
+		t.Fatalf("gc_tick_failed lines %v, want one (the blob pass's)", ev)
+	}
+	if msg, _ := ev[0]["err"].(string); !strings.Contains(msg, "blob gc batch") {
+		t.Fatalf("gc_tick_failed err %q, want the blob batch's failure", msg)
+	}
+	if g.nextPass != urlPathPass {
+		t.Fatalf("after a failed blob pass the rotation is at pass %d, want the url-path pass (%d)", g.nextPass, urlPathPass)
+	}
+}
+
+// The run that deletes the retired snapshots an hour after the start logs
+// WARN gc_tick_failed for a chunk that failed while the GC's context
+// lived, and none when the context ended during the chunk (a shutdown
+// stopped the run; it did not fail). The test is the context's, as
+// passFailed's is, not the error's shape: neither chunk error here wraps a
+// context error.
+func TestRetiredRun_LogsAFailureOnlyWhileTheContextLives(t *testing.T) {
+	logger, buf := captureLogger()
+	g, _ := storeGC(t, &fakeStore{chunkErrs: true}, 2, logger)
+	g.retiredRun(context.Background())
+	ev := gcEvents(t, buf, "gc_tick_failed")
+	if len(ev) != 1 || ev[0]["level"] != "WARN" {
+		t.Fatalf("a chunk failed while the context lived: gc_tick_failed lines %v, want one at WARN", ev)
+	}
+	if msg, _ := ev[0]["err"].(string); !strings.Contains(msg, "retired chunk fault") {
+		t.Fatalf("gc_tick_failed err %q, want the chunk's failure", msg)
+	}
+
+	logger, buf = captureLogger()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g, _ = storeGC(t, &fakeStore{chunkErrs: true, chunkHook: cancel}, 2, logger)
+	g.retiredRun(ctx)
+	if ctx.Err() == nil {
+		t.Fatal("the chunk's hook did not run: the run ended before its chunk")
+	}
+	if n := len(gcEvents(t, buf, "gc_tick_failed")); n != 0 {
+		t.Fatalf("the context ended during the chunk: %d gc_tick_failed lines, want 0", n)
+	}
+	if runs := gcEvents(t, buf, "gc_retired_run_complete"); len(runs) != 1 {
+		t.Fatalf("gc_retired_run_complete lines %v, want the run's one", runs)
 	}
 }

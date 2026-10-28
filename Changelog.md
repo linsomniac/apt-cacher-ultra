@@ -59,3 +59,5 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   and logged.
 - Idle SQLite read connections are kept between requests, so connection
   churn no longer starves the writer.
+- A GC pass that fails at every tick no longer keeps the passes after it,
+  the blob pass included, from running.
