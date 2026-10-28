@@ -78,9 +78,9 @@ jobs:
       # e2e/live/smoke.sh, which runs only by hand (the Makefile's
       # shellcheck target, which `make lint` runs too). It runs ShellCheck
       # from the pinned koalaman/shellcheck:v0.11.0 image, not the runner's:
-      # ShellCheck versions differ in what they flag (ubuntu-latest's 0.9.0
-      # and 0.10.0 report an SC2015 that 0.11.0 does not), so CI and every
-      # checkout run the one version. -x follows each `source`
+      # ShellCheck versions differ in what they flag (0.9.0, the one
+      # ubuntu-latest ships, flagged an SC2015 at e2e/flat/test.sh that the
+      # local 0.11.0 did not), so CI and every checkout run the one version. -x follows each `source`
       # (e2e/flat/lib.sh, for both harnesses); without it ShellCheck reports
       # SC1091. It does not report an upper-case setting or a function a
       # sourced file stops defining.
