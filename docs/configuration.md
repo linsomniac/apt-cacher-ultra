@@ -953,7 +953,8 @@ download rather than served. A read fault never overturns a refusal
 already decided: before refusing a package while no adoption runs on its
 host, the cache reads its hashes once more, in case an adoption has just
 vouched for it, and only hashes found there change the answer — a fault
-in that read is logged as above and the package is refused. A request
+in that read is logged as above and the package is refused, and hashes
+there that disagree are refused at once as a conflict. A request
 whose client left (or, through the HTTPS proxy, whose tunnel is shutting
 down) is not a database error: it is answered 503 and never served an
 unvouched package.

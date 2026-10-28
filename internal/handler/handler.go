@@ -2404,16 +2404,20 @@ func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request) (res sf
 
 // prefetchRecheck is the miss path's second look before a strict-mode
 // refusal with no signed adoption in flight on the host, recheckRefusal's
-// twin (final review R1 #2): one more package_hash read, at once. Rows it
-// finds let the download go ahead (end false): the read after it validates
-// the bytes, and refuses a conflict. Anything else keeps the refusal
-// already decided — count is its current_snapshot_count — and nothing is
+// twin (final review R1 #2): one more package_hash read, at once. Rows that
+// agree let the download go ahead (end false): the read after it validates
+// the bytes. Rows that disagree are refused here, before the download, as
+// prefetchCheck refuses them. Anything else keeps the refusal already
+// decided — count is its current_snapshot_count — and nothing is
 // downloaded; the host's coverage is not read again.
 //
 // AIDEV-NOTE: a read fault here keeps the refusal, logged WARN. Re-running
 // the whole check (as R1 #2's fix first did) failed open on a coverage-read
 // fault and deferred a package_hash-read fault to the reads after the
-// download, which could fail open too (final review R1 re-review #1).
+// download, which could fail open too (final review R1 re-review #1). A
+// conflict is refused here for the same reason: left to the read after
+// the download, a fault of that read served the file unchecked (the D4/D5
+// re-review).
 func (h *Handler) prefetchRecheck(ctx context.Context, req *proxy.Request, count int) (res sfResult, end bool) {
 	rows, err := h.cache.DeclaredHashesForPath(ctx,
 		req.CanonicalScheme, req.CanonicalHost, req.Path)
@@ -2424,6 +2428,14 @@ func (h *Handler) prefetchRecheck(ctx context.Context, req *proxy.Request, count
 			"canonical_host", req.CanonicalHost,
 			"path", req.Path,
 		)
+	case len(distinctDeclared(rows)) >= 2:
+		h.logger.Error("package_hash_conflict",
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+			"fetched", false,
+			"declared", declaredAttrs(rows),
+		)
+		return sfResult{err: ErrPackageHashConflict}, true
 	case len(rows) > 0:
 		return sfResult{}, false
 	}

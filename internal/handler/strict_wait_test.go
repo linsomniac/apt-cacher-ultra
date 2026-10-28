@@ -425,6 +425,47 @@ func TestServeHTTP_StrictRecheckReadFaultKeepsTheRefusal(t *testing.T) {
 	})
 }
 
+// The D4/D5 re-review's corollary: when the miss path's second look finds
+// snapshots that disagree on the .deb's hash (they committed between the
+// two looks), it refuses the conflict before the download, as the first
+// look does. Deciding it after the download let a fault of the read there
+// serve the file unchecked: here the package_hash table becomes
+// unreadable as the upstream is asked.
+func TestServeHTTP_StrictMissSecondLookRefusesAConflictBeforeTheDownload(t *testing.T) {
+	a := &fakeAdoptions{}
+	h, logs, srvURL, scheme, canon := strictWaitRig(t, a)
+	var once sync.Once
+	a.asked = func() {
+		once.Do(func() {
+			commitVouching(t, h, scheme, canon, "/dists/a", waitDebPath, sha256Hex([]byte("one build")))
+			commitVouching(t, h, scheme, canon, "/dists/b", waitDebPath, sha256Hex([]byte("another build")))
+		})
+	}
+	db, err := sql.Open("sqlite", filepath.Join(h.cache.Dir(), "cache.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	var downloaded atomic.Bool
+	h.fetch = &firstFetchHook{Fetcher: h.fetch, before: func() {
+		downloaded.Store(true)
+		if _, err := db.Exec(`ALTER TABLE package_hash RENAME TO package_hash_unreadable`); err != nil {
+			t.Errorf("inject the post-download read fault: %v", err)
+		}
+	}}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, proxyReq("GET", srvURL, waitDebPath))
+	if rec.Code != http.StatusBadGateway || rec.Body.String() != "package hash conflict\n" {
+		t.Fatalf("status %d body %q, want 502 package hash conflict", rec.Code, rec.Body.String())
+	}
+	if downloaded.Load() {
+		t.Fatal("the upstream was asked for a .deb whose snapshots disagree")
+	}
+	if c := logs.find("package_hash_conflict"); len(c) != 1 || c[0]["fetched"] != false {
+		t.Fatalf("package_hash_conflict lines %v, want one with fetched=false", c)
+	}
+}
+
 // Spec C10: no wait without an adoption in flight; beyond 64 waiters per
 // host (the waiter says no) the refusal is immediate; and a .deb still
 // unvouched after the wait is refused, its refusal logged once.

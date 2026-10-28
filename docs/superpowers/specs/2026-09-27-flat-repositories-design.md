@@ -1740,7 +1740,10 @@ by then, since its count ends after its commit (final review R1 #2). Only
 rows found there change the answer; a read fault in that second read, or
 no row, keeps the refusal, and the host's coverage is not read again (R1
 re-review #1: re-running the whole check failed open on a fault of either
-read).
+read). Rows there that disagree on the hash are refused at once, as a
+conflict found by the first lookup is: on the miss path, deciding it after
+the download let a fault of the read there serve the file unchecked (the
+D4/D5 re-review).
 
 Documented consequences: a client fetching N unvouched packages one
 after another during a long adoption waits up to 15 s for each (M-11); an
