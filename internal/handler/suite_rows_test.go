@@ -1009,8 +1009,11 @@ func TestServeHTTP_LateRegistrationClientThatLeftIsAClientAbort(t *testing.T) {
 // as an onboarding hit does, whether it then serves the suite's url_path
 // anchor (no snapshot yet) or a snapshot's. Here the suite's flip is in its
 // hold, its commit running: the request waits in the hold and is answered
-// once the commit is done. The seam answers the entry read "no row" and
-// every later read from the cache.
+// once the commit is done — an adopted suite's from its current snapshot,
+// which only the re-dispatch after the late registration reaches (R4
+// re-review #1: without it, or with it only when Held() > 0, the url_path
+// row the adoption wrote was served, no X-Cache-Snapshot). The seam answers
+// the entry read "no row" and every later read from the cache.
 func TestServeHTTP_HitOfASuiteTrackedAfterAnchorStartRegistersLate(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -1050,23 +1053,31 @@ func TestServeHTTP_HitOfASuiteTrackedAfterAnchorStartRegistersLate(t *testing.T)
 				if st := s.gate.Stats(); st.Holds != holds+1 {
 					t.Fatalf("holds = %d, want %d (setup: the flip holds)", st.Holds, holds+1)
 				}
-				done := make(chan int, 1)
+				type answer struct {
+					gen  string // X-Cache-Snapshot
+					code int
+				}
+				done := make(chan answer, 1)
 				go func() {
-					_, code := s.get(suite+"/InRelease", 0)
-					done <- code
+					gen, code := s.get(suite+"/InRelease", 0)
+					done <- answer{gen, code}
 				}()
 				synctest.Wait()
 				select {
-				case code := <-done:
+				case a := <-done:
 					// Errorf: the flip still waits for its release below.
-					t.Errorf("served (status %d) during the flip's hold: the hit was never registered", code)
-					done <- code
+					t.Errorf("served (status %d) during the flip's hold: the hit was never registered", a.code)
+					done <- a
 				default:
 				}
 				close(release)
 				<-committed
-				if code := <-done; code != http.StatusOK {
-					t.Fatalf("status %d after the hold, want 200", code)
+				a := <-done
+				if a.code != http.StatusOK {
+					t.Fatalf("status %d after the hold, want 200", a.code)
+				}
+				if want := s.current(suite); tc.adopted && (want == "" || a.gen != want) {
+					t.Fatalf("X-Cache-Snapshot %q, want the current snapshot %q: the late registration re-dispatches", a.gen, want)
 				}
 				if st := s.gate.Stats(); st.HeldRequests != 1 || reads != 2 {
 					t.Fatalf("held requests %d, registration reads %d; want 1 and 2 (the entry's, the late one's)", st.HeldRequests, reads)
