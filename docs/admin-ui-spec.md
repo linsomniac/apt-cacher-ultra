@@ -454,7 +454,7 @@ Two more fields, additive to the locked JSON contract as §4.5's are:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `gc.retired_reaped` | int | Retired snapshots the last GC run deleted — those of reaped, forgotten and evicted suites, and those the upgrade's trust audit quarantined (spec C9, sub-job C) — beside `displaced_reaped`; the GC panel shows it as *Retired reaped*. Always 0 after the startup run, which leaves them to the periodic runs. |
+| `gc.retired_reaped` | int | Retired snapshots the last GC run deleted — those of reaped, forgotten and evicted suites, and those the upgrade's trust audit quarantined (spec C9, sub-job C) — beside `displaced_reaped`; the GC panel shows it as *Retired reaped*. Always 0 after the startup run, which leaves them to a run an hour after the start (when `gc.interval` is longer than an hour) and to the periodic runs; that run's count (INFO `gc_retired_run_complete`) is not a last-run figure and does not reach this field. |
 | `recent_adoptions[].scheme` | string | The adopted suite's canonical scheme, `http` or `https`; the Recent Adoptions table's Host cell shows `scheme://host`, as the Suites table does. Empty for an event recorded without one. |
 
 A Recent Adoptions row's duration is the attempt's wall-clock time,

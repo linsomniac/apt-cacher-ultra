@@ -1018,14 +1018,14 @@ those no client asked for within `url_path_ttl`, after
 deletes the retired snapshots an hour after each start (when `interval`
 is longer than an hour: a run of that work alone, INFO
 `gc_retired_run_complete`, so a daemon restarted more often than
-`interval` still deletes them) and at each periodic pass, and the next
-blob pass (the next start's, or the next periodic pass's) the pool files
-nothing else uses, once `blob_grace` has passed — not the pass at
-startup, which deletes only a never-adopted one whose heartbeat went
-stale, as it does any abandoned adoption candidate, so a restart
-after many reaps does not keep the listeners
-closed while they are deleted; with `enabled = false` suites are still
-reaped, but their snapshots and pool files stay until GC runs again.
+`interval` still deletes them) and at each periodic pass, but not in the
+pass at startup, which deletes only a never-adopted one whose heartbeat
+went stale, as it does any abandoned adoption candidate, so a restart
+after many reaps does not keep the listeners closed while they are
+deleted. The pool files nothing else uses then go at the next blob pass
+(the next start's, or the next periodic pass's), once `blob_grace` has
+passed. With `enabled = false` suites are still reaped, but their
+snapshots and pool files stay until GC runs again.
 
 A reaped suite whose clients come back is tracked again at their first
 request and, with adoption enabled, adopted again at its first check

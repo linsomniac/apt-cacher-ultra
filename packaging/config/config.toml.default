@@ -174,7 +174,8 @@ heartbeat_interval  = "60s"
 # artifacts stay protected. Blob reclamation follows after blob_grace.
 url_path_ttl        = "168h"
 # A suite no client asked for in this long is reaped: its metadata rows and
-# its row; its snapshots go with the next periodic GC runs. Its next
+# its row; GC deletes its snapshots an hour after a start (when interval
+# is over 1h) or at the next periodic GC runs. Its next
 # request makes it new again, from upstream. The reap deletes no package,
 # but its packages lose the version retention its snapshot gave them:
 # with GC on and url_path_ttl > 0s, those no client asked for within

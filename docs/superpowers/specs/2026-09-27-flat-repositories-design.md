@@ -1614,8 +1614,9 @@ which runs before the
 listeners serve, skips it, since retired snapshots never serve and the
 backlog after a burst of reaps (some 70–100k `package_hash` rows per
 snapshot of a large suite) could keep the listeners closed up to
-`max_tick_duration` (phase F, ruling PF-15; after a start the periodic
-ticks run it, normally the first one — a later one when an earlier pass,
+`max_tick_duration` (phase F, ruling PF-15; after a start the run of C
+alone above runs it, or, with a `gc.interval` of an hour or less, the
+periodic ticks, normally the first one — a later one when an earlier pass,
 the startup pass's blob pass say, reached its deadline, since the passes
 resume in rotation): after sub-jobs A and B, within the snapshot pass's
 deadline, one retired
