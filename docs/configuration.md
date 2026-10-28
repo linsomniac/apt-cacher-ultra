@@ -777,7 +777,9 @@ adoption*), whatever it was quarantined for and without comparing its
 stored copy with upstream: at its first check when a client fetched one of
 its anchor files in the 7 days before the upgrade, otherwise once a client
 asks for it again. A suite quarantined `anchor_corrupt`, whose cached
-copies the audit deleted, waits for that request. One quarantined because
+copies of the corrupt file the audit deleted, waits for that request,
+unless a client fetched another of its anchor files that is still cached
+(its `Release`, say): then it adopts at its first check. One quarantined because
 its stored file was lost or corrupt may have no record that it was signed
 (see the threat notes in *Anchor forms and unsigned repositories*). A
 quarantined plain-text
@@ -839,7 +841,8 @@ upgrade carry no SHA512 by-hash names: such requests are answered 404
 from the snapshot, and apt then fetches the file by its name, until the
 suite's next adoption. Releases before 1.1.0 never adopted a flat
 repository, whose signing key may be installed only on the clients: load
-it on the cache host before upgrading (and, under
+it on the cache host before upgrading (unless `accept_any_signer = true`
+and no `[[trusted_signer]]` names its host; and, under
 `require_pinned_signer`, add its `[[trusted_signer]]` rule), or each of
 its adoptions fails and is retried (see *Flat repositories*).
 
@@ -1249,7 +1252,7 @@ Ubuntu 20.04) refuses it: use `-sS -w '%{http_code}\n'` instead, which
 prints the body and then the status.
 
 Each accepted request is logged as INFO `admin_forget_requested` (a
-request refused with 400, 403 or 413 is not), and each suite forgotten
+request refused with 400, 401, 403 or 413 is not), and each suite forgotten
 as INFO `suite_forgotten` — with `settled=true` when its final delete
 committed although the request then failed (500, or 503 at shutdown)
 and a fresh read then found the row gone. A 409 is logged at DEBUG as
