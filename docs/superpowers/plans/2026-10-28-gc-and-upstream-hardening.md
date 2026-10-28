@@ -2,27 +2,30 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Close five open items for 1.1.0 — two GC defects that predate 1.1.0 and three upstream-trust gaps — so that the cache never holds the database writer for seconds on a GC batch, never lets one failing GC pass starve the others, never adopts a signed anchor some supported apt rejects, never downloads an adoption member past its declared size, and never serves a strict host's `.deb` unchecked because its vouching snapshot went away during the download. In the maintainer's words: "a reliable, robust, and low maintenance system".
+**Goal:** Close five open items for 1.1.0 — two GC defects that predate 1.1.0 and three upstream-trust gaps — so that the cache never holds the database writer for seconds on a GC batch while it serves, never lets one failing GC pass starve the others, adopts none of the measured signed-anchor shapes that some supported apt rejects, never downloads an adoption member past its declared size, and never serves a strict host's `.deb` unchecked because its vouching snapshot went away during the download. In the maintainer's words: "a reliable, robust, and low maintenance system".
 
-**Architecture:** Five small, independent changes in five packages (`internal/gc`, `internal/cache`, `internal/fetch` with its adoption caller in `internal/freshness`, `internal/handler`, `internal/gpg`), each proven by tests written first, plus a manual apt oracle (`make e2e-apt-oracle`) that runs the verifier's fixtures through the real apt of six client images and fails when the cache would accept a shape some apt rejects. No schema change, no new configuration key.
+**Architecture:** Small, independent changes in five packages (`internal/gc`, `internal/cache`, `internal/fetch` with its adoption caller in `internal/freshness`, `internal/handler`, `internal/gpg`), each proven by tests written first. The verifier work rests on a committed corpus of signature shapes (`internal/gpg/testdata/aptshapes/`): byte-exact fixtures made by one committed generator, with the verdicts the real apt of six client images gave on those very bytes. A unit test holds the cache to that table; a manual oracle (`make e2e-apt-oracle`) re-measures apt. No schema change, no new configuration key.
 
-**Tech Stack:** Go 1.25 (language), Go 1.27 (CI and release builds; 1.26 locally), modernc SQLite, `github.com/ProtonMail/go-crypto` v1.4.1, Bash 5 and shellcheck 0.11, Docker, apt 2.2–3.2 in `debian:11`, `ubuntu:22.04`, `ubuntu:24.04`, `debian:12`, `debian:13`, `ubuntu:26.04`.
+**Tech Stack:** Go 1.25 (language), Go 1.27 (CI and release builds; 1.26 locally), modernc SQLite, `github.com/ProtonMail/go-crypto` v1.4.1, Python 3 (stdlib only; ruff, mypy) and gpg 2.4 for the fixture generator, Bash 5 and shellcheck 0.11, Docker, apt 2.2–3.2 in `debian:11`, `ubuntu:22.04`, `ubuntu:24.04`, `debian:12`, `debian:13`, `ubuntu:26.04`.
 
-**Spec:** `docs/open-decisions.md`, section *Open*, these five entries — they are the requirement, each with its recommendation: **"GC's sub-job B deletes displaced snapshots in one transaction"**, **"A GC pass that fails at every tick starves the passes after it"**, **"The inline verifier accepts three shapes apt rejects"**, **"No limit on an upstream body's size"**, **"A vouched `.deb` whose snapshot is retired during its download"**. Background: the 2026-09-08 security review, `docs/security-review-findings.md` in the main checkout (untracked; `/home/sean/projects/apt-cacher-ultra/docs/security-review-findings.md`), Theme 1 (C-4, VC-1, VC-2) and Theme 3 (A-2, VA-3, VA-4). The maintainer asked for these five to be worked now (2026-10-28), into 1.1.0, collected in `Changelog.md`.
+**Spec:** `docs/open-decisions.md`, section *Open*, these five entries — they are the requirement, each with its recommendation: **"GC's sub-job B deletes displaced snapshots in one transaction"**, **"A GC pass that fails at every tick starves the passes after it"**, **"The inline verifier accepts three shapes apt rejects"**, **"No limit on an upstream body's size"**, **"A vouched `.deb` whose snapshot is retired during its download"**. Background: the 2026-09-08 security review, `/home/sean/projects/apt-cacher-ultra/docs/security-review-findings.md` (main checkout, untracked), Theme 1 (C-4, VC-1, VC-2) and Theme 3 (A-2, VA-3, VA-4). The maintainer asked for these five to be worked now (2026-10-28), into 1.1.0, collected in `Changelog.md`. This revision applies the two plan reviews of 2026-10-28 (`PE/security-report.md`, `PE/gc-exec-report.md`; `PE` below) and the rulings on them (HD-1 to HD-9).
+
+`PE` = `.superpowers/sdd/2026-10-28-gc-and-upstream-hardening/planning-evidence/` in the worktree (git-ignored; it survives reboots, the session scratchpad does not): the planning generators (`gen.py`, the security review's `gen2.py`–`gen6.py` and `pgp.py`), `in-container.sh`, the verdict tables (`table.txt`, `combined.txt`, `combined-fixed.txt`), the reviewer's prototype of the recommended verifier rules (`proto/fixed.go`, with today's verifier copied in `proto/main.go`) and both review reports.
 
 ## Global Constraints
 
 - **Nothing goes to GitHub** (push, pull request, tag, release, comment). Local commits on `fix/gc-and-upstream-hardening` only. Do not tag 1.1.0-rc1.
 - **No schema change and no configuration key.** Never edit an entry of `migrations` in `internal/cache/schema.go`.
-- `go test -race ./...`, `go vet ./...` and `golangci-lint run ./...` are clean at the end of every task that touches Go; `gofmt -l .` lists only the five drift files (`cmd/apt-cacher-ultra/ca_print.go`, `internal/cache/cache_test.go`, `internal/cache/gc_urlpath_test.go`, `internal/freshness/hot_prefetch_test.go`, `internal/proxy/connect_stats.go`). Never run `gofmt -w` on those five; format only the files you change (`gofmt -w <file>` for each, or `goimports`).
+- `go test -race ./...`, `go vet ./...` and `golangci-lint run ./...` are clean at the end of every task that touches Go; `gofmt -l .` lists only the five drift files (`cmd/apt-cacher-ultra/ca_print.go`, `internal/cache/cache_test.go`, `internal/cache/gc_urlpath_test.go`, `internal/freshness/hot_prefetch_test.go`, `internal/proxy/connect_stats.go`). Never run `gofmt -w` on those five; format only the files you change.
+- Python files are typed (every function annotated), formatted with `ruff format`, and pass `ruff check` and `mypy --strict`; stdlib only, run as `python3 -I <script>` (no packaging).
 - **Every change is proven:** a test written first and seen failing, then passing, and a mutant (the change reverted or inverted in one place) that fails it. The task report names each mutant and the test that caught it.
 - **Every doc claim is checked against the code** by a grep with its expected output or a named test. A claim whose check fails is corrected to what the code does.
 - `AIDEV-NOTE`s at every subtle point; existing `AIDEV-*` comments are kept and updated, never removed.
-- Each user-visible change adds one line to `Changelog.md` under `## Unreleased: 1.1.0` (*Added*, *Changed* or *Fixed*), in the file's style: one sentence, operator's view.
+- Each user-visible change adds one entry to `Changelog.md` under `## Unreleased: 1.1.0` (*Added*, *Changed* or *Fixed*), in the file's style: one sentence, operator's view, wrapped at the file's width (about 76 columns).
 - `git diff` goes through difftastic in this repository: pass `--no-ext-diff` to every diff a step reads.
-- Scratch files go under `/tmp/claude-1000/-home-sean-projects-apt-cacher-ultra/99c125aa-f038-423f-88d6-3cb913c207d4/scratchpad/hardening/` (one variable at the top of a step that uses it). The measured apt table is `…/scratchpad/apt-oracle/table.txt`; its generator `gen.py` and runner `in-container.sh` are beside it.
-- `git add` names files; never `-A` or `commit -a`. Commit trailer: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
-- Never amend or rewrite a commit.
+- Scratch files go under `/tmp/claude-1000/-home-sean-projects-apt-cacher-ultra/99c125aa-f038-423f-88d6-3cb913c207d4/scratchpad/hardening/` (one variable at the top of a step that uses it).
+- No private key is ever committed: the generator makes its keys in a temporary GnuPG home and discards them; only public keys and signed fixtures are committed.
+- `git add` names files; never `-A` or `commit -a`. Commit trailer: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Never amend or rewrite a commit.
 
 Conventions: every command runs from the repository root. Expected outputs quote planning runs (2026-10-28, a 12-core machine, Go 1.26.8, Docker 29). A test name in a step is the name to use.
 
@@ -30,106 +33,89 @@ Conventions: every command runs from the repository root. Expected outputs quote
 
 The inputs the spec implies that are most likely to bite a person running this, most likely first, each pinned by a test in the task that owns the code:
 
-1. **A legitimate signed repository whose anchor has an unusual but valid shape** — CRLF line ends, trailing spaces on a marker line, no final newline, a `Comment:` armor header, a blank line inside the base64, no CRC line, an extra signature from a key the cache does not know — must still adopt. Every one of these is accepted by all six apt versions (design note 2). Tasks 5 and 6 pin each as a control row.
-2. **A repository signed by two keys where one is expired** (a vendor rotating keys keeps signing with the old one for a while): a good signature from the expired key beside a good one from the current key must still adopt (all apt versions accept it); only a signature that fails its cryptographic check rejects. Task 6.
-3. **An upgraded cache with a backlog of displaced snapshots:** the first GC passes must retire them quickly (the startup pass gates the listeners), delete them in chunks within `gc.max_tick_duration`, and terminate (no batch selects a snapshot it already retired). Task 2.
-4. **A member declared empty, a chunked member response, and a by-hash URL that serves a newer, larger file:** each download stops at the declared size, and the by-hash probe still falls back to the plain path. Task 3.
+1. **A legitimate signed repository whose anchor has an unusual but valid shape** — CRLF line ends, spaces or tabs after a marker, no final newline, a `Comment:` or `Version:` armor header, a blank line in the base64, no CRC line, an extra signature from a key the cache does not know, a subkey signature, a SHA-512 or SHA-1 extra signature beside a good one — must still adopt. Every such shape is a control row of the corpus (Task 5), accepted by all six apt versions; Task 6 and 7's table test holds the cache to it, and Task 8's gate re-runs the 81 real vendors' anchors the security review collected (68 `InRelease` that verify today must still verify).
+2. **A repository signed by two keys where one is expired** (a vendor rotating keys): a good signature from the expired key beside a good one must still adopt; only a signature that fails its cryptographic check rejects. Task 7.
+3. **An upgraded cache with a backlog of displaced snapshots, and a daemon that never runs an hour** (a CI sidecar on a persistent cache): the startup pass still deletes them (ruling HD-7), and periodic ticks retire them and delete them in chunks within `gc.max_tick_duration`; no batch selects a snapshot it retired. Task 2.
+4. **A member declared empty, a chunked member response, a resumed download, and a by-hash URL that serves a newer, larger file:** each download stops at the declared size, and the by-hash probe still falls back to the plain path. Task 3.
 5. **A non-strict host whose `.deb` loses its vouching during the download** is still served as before; only a strict host refuses it. Task 4.
 
 ---
 
 ## Design notes and rulings
 
-**DN-1 — Scope.** Exactly the five *Open* entries named in **Spec**, plus what the measurement of design note 2 shows belongs to the same defect: the detached form's framing (`Release.gpg` with lines around its armor, two armor blocks, or binary), which the same apt versions reject and the cache accepts (ruling HD-1). Not in scope, each staying in `docs/open-decisions.md`: the security review's C-1 (dates, rollback), C-3 (weak digests and keys), the request path's and hot prefetch's downloads of bodies with no declared length (no size is stored for them: `package_hash` has no size column, and adding one is a schema change), and `adoption.accept_any_signer`'s bypass (design note 7).
+**DN-1 — Scope.** The five *Open* entries named in **Spec**, plus what the measurement of DN-2 shows belongs to the same defect: the detached form's framing (`Release.gpg` with lines around its armor or a binary signature) and the packet-level shapes go-crypto skips (ruling HD-1). Not in scope, each staying in `docs/open-decisions.md` (Task 8): the security review's C-1 (dates, rollback) and C-3 (weak digests and keys: `x3i_sha1_only`, an `InRelease` whose only signature uses SHA-1, is rejected by every apt and adopted by the cache, today and after this plan; only the signer can make it); downloads with no declared size — the request path's misses, hot prefetch, and the handler's snapshot-member recovery `runSnapshotMemberFetch` (`cache.SnapshotMember` and `package_hash` have no size; adding one is a schema change; repair and reconcile go through `adoptMember` and get the cap); and `adoption.accept_any_signer`'s bypass (DN-7).
 
-**DN-2 — What apt does (measured, 2026-10-28).** The controller generated 47 signature shapes with `gpg` 2.4.9 and a throwaway RSA-3072 key A (key E: expired 2021, also in the client's `signed-by`; key B: unknown to the client), each as a flat `file:` repository, and ran `apt-get update` in each client image (`…/scratchpad/apt-oracle/`, `table.txt`). `ok` = accepted, `REJ` = rejected. Images: `debian:11` apt 2.2.4 (gpgv 2.2.27), `ubuntu:22.04` apt 2.4.14 (gpgv 2.2.27), `ubuntu:24.04` apt 2.8.3 (gpgv 2.4.4), `debian:12` apt 2.6.1 (gpgv 2.2.40), `debian:13` apt 3.0.3 (sqv, no gpgv), `ubuntu:26.04` apt 3.2.0 (gpgv 2.4.8).
+**DN-2 — What apt does (measured, 2026-10-28).** 128 signature shapes, each built without a key from a legitimately signed `InRelease` or `Release.gpg` (key A trusted; key E in the client's `signed-by`, expired in 2021; key S, a primary that only certifies with a signing subkey; key B unknown to the client), as a flat `file:` repository, through `apt-get update` in each client image: `debian:11` apt 2.2.4 (gpgv 2.2.27), `ubuntu:22.04` apt 2.4.14 (gpgv 2.2.27), `ubuntu:24.04` apt 2.8.3 (gpgv 2.4.4), `debian:12` apt 2.6.1 (gpgv 2.2.40), `debian:13` apt 3.0.3 (Sequoia `sqv`, no gpgv), `ubuntu:26.04` apt 3.2.0 (gpgv 2.4.8). The controller measured 47 (`PE/gen.py`, `PE/table.txt`), the security review 81 more (`PE/gen2.py`–`gen6.py`); **Appendix A** holds all 128 verdicts and the verdict the rules below give. The classes:
 
-| Shape (`i_` = `InRelease`, `d_` = `Release.gpg`) | d11 | u22 | u24 | d12 | d13 | u26 |
-|---|---|---|---|---|---|---|
-| `i_good`, `d_good` | ok | ok | ok | ok | ok | ok |
-| `i_trail_lf`, `i_trail_ws`, `i_trail_text` (a line after END: empty, spaces, text) | REJ | REJ | REJ | REJ | REJ | REJ |
-| `d_trail_lf` | REJ | REJ | REJ | REJ | REJ | REJ |
-| `i_no_final_nl`, `i_end_crlf`, `i_end_trailing_ws`, `d_no_final_nl`, `d_end_crlf`, `d_end_trailing_ws` | ok | ok | ok | ok | ok | ok |
-| `i_lead_nl` (blank line before BEGIN) | REJ | REJ | REJ | REJ | REJ | REJ |
-| `d_lead_nl`, `d_lead_ws` (blank line, or spaces, before BEGIN) | REJ | REJ | REJ | REJ | REJ | REJ |
-| `i_begin_trailing_ws`, `i_sigbegin_trailing_ws`, `d_begin_trailing_ws` (spaces after a BEGIN marker) | ok | ok | ok | ok | ok | ok |
-| `i_crlf_all`, `d_crlf_all` | ok | ok | ok | ok | ok | ok |
-| `i_crc_forged`, `d_crc_forged` (one character of the `=XXXX` line changed) | REJ | REJ | REJ | REJ | ok | REJ |
-| `i_crc_missing`, `d_crc_missing`, `i_crc_ok_rearmored` | ok | ok | ok | ok | ok | ok |
-| `i_line_after_crc`, `d_line_after_crc` (a base64 line between the CRC line and END) | ok | ok | ok | ok | REJ | ok |
-| `i_crc_lowercase_eq_ws` (a space before the `=XXXX` line) | ok | ok | ok | ok | ok | ok |
-| `i_blank_in_base64`, `d_blank_in_base64` (a blank line before the CRC line) | ok | ok | ok | ok | ok | ok |
-| `i_comment_header`, `d_comment_header` | ok | ok | ok | ok | ok | ok |
-| `i_badsig_goodfirst`, `i_badsig_badfirst`, `d_badsig_goodfirst`, `d_badsig_badfirst` (A's good signature plus A's signature over other text) | REJ | REJ | REJ | REJ | ok | REJ |
-| `i_badsig_only` | REJ | REJ | REJ | REJ | REJ | REJ |
-| `i_unknown_goodfirst`, `i_unknown_unknownfirst`, `d_unknown_goodfirst` (plus B's good signature) | ok | ok | ok | ok | ok | ok |
-| `i_expired_good_plus_good`, `i_good_plus_expired_good` (E's good signature, made while E was valid, plus A's) | ok | ok | ok | ok | ok | ok |
-| `i_expired_bad_plus_good` (E's signature over other text plus A's) | REJ | REJ | REJ | REJ | ok | REJ |
-| `i_expired_only` | REJ | REJ | REJ | REJ | ok | REJ |
-| `d_binary` (the good signature, de-armored) | REJ | REJ | REJ | REJ | REJ | REJ |
-| `d_twoblocks` (two armor blocks, the second A's signature over other text) | REJ | REJ | REJ | REJ | ok | REJ |
-| `i_dash_escaped_end` (a Release line `-----END PGP SIGNATURE-----`, dash-escaped) | REJ | REJ | REJ | REJ | REJ | REJ |
+- **Every apt rejects:** any line after the signature's END line (empty, spaces, text, a lone CR line); a blank line or spaces before BEGIN (inline and detached); a binary `Release.gpg`; an armor header without `: ` (`Junk:junk`, `Comment:<TAB>x`, no colon); a `-----END X-----` or `-----END PGP SIGNATURE-----x` line before the real END; a second `-----BEGIN` line inside the armor; a v3 garbage packet naming a known key; a UTF-8 BOM before the armor; the only signature bad, or critical-notation only.
+- **Every gpgv-based apt rejects, `debian:13`'s sqv accepts:** a forged CRC line; a bad signature from a known key beside a good one (whatever the order, inline or detached, from the expired key too, from a subkey too, with its unhashed issuer rewritten or an unhashed issuer fingerprint added, in a second inline block); a critical notation beside a good signature; the expired key's signature alone.
+- **Only some apt rejects:** a base64 line, or a second `=` line, between the CRC line and END (d13); an empty armor header value `Comment:` (d13); an unknown hash or an unknown key's v3 packet, a marker, an unknown packet tag, a user-ID packet or trailing zero bytes beside a good signature (d13 or u26); a literal-data packet (all but d13); an invalid base64 character (d13); `xi_goodsig_issuer_rewritten` (d11, u22, d12).
+- **Every apt accepts:** CRLF throughout; spaces, tabs or extra CRs after a marker; no final newline; a CR before EOF; `Comment:`, `Version:`, several or unknown armor headers, a header with a leading space, a space in its key, UTF-8 or control bytes; a blank line before or after the CRC line; no CRC line; a CRC line with spaces around it; base64 lines of 76 characters or with a leading space; an extra signature from an unknown key; the expired key's good signature beside a good one; a subkey signature; SHA-1, SHA-512 or no `Hash:` header beside a good signature; dash-escaped extra plaintext lines; two good armor blocks, or a good and an unknown-key block (`d_twoblocks`, the controller's row, is rejected for its second block's BADSIG, not its framing).
 
-`i_dash_escaped_end` is rejected by apt's Release parser ("Unable to parse package file"), not by its signature check, so it says nothing about framing; keep it out of the verifier's table. `debian:13` verifies with Sequoia's `sqv`, which ignores the CRC (RFC 9580) and accepts a bad signature beside a good one; every gpgv-based apt rejects those.
+`i_dash_escaped_end` (a Release line `-----END PGP SIGNATURE-----`, dash-escaped) is rejected by apt's Release parser, not its signature check; it stays in the table, because the cache's `ParseRelease` ignores the stray line and would adopt an anchor every client then fails to parse (rule F0 keeps refusing it, as today's code does).
 
-**DN-3 — The rule (ruling HD-2).** The verifier rejects a shape when **any** supported apt rejects it, and accepts a shape **every** supported apt accepts, except for deviations listed, each with its reason, in the test table (`aptShapeDeviations`, Task 5). Why "any": a cache that accepts what some client rejects breaks that client's `apt update` for the suite until upstream publishes again (forever for a frozen pocket); a cache that rejects what every client accepts only keeps its previous snapshot, a staleness a legitimate repository never meets, since such a shape fails other clients too. Consequences:
+**DN-3 — The rule (ruling HD-2).** The verifier rejects a shape when **any** supported apt rejects it, and accepts a shape **every** supported apt accepts, except for the deviations of DN-6, each with its reason. Why "any": a cache that accepts what some client rejects breaks that client's `apt update` for the suite until upstream publishes again (forever for a frozen pocket); a cache that rejects what every client accepts only keeps its previous snapshot, a staleness no surveyed vendor meets (Task 8's vendor re-run). The rules, applied in this order, each failure fatal (ruling HD-8, the security review's recommended set, prototyped in `PE/proto/fixed.go`):
 
-| Rule | Inline (`InRelease`) | Detached (`Release.gpg`) |
+| Rule | What it requires | Forms |
 |---|---|---|
-| F1. The first line is the BEGIN marker (spaces, tabs and a CR may follow it) | unchanged (ruling R-D2) | **new**: no byte before it; a binary signature is rejected |
-| F2. The first END line of the signature armor is the last line: only spaces, tabs, one CR and one LF may follow the marker, or nothing | **new** (was: any whitespace after END) | **new**; it also rejects two armor blocks |
-| F3. A CRC line (`=` and four base64 characters, after trimming spaces, tabs and CR) present in the armor must equal the CRC-24 of the signature packets the cache decoded, and the line after it is the END line; a second line starting with `=` is rejected | **new** | **new** |
-| S1. A signature packet whose issuer is a key in the host keyring must pass its cryptographic check (an expired or revoked key's packet that passes it is not a failure); a packet whose issuer the keyring lacks is ignored | **new** | **new** |
-| S2. At least one packet passes the trust check and verifies | unchanged | unchanged |
+| F1 | The first line is the BEGIN marker (`-----BEGIN PGP SIGNED MESSAGE-----` inline, `-----BEGIN PGP SIGNATURE-----` detached), followed only by spaces, tabs and CRs. Detached: nothing before it — a binary signature fails F1. | both (inline: unchanged, ruling R-D2) |
+| F0 | The first occurrence of `-----END PGP SIGNATURE-----` anywhere in the body begins the last line (today's substring rule, kept: it catches `-----END PGP SIGNATURE-----x` and a dash-escaped END in the signed text, which no line-based rule sees). | both |
+| F2 | The signature armor's first END line (`-----END PGP SIGNATURE-----` followed only by spaces, tabs and CRs) is the last line: after it nothing, or one LF. | both |
+| F3 | A CRC line (`=` and four base64 characters, after trimming spaces, tabs and CRs) inside the armor, if present, equals the CRC-24 of the signature packets the cache decoded, and only blank lines follow it before END. | both |
+| F4 | No line strictly between the armor's BEGIN line and its END line starts with `-`. | both |
+| F5 | Every non-blank line between the armor's BEGIN line and the first blank line (the armor headers) contains `: `. | both |
+| F6 | The decoded signature bytes are signature packets only, each parsed by go-crypto: a packet-framing walk (old and new formats; a partial or indeterminate length refused) finds tag 2 only, and `packet.Reader.NextWithUnsupported()` returns one `*packet.Signature` per framed packet, never an `*packet.UnsupportedPacket`. | both |
+| S1 | Every signature packet whose **hashed** issuer (DN-5) names a signing key in the host keyring passes its cryptographic check against one of the keyring's entities that hold that key ID, with no `SignatureError`; and its unhashed issuer does not contradict the hashed one. A packet whose issuer the keyring lacks is ignored. | both |
+| S2 | At least one packet passes the trust check and verifies (unchanged). | both |
 
-F1–F3 are structural: they also apply under `accept_any_signer`'s bypass. S1 does not (design note 7).
+F0–F6 are structural: they also apply under `accept_any_signer`'s bypass. S1 does not (DN-7). Result over Appendix A: 1 shape unsafe (`x3i_sha1_only`, C-3, out of scope) and 10 stricter than every apt (DN-6); over the review's real vendors, every `InRelease` that verifies today still verifies, and only the three binary `Release.gpg` the measured apt reject too are refused.
 
-**DN-4 — Errors and reasons.** Inline F1–F3 failures wrap `ErrMalformedClearsign` (reason `malformed_clearsign`, as today). Detached F1–F3 failures wrap a new `ErrMalformedSignature` = `errors.New("Release.gpg is not one ASCII-armored signature block")` (reason `malformed_signature`). S1 failures wrap a new `ErrBadSignature` = `errors.New("a signature from a known key failed verification")` (reason `bad_signature`). `ClassifyVerifyErr` gains both cases, before its `crypto_verify_failed` default. These reasons are what the adoption failure lines and `acu_adoption_total`'s outcome carry today for the other sentinels; check where the existing reasons are documented (`grep -rn "malformed_clearsign\|untrusted_signer" docs/`) and add the two new ones there.
+**DN-4 — Errors and reasons.** Inline F0–F6 failures wrap `ErrMalformedClearsign` (reason `malformed_clearsign`, as today). Detached F0–F6 failures wrap a new `ErrMalformedSignature` = `errors.New("Release.gpg is not one ASCII-armored signature block")` (reason `malformed_signature`). S1 failures wrap a new `ErrBadSignature` = `errors.New("a signature from a known key failed verification")` (reason `bad_signature`). `ClassifyVerifyErr` gains both cases before its `crypto_verify_failed` default. Where the reasons surface: `classifyAdoptionReason` (`internal/freshness/metrics.go`) carries them into `recent_adoptions[].reason` and `adoption_fail_reason` (the adoption counter's outcome stays `gpg_failed`); the operator-facing text is `reasonTooltip` (`internal/admin/status.go`, one case per reason, pinned by `TestReasonTooltip`) and the `Reason` field comment beside it. No document lists the gpg reasons; none is added (`docs/admin-ui-spec.md`'s example near line 370 stays an example).
 
-**DN-5 — S1's "known" and "fails" (ruling HD-3).** go-crypto's `openpgp.VerifyDetachedSignature(keyring, signed, oneSignaturePacket, nil)` returns a non-nil `*packet.Signature` exactly when the cryptographic check passed — and then also reports `ErrKeyExpired`, `ErrSignatureExpired` or `ErrKeyRevoked` from `checkMessageSignatureDetails` (`openpgp/read.go:546–553`, v1.4.1); it returns a nil signature when the check failed, and `errors.ErrUnknownIssuer` when the keyring has no signing key with the packet's issuer key ID. So for each signature packet, re-serialized alone (as `verifyAnyTrusted` does today): known = the packet carries an issuer key ID and `v.keyring.EntityList().KeysByIdUsage(id, packet.KeyFlagSign)` is non-empty; failed = known and `VerifyDetachedSignature(v.keyring.EntityList(), …)` returned a nil signature. apt agrees (design note 2: `i_expired_good_plus_good` ok, `i_expired_bad_plus_good` REJ). The host keyring, not the per-suite trust set: a client that installed any of the cache's keys sees a BADSIG from it.
+**DN-5 — S1's "known", "fails" and the issuer (rulings HD-3, HD-8).** go-crypto takes a signature's issuer from the last issuer subpacket it parses, unhashed area after hashed (`packet/signature.go`), and looks keys up by that key ID only (`openpgp/read.go:523`); gpgv looks up by the hashed issuer. So S1 reads the issuer from the **hashed** area, `sig.HashSuffix` (the hashed subpacket area verbatim: bytes `[6:6+len]` for v4, `[8:8+len]` for v6): the issuer fingerprint (subpacket 33; key ID = bytes 12–19 of a v4 fingerprint, 0–7 of a v6) first, else the issuer key ID (16); when the hashed area names neither, `*sig.IssuerKeyId`. Known = `v.keyring.EntityList().KeysByIdUsage(id, packet.KeyFlagSign)` is non-empty. A known packet fails when `sig.IssuerKeyId` is nil or differs from the hashed id (an unhashed issuer contradicting the hashed one: gpgv's BADSIG), or when no entity holding the key ID passes: for each such entity `e`, `openpgp.VerifyDetachedSignature(openpgp.EntityList{e}, signed, onePacket, nil)` passes iff it returns a non-nil signature and its error is not an `errors.SignatureError` (an unknown critical notation, `checkMessageSignatureDetails`; `ErrKeyExpired`, `ErrSignatureExpired` and `ErrKeyRevoked` are tolerated, as apt tolerates EXPKEYSIG and REVKEYSIG beside a good signature). One entity at a time, because `verifyDetachedSignature` hashes once and tries every candidate key with that one hash, which only the first can pass (a key-ID collision would turn a valid signature into a failure). The host keyring, not the per-suite trust set: a client that installed any of the cache's keys sees a BADSIG from it. S1 protects clients exactly for the keys the cache also holds: a client trusting a key the cache lacks still rejects a bad signature from it, which the cache ignores (inherent; the operator installs in the cache every key the clients' `signed-by` names).
 
-**DN-6 — Sub-job B retires; sub-job C deletes (ruling HD-4).** `RunSnapshotGCBatch` keeps its selection (sub-jobs A ∪ B, `gc.snapshot_batch_size` at a time) but, for the displaced snapshots (class `displaced`), stamps `retired_at` in one short `UPDATE` instead of deleting their rows; sub-job C (`RunRetiredSnapshotGCChunk`, 10,000 rows a transaction) then deletes them, in the same snapshot pass of a periodic tick (A ∪ B, then C) or at the retired run an hour after a start. Orphan candidates (class `orphan`, never adopted) are still deleted at once: their rows are inserted only by `CommitAdoption`, which rolls back as a whole, so an orphan holds a header and nothing else. Why retiring is safe: every reader filters `retired_at` (spec C9; the natural key's partial index `idx_suite_snapshot_natural_v7` is `WHERE retired_at IS NULL`; signed history `signedHistorySnapshotSQL`, retained by-hash `snapshot_reads.go:84` and the rollback check all read non-retired rows), so a retired displaced snapshot is invisible exactly as a deleted one is; and B's own selection already has `retired_at IS NULL`, so a batch never selects what it retired, and the loop ends. Consequences: the startup pass retires (fast) and deletes nothing (ruling PF-15 keeps C out of it), so the listeners wait less; `gc_run_complete`'s `displaced_reaped` counts displaced snapshots retired, and their deletion is counted again in `retired_reaped` when C deletes them.
+**DN-6 — The deviations (ruling HD-9).** Each shape below is accepted by all six apt and rejected by the cache; `aptShapeDeviations` lists each with its reason, and the table test fails on any other disagreement:
 
-**DN-7 — Not changed, deliberately.** `adoption.accept_any_signer`'s bypass verifies no signature, so S1 is not applied there (it would be the only signature check in that mode; recorded *Open*). The handler's sniff of a fetched `Release.gpg` (`aptpath.SniffReleaseGPG`) still accepts a binary signature as a signed anchor: its marker only makes the suite never adopt unsigned, the fail-safe direction. The upgrade's trust audit classifies 1.0.x snapshots with its own structural classifier (`classifyLegacyInline`), not the verifier, so the stricter verifier quarantines nothing new at the upgrade.
+| Shapes | Reason |
+|---|---|
+| `xi_twoblocks_goodgood`, `xi_twoblocks_good_unknown`, `xd_twoblocks_goodgood`, `xd_twoblocks_good_unknown` | one armor block: the decoders read only the first, so S1 and S2 cannot check a second; no surveyed vendor publishes two (2026-10-28) |
+| `i_sigbegin_trailing_ws`, `xi_cleartext_comment_hdr`, `x3i_armor_no_blank`, `x3d_armor_no_blank` | go-crypto's decoder refuses the shape (rejected today too) |
+| `xi_good_plus_unknownpk_A` | go-crypto cannot parse an unknown public-key algorithm, so the packet cannot be told from garbage (F6); a vendor adding a signature with an algorithm go-crypto v1.4.1 lacks is refused until go-crypto supports it |
+| `x3i_goodsig_unhashed_fpr_added` | today's S2 refuses it already (the unhashed fingerprint overrides the issuer go-crypto looks up) |
 
-**DN-8 — The download cap (ruling HD-5).** Two changes. (a) The upstream transport sets `DisableCompression: true`: Go then sends no `Accept-Encoding: gzip` and decodes nothing, so a response's `Content-Length` is what lands on disk (VA-3: a decoded gzip body had length −1 and skipped the size check; VA-4: a resumed download appended compressed bytes to a decoded prefix). The cache serves pool bytes without a `Content-Encoding` header, and nothing in the tree relies on transparent gzip (the review's finding). (b) `fetch.Target` gains `MaxBytes`: a response whose declared length exceeds it fails before its body is read, and a body that runs past it fails as soon as it does, with `ErrBodyTooLarge`, never retried, outcome `body_too_large` (the label `Conditional` already uses). Adoption sets it to the member's declared size for both the by-hash probe and the plain-path fetch (`memberMaxBytes`: one byte for a member declared empty, since 0 means no limit). This bounds a signed member exactly and an unsigned member by what its `Release` declares; the request path's and hot prefetch's downloads keep only `Content-Length` and `upstream.total_timeout` (DN-1).
+**DN-7 — Sub-job B retires in the periodic ticks and deletes at startup (rulings HD-4, HD-7).** `RunSnapshotGCBatch` gains `retireDisplaced bool` (and `gcStore` with it). It keeps its selection (sub-jobs A ∪ B, `gc.snapshot_batch_size` at a time). With `retireDisplaced` (periodic ticks), the displaced snapshots (class `displaced`) get `retired_at` in one short `UPDATE` and sub-job C deletes their rows, 10,000 rows a transaction, in the same snapshot pass (A ∪ B, then C) or the retired run an hour after a start. Without it (the startup pass), they are deleted as today: the startup pass runs before the freshness scheduler and before any listener (`cmd/apt-cacher-ultra/main.go`, `gcsvc.StartupPass`), so its long transactions hold up no client and no other writer, and a daemon that never lives min(1 h, `gc.interval`) still deletes them at every start, with their blobs in the same startup pass's blob pass (G-I1: with retirement at startup, such a daemon would delete none). Orphan candidates (class `orphan`) are deleted at once in both modes: only `CommitAdoption` inserts child rows, in the transaction that sets `adopted_at`, so an orphan holds a header only. Why retiring is safe: every reader that serves, vouches or judges history filters `retired_at` or reads current snapshots only (signed history `signedHistorySnapshotSQL`, retained by-hash `snapshot_reads.go:84`, the natural-key index and lookup behind `rollback_refused`, `declaredExactSQL`/`declaredBySuffixSQL`, coverage and the url_path guards); GC's blob reachability, `adoptionStampTx`'s stamp floor, `GetSuiteStats`' `AdoptedTotal` (the `acu_snapshots_displaced` gauge) and the id-keyed reads see retired rows until C deletes them, all benign; and B's selection has `retired_at IS NULL`, so a batch never selects what it retired. Telemetry: in a periodic tick, a displaced snapshot beyond `keep_displaced` counts once in `displaced_reaped` / `acu_gc_displaced_reaped_total` when retired and again in `retired_reaped` / `acu_gc_retired_reaped_total` when deleted; snapshots deleted = orphan + retired (startup: orphan + displaced, as today).
 
-**DN-9 — Strict mode, vouching lost during the download (ruling HD-6).** `prefetchCheck` reports `vouched` when its read (or `prefetchRecheck`'s) found the path vouched; when `runFetch`'s read after the download finds no row for a `.deb` that was vouched before it, strict mode decides there (`strictAfterDownload`), as it already does when the read before the download failed: refused on a strict host (or, with a signed adoption in flight on the host, the miss waits and retries once), served unchecked as today elsewhere.
+**DN-8 — Not changed, deliberately.** `adoption.accept_any_signer`'s bypass verifies no signature, so S1 is not applied there (it would be the only signature check in that mode; recorded *Open*). The handler's sniff of a fetched `Release.gpg` (`aptpath.SniffReleaseGPG`) still accepts a binary signature as a signed anchor: its marker only makes the suite never adopt unsigned, the fail-safe direction (the four surveyed vendors with a binary `Release.gpg` all publish an `InRelease`, which the checker prefers). The upgrade's trust audit classifies 1.0.x snapshots with its own structural classifier (`classifyLegacyInline`), not the verifier, so the stricter verifier quarantines nothing new at the upgrade.
+
+**DN-9 — The download cap (ruling HD-5).** (a) The upstream transport sets `DisableCompression: true`: Go then sends no `Accept-Encoding: gzip` and decodes nothing, so a response's `Content-Length` is what lands on disk (VA-3: a decoded gzip body had length −1 and skipped the size check; VA-4: a resumed download appended compressed bytes to a decoded prefix; it also fixes an Apache serving `.gz` files with `Content-Encoding: gzip`, which Go decoded into the wrong bytes). apt's http method sends no `Accept-Encoding` either; the HTTP/2 transport honours the setting. Its one cost: an uncompressed file an upstream would gzip on the fly when asked now downloads at full size. (b) `fetch.Target` gains `MaxBytes`: a response whose declared length exceeds it fails before its body is read, and a body that runs past it fails as soon as it does, with `ErrBodyTooLarge`, never retried, outcome `body_too_large` (the label `Conditional` already uses). Adoption sets it to the member's declared size for the by-hash probe and the plain-path fetch (`memberMaxBytes`: one byte for a member declared empty, since 0 means no limit). This bounds a signed member exactly and an unsigned member by what its `Release` declares.
+
+**DN-10 — Strict mode, vouching lost during the download (ruling HD-6).** `prefetchCheck` reports `vouched` when its read, or `prefetchRecheck`'s second look, found the path vouched; when `runFetch`'s read after the download finds no row for a `.deb` that was vouched before it, strict mode decides there (`strictAfterDownload`), as it already does when the read before the download failed: refused on a strict host (or, with a signed adoption in flight on the host, the miss waits and retries once), served unchecked as today elsewhere.
+
+**Rulings on the plan reviews (2026-10-28).** HD-7 (G-I1) is DN-7's startup mode. HD-8 (S-C1, S-C2, S-I2, S-M1, S-M3) is DN-3's F0, F4–F6 and DN-5's S1. HD-9 (S-I1, S-M2) is DN-6. Every other finding of both reports is accepted with the reviewer's text, folded into the task it names.
 
 ---
 
 ### Task 1: A GC pass that fails at every tick no longer starves the passes after it
 
 **Files:**
-- Modify: `internal/gc/gc.go` (`skipPanickedPass`, `runTick`, the `nextPass` field comment)
+- Modify: `internal/gc/gc.go` (`skipPanickedPass`, new `skipPass` and `passFailed`, `runTick`, `periodicTick`'s WARN condition, the `nextPass` field comment), `internal/gc/snapshot.go` (`retiredRun`'s WARN condition)
 - Test: `internal/gc/gc_store_test.go`
 - Modify: `Changelog.md`
 
 **Interfaces:**
-- Consumes: `fakeStore`, `storeGC`, `gcEvents`, `captureLogger` (existing, `internal/gc` tests).
+- Consumes: `fakeStore`, `storeGC`, `gcEvents`, `captureLogger`, `openTestCache` (existing `internal/gc` tests).
 - Produces: `func (g *GC) skipPass()`; `func (g *GC) passFailed(ctx context.Context, err error) error`.
 
-- [ ] **Step 1: Extend `fakeStore`** with an error mode beside its panic mode:
+- [ ] **Step 1: Extend `fakeStore`** (add `"errors"` to the test file's imports):
 
 ```go
-	batchErrs   int    // RunSnapshotGCBatch fails on this many first calls (after batchPanics)
-	batchHook   func() // called at the start of every RunSnapshotGCBatch call
+	batchErrs int    // RunSnapshotGCBatch fails on this many calls after the batchPanics ones
+	batchHook func() // called at the start of every RunSnapshotGCBatch call
 ```
 
-and in `RunSnapshotGCBatch`, after the panic check:
+In `RunSnapshotGCBatch`, after the panic check (which stays first, so `batchPanics` alone behaves as today): call `batchHook` if set, then `if n <= f.batchPanics+f.batchErrs { return cache.SnapshotGCBatchResult{}, errors.New("snapshot batch fault") }`. (Task 2 changes the method's signature; this step uses today's.)
 
-```go
-	if f.batchHook != nil {
-		f.batchHook()
-	}
-	if n <= f.batchPanics+f.batchErrs {
-		return cache.SnapshotGCBatchResult{}, errors.New("snapshot batch fault")
-	}
-```
-
-(keep the panic check first; adjust the counting so `batchPanics` alone behaves exactly as today).
-
-- [ ] **Step 2: Write the failing tests**
+- [ ] **Step 2: Write the failing tests.**
 
 ```go
 // The H3 final review R3 #5: a pass that fails at every tick (a fault
@@ -154,10 +140,10 @@ func TestPeriodicTick_AFailingPassDoesNotStarveTheNext(t *testing.T) {
 	}
 }
 
-// A pass that fails because the GC's context ended (shutdown) keeps the
-// rotation where it is: the pass did not fail, it was stopped.
+// A pass stopped because the GC's context ended (shutdown) keeps the
+// rotation where it is, and logs no gc_tick_failed: it did not fail.
 func TestPeriodicTick_AnEndedContextKeepsTheRotation(t *testing.T) {
-	logger, _ := captureLogger()
+	logger, buf := captureLogger()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	f := &fakeStore{batchErrs: 1000, batchHook: cancel}
@@ -165,6 +151,9 @@ func TestPeriodicTick_AnEndedContextKeepsTheRotation(t *testing.T) {
 	g.periodicTick(ctx)
 	if g.nextPass != snapshotPass {
 		t.Fatalf("after a pass stopped by its context the rotation is at pass %d, want the snapshot pass (%d)", g.nextPass, snapshotPass)
+	}
+	if n := len(gcEvents(t, buf, "gc_tick_failed")); n != 0 {
+		t.Fatalf("%d gc_tick_failed lines, want 0", n)
 	}
 }
 
@@ -182,9 +171,11 @@ func TestStartupPass_AFailingPassMovesTheRotation(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: Run them; expect the first and third to fail** (`go test ./internal/gc -run 'AFailingPass|AnEndedContext' -v`): the rotation stays at the snapshot pass.
+Also, in the style of `TestSkipPanickedPass_MovesPastEachPass`: `TestPassFailed_MovesPastEachPassUnlessTheContextEnded`, a table over the three passes × {live context, cancelled context}: `g.nextPass = p; g.passFailed(ctx, errors.New("x"))` moves to the next pass (url-path → snapshot → blob → url-path) with a live context and leaves it with a cancelled one, and returns the error. And two wiring tests on a real cache (`storeGC` with the real cache as its store, or `openTestCache` and `New`), each breaking one pass's table the way the handler tests do (`ALTER TABLE … RENAME TO …` through a second `sql.Open("sqlite", filepath.Join(c.Dir(), "cache.db"))`): `TestPeriodicTick_AFailingURLPathPassMovesToTheSnapshotPass` (`URLPathTTL > 0`, `url_path` renamed: one tick leaves `nextPass == snapshotPass`) and `TestPeriodicTick_AFailingBlobPassMovesToTheURLPathPass` (`g.nextPass = blobPass`, `blob` renamed: one tick leaves `nextPass == urlPathPass`). If a rename does not make the pass fail (SQLite may keep a prepared statement), report it and use another fault confined to that pass's table.
 
-- [ ] **Step 4: Implement.** In `internal/gc/gc.go`, split the rotation step out of `skipPanickedPass`, add `passFailed`, and use it at each pass's error return in `runTick`:
+- [ ] **Step 3: Run them; expect the failures** (`go test ./internal/gc -run 'AFailing|AnEndedContext|PassFailed' -v`): the rotation stays at the failed pass (and `passFailed` does not exist yet).
+
+- [ ] **Step 4: Implement.** In `internal/gc/gc.go`:
 
 ```go
 // skipPass moves the rotation past the pass in progress (g.nextPass).
@@ -205,9 +196,12 @@ func (g *GC) skipPass() {
 //
 // AIDEV-NOTE: the H3 final review R3 #5. Before, only a panic moved the
 // rotation: a pass that returned an error at every tick (a fault limited to
-// its tables) was retried first at every tick and the passes after it —
+// its tables) was retried first at every tick, and the passes after it —
 // the blob pass, which reclaims disk — never ran; the only sign was WARN
-// gc_tick_failed per tick. The failing pass now runs every third tick.
+// gc_tick_failed per tick. A failing url-path or snapshot pass now runs
+// every other tick, the passes after it in between (a failing blob pass, the
+// last, still runs every tick, after the others); a failed url-path pass
+// resumes, next time, at the cursor its last deadline saved.
 func (g *GC) passFailed(ctx context.Context, err error) error {
 	if ctx.Err() == nil {
 		g.skipPass()
@@ -216,53 +210,65 @@ func (g *GC) passFailed(ctx context.Context, err error) error {
 }
 ```
 
-`skipPanickedPass` keeps its early return and then calls `g.skipPass()`. In `runTick`, each of the three `if err != nil { return res, err }` after a pass becomes `return res, g.passFailed(ctx, err)` (at each, `g.nextPass` is the pass that failed). Update the `nextPass` field's comment: "A pass that panicked or failed moves it too, past that pass (skipPanickedPass, passFailed)".
+`skipPanickedPass` keeps its early return and then calls `g.skipPass()`. In `runTick`, each of the three `if err != nil { return res, err }` after a pass becomes `return res, g.passFailed(ctx, err)`. `periodicTick` and `retiredRun` log `gc_tick_failed` when `err != nil && ctx.Err() == nil` (the same test as `passFailed`; today they test the error's shape). Update the `nextPass` field's comment: "A pass that panicked or failed moves it too, past that pass (skipPanickedPass, passFailed)".
 
 - [ ] **Step 5: Run the package's tests** (`go test -race ./internal/gc`); all pass, including `TestPeriodicTick_APanickingPassDoesNotStarveTheNext` and `TestSkipPanickedPass_MovesPastEachPass`.
 
-- [ ] **Step 6: Mutants.** (a) `passFailed` never calls `skipPass` → the first and third tests fail. (b) `passFailed` ignores `ctx` → the second fails. Restore.
+- [ ] **Step 6: Mutants.** (a) `passFailed` never calls `skipPass` → the first, third and table tests fail. (b) `passFailed` ignores `ctx` → the second and the table's cancelled rows fail. (c) No `passFailed` at the url-path return → `…URLPathPassMovesToTheSnapshotPass` fails. (d) None at the blob return → `…BlobPassMovesToTheURLPathPass` fails. Restore each.
 
-- [ ] **Step 7: Changelog** — under *Fixed*: `- A GC pass that fails at every tick no longer keeps the passes after it, the blob pass included, from running.`
+- [ ] **Step 7: Changelog** — under *Fixed*:
 
-- [ ] **Step 8: Commit** `internal/gc/gc.go internal/gc/gc_store_test.go Changelog.md`: "GC: a pass that fails moves the rotation on, as a panic does (H3 final review R3 #5)".
+```
+- A GC pass that fails at every tick no longer keeps the passes after it,
+  the blob pass included, from running.
+```
 
-### Task 2: Sub-job B retires the displaced snapshots; sub-job C deletes them in chunks
+- [ ] **Step 8: Commit** `internal/gc/gc.go internal/gc/snapshot.go internal/gc/gc_store_test.go Changelog.md`: "GC: a pass that fails moves the rotation on, as a panic does (H3 final review R3 #5)".
+
+### Task 2: Periodic GC retires displaced snapshots and deletes them in chunks
 
 **Files:**
-- Modify: `internal/cache/gc.go` (`RunSnapshotGCBatch` and its doc comment, `RunRetiredSnapshotGCChunk`'s AIDEV-NOTE)
-- Modify: `internal/gc/snapshot.go` (`runSnapshotPass`'s doc comment and AIDEV-NOTE)
-- Test: `internal/cache/gc_test.go`, `internal/gc/integration_test.go` (or the file holding the gc package's real-cache snapshot tests), and any test that expected B to delete rows
-- Modify: `docs/configuration.md` (the `[gc]` table's `snapshot_batch_size` and `keep_displaced` rows), `docs/admin-ui-spec.md` (`gc.displaced_reaped` and `gc.retired_reaped`), `docs/log-fields.md` (`gc_run_complete`'s `displaced_reaped`/`retired_reaped`, if described), `Changelog.md`
+- Modify: `internal/cache/gc.go` (`RunSnapshotGCBatch` and its doc, `SnapshotGCBatchResult`'s doc, `RunRetiredSnapshotGCChunk`'s AIDEV-NOTE), `internal/cache/queries.go` (an AIDEV-NOTE at `GetSuiteStats`), `internal/gc/snapshot.go` (`runSnapshotPass`, its doc and AIDEV-NOTE, `retiredRun`'s AIDEV-NOTE), `internal/gc/gc.go` (`gcStore`), `internal/gc/metrics.go` (the help of `acu_gc_displaced_reaped_total` and `acu_gc_retired_reaped_total`)
+- Test: `internal/cache/gc_test.go`, `internal/gc/retired_test.go`, `internal/gc/gc_store_test.go` (`fakeStore`'s signature), and the existing tests listed in Step 5
+- Modify: `docs/configuration.md`, `docs/admin-ui-spec.md`, `docs/log-fields.md`, `docs/superpowers/specs/2026-09-27-flat-repositories-design.md` (spec C9's definition of `retired_at`), `Changelog.md`
 
 **Interfaces:**
-- Consumes: `RunRetiredSnapshotGCChunk(ctx, 0)` (unchanged).
-- Produces: `RunSnapshotGCBatch` with the same signature and result type; `DisplacedReaped` now counts displaced snapshots retired.
+- Produces: `RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGraceSeconds int64, keepDisplaced int, retireDisplaced bool) (SnapshotGCBatchResult, error)`; `gcStore` with the same method; `DisplacedReaped` counts displaced snapshots retired (`retireDisplaced`) or deleted (not).
 
-- [ ] **Step 1: Pre-flight.** Confirm the facts DN-6 rests on, each with its expected output:
-  - `grep -n "INSERT INTO snapshot_member\|INSERT INTO snapshot_skipped_member\|INSERT INTO package_hash" internal/cache/*.go | grep -v _test` lists only `adoption.go` (inside `CommitAdoption`), `reconcile.go` and `skipped_member.go` (both act on adopted snapshots). If another writer inserts child rows for an unadopted snapshot, stop and report.
-  - `grep -n "retired_at IS NULL" internal/cache/*.go | grep -v _test` includes `signed_seen.go` (`signedHistorySnapshotSQL`), `snapshot_reads.go`, `adoption.go` (the natural-key lookup) and `gc.go` (B's selection). Find the rollback check's read (`grep -rn "rollback_refused" internal --include=*.go | grep -v _test`) and confirm it reads non-retired snapshots only; if it does not, stop and report.
+- [ ] **Step 1: Pre-flight.** Confirm DN-7's facts, each with its expected output:
+  - `grep -n "INSERT INTO snapshot_member\|INSERT INTO snapshot_skipped_member\|INSERT INTO package_hash" internal/cache/*.go | grep -v _test` lists `adoption.go` (inside `CommitAdoption`), `reconcile.go` and `skipped_member.go` only; reconcile and repair act on a current snapshot only (`reconcile.go` ~150–159, `skipped_member.go` ~104–113).
+  - `grep -n "retired_at IS NULL" internal/cache/*.go | grep -v _test` includes `signed_seen.go` (`signedHistorySnapshotSQL`), `snapshot_reads.go`, `adoption.go` (the natural-key lookup), `gc.go` (B's selection), `suite_reap.go`, `legacy_audit.go`, `schema.go` (the partial index).
+  - `grep -n "StartupPass\|scheduler" cmd/apt-cacher-ultra/main.go`: `gcsvc.StartupPass(ctx)` comes before the scheduler's start and before `serveListeners` serves.
+  If any fails, stop and report.
 
-- [ ] **Step 2: Write the failing tests** in `internal/cache/gc_test.go`, reusing its seeding helpers (a suite with a current snapshot and displaced ones, each with `snapshot_member`, `snapshot_skipped_member` and `package_hash` rows):
-  - `TestRunSnapshotGCBatch_RetiresTheDisplacedBeyondKeep`: one current and five displaced snapshots, `keepDisplaced = 3`, batch size 10. The batch returns `DisplacedReaped == 2`; the two oldest displaced have `retired_at` set (= the batch's time, within a second of now) and **all** their child rows are still there (counted per table); the other snapshots are untouched. A second batch returns `Total() == 0`. Then `RunRetiredSnapshotGCChunk(ctx, 0)` until `more == false` deletes the two retired snapshots' rows and headers and nothing else.
-  - `TestRunSnapshotGCBatch_StillDeletesOrphanCandidates`: an orphan candidate (unadopted, heartbeat older than the grace, not current) is deleted by the batch, header gone, `OrphanReaped == 1` (if an existing test already pins this, name it in the report instead).
-  - `TestRunSnapshotGCBatch_ARetiredDisplacedSnapshotIsNoLongerRead`: after the batch, the reads DN-6 names (signed history for the suite's base, retained by-hash's displaced read, the rollback check) see the kept displaced snapshots and not the retired ones — the same answers as after a deletion.
-  In `internal/gc` (real cache): `TestStartupPass_RetiresDisplacedAndLeavesTheirRowsToSubJobC` (after `StartupPass`, the displaced snapshot beyond keep is retired and its rows remain) and `TestPeriodicTick_DeletesTheDisplacedSnapshotsItRetires` (one periodic tick retires and deletes them; `gc_run_complete` shows `displaced_reaped` and `retired_reaped` both counting them).
+- [ ] **Step 2: Write the failing tests** in `internal/cache/gc_test.go`. Seed with the existing helpers: `adoptCandidate` (`gc_test.go`, headers only), `adoptWith` (`suite_reap_test.go`), `seedPackageHash` (`gc_urlpath_test.go`, a drift file: call it, never edit it), `childRows` (`snapshot_gc_retired_test.go`), `sk`/`seedRow` (`suite_evict_test.go`) and the raw `snapshot_skipped_member` INSERT of `snapshot_gc_retired_test.go`; the tests stub `nowUnix` with `stubNow`.
+  - `TestRunSnapshotGCBatch_RetiresTheDisplacedBeyondKeep`: one current and five displaced snapshots, each with `snapshot_member`, `snapshot_skipped_member` and `package_hash` rows; `keepDisplaced = 3`, batch size 10, `retireDisplaced = true`. The batch returns `DisplacedReaped == 2`; the two oldest displaced have `retired_at` equal to the stubbed `nowUnix()` and every child row still there (counted per table); the others are untouched. A second batch returns `Total() == 0`. Then `RunRetiredSnapshotGCChunk(ctx, 0)` until `more == false` deletes the two retired snapshots' rows and headers and nothing else.
+  - `TestRunSnapshotGCBatch_DeletesTheDisplacedWhenNotRetiring`: the same seed with `retireDisplaced = false` deletes the two oldest displaced snapshots' rows and headers in the batch (today's behaviour, the startup mode).
+  - `TestRunSnapshotGCBatch_ARetiredDisplacedSnapshotIsNoLongerRead`, three legs, each asserting the same answer after a retirement as after a deletion: (signed history) a suite whose only signed history is displaced snapshots — no current pointer, `keep_displaced = 0`, no marker — is refused by `CheckUnsignedDowngrade` before the batch and admitted after; (retained by-hash) `DisplacedSnapshotMembers` returns the kept snapshots' ids and not the retired ones'; (rollback) `InsertCandidateSnapshot` with a retired snapshot's natural key inserts a new candidate, and with a kept one's returns `*NaturalKeyAdoptedError`. Its mutant: drop `retired_at IS NULL` from `snapshot_reads.go:84` and the by-hash leg fails.
+  - Orphans are already pinned by `TestRunSnapshotGCBatch_OrphanReap_HeartbeatStale`; run it in both modes (add the parameter).
+  In `internal/gc/retired_test.go`: extend `TestRun_DeletesRetiredSnapshotsAnHourAfterTheStart` with a displaced snapshot beyond `keep_displaced` (the startup pass deletes it: the startup mode), and add `TestPeriodicTick_RetiresAndDeletesTheDisplacedSnapshots` (one periodic tick retires and deletes them; its `gc_run_complete` shows both `displaced_reaped` and `retired_reaped` counting them).
 
-- [ ] **Step 3: Run them; the first and the gc ones fail** (B deletes the rows at once).
+- [ ] **Step 3: Run them; the retiring ones fail** (no parameter; B deletes at once).
 
-- [ ] **Step 4: Implement.** In `RunSnapshotGCBatch`, after the SELECT, split the ids by class; delete the orphans with the existing cascade (placeholders for the orphan ids only); retire the displaced:
+- [ ] **Step 4: Implement.** In `RunSnapshotGCBatch`, after the SELECT, split the ids by class. Orphans: the existing cascade delete, with placeholders for the orphan ids only. Displaced: with `retireDisplaced` false, the same cascade delete (today's behaviour); with it true:
 
 ```go
-		if len(displaced) > 0 {
-			// AIDEV-NOTE: ruling HD-4 (the H3 final review R3 #4). B used to
-			// delete a displaced snapshot's rows here, in this one writer
-			// transaction: six snapshots of 70,000 package_hash rows held the
-			// writer 4.7 s in a probe, so a full batch held every write (a
-			// miss's store, a flip's commit) about 8 s. B now only retires
-			// them, and sub-job C deletes them in chunks (retiredChunkRows a
-			// transaction). Every reader filters retired_at, so a retired
-			// displaced snapshot is invisible exactly as a deleted one was,
-			// and B's selection (retired_at IS NULL) never selects it again.
+		if retireDisplaced && len(displaced) > 0 {
+			// AIDEV-NOTE: rulings HD-4/HD-7 (the H3 final review R3 #4). A
+			// periodic tick's B used to delete a displaced snapshot's rows here,
+			// in this one writer transaction: six snapshots of 70,000
+			// package_hash rows held the writer 4.7 s in a probe, so a full
+			// batch held every write (a miss's store, a flip's commit) about
+			// 8 s. It now only retires them, and sub-job C deletes them in
+			// chunks (retiredChunkRows a transaction), in the same snapshot
+			// pass. Every reader that serves, vouches or judges history filters
+			// retired_at or reads current snapshots only, so a retired displaced
+			// snapshot is invisible to them exactly as a deleted one was, and
+			// B's selection (retired_at IS NULL) never selects it again. The
+			// startup pass still deletes (retireDisplaced false): it runs before
+			// the scheduler and the listeners, so its long transactions hold up
+			// no one, and a daemon that never lives until sub-job C runs still
+			// deletes its displaced snapshots at every start.
 			res, err := tx.ExecContext(ctx,
 				`UPDATE suite_snapshot SET retired_at = ? WHERE retired_at IS NULL AND snapshot_id IN (`+placeholders(len(displaced))+`)`,
 				append([]any{now}, displaced...)...)
@@ -279,39 +285,58 @@ func (g *GC) passFailed(ctx context.Context, err error) error {
 		}
 ```
 
-(`placeholders(n)` builds `?,?,…`; reuse the loop that builds `idList` today or add a small helper beside it.) Update the function's doc comment (steps 3–4: orphans cascade-deleted, displaced retired), `runSnapshotPass`'s comment ("Each batch … cascade DELETE" → retire for B), and `RunRetiredSnapshotGCChunk`'s AIDEV-NOTE (its callers now delete B's displaced snapshots too).
+(`placeholders(n)` builds `?,?,…`; reuse the loop that builds `idList` today or add a helper beside it.) `runSnapshotPass` passes `phase != phaseStartup`. Comments: `RunSnapshotGCBatch`'s doc (steps 3–4 by mode; the closing "blobs … reaped by the blob pass … later in the same tick" holds for the startup mode, and for periodic ticks after C), `SnapshotGCBatchResult`'s ("rows reaped" → reaped or retired), `runSnapshotPass`'s and its AIDEV-NOTE, `retiredRun`'s AIDEV-NOTE (C now also deletes B's retirements), and `RunRetiredSnapshotGCChunk`'s AIDEV-NOTE: its "every retirer holds the suite's mutex" justification does not cover B, which holds none; state B's own reason — B retires only adopted, non-current snapshots, `CommitAdoption` commits only an unadopted candidate and is the only writer of `current_snapshot_id`, so a retired displaced snapshot never becomes current again. Add at `GetSuiteStats` (`queries.go`): "AIDEV-NOTE: `AdoptedTotal` includes retired snapshots (sub-job B's too, until sub-job C deletes them), so `acu_snapshots_displaced` counts them meanwhile."
 
-- [ ] **Step 5: Run the whole suite** (`go test -race ./...`). Tests that asserted B's deletion directly now see retired rows: change each to run sub-job C (or a periodic tick) before asserting the deletion, or to assert the retirement — never weaken an assertion about what clients are served. List every test changed, with why, in the report.
+- [ ] **Step 5: Fix the existing tests that pinned B's deletion**, each asserting the retirement (the child rows kept) and then running `RunRetiredSnapshotGCChunk(ctx, 0)` until `!more` before asserting the deletion — or passing `retireDisplaced = false` where the test is about the startup mode; never weaken an assertion about what clients are served:
+  - `internal/cache/gc_test.go`: `TestRunSnapshotGCBatch_FiveAdopted_KeepDisplaced3_ReapsOldest`, `…_KeepDisplaced0_ReapsAllDisplaced`, `…_NullCurrent_AllAdoptedReaped`, `…_TieBreakOnSnapshotIDDesc`;
+  - `internal/cache/f24_gc_test.go`: `TestRunSnapshotGCBatch_KeepsTheAuditsVerdict/keep`, `TestRunSnapshotGCBatch_AQueuedSnapshotTakesNoKeepSlot`;
+  - `internal/cache/skipped_member_test.go`: `TestSnapshotGC_ReapsSkippedMemberRows`;
+  - `internal/cache/chaos_evict_race_test.go`: `TestChaos_BlobGC_EvictRace_OneZeroNegOne` (its later blob reap needs the snapshot's `snapshot_member` rows gone);
+  - `internal/cache/chaos_snapshot_race_test.go`: `TestChaos_SnapshotGC_DisplacementDuringTick_VariantOne` — its invariant changes, not one assertion: the outcomes become "S1 current at the SELECT, not retired" and "S1 retired, `DisplacedReaped` 1";
+  - `internal/gc/retired_test.go`: `TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs` (the startup mode keeps its deletion; its `retired_reaped` expectations follow DN-7's telemetry).
+  Run the whole suite (`go test -race ./...`) and list in the report every test changed, with why. Unaffected (a non-startup `runTick` runs C in the same pass): `TestGCEndToEnd_DisplacedSnapshot_DeadBlobReaped`, `TestForensicRetention_KeepDisplacedThree`/`…Zero` — confirm they pass unchanged.
 
-- [ ] **Step 6: Probe (recorded, not committed).** In a scratch test, seed six displaced snapshots of 70,000 `package_hash` rows each beyond `keep_displaced`, time `RunSnapshotGCBatch` and each `RunRetiredSnapshotGCChunk` call, and record the numbers in the report (expected: the batch in milliseconds, each chunk under 200 ms).
+- [ ] **Step 6: Probe (recorded, not committed).** In a scratch test, seed six displaced snapshots of 70,000 `package_hash` rows each beyond `keep_displaced`; time `RunSnapshotGCBatch(…, true)` and each `RunRetiredSnapshotGCChunk` call; record the numbers in the report (expected: the batch in milliseconds, each chunk under 200 ms).
 
-- [ ] **Step 7: Mutant.** Restore the deletion of displaced rows in the batch → `TestRunSnapshotGCBatch_RetiresTheDisplacedBeyondKeep` fails. Restore.
+- [ ] **Step 7: Mutants.** (a) Delete instead of retire with `retireDisplaced` → `…RetiresTheDisplacedBeyondKeep` fails. (b) Retire also at startup (ignore the parameter) → `…DeletesTheDisplacedWhenNotRetiring` and the extended `TestRun_DeletesRetiredSnapshotsAnHourAfterTheStart` fail. (c) `runSnapshotPass` passes `false` always → `TestPeriodicTick_RetiresAndDeletesTheDisplacedSnapshots`'s `retired_reaped` assertion fails. Restore each.
 
-- [ ] **Step 8: Docs.** `docs/configuration.md`, `snapshot_batch_size`: "Maximum snapshots one GC batch removes: displaced snapshots beyond `keep_displaced` are retired, and their rows are then deleted in chunks of 10,000 rows a transaction, so a large suite never holds the database for long. At least `1`." `keep_displaced`: keep the row, adding nothing unless it says displaced snapshots are deleted at once. `docs/admin-ui-spec.md`: `gc.displaced_reaped` "Displaced snapshots beyond `gc.keep_displaced` the last GC run retired; their rows are deleted with the retired snapshots (`retired_reaped`), normally in the same run"; `gc.retired_reaped` gains "and the displaced snapshots retired beyond `gc.keep_displaced`". Grep `docs/log-fields.md` for `displaced_reaped` and align it. Check each claim against the code (Step 1's greps and this task's tests).
+- [ ] **Step 8: Docs**, each claim checked against Step 1's greps and this task's tests:
+  - `docs/configuration.md`, the `[gc]` table: `snapshot_batch_size` → "Maximum snapshots one GC batch handles: abandoned adoption candidates are deleted; displaced snapshots beyond `keep_displaced` are deleted by the startup pass and retired by the periodic runs, whose retired snapshots' rows are then deleted 10,000 rows a transaction, so a large suite never holds the database for long while the cache serves. At least `1`."; `max_tick_duration` (~line 970): its list of retired snapshots gains "and the displaced snapshots a periodic run retired beyond `keep_displaced`".
+  - `docs/admin-ui-spec.md` (~line 457): the `gc.retired_reaped` row's list gains the displaced snapshots retired by a periodic run, and states the double count of DN-7 (`displaced_reaped` counts them when retired; `retired_reaped` when deleted).
+  - `docs/log-fields.md`: `acu_gc_retired_reaped_total` (~lines 231–234) and `gc_retired_run_complete` (~line 404) gain the same, with the double count.
+  - `internal/gc/metrics.go`: `acu_gc_displaced_reaped_total`'s help → "Total displaced suite_snapshot rows beyond keep_displaced reaped (startup) or retired (periodic; deleted later and counted in acu_gc_retired_reaped_total)"; `acu_gc_retired_reaped_total`'s help gains the displaced ones.
+  - The spec's C9 paragraph defining `retired_at` (~lines 1456–1458): it also marks displaced snapshots beyond `keep_displaced` that a periodic GC run retired (this plan, ruling HD-4).
 
-- [ ] **Step 9: Changelog** — under *Changed*: `- GC deletes old snapshots in bounded chunks: the displaced snapshots beyond \`gc.keep_displaced\` are retired and then deleted 10,000 rows a transaction, so a large suite no longer holds every database write for seconds.`
+- [ ] **Step 9: Changelog** — under *Fixed*:
 
-- [ ] **Step 10: Commit** the changed files: "GC: sub-job B retires displaced snapshots and sub-job C deletes them in chunks (H3 final review R3 #4)".
+```
+- GC no longer holds every database write for seconds while it deletes old
+  snapshots: periodic runs retire the displaced snapshots beyond
+  `gc.keep_displaced` and delete them 10,000 rows a transaction.
+```
+
+- [ ] **Step 10: Commit** the changed files: "GC: periodic sub-job B retires displaced snapshots and sub-job C deletes them in chunks (H3 final review R3 #4)".
 
 ### Task 3: No transparent gzip; adoption stops a member's download at its declared size
 
 **Files:**
-- Modify: `internal/fetch/dialer.go` (`newTransport`), `internal/fetch/fetch.go` (`Target`, `ErrBodyTooLarge`, `doAttempt`, `streamBody`, `isRetryable`), `internal/fetch/classify.go`
+- Modify: `internal/fetch/dialer.go` (`newTransport`), `internal/fetch/fetch.go` (`Target`, `ErrBodyTooLarge`, `doAttempt`, `streamBody`, `isRetryable`), `internal/fetch/classify.go` (the case and the row comments), `internal/fetch/conditional.go` (its stale comment)
 - Modify: `internal/freshness/adoption.go` (`tryByHashFetch`, `fetchMemberURL`, new `memberMaxBytes`)
-- Test: `internal/fetch/fetch_test.go`, `internal/fetch/classify_test.go`, a `internal/freshness` adoption test file (the one with member-fetch tests)
-- Modify: `docs/configuration.md` (the unsigned threat note at "but not in bytes"), the doc that lists `acu_fetch_total`'s outcomes (`grep -rn "body_too_large" docs/ e2e/ internal --include=*.md`), `Changelog.md`
+- Test: `internal/fetch/fetch_test.go`, `internal/fetch/classify_test.go`, `internal/freshness/adoption_test.go`
+- Modify: `docs/configuration.md` (the unsigned threat note), `Changelog.md`
 
 **Interfaces:**
 - Produces: `fetch.Target.MaxBytes int64`; `fetch.ErrBodyTooLarge`; `func memberMaxBytes(m ReleaseMember) int64`.
 
-- [ ] **Step 1: Write the failing fetch tests** (httptest servers through `newTestClient`):
-  - `TestFetch_SendsNoAcceptEncoding`: the server records `r.Header.Values("Accept-Encoding")` and answers gzip only when asked; after a fetch, no value was sent and `dst` holds the identity body.
-  - `TestFetch_StoresAGzipBodyItDidNotAskFor`: the server always sends `Content-Encoding: gzip` and a gzip body; `dst` holds the compressed bytes, unchanged (nothing is decoded in transit).
+- [ ] **Step 1: Write the failing fetch tests** (httptest servers through `newTestClient`, `bufDst`):
+  - `TestFetch_SendsNoAcceptEncoding`: the server records `r.Header.Values("Accept-Encoding")` and answers gzip only when asked; no value was sent and `dst` holds the identity body. `TestFetch_SendsNoAcceptEncodingOverHTTP2`: the same over HTTP/2 (`httptest.NewUnstartedServer` with `EnableHTTP2 = true`, `StartTLS`, the server's CA through `SetRootCAsForTest`), asserting `r.ProtoMajor == 2`.
+  - `TestFetch_StoresAGzipBodyItDidNotAskFor`: the server always sends `Content-Encoding: gzip` and a gzip body; `dst` holds the compressed bytes, unchanged.
   - `TestFetch_MaxBytesStopsAChunkedBodyThatRunsOver`: a chunked 200 (flush after each 4 KiB, 1 MiB in all), `MaxBytes: 10000`: `errors.Is(err, ErrBodyTooLarge)`, `dst.Written() <= 10001`, and the server saw one request (not retried).
   - `TestFetch_MaxBytesRefusesADeclaredLengthOverIt`: `Content-Length: 50000`, `MaxBytes: 10000`: `ErrBodyTooLarge` with `dst.Written() == 0`.
   - `TestFetch_MaxBytesAcceptsABodyOfExactlyIt`: 10,000 bytes, with and without `Content-Length`, `MaxBytes: 10000`: success.
-  - `TestFetch_MaxBytesBoundsAResumedDownload`: a chunked first 200 with an `ETag`, cut after 5,000 bytes; the resume's 206 declares `bytes 5000-49999/50000`; `MaxBytes: 10000`: `ErrBodyTooLarge`.
-  - `TestFetch_ZeroMaxBytesIsNoLimit`: a 100,000-byte chunked body with `MaxBytes` 0 succeeds (the existing tests cover this too; keep this one explicit).
+  - `TestFetch_MaxBytesRefusesAResumeDeclaringMore`: a chunked first 200 with an `ETag`, cut after 5,000 bytes; the 206 declares `bytes 5000-49999/50000`; `MaxBytes: 10000`: `ErrBodyTooLarge`, no third request.
+  - `TestFetch_MaxBytesStopsAResumedBodyThatRunsOver`: the same first 200; the 206 declares `bytes 5000-9999/*` and its body runs past 10,000 bytes: `ErrBodyTooLarge`, no third request (without the cap at the 206 call site it ends as `ErrSizeMismatch`, which is retried).
+  - `TestFetch_ZeroMaxBytesIsNoLimit`: a 100,000-byte chunked body with `MaxBytes` 0 succeeds.
   In `classify_test.go`: a `Fetch` error wrapping `ErrBodyTooLarge` classifies as `body_too_large`.
 
 - [ ] **Step 2: Run them; they fail** (Go sends `Accept-Encoding: gzip` and decodes; no `MaxBytes`).
@@ -325,7 +350,8 @@ func (g *GC) passFailed(ctx context.Context, err error) error {
 		// skipped the size check, and a resumed download (Go does not ask for
 		// gzip on a Range request) appended compressed bytes to a decoded
 		// prefix. The cache stores and serves bytes as the upstream sent
-		// them, never with a Content-Encoding, so it must not ask for any.
+		// them, never with a Content-Encoding, so it must not ask for any —
+		// as apt's own http method does not. The HTTP/2 transport honours it.
 		DisableCompression: true,
 ```
 
@@ -339,7 +365,7 @@ func (g *GC) passFailed(ctx context.Context, err error) error {
 	MaxBytes int64
 ```
 
-New sentinel beside the others: `ErrBodyTooLarge = errors.New("fetch: response body exceeds the size expected")`. `doAttempt`, case 200, before the truncate: `if target.MaxBytes > 0 && resp.ContentLength > target.MaxBytes { return out, fmt.Errorf("%w: declared %d bytes, at most %d expected", ErrBodyTooLarge, resp.ContentLength, target.MaxBytes) }`; case 206, after the existing total checks: `if target.MaxBytes > 0 && (total > target.MaxBytes || last >= target.MaxBytes) { return out, fmt.Errorf("%w: …", ErrBodyTooLarge, …) }`. `streamBody` takes the limit:
+New sentinel beside the others: `ErrBodyTooLarge = errors.New("fetch: response body exceeds the size expected")`. `doAttempt`, case 200, before the truncate: `if target.MaxBytes > 0 && resp.ContentLength > target.MaxBytes { return out, fmt.Errorf("%w: declared %d bytes, at most %d expected", ErrBodyTooLarge, resp.ContentLength, target.MaxBytes) }`; case 206, after the existing total checks: `if target.MaxBytes > 0 && (total > target.MaxBytes || last >= target.MaxBytes) { return out, fmt.Errorf("%w: …", ErrBodyTooLarge, …) }` (`last` is an index: an exact-size resume passes). `streamBody` takes the limit:
 
 ```go
 // streamBody copies resp.Body into dst, … (keep the existing text). With max
@@ -364,11 +390,13 @@ func streamBody(resp *http.Response, dst FetchDst, max int64) error {
 }
 ```
 
-Both call sites pass `target.MaxBytes`. `isRetryable`: `if errors.Is(err, ErrBodyTooLarge) { return false }` beside `ErrCacheWriteFailed`'s. `classifyError`: `case errors.Is(err, ErrBodyTooLarge): return "body_too_large"` in the switch that holds `ErrSizeMismatch`, before it; update the function's row comment.
+Both call sites pass `target.MaxBytes`. `isRetryable`: `if errors.Is(err, ErrBodyTooLarge) { return false }` beside `ErrCacheWriteFailed`'s. `classifyError`: `case errors.Is(err, ErrBodyTooLarge): return "body_too_large"` in the switch that holds `ErrSizeMismatch`, before it; update the row comments ("The 23 rows" → 24; the `conditional` parameter's comment: `body_too_large` is now also a `Fetch` outcome). `conditional.go` (~line 148): drop "(and when the transport decompresses)" from the `ContentLength` comment.
 
 - [ ] **Step 4: Run the fetch tests**; all pass, the existing ones included.
 
-- [ ] **Step 5: Write the failing adoption tests.** With the freshness tests' fake fetcher (record each `*fetch.Target`): `TestAdoptMember_LimitsTheDownloadToTheDeclaredSize` — a member of declared size 1234 is fetched with `MaxBytes == 1234` on the by-hash probe and on the plain path (make the probe fail so both run); a member declared size 0 with `MaxBytes == 1`. With a real `fetch.Client` and an httptest upstream that serves a member chunked and longer than declared: `TestAdoptMember_AMemberLongerThanDeclaredStopsAtItsSize` — the member fails (`ErrAdoptionMemberFetchFailed`), no pool file and no temp file remain for it, and the upstream handler observed a write error before it had sent twice the declared size.
+- [ ] **Step 5: Write the failing adoption tests** in `internal/freshness/adoption_test.go`:
+  - `TestAdoptMember_LimitsTheDownloadToTheDeclaredSize`: the `fakeFetcher` gains a `targets []fetch.Target` field recording each call; a member of declared size 1234 is fetched with `MaxBytes == 1234` on the by-hash probe and on the plain path (make the probe fail so both run); a member declared size 0 with `MaxBytes == 1`.
+  - `TestAdoptMember_AMemberLongerThanDeclaredStopsAtItsSize`: a real `fetch.Client` and an httptest upstream that serves a member of declared size 1 MiB as a 16 MiB chunked body in flushed 4 KiB writes, counting the bytes it wrote; call `a.adoptMember(ctx, suite, m, false)` directly (no by-hash probe; `MemberRetryCount` 0). Assert `errors.Is(err, ErrAdoptionMemberFetchFailed)` (before the change it is `ErrAdoptionMemberMismatch`: a chunked body skips the size checks and only the hash fails), the `*AdoptionMemberError`'s `Detail` contains `fetch.ErrBodyTooLarge.Error()`, no pool file and no temp file remain for it, and the upstream wrote fewer than declared + 1 MiB bytes.
 
 - [ ] **Step 6: Implement adoption.**
 
@@ -386,222 +414,385 @@ func memberMaxBytes(m ReleaseMember) int64 {
 }
 ```
 
-Set `MaxBytes: memberMaxBytes(m)` in the `fetch.Target` of `tryByHashFetch` and of `fetchMemberURL`.
+Set `MaxBytes: memberMaxBytes(m)` in the `fetch.Target` of `tryByHashFetch` and of `fetchMemberURL`. (A by-hash probe that fails `ErrBodyTooLarge` falls back to the plain path like any probe error but `ErrAdoptionDBFailed`; repair and reconcile go through `adoptMember` and so get the cap — say so in the report.)
 
 - [ ] **Step 7: Run** `go test -race ./internal/fetch ./internal/freshness`; all pass.
 
-- [ ] **Step 8: Mutants.** (a) Drop `DisableCompression` → `TestFetch_SendsNoAcceptEncoding` and `TestFetch_StoresAGzipBodyItDidNotAskFor` fail. (b) `streamBody` ignores `max` → the chunked test fails. (c) Drop the declared-length check → `TestFetch_MaxBytesRefusesADeclaredLengthOverIt` fails (`Written` > 0). (d) Retry `ErrBodyTooLarge` → the chunked test's one-request assertion fails. (e) Drop `MaxBytes` from `fetchMemberURL` → both adoption tests fail. Restore each.
+- [ ] **Step 8: Mutants.** (a) Drop `DisableCompression` → both `…SendsNoAcceptEncoding…` tests and `…StoresAGzipBodyItDidNotAskFor` fail. (b) `streamBody` ignores `max` → the chunked test fails. (c) Drop the declared-length check → `…RefusesADeclaredLengthOverIt` fails. (d) Retry `ErrBodyTooLarge` → the one-request assertion fails. (e) Drop `max` at the 206 call site → `…StopsAResumedBodyThatRunsOver` fails. (f) Drop `MaxBytes` from `fetchMemberURL` → both adoption tests fail. Restore each.
 
-- [ ] **Step 9: Docs.** `docs/configuration.md`, the unsigned threat note: replace "but not in bytes: each file can be as large as its server sends within `upstream.total_timeout` (no response-body ceiling, and gzip is decompressed in transit: the 2026-09 security review's A-2 and VA-3, open)," with "and in bytes by the sizes its own `Release` declares: each file's download stops at its declared size, and nothing is decompressed in transit (the 2026-09 security review's A-2 and VA-3), but an unsigned `Release` declares what its server wants,". Read the paragraph whole afterwards: the sentence must still parse. Add `body_too_large` to wherever `acu_fetch_total`'s outcomes are listed for `Fetch` (it is already listed for conditional fetches).
+- [ ] **Step 9: Docs.** `docs/configuration.md`, the unsigned threat note (~line 693): replace "but not in bytes: each file can be as large as its server sends within `upstream.total_timeout` (no response-body ceiling, and gzip is decompressed in transit: the 2026-09 security review's A-2 and VA-3, open)," with "and in bytes by the sizes its own `Release` declares: each file's download stops at its declared size, and nothing is decompressed in transit (the 2026-09 security review's A-2 and VA-3), but an unsigned `Release` declares what its server wants,". Read the paragraph whole afterwards: the sentence must still parse. No document lists `acu_fetch_total`'s outcomes (`grep -rn "acu_fetch_total\|body_too_large" docs/` finds none); the code comments of Step 3 are the record.
 
-- [ ] **Step 10: Changelog** — under *Fixed*: `- Upstream downloads are no longer decompressed in transit (a gzip-encoded body skipped the size check, and a resumed one could be corrupted), and adoption stops a member's download at the size its \`Release\` declares.`
+- [ ] **Step 10: Changelog** — under *Fixed*:
+
+```
+- Upstream downloads are no longer decompressed in transit (a gzip-encoded
+  body skipped the size check, and a resumed one could be corrupted), and
+  adoption stops a member's download at the size its `Release` declares.
+```
 
 - [ ] **Step 11: Commit** the changed files: "Fetch: no transparent gzip; adoption caps each member's download at its declared size (security review A-2, VA-3, VA-4)".
 
 ### Task 4: Strict mode refuses a `.deb` whose vouching ends during its download
 
 **Files:**
-- Modify: `internal/handler/handler.go` (`prefetchCheck`, `prefetchRecheck`, `runFetch`, `strictAfterDownload`'s comment)
+- Modify: `internal/handler/handler.go` (`prefetchCheck`, `prefetchRecheck`, `runFetch`, the doc comments of `prefetchCheck` and `strictAfterDownload`)
 - Test: `internal/handler/strict_wait_test.go`
 - Modify: `Changelog.md`
 
 **Interfaces:**
-- Consumes: `strictWaitRig`, `commitVouching`, `fakeAdoptions`, `firstFetchHook` (existing handler tests).
+- Consumes: `strictWaitRig` (strict mode on), `newPhase3StrictHandlerCapturing(t, false, true, nil)` with `adoptCoverageComplete` (strict mode off), `commitVouching` (returns nothing), `commitStrictSnap` (`flat_strict_test.go`, returns the snapshot id), `fakeAdoptions` (its `asked` hook), `firstFetchHook`, `(*cache.Cache).ForgetSuite(…, wantCurrent)` (existing).
 - Produces: `prefetchCheck(ctx, req) (res sfResult, end, unread, vouched bool)`; `prefetchRecheck(ctx, req, count) (res sfResult, end, vouched bool)`.
 
-- [ ] **Step 1: Write the failing test** `TestServeHTTP_StrictMissDecidesWhenVouchingEndsDuringTheDownload`, table-driven like `TestServeHTTP_StrictMissDecidesAfterAFailedPrefetchRead`: the `.deb` is vouched by a current snapshot before the request; a fetch hook that runs **after** the upstream body is written (extend `firstFetchHook` with an `after func()`, or add a sibling hook type) ends the vouching — retire the vouching snapshot the way a reap or forget does (find the cache call: `grep -n "func (c \*Cache) \(Forget\|Reap\|Retire\)" internal/cache/*.go`), or commit a new current snapshot that does not list the path. Rows:
-  - strict host, nothing in flight → 502, `Retry-After: 60`, one `unvouched_deb_refused`, the file not served;
+- [ ] **Step 1: Write the failing test** `TestServeHTTP_StrictMissDecidesWhenVouchingEndsDuringTheDownload`, table-driven like `TestServeHTTP_StrictMissDecidesAfterAFailedPrefetchRead`. A fetch hook that runs **after** the upstream body is written ends the vouching — `firstFetchHook` gains an `after func()` (guard both `before` and `after` against nil; today a nil `before` panics in `once.Do`) — by forgetting the vouching suite (`ForgetSuite`; `commitStrictSnap` gives the id if needed) or committing a new current snapshot that does not list the path. Rows:
+  - strict host, the `.deb` vouched before the request, nothing in flight → 502, `Retry-After: 60`, one `unvouched_deb_refused`, the file not served;
   - strict host, a signed adoption in flight that commits rows vouching the same bytes while the miss waits → 200 with the body after one wait;
-  - a host with strict mode off → 200, the body served (unchanged behaviour).
+  - strict host, **no** row before the request: `fakeAdoptions.asked` commits the vouching suite once, as `TestServeHTTP_StrictRefusalLooksUpOnceMoreWhenTheAdoptionJustEnded` does, so `prefetchRecheck`'s second look finds it; the after-download hook forgets it → 502, `Retry-After: 60`, one `unvouched_deb_refused`;
+  - strict mode off (`newPhase3StrictHandlerCapturing(t, false, true, nil)`, `adoptCoverageComplete`, `commitVouching`) → 200, the body served (unchanged behaviour).
 
-- [ ] **Step 2: Run it; the strict rows fail** (the file is served: today the read after the download finds no row, and strict mode is decided there only after a failed read before it).
+- [ ] **Step 2: Run it; the strict rows fail** (the file is served).
 
-- [ ] **Step 3: Implement.** `prefetchCheck` returns `vouched = true` when its read found exactly one distinct declared hash, and passes on `prefetchRecheck`'s `vouched` (true when the second look found rows). In `runFetch`, keep `prefetchVouched` beside `prefetchUnread`, and in the read after the download, case 0:
+- [ ] **Step 3: Implement.** `prefetchCheck` returns `vouched = true` when its read found exactly one distinct declared hash, and passes on `prefetchRecheck`'s `vouched` (true in its `len(rows) > 0` case). In `runFetch`, keep `prefetchVouched` beside `prefetchUnread`, and in the read after the download, case 0:
 
 ```go
 				// Final review R4 #2 and ruling HD-6: strict mode's decision is
 				// made here when the check before the download could not read
 				// the vouching hashes, or when it found the path vouched and the
-				// vouching is gone now (its snapshot retired or displaced by one
+				// vouching is gone now (its snapshot retired, or displaced by one
 				// that does not list it, during the download) — a .deb that was
 				// vouched is never served unchecked on a strict host.
 				if (prefetchUnread || prefetchVouched) && isDebPath(req.Path) {
 ```
 
-Update `prefetchCheck`'s and `strictAfterDownload`'s doc comments to name both callers' cases.
+Update `prefetchCheck`'s and `strictAfterDownload`'s doc comments to name both cases.
 
 - [ ] **Step 4: Run** `go test -race ./internal/handler`; all pass.
 
-- [ ] **Step 5: Mutant.** Drop `|| prefetchVouched` → the strict rows fail. Restore.
+- [ ] **Step 5: Mutants.** (a) Drop `|| prefetchVouched` → the three strict rows fail. (b) `prefetchRecheck` never reports `vouched` → the no-row-before row fails. Restore each.
 
-- [ ] **Step 6: Changelog** — under *Fixed*: `- With \`integrity.refuse_unvouched_debs\`, a \`.deb\` whose vouching snapshot is retired or replaced while it downloads is refused like any unvouched \`.deb\`, instead of being served unchecked.`
+- [ ] **Step 6: Changelog** — under *Fixed*:
+
+```
+- With `integrity.refuse_unvouched_debs`, a `.deb` whose vouching snapshot
+  is retired or replaced while it downloads is refused like any unvouched
+  `.deb`, instead of being served unchecked.
+```
 
 - [ ] **Step 7: Commit** the changed files: "Strict mode: a .deb whose vouching ends during its download is decided after it (H3 final review, R6 re-review)".
 
-### Task 5: The verifier rejects the anchor shapes apt rejects: framing and CRC, both forms
+### Task 5: The apt-shape corpus — fixtures, their generator, apt's verdicts and the oracle
+
+No verifier change in this task: it builds the corpus Tasks 6 and 7 hold the verifier to, and the manual oracle that re-measures apt.
 
 **Files:**
-- Create: `internal/gpg/armor_shape.go` (the F1–F3 checks and CRC-24), `internal/gpg/aptshape_test.go` (fixture builders, the measured table, the table test)
-- Modify: `internal/gpg/verifier.go` (`VerifyInline`, `VerifyDetached`, `requireBareClearsigned`, `decodeMaybeArmoredSignature`, `isArmoredSignature`, `ClassifyVerifyErr`, the sentinels, the AIDEV-NOTEs that list these shapes as open), existing tests that pin the old behaviour (a binary `Release.gpg` accepted, whitespace after END accepted)
-- Modify: the doc listing the verification reasons (DN-4), `docs/configuration.md` if it says a binary `Release.gpg` is accepted (`grep -n "binary" docs/configuration.md`), `Changelog.md`
+- Create: `e2e/apt-oracle/gen_shapes.py` (the generator), `e2e/apt-oracle/in-container.sh`, `e2e/apt-oracle/run.sh`, `e2e/apt-oracle/README.md`
+- Create: `internal/gpg/testdata/aptshapes/` — `keys.gpg`, `Release`, one `<name>.InRelease` or `<name>.Release.gpg` per shape (plus `<name>.Release` for a shape whose detached signature covers another `Release`), `verdicts.txt`
+- Modify: `Makefile` (target `e2e-apt-oracle` beside `e2e-live`, in `.PHONY`; `SHELL_SCRIPTS` gains `e2e/apt-oracle/*.sh`), `docs/open-decisions.md` (the pre-RC list), `Changelog.md`
 
 **Interfaces:**
-- Produces: `ErrMalformedSignature`; `aptShape` fixtures `func aptShapes(t *testing.T) []aptShape` with `type aptShape struct { name string; inline []byte; release, sig []byte; keys openpgp.EntityList }`; `aptVerdicts map[string][6]bool` (true = that apt accepts; the image order of DN-2); `aptShapeDeviations map[string]string` (shape → why the cache's verdict differs from DN-3's rule). Task 6 adds rows to the same table; Task 7 writes the same fixtures to disk.
+- Produces: the corpus layout above; `verdicts.txt` lines `<name> <d11> <u22> <u24> <d12> <d13> <u26>` (`ok`/`REJ`, DN-2's image order) after a `#` header naming the date and each image's apt and verifier versions; `make e2e-apt-oracle` (manual, like `make e2e-live`; not in CI); `bash e2e/apt-oracle/run.sh --record` (rewrites `verdicts.txt` from a measurement).
 
-- [ ] **Step 1: Write the fixture builders and the measured table.** In `aptshape_test.go`, build every DN-2 shape except the S1 rows (`*_badsig_*`, `i_badsig_only`, `*_unknown_*`, `i_expired_*`, which Task 6 adds) and `i_dash_escaped_end`, with go-crypto (`newTestEntity`, `clearsignWith`, `detachSignWith`, `assembleClearsignedBlock`, and an armor writer that can write a forged, missing or misplaced CRC line, headers and blank lines). Name each fixture exactly as DN-2 does. The table `aptVerdicts` holds DN-2's verdicts for those rows (copy them from `…/scratchpad/apt-oracle/table.txt`). Add a CRC-24 test against RFC 4880's check value (`crc24([]byte("123456789")) == 0x21CF02`).
+- [ ] **Step 1: The generator.** `e2e/apt-oracle/gen_shapes.py OUT` consolidates `PE/gen.py`, `PE/gen2.py`–`gen6.py` and `PE/pgp.py` into one typed script (stdlib + the `gpg` binary): one temporary GnuPG home (deleted at exit), keys A (RSA-3072, signs), B (unknown to the client), E (made with `--faked-system-time 20200101T000000!`, valid one year: expired 2021; its signatures made at `20200601T000000!`) and S (a certify-only primary with a signing subkey); one shared `Release` (a flat repository: `Packages` empty, its SHA256 line, a fixed `Date:` in the past); every one of Appendix A's 128 shapes, by the same name and built exactly as the planning generator built it; `keys.gpg` = the binary export of A, E and S (never B, never a secret key). Header comment: what each key is and why, and that fixtures and verdicts must be regenerated and re-measured together. `ruff format`, `ruff check`, `mypy --strict` clean.
 
-- [ ] **Step 2: Write the table test** `TestVerifier_AcceptsWhatEveryAptAccepts`: for each shape, run `VerifyInline` (or `VerifyDetached`) with a verifier whose host keyring holds the shape's keys, default options (`require_signature = true`, no pins, `allow_short_keyid = true`); want accepted iff every apt accepts (DN-3), unless the shape is in `aptShapeDeviations`, in which case want the opposite and the deviation's reason is non-empty. Also a test that every key of `aptShapeDeviations` names a shape in the table (no stale deviation). Run it: the F2/F3 rows and the detached F1 rows fail (they are accepted today).
+- [ ] **Step 2: Generate** into `internal/gpg/testdata/aptshapes/` (`python3 -I e2e/apt-oracle/gen_shapes.py internal/gpg/testdata/aptshapes`). Expected: 128 shape files plus `keys.gpg` and `Release`, a few hundred KiB in all.
 
-- [ ] **Step 3: Implement `armor_shape.go`.**
+- [ ] **Step 3: The oracle.** `e2e/apt-oracle/in-container.sh` is `PE/in-container.sh` adapted: it reads the corpus at `/fx`, builds each shape's flat repository in a temp directory (the shape file as `InRelease`, or `Release` + `Release.gpg`; an empty `Packages`), runs `apt-get update` with `signed-by=/fx/keys.gpg`, and prints `<name> <rc> <first E:/W: line>` (`|| true` on the `grep` that extracts the line: it exits 1 when apt printed none, which under `set -o pipefail` would end the script at the first accepted shape). `e2e/apt-oracle/run.sh`: for each image in `${E2E_APT_ORACLE_IMAGES:-debian:11 ubuntu:22.04 ubuntu:24.04 debian:12 debian:13 ubuntu:26.04}` runs `timeout 600 docker run --rm --network none -v "<repo>/internal/gpg/testdata/aptshapes:/fx:ro" -v "<repo>/e2e/apt-oracle/in-container.sh:/in-container.sh:ro" "<image>" bash /in-container.sh`, collects the verdicts, prints one table (shape × image), and compares them with `verdicts.txt`: any difference is **apt changed** (exit 1; update Appendix A's row in this plan's successor record, `verdicts.txt` via `--record`, and the README's date). With `--record` it writes `verdicts.txt` from the run instead. `set -euo pipefail`; `shellcheck -x` clean (`make shellcheck`).
 
-```go
-// Package-level apt-shape checks (spec: docs/open-decisions.md, "The inline
-// verifier accepts three shapes apt rejects"; ruling HD-2). Each rule is
-// what apt 2.2–3.2 enforce on an InRelease or Release.gpg (the measured table
-// in docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md, DN-2;
-// `make e2e-apt-oracle` re-measures it).
+- [ ] **Step 4: Record and compare.** `bash e2e/apt-oracle/run.sh --record`, then compare the recorded verdicts with Appendix A's apt columns, shape by shape. Expected: identical (a fresh key changes no verdict). Any difference: stop and report it with the shape's bytes; do not edit Appendix A. Then `make e2e-apt-oracle`: exit 0, about one minute with the images cached. Record both runs' output in the report and the README's *Results* (date, tree, the six apt versions).
 
-const (
-	sigArmorBegin = "-----BEGIN PGP SIGNATURE-----"
-	sigArmorEnd   = "-----END PGP SIGNATURE-----"
-)
+- [ ] **Step 5: Mutant.** Flip one recorded verdict in `verdicts.txt` → `make e2e-apt-oracle` reports **apt changed** for that shape and exits 1. Restore.
 
-// isMarkerLine reports whether line (without its LF) is marker followed only
-// by spaces, tabs and one trailing CR — apt's reading of a marker line.
-func isMarkerLine(line []byte, marker string) bool
+- [ ] **Step 6: Docs.** `e2e/apt-oracle/README.md`: what the corpus is (the shapes, the keys, how to add one: a builder in the generator, regenerate, `--record`, review the new row), what the oracle checks (that apt still gives the recorded verdicts; the cache's verdicts are the Go table test's job, Tasks 6–7), that the "unsafe" guarantee is only as wide as the corpus, the images, when to run it (before a release, after a go-crypto upgrade, after a change to `internal/gpg`'s armor or signature checks), and *Results*. `docs/open-decisions.md`, the pre-RC list: add "`make e2e-apt-oracle` on the tree you tag" beside `make e2e-live`.
 
-// crc24 is OpenPGP's armor checksum (RFC 4880 §6.1): init 0xB704CE,
-// polynomial 0x1864CFB.
-func crc24(b []byte) uint32
+- [ ] **Step 7: Changelog** — under *Added*:
 
-// checkSignatureArmor applies F2 and F3 to the signature armor that starts
-// at the line `begin` of b (the index of its BEGIN line) and returns the
-// index just past its END line. decoded is what go-crypto decoded from the
-// armor (the signature packets). Errors are plain (the callers wrap them in
-// their form's sentinel).
-func checkSignatureArmor(b []byte, begin int, decoded []byte) error
+```
+- `make e2e-apt-oracle`: checks that the real apt of six client images
+  still gives the recorded verdicts on the verifier's 128 signature-shape
+  fixtures (manual).
 ```
 
-Rules for `checkSignatureArmor`, from DN-3: scan the lines after the BEGIN line; the first line that `isMarkerLine(…, sigArmorEnd)` is the END line; there must be one (else error). After the END line's LF there is nothing; or the END line ends at EOF. Among the lines between BEGIN and END, a line whose trimmed form (spaces, tabs, CR) starts with `=` is a CRC line: at most one; if there is one, it is the line right before END, its trimmed form is `=` plus four base64 characters that decode to three bytes, and that 24-bit value equals `crc24(decoded)`. Keep it a pure function with no go-crypto calls, so it is cheap to test line by line.
+- [ ] **Step 8: Commit** the generator, scripts, README, corpus, `Makefile`, `docs/open-decisions.md`, `Changelog.md`: "e2e/apt-oracle: 128 signature shapes and apt 2.2-3.2's verdicts on them".
 
-- [ ] **Step 4: Wire it in.**
-  - Inline: `requireBareClearsigned` keeps its F1 check (`aptpath.SniffInRelease`) and drops the whitespace-after-END rule (F2 moves to `checkSignatureArmor`). In `VerifyInline`, after `readArmoredSignature` (on both the bypass and the trusted path), locate the signature armor's BEGIN line in `inRelease` — the first line after the signed text that `isMarkerLine(…, sigArmorBegin)` (dash-escaping guarantees no plaintext line is one) — and call `checkSignatureArmor(inRelease, begin, sigBytes)`; wrap a failure as `fmt.Errorf("%w: %v", ErrMalformedClearsign, err)`. A body with the BEGIN marker but no END line keeps today's error from the decoder.
-  - Detached: replace `isArmoredSignature`'s whitespace skip: the signature must start at byte 0 with a line that `isMarkerLine(…, sigArmorBegin)` (F1); anything else — a binary signature included — is `fmt.Errorf("%w: …", ErrMalformedSignature)`, on the bypass path too. After `armor.Decode` and the size cap, call `checkSignatureArmor(sigBytes, 0, out)`; wrap a failure in `ErrMalformedSignature`. Remove the "binary Release.gpg also exists in the wild; both forms are accepted" text from `VerifyDetached`'s comment and say what is enforced now.
-  - `ClassifyVerifyErr`: `case errors.Is(err, ErrMalformedSignature): return "malformed_signature"`.
-  - Rewrite the two AIDEV-NOTEs that list VC-2, C-4 and VC-1 as open (`VerifyDetached`'s and `requireBareClearsigned`'s): VC-2 and C-4 are enforced (name the rules), VC-1 and C-3 remain (Task 6 closes VC-1); keep the R-D2 history.
-
-- [ ] **Step 5: Run** `go test -race ./internal/gpg`. Fix the existing tests that pinned the old behaviour (a binary `Release.gpg` adopted; whitespace lines after END accepted): each now expects rejection with its sentinel; list them in the report. If a DN-2 control row fails (the cache rejects a shape every apt accepts), first try to accept it; if go-crypto itself cannot decode it (a decoder limit, not a rule of ours), add it to `aptShapeDeviations` with that reason, and report it.
-
-- [ ] **Step 6: Mutants.** (a) Allow a blank line after END → `i_trail_lf`/`d_trail_lf` rows fail. (b) Skip the CRC comparison → `*_crc_forged` fail. (c) Allow a line between CRC and END → `*_line_after_crc` fail. (d) Accept a binary signature → `d_binary` fails. (e) Reject a trailing CR on the END line → `*_end_crlf` fail. Restore each.
-
-- [ ] **Step 7: Run the freshness and handler packages** (`go test -race ./internal/freshness ./internal/handler`): adoption tests that build their anchors with the helpers must still pass; any that wrote whitespace after END or a binary `Release.gpg` now see a refusal — fix the fixture (never the rule) and list it.
-
-- [ ] **Step 8: Docs and Changelog.** Add `malformed_signature` beside the existing reasons (DN-4's grep). If `docs/configuration.md` says binary `Release.gpg` is accepted, say it is refused. Changelog under *Fixed*: `- Adoption refuses an \`InRelease\` or \`Release.gpg\` that apt rejects: a line after the signature, a forged armor checksum, a \`Release.gpg\` with bytes around its armor, two armor blocks, or a binary signature (apt 2.2 to 3.2 reject each; the cache adopted them and its clients' \`apt update\` then failed).`
-
-- [ ] **Step 9: Commit** the changed files: "Verifier: framing and armor CRC as apt checks them, inline and detached (security review VC-2, C-4)".
-
-### Task 6: Every signature from a known key must verify
+### Task 6: The verifier refuses the shapes apt refuses: structure (F0–F6), both forms
 
 **Files:**
-- Modify: `internal/gpg/verifier.go` (new `requireKnownSignaturesVerify`, called by `VerifyInline` and `VerifyDetached` on the trusted path; `ErrBadSignature`; `ClassifyVerifyErr`; the AIDEV-NOTEs)
-- Test: `internal/gpg/aptshape_test.go` (the S1 rows), `internal/gpg/verifier_test.go` / `verifier_detached_test.go` (focused tests)
-- Modify: the reasons doc (DN-4), `Changelog.md`
+- Create: `internal/gpg/armor_shape.go` (F0, F2–F5, CRC-24, the line splitter), `internal/gpg/packet_shape.go` (F6), `internal/gpg/aptshape_test.go` (the table test over the corpus)
+- Modify: `internal/gpg/verifier.go` (`VerifyInline`, `VerifyDetached`, `requireBareClearsigned`, `decodeMaybeArmoredSignature`, `isArmoredSignature`, `ClassifyVerifyErr`, the sentinels, the AIDEV-NOTEs that list these shapes as open), `internal/gpg/verifier_test.go` and `verifier_detached_test.go` (Step 5's tests), `internal/admin/status.go` (`reasonTooltip`, the `Reason` field comment), `internal/admin/status_test.go` (`TestReasonTooltip`)
+- Modify: `docs/configuration.md` if it says a binary `Release.gpg` is accepted (`grep -n "binary" docs/configuration.md`), `Changelog.md`
 
 **Interfaces:**
-- Consumes: Task 5's `aptShape`, `aptVerdicts`, table test; `newExpiredEntity`.
-- Produces: `ErrBadSignature`; `func (v *Verifier) requireKnownSignaturesVerify(signed, sigBytes []byte) error`.
+- Consumes: Task 5's corpus.
+- Produces: `ErrMalformedSignature`; `func checkSignatureArmor(b []byte, lines []lineSpan, begin int, decoded []byte) error`; `func requireSignaturePacketsOnly(sigBytes []byte) error`; `func crc24(b []byte) uint32`; in the tests, `aptShapeDeviations map[string]string` and `pendingS1 map[string]bool` (Task 7 deletes the latter).
 
-- [ ] **Step 1: Add the S1 rows** to the fixture builders and `aptVerdicts`: `i_badsig_goodfirst`, `i_badsig_badfirst`, `i_badsig_only`, `d_badsig_goodfirst`, `d_badsig_badfirst`, `i_unknown_goodfirst`, `i_unknown_unknownfirst`, `d_unknown_goodfirst`, `i_expired_good_plus_good`, `i_good_plus_expired_good`, `i_expired_bad_plus_good`, `i_expired_only` — key A trusted; B not in the keyring; E in the keyring, expired, its signatures made (go-crypto `packet.Config.Time`) while it was valid. Run the table test: the `badsig` rows with a good signature and `i_expired_bad_plus_good` fail (accepted today).
+- [ ] **Step 1: The table test** `TestVerifier_FollowsTheAptShapeTable` in `aptshape_test.go`: load `testdata/aptshapes/` (`keys.gpg` as the host keyring through the package's keyring loader; `verdicts.txt`); for each shape run `VerifyInline` (an `.InRelease` file) or `VerifyDetached` (a `.Release.gpg`, with `Release` or the shape's own `.Release`) with default options (`require_signature = true`, no pins, `allow_short_keyid = true`). Want: rejected iff any apt rejects (DN-3); for a shape in `aptShapeDeviations` the opposite, with a non-empty reason; a shape in `pendingS1` is skipped with its name logged. Also `TestAptShapeDeviations_NameShapesInTheTable` (no stale deviation). `aptShapeDeviations` holds DN-6's ten shapes with DN-6's reasons. `pendingS1` holds the shapes only S1 refuses (Appendix A's *rule* column marks them `S1`); Task 7 empties it. Add `TestCRC24_RFC4880CheckValue` (`crc24([]byte("123456789")) == 0x21CF02`). Run: the structural rows fail (accepted today).
 
-- [ ] **Step 2: Focused tests** (`verifier_test.go`): `TestVerifyInline_ABadSignatureFromAKnownKeyRejects` (both orders; `errors.Is(err, ErrBadSignature)`; `ClassifyVerifyErr` → `bad_signature`), `TestVerifyInline_AKnownKeyOutsideThePinsStillCounts` (a pin for host H names key A only; the keyring also holds key C; A's good signature plus C's bad one → `ErrBadSignature`), `TestVerifyInline_AnExpiredKeysGoodSignatureBesideAGoodOneAdopts`, and the detached twins of the first two.
+- [ ] **Step 2: Implement `armor_shape.go`**, starting from `PE/proto/fixed.go`'s `checkArmorFixed`, `isMarkerLineRelaxed` and the inline F0 check (adapt names to the package; keep its error texts plain, the callers wrap them):
 
-- [ ] **Step 3: Implement.**
+```go
+// The apt-shape checks (spec: docs/open-decisions.md, "The inline verifier
+// accepts three shapes apt rejects"; rulings HD-2, HD-8). Each rule is what
+// apt 2.2–3.2 enforce on an InRelease or Release.gpg, measured on the corpus
+// in testdata/aptshapes (`make e2e-apt-oracle` re-measures it): DN-3 of
+// docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md.
+//
+// AIDEV-NOTE: go-crypto's decoders are lenient where apt is not — the armor
+// reader skips a header line without a colon to the next BEGIN line, ends the
+// body at any line starting "-----END ", takes any line with a colon as a
+// header, and ignores the CRC (RFC 9580); clearsign.Decode cuts the armor at
+// the first substring "\n-----END PGP SIGNATURE-----". These checks run on the
+// raw bytes beside the decode, so what the decoder skipped cannot reach the
+// pool. Re-check them when go-crypto is upgraded (the table test and the
+// oracle pin them).
+```
+
+Rules, from DN-3: F2 (the first line after the armor's BEGIN that is `-----END PGP SIGNATURE-----` followed only by spaces, tabs and CRs is the END line, and it is the last line); F3 (lines whose trimmed form starts with `=`: the CRC line; at most one non-blank line form `=` + four base64 characters decoding to three bytes equal to `crc24(decoded)`; only blank lines after it before END); F4 (no line strictly inside the armor starts with `-`); F5 (every non-blank line before the first blank one contains `: `); F0 (inline and detached: `bytes.Index(b, []byte("-----END PGP SIGNATURE-----"))` is the start of the last line). Lines split on LF; a CR before LF belongs to the line (the marker test trims it).
+
+- [ ] **Step 3: Implement `packet_shape.go`** (F6), from `PE/proto/fixed.go`'s `rawTags` and `requireSignaturePacketsOnly`: the framing walk (old format lengths 0–2, indeterminate refused; new format one-, two- and five-octet lengths, partial refused; every packet tag 2), then `packet.NewReader(…).NextWithUnsupported()` until `io.EOF`, refusing an `*packet.UnsupportedPacket` or any non-signature packet, and requiring one parsed signature per framed packet. AIDEV-NOTE: `packet.Reader.Next()` silently skips v3/v5 signatures, unknown algorithms, markers and unknown tags (`packet/reader.go`), so every later walk over the signature (S1, S2) would not see them; a vendor adding a signature with an algorithm go-crypto lacks is refused until go-crypto supports it (`xi_good_plus_unknownpk_A`, a listed deviation).
+
+- [ ] **Step 4: Wire it in.**
+  - Inline: `requireBareClearsigned` keeps its F1 check (`aptpath.SniffInRelease`) and its F0 substring rule (today's END check, now "the first END marker begins the last line" rather than "only whitespace follows it"); F2–F5 move to `checkSignatureArmor`. In `VerifyInline`, after `readArmoredSignature` (on the bypass and the trusted path): split `inRelease` into lines, find the armor's BEGIN line — the first line from line 1 on that is `-----BEGIN PGP SIGNATURE-----` followed only by spaces, tabs and CRs (F4 then refuses an un-escaped such line in the signed text, which go-crypto would take as plaintext: dash-escaping is optional to it); `aptpath.DecodableClearsign` rewrites only line 0, so line indexes on `inRelease` stay valid — and call `checkSignatureArmor`, then `requireSignaturePacketsOnly(sigBytes)`; wrap a failure as `fmt.Errorf("%w: %v", ErrMalformedClearsign, err)`. Keep the wording "extraneous bytes after the END marker" for the F2/F0 failure after END (`TestVerifier_RejectsSuffixGarbage` asserts "END marker"). A body with the BEGIN marker but no END line keeps today's error from the decoder.
+  - Detached: the signature must start at byte 0 with `-----BEGIN PGP SIGNATURE-----` followed only by spaces, tabs and CRs (F1; `isArmoredSignature`'s whitespace skip goes); anything else — a binary signature included — is `fmt.Errorf("%w: …", ErrMalformedSignature)`, on the bypass path too. After `armor.Decode` and the size cap: F0 and `checkSignatureArmor(sigBytes, lines, 0, out)`, then `requireSignaturePacketsOnly(out)`; wrap failures in `ErrMalformedSignature`. Remove "binary Release.gpg also exists in the wild; both forms are accepted" from `VerifyDetached`'s comment and say what is enforced now.
+  - `ClassifyVerifyErr`: `case errors.Is(err, ErrMalformedSignature): return "malformed_signature"`; a `TestClassifyVerifyErr` row for it.
+  - `reasonTooltip`: a `malformed_signature` case ("the upstream `Release.gpg` is not one ASCII-armored signature block as apt requires — bytes around it, a binary signature, or a damaged armor"); amend `malformed_clearsign`'s text to cover the new refusals (a line after the signature, a forged checksum, a damaged armor, packets apt refuses); the `Reason` field comment lists the new sentinel; `TestReasonTooltip` gains the case.
+  - Rewrite the two AIDEV-NOTEs that list VC-2, C-4 and VC-1 as open (`VerifyDetached`'s and `requireBareClearsigned`'s): VC-2 and C-4 are enforced (name F0–F6), VC-1 is Task 7's, C-3 remains; keep the R-D2 history.
+
+- [ ] **Step 5: Fix the existing tests that pinned the old behaviour**, each listed in the report:
+  - `TestVerifyDetached_HappyPath_Binary` (`verifier_detached_test.go`) expects `ErrMalformedSignature` (reason `malformed_signature`);
+  - `TestVerifyDetached_TamperedSignature` and `TestVerifyDetached_MultiSig_AllStaleRejects` use binary signatures and would now pass vacuously (refused as binary before any crypto check): move them to armored input and assert their sentinel;
+  - `TestVerifyDetached_MultiSig_Binary_StaleAccompaniesCurrent` moves to armored input (Task 7 then rewrites its stale packet);
+  - `TestVerifier_AcceptsTrailingNewlines` (appends `"\n\n  \r\n"`) becomes "one final LF accepted; a blank line after END refused";
+  - grep `internal/gpg`, `internal/freshness` and `internal/handler` tests for binary `Release.gpg` fixtures (`detachSignWith(…, false)`) and whitespace after END: each now sees a refusal — fix the fixture (never the rule).
+
+- [ ] **Step 6: Run** `go test -race ./internal/gpg ./internal/freshness ./internal/handler ./internal/admin`; all pass, the table test's structural rows included.
+
+- [ ] **Step 7: Mutants**, each caught by the table test (name the rows in the report): (a) allow a line after END (F2); (b) skip the CRC comparison (F3); (c) allow a non-blank line between the CRC line and END; (d) accept a binary signature (F1 detached); (e) refuse an extra CR after END (F2 too strict: `*_end_double_cr` flip); (f) drop F0 (`i_dash_escaped_end`, `xi_endsuffix_nocrc`); (g) drop F4 (`*_hdrjunk_begin`, `*_endx_nocrc`, `xd_endsuffix_nocrc`); (h) drop F5 (`*_hdr_colon_nospace`, `x5i_hdr_tab_after_colon`); (i) F6 with `Next()` instead of `NextWithUnsupported()` (`*_v3garbage_*`, `xi_good_plus_unknownhash_A`); (j) drop F6's framing walk (`xi_good_plus_marker`, `x6i_good_plus_unknowntag`, `x6i_good_plus_userid`); (k) drop the `malformed_signature` case in `ClassifyVerifyErr` (its row fails: `crypto_verify_failed`). Restore each.
+
+- [ ] **Step 8: Docs and Changelog.** If `docs/configuration.md` says a binary `Release.gpg` is accepted, say it is refused. Changelog under *Fixed*:
+
+```
+- Adoption refuses an `InRelease` or `Release.gpg` that apt rejects: a
+  line after the signature, a forged armor checksum, damaged armor lines,
+  packets apt refuses, a `Release.gpg` with bytes around its armor, or a
+  binary one (apt 2.2 to 3.2 reject each; the cache adopted them and its
+  clients' `apt update` then failed). A second armor block is refused too.
+```
+
+- [ ] **Step 9: Commit** the changed files: "Verifier: the armor and packet shapes apt refuses, inline and detached (security review VC-2, C-4)".
+
+### Task 7: Every signature from a known key must verify (S1)
+
+**Files:**
+- Modify: `internal/gpg/verifier.go` (new `hashedIssuer` and `requireKnownSignaturesVerify`, called by `VerifyInline` and `VerifyDetached` on the trusted path; `ErrBadSignature`; `ClassifyVerifyErr`; the AIDEV-NOTEs), `internal/gpg/aptshape_test.go` (empty `pendingS1`), `internal/gpg/verifier_test.go` and `verifier_detached_test.go`, `internal/admin/status.go` and `status_test.go`
+- Modify: `docs/configuration.md` (one sentence on keyring parity), `Changelog.md`
+
+**Interfaces:**
+- Consumes: Task 6's table test and `pendingS1`; `newExpiredEntity`, `buildMultiSigBlock`.
+- Produces: `ErrBadSignature`; `func hashedIssuer(sig *packet.Signature) (uint64, bool)`; `func (v *Verifier) requireKnownSignaturesVerify(signed, sigBytes []byte) error`.
+
+- [ ] **Step 1: Empty `pendingS1`** and run the table test: the S1 rows fail (accepted today): `*_badsig_*` beside a good signature, `i_expired_bad_plus_good`, `xi_crit_plus_good`, `*_badsig_issuer_rewritten`, `*_badsig_unhashed_fpr_added`, `x3i_subkey_bad_plus_good`, `xi_twoblocks_good_badsig` (already refused by F2; confirm), and the others Appendix A marks `S1`.
+
+- [ ] **Step 2: Focused tests** (`verifier_test.go`, `verifier_detached_test.go`): `TestVerifyInline_ABadSignatureFromAKnownKeyRejects` (both orders; `errors.Is(err, ErrBadSignature)`; `ClassifyVerifyErr` → `bad_signature`, a `TestClassifyVerifyErr` row), `TestVerifyInline_AKnownKeyOutsideThePinsStillCounts` (a pin for host H names key A only; the keyring also holds key C; A's good signature plus C's bad one → `ErrBadSignature`), `TestVerifyInline_AnExpiredKeysGoodSignatureBesideAGoodOneAdopts` (E made with a lifetime that ends after its signature's time: add a `clearsignAt(t, e, text, when)` helper, since `newExpiredEntity`'s key is valid one second and `clearsignWith` signs at `time.Now`), `TestVerifyInline_ACriticalNotationFailsS1`, `TestVerifyInline_AKeyIDCollisionDoesNotFailAValidSignature` (two entities in the keyring sharing the signer's key ID, the collider first — patch the collider's key ID as `PE/proto/collision_test.go` does: a valid signature still verifies), `TestHashedIssuer` (v4 with hashed 33 only, hashed 16 only, hashed 33 and unhashed 16, hashed nothing → false), and the detached twins of the first two.
+
+- [ ] **Step 3: Implement**, from `PE/proto/fixed.go`'s `hashedIssuer` and `requireKnownSignaturesVerifyFixed`, with S-I2's per-entity verification:
 
 ```go
 // requireKnownSignaturesVerify applies apt's rule that a bad signature from a
-// known key is fatal (VC-1; ruling HD-3): every signature packet whose issuer
-// key ID names a signing key in the host keyring must pass its cryptographic
-// check against the host keyring. A packet whose check passes but whose key
-// or signature is expired or revoked is not a failure (gpgv's EXPKEYSIG and
-// REVKEYSIG, which apt ignores beside a good signature), and a packet whose
-// issuer the keyring lacks is ignored (gpgv's NO_PUBKEY).
+// known key is fatal (VC-1; rulings HD-3, HD-8): every signature packet whose
+// hashed issuer names a signing key in the host keyring must pass its
+// cryptographic check against one of the keyring's entities holding that key
+// ID, and its unhashed issuer must not contradict the hashed one. A packet
+// whose check passes but whose key or signature is expired or revoked passes
+// (gpgv's EXPKEYSIG and REVKEYSIG, which apt ignores beside a good
+// signature); an unknown critical notation fails (gpgv's BADSIG); a packet
+// whose issuer the keyring lacks is ignored (gpgv's NO_PUBKEY).
 //
-// AIDEV-NOTE: openpgp.VerifyDetachedSignature returns a non-nil signature
-// exactly when the cryptographic check passed, then reports expiry or
-// revocation as its error (go-crypto v1.4.1 openpgp/read.go,
-// verifyDetachedSignature and checkMessageSignatureDetails), so "failed" is
-// a nil signature, never a non-nil error. Re-check this if go-crypto is
-// upgraded (TestVerifyInline_AnExpiredKeysGoodSignatureBesideAGoodOneAdopts
-// pins it). The host keyring, not the suite's trust set: a client that
-// installed any of the cache's keys sees the BADSIG.
-func (v *Verifier) requireKnownSignaturesVerify(signed, sigBytes []byte) error {
-	keyring := v.keyring.EntityList()
-	reader := packet.NewReader(bytes.NewReader(sigBytes))
-	for {
-		pkt, err := reader.Next()
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("read signature packet: %w", err)
-		}
-		sig, ok := pkt.(*packet.Signature)
-		if !ok || sig.IssuerKeyId == nil || len(keyring.KeysByIdUsage(*sig.IssuerKeyId, packet.KeyFlagSign)) == 0 {
-			continue
-		}
-		var one bytes.Buffer
-		if err := sig.Serialize(&one); err != nil {
-			return fmt.Errorf("re-serialize signature packet: %w", err)
-		}
-		if ok, _, _ := openpgp.VerifyDetachedSignature(keyring, bytes.NewReader(signed), &one, nil); ok == nil {
-			return fmt.Errorf("%w: issuer %016X", ErrBadSignature, *sig.IssuerKeyId)
-		}
-	}
-}
+// AIDEV-NOTE: go-crypto takes the issuer from the last issuer subpacket it
+// parses, unhashed after hashed, and looks keys up by that key ID only; gpgv
+// uses the hashed issuer. So "known" is read from sig.HashSuffix
+// (hashedIssuer), and a contradicting unhashed issuer is a failure — else an
+// on-path attacker rewrites a bad signature's unhashed issuer and it is
+// ignored here while every gpgv-based apt reports BADSIG
+// (xi_badsig_issuer_rewritten). openpgp.VerifyDetachedSignature returns a
+// non-nil signature exactly when the cryptographic check passed, then reports
+// expiry, revocation or an unknown critical notation as its error (go-crypto
+// v1.4.1 openpgp/read.go, verifyDetachedSignature and
+// checkMessageSignatureDetails). Each candidate entity is tried alone: the
+// library hashes once and tries every key with that one hash, which only the
+// first candidate can pass. The host keyring, not the suite's trust set: a
+// client that installed any of the cache's keys sees the BADSIG. Re-check all
+// of this when go-crypto is upgraded (the table test and this file's tests
+// pin it).
+func (v *Verifier) requireKnownSignaturesVerify(signed, sigBytes []byte) error
 ```
 
-(name the first result something other than `ok`, which already names the type assertion above). Call it in `VerifyInline` and `VerifyDetached` on the trusted path only — after `len(trustSet) == 0`'s check and before `verifyAnyTrusted` — never on the bypass path (DN-7). `ClassifyVerifyErr`: `case errors.Is(err, ErrBadSignature): return "bad_signature"`. Update the AIDEV-NOTEs Task 5 rewrote: VC-1 is enforced; C-3 stays open.
+Body: walk the packets (F6 has already refused anything but signatures); for each, `id, hashed := hashedIssuer(sig)`; if not hashed, use `*sig.IssuerKeyId` (skip when nil); `keys := keyring.KeysByIdUsage(id, packet.KeyFlagSign)`; skip when empty; fail when `sig.IssuerKeyId == nil || *sig.IssuerKeyId != id`; re-serialize the packet alone; for each distinct entity of `keys`, `got, _, verr := openpgp.VerifyDetachedSignature(openpgp.EntityList{e}, bytes.NewReader(signed), bytes.NewReader(one), nil)` passes iff `got != nil && !errors.As(verr, new(pgperrors.SignatureError))`; fail (`fmt.Errorf("%w: issuer %016X", ErrBadSignature, id)`) when none passes. Call it in `VerifyInline` after `readArmoredSignature` with `(block.Bytes, sigBytes)`, and in `VerifyDetached` after `decodeMaybeArmoredSignature` with `(releaseBytes, binarySig)` — on the trusted path only, after `len(trustSet) == 0`'s check and before `verifyAnyTrusted`, never on the bypass path (DN-8). `ClassifyVerifyErr`: `case errors.Is(err, ErrBadSignature): return "bad_signature"`. `reasonTooltip`: a `bad_signature` case ("the upstream anchor carries a signature from a key the cache knows that fails verification — apt rejects it; often tampering on the path"), `TestReasonTooltip` gains it. Update the AIDEV-NOTEs Task 6 rewrote: VC-1 is enforced; C-3 stays open.
 
-- [ ] **Step 4: Run** `go test -race ./internal/gpg ./internal/freshness`; all pass.
+- [ ] **Step 4: Fix the existing tests that pinned a bad signature beside a good one**, keeping the per-packet loop's coverage (SPEC2 §7.6.3: the loop walks past a packet that fails S2 and accepts on a later one): `TestVerifier_MultiSig_StaleAndCurrent` and the armored `TestVerifyDetached_MultiSig_…StaleAccompaniesCurrent` get a first packet that fails S2 but not S1 — the expired key E's good signature (`ErrKeyExpired`, so `verifyAnyTrusted` moves on) or B's unknown-key one — and still expect acceptance; add `…_StaleAndCurrentRejects` twins with A's stale signature expecting `ErrBadSignature`; the two `AllStale` tests assert `ErrBadSignature`. Grep `internal/freshness` and `internal/handler` tests for `buildMultiSigBlock` and fix any fixture S1 now refuses (never the rule). List each in the report.
 
-- [ ] **Step 5: Mutants.** (a) Treat a non-nil error as a failure → `i_expired_good_plus_good` and `i_good_plus_expired_good` fail. (b) Use the trust set instead of the host keyring → `TestVerifyInline_AKnownKeyOutsideThePinsStillCounts` fails. (c) Skip the call in `VerifyDetached` → `d_badsig_*` fail. Restore each.
+- [ ] **Step 5: Run** `go test -race ./internal/gpg ./internal/freshness ./internal/handler ./internal/admin`; all pass, every table row included.
 
-- [ ] **Step 6: Docs and Changelog.** `bad_signature` beside the reasons (DN-4). Changelog under *Fixed*: `- Adoption refuses a signed anchor that carries a bad signature from a key the cache knows beside a good one, as apt does.`
+- [ ] **Step 6: Mutants.** (a) Treat any non-nil error as a failure → `i_expired_good_plus_good`, `i_good_plus_expired_good` and `…AnExpiredKeysGoodSignatureBesideAGoodOneAdopts` fail. (b) Tolerate a `SignatureError` → `xi_crit_plus_good` and `…ACriticalNotationFailsS1` fail. (c) Use `sig.IssuerKeyId` for "known" → `*_badsig_issuer_rewritten`, `*_badsig_unhashed_fpr_added` fail. (d) Verify against the whole keyring at once → `…AKeyIDCollisionDoesNotFailAValidSignature` fails. (e) Use the trust set instead of the host keyring → `…AKnownKeyOutsideThePinsStillCounts` fails. (f) Skip the call in `VerifyDetached` → `d_badsig_*` fail. (g) Drop the `bad_signature` case in `ClassifyVerifyErr` → its row fails. Restore each.
 
-- [ ] **Step 7: Commit**: "Verifier: a bad signature from a known key rejects, as apt's BADSIG does (security review VC-1)".
+- [ ] **Step 6b: Re-run the oracle** (`make e2e-apt-oracle`): apt's verdicts unchanged; and the table test with the final rules: Appendix A's *rule* column exactly (1 unsafe shape, `x3i_sha1_only`, C-3; the ten DN-6 deviations).
 
-### Task 7: `make e2e-apt-oracle` — the verifier's fixtures through real apt
+- [ ] **Step 7: Docs and Changelog.** `docs/configuration.md`, where `[[trusted_signer]]` or the host keyring is described: one sentence — "The cache refuses an anchor that carries a bad signature from any key in its keyring, as apt does; install in the cache every key your clients' `signed-by` names, so that it refuses what they would." Changelog under *Fixed*:
 
-**Files:**
-- Modify: `internal/gpg/aptshape_test.go` (`TestWriteAptOracleFixtures`)
-- Create: `e2e/apt-oracle/run.sh`, `e2e/apt-oracle/in-container.sh`, `e2e/apt-oracle/README.md`
-- Modify: `Makefile` (target `e2e-apt-oracle`, beside `e2e-live`), `docs/open-decisions.md` (the pre-RC list: run it on the tree you tag), `Changelog.md`
+```
+- Adoption refuses a signed anchor that carries a bad signature from a key
+  the cache knows beside a good one, as apt does.
+```
 
-**Interfaces:**
-- Consumes: Tasks 5–6's `aptShapes`, `aptVerdicts`, `aptShapeDeviations` and the verifier.
-- Produces: `make e2e-apt-oracle` (manual, like `make e2e-live`; not in CI).
-
-- [ ] **Step 1: The fixture writer.** `TestWriteAptOracleFixtures` skips unless `ACU_APT_ORACLE_DIR` is set; then, for each shape, writes `<dir>/<name>/` as a flat repository (`Packages` empty; `Release` with its SHA256 line; `InRelease`, or `Release` and `Release.gpg`), the client keyring `<dir>/keys.gpg` (binary export of every key the shapes trust or know: A and E, never B), and `<dir>/expected.txt`, one line per shape: `<name> <cache verdict: ok|REJ> <the six recorded apt verdicts in DN-2's image order>`. The cache verdict is computed by running the verifier on the shape, not copied from the table.
-
-- [ ] **Step 2: The runner.** `e2e/apt-oracle/in-container.sh` is the controller's `…/scratchpad/apt-oracle/in-container.sh` with the key file name `keys.gpg` (bash, `set -euo pipefail` except around `apt-get update`, whose exit status it records). `e2e/apt-oracle/run.sh`: makes a temp dir (removed on exit), runs `ACU_APT_ORACLE_DIR=<dir> go test ./internal/gpg -run '^TestWriteAptOracleFixtures$' -count=1`, copies `in-container.sh` in, and for each image in `${E2E_APT_ORACLE_IMAGES:-debian:11 ubuntu:22.04 ubuntu:24.04 debian:12 debian:13 ubuntu:26.04}` runs `docker run --rm --network none -v "<dir>:/fx:ro" "<image>" bash /fx/in-container.sh` (bounded: `timeout 600`). It prints one table (shape × image) and fails when, for any shape: the cache accepts and some apt rejects (**unsafe**); an apt verdict differs from the recorded one (**apt changed**: update DN-2's table, `aptVerdicts` and the README's date); or every apt accepts and the cache rejects and the shape is not a listed deviation (**too strict**). `shellcheck -x` clean.
-
-- [ ] **Step 3: Run it** (`make e2e-apt-oracle`); expected: every row agrees, exit 0, about one minute with the images cached. Record the run's output in the report and the README's *Results* (date, tree, the six apt versions).
-
-- [ ] **Step 4: Mutant.** Temporarily make `checkSignatureArmor` accept a line after END → the oracle reports `i_trail_lf` and `d_trail_lf` **unsafe** and exits non-zero. Restore.
-
-- [ ] **Step 5: Docs.** `e2e/apt-oracle/README.md`: what it checks, the three failure kinds and what to do for each, the images, when to run it (before a release, and after a go-crypto upgrade or a change to `internal/gpg`), results. `docs/open-decisions.md`, the pre-RC list: add "`make e2e-apt-oracle` on the tree you tag" beside `make e2e-live`. Changelog under *Added*: `- \`make e2e-apt-oracle\`: runs the verifier's signature-shape fixtures through the real apt of six client images (manual).`
-
-- [ ] **Step 6: Commit**: "e2e/apt-oracle: the verifier's shapes through real apt 2.2–3.2".
+- [ ] **Step 8: Commit**: "Verifier: a bad signature from a known key rejects, as apt's BADSIG does (security review VC-1)".
 
 ### Task 8: Records, the gate and the final review
 
 **Files:**
-- Modify: `docs/open-decisions.md`, `Changelog.md` (read it whole: one line per change, the file's style)
+- Modify: `docs/open-decisions.md`, `Changelog.md` (read it whole: one entry per change, the file's style)
 
-- [ ] **Step 1: `docs/open-decisions.md`.** Move the five entries from *Open* to *Decided*, each dated "the maintainer, 2026-10-28: worked for 1.1.0", saying what was done and naming its commits. Add to *Open*, each with its evidence and a recommendation: (a) downloads with no declared length on the request path and in hot prefetch keep only `upstream.total_timeout` (a cap needs a size per `.deb`: a `package_hash` column, a schema change); (b) `accept_any_signer`'s bypass applies no S1 check (DN-7); (c) the handler's `SniffReleaseGPG` still treats a binary `Release.gpg` as a signed anchor (fail-safe; DN-7); (d) `debian:13`'s `sqv` accepts a forged CRC and a bad signature beside a good one, which the cache now refuses (stricter than that client, never looser); (e) the security review's C-3 (weak digests and keys) and C-1 (dates, rollback) stay open.
+- [ ] **Step 1: `docs/open-decisions.md`.** Move the five entries from *Open* to *Decided*, each dated "the maintainer, 2026-10-28: worked for 1.1.0", saying what was done and naming its commits (the GC entry records Task 2's probe numbers and ruling HD-7). Add to *Open*, each with its evidence and a recommendation: (a) downloads with no declared size — request-path misses, hot prefetch, the handler's `runSnapshotMemberFetch` — keep only `Content-Length` and `upstream.total_timeout` (a cap needs a size per file: a schema change; `runSnapshotMemberFetch` could use the blob row's size when it survives); (b) `accept_any_signer`'s bypass applies no S1 check (DN-8); (c) the handler's `SniffReleaseGPG` still treats a binary `Release.gpg` as a signed anchor (fail-safe; DN-8); (d) `debian:13`'s `sqv` accepts a forged CRC and a bad signature beside a good one, which the cache now refuses (stricter than that client, never looser); (e) the ten deviations of DN-6, revisited when go-crypto changes; (f) the security review's C-3 (weak digests and keys: `x3i_sha1_only` is adopted, all six apt reject it) and C-1 (dates, rollback) stay open; (g) S1 covers only the keys the cache holds (DN-5).
 
-- [ ] **Step 2: The gate**, on the final tree, results recorded in `…/scratchpad/hardening/gate/summary.txt`: `go vet ./...`; `go test -race ./...` (the `e2ehooks` build tag too: `go test -race -tags e2ehooks ./...`); `golangci-lint run ./...` and with `--build-tags e2ehooks`; `gofmt -l .` (the five drift files only); `make shellcheck`; the simulations under 4.5 s each under `-race`; the race suite under `golang:1.27-bookworm`; `make e2e`; `E2E_FLAT_IMAGES=debian:12 make e2e-flat`; `make e2e-apt-oracle`; `make lint`.
+- [ ] **Step 2: The gate**, on the final tree, results in `…/scratchpad/hardening/gate/summary.txt`: `go vet ./...`; `go test -race ./...` and `go test -race -tags e2ehooks ./...`; `golangci-lint run ./...` and with `--build-tags e2ehooks`; `gofmt -l .` (the five drift files only); `ruff format --check`, `ruff check` and `mypy --strict` on `e2e/apt-oracle/gen_shapes.py`; `make shellcheck`; the simulations under 4.5 s each under `-race`; the race suite under `golang:1.27-bookworm`; `make e2e`; `E2E_FLAT_IMAGES=debian:12 make e2e-flat`; `make e2e-apt-oracle`; `make lint`. And the **vendor re-run**: the security review's corpus (`/tmp/claude-1000/-home-sean-projects-apt-cacher-ultra/99c125aa-f038-423f-88d6-3cb913c207d4/scratchpad/hardening/plan-review/security/vendor/`, `vendor-keys/`, `vendors.txt`; `vendor-verdicts.txt` holds today's verdicts) through the final verifier — a scratch `_test.go` copied into `internal/gpg` for the run and removed after it, never committed — with one host keyring of all `vendor-keys/`: every `InRelease` that verifies today (68) still verifies, and the only `Release.gpg` refused are the binary ones. If the corpus is gone (a reboot), re-fetch it with the review's `fetch-vendors.sh`/`fetch-keys.sh`, or record that the step could not run.
 
-- [ ] **Step 3: The final review** — four lenses, each an independent reviewer on the branch's whole diff from `main`: (1) the verifier against DN-2/DN-3 and apt's behaviour; (2) GC data lifecycle (retire vs delete, every reader of `retired_at`, the rotation); (3) fetch and the handler (the cap, the retry and classification, strict mode); (4) tests, docs and operability (each claim against the code, the Changelog). Triage, fix, re-review (at most two rounds per lens), re-gate.
+- [ ] **Step 3: The final review** — four lenses, each an independent reviewer on the branch's whole diff from `main` (`git diff --no-ext-diff main...HEAD`): (1) the verifier against DN-2/DN-3 and apt's behaviour, including shapes beyond the corpus; (2) GC data lifecycle (retire vs delete by mode, every reader of `retired_at`, the rotation); (3) fetch and the handler (the cap, retry and classification, strict mode); (4) tests, docs and operability (each claim against the code, the Changelog). Triage, fix, re-review (at most two rounds per lens), re-gate.
 
 - [ ] **Step 4: Commit** the records: "GC and upstream hardening: records".
+
+---
+
+## Appendix A — The planning verdicts (2026-10-28)
+
+Each shape: apt's verdict in `debian:11`, `ubuntu:22.04`, `ubuntu:24.04`, `debian:12`, `debian:13`, `ubuntu:26.04`; then **rule**, the verdict DN-3's rules give (from the security review's prototype, `PE/proto/fixed.go`), with the rule that refuses it where only S1 does (`S1`) and the class: `ok` (agrees with DN-3), `dev` (a DN-6 deviation), `UNSAFE` (C-3, out of scope). Batch `fx` is the controller's (`PE/gen.py`), `fx2`–`fx6` the security review's (`PE/gen2.py`–`gen6.py`). Source: `PE/combined-fixed.txt`; Task 5 Step 4 re-measures the apt columns on the committed corpus.
+
+```
+batch shape                           d11 u22 u24 d12 d13 u26  rule      class
+fx    d_badsig_badfirst               REJ REJ REJ REJ ok  REJ  REJ(S1)   ok
+fx    d_badsig_goodfirst              REJ REJ REJ REJ ok  REJ  REJ(S1)   ok
+fx    d_begin_trailing_ws             ok  ok  ok  ok  ok  ok   ok        ok
+fx    d_binary                        REJ REJ REJ REJ REJ REJ  REJ       ok
+fx    d_blank_in_base64               ok  ok  ok  ok  ok  ok   ok        ok
+fx    d_comment_header                ok  ok  ok  ok  ok  ok   ok        ok
+fx    d_crc_forged                    REJ REJ REJ REJ ok  REJ  REJ       ok
+fx    d_crc_missing                   ok  ok  ok  ok  ok  ok   ok        ok
+fx    d_crlf_all                      ok  ok  ok  ok  ok  ok   ok        ok
+fx    d_end_crlf                      ok  ok  ok  ok  ok  ok   ok        ok
+fx    d_end_trailing_ws               ok  ok  ok  ok  ok  ok   ok        ok
+fx    d_good                          ok  ok  ok  ok  ok  ok   ok        ok
+fx    d_lead_nl                       REJ REJ REJ REJ REJ REJ  REJ       ok
+fx    d_lead_ws                       REJ REJ REJ REJ REJ REJ  REJ       ok
+fx    d_line_after_crc                ok  ok  ok  ok  REJ ok   REJ       ok
+fx    d_no_final_nl                   ok  ok  ok  ok  ok  ok   ok        ok
+fx    d_trail_lf                      REJ REJ REJ REJ REJ REJ  REJ       ok
+fx    d_twoblocks                     REJ REJ REJ REJ ok  REJ  REJ       ok
+fx    d_unknown_goodfirst             ok  ok  ok  ok  ok  ok   ok        ok
+fx    i_badsig_badfirst               REJ REJ REJ REJ ok  REJ  REJ(S1)   ok
+fx    i_badsig_goodfirst              REJ REJ REJ REJ ok  REJ  REJ(S1)   ok
+fx    i_badsig_only                   REJ REJ REJ REJ REJ REJ  REJ       ok
+fx    i_begin_trailing_ws             ok  ok  ok  ok  ok  ok   ok        ok
+fx    i_blank_in_base64               ok  ok  ok  ok  ok  ok   ok        ok
+fx    i_comment_header                ok  ok  ok  ok  ok  ok   ok        ok
+fx    i_crc_forged                    REJ REJ REJ REJ ok  REJ  REJ       ok
+fx    i_crc_lowercase_eq_ws           ok  ok  ok  ok  ok  ok   ok        ok
+fx    i_crc_missing                   ok  ok  ok  ok  ok  ok   ok        ok
+fx    i_crc_ok_rearmored              ok  ok  ok  ok  ok  ok   ok        ok
+fx    i_crlf_all                      ok  ok  ok  ok  ok  ok   ok        ok
+fx    i_dash_escaped_end              REJ REJ REJ REJ REJ REJ  REJ       ok
+fx    i_end_crlf                      ok  ok  ok  ok  ok  ok   ok        ok
+fx    i_end_trailing_ws               ok  ok  ok  ok  ok  ok   ok        ok
+fx    i_expired_bad_plus_good         REJ REJ REJ REJ ok  REJ  REJ(S1)   ok
+fx    i_expired_good_plus_good        ok  ok  ok  ok  ok  ok   ok        ok
+fx    i_expired_only                  REJ REJ REJ REJ ok  REJ  REJ       ok
+fx    i_good                          ok  ok  ok  ok  ok  ok   ok        ok
+fx    i_good_plus_expired_good        ok  ok  ok  ok  ok  ok   ok        ok
+fx    i_lead_nl                       REJ REJ REJ REJ REJ REJ  REJ       ok
+fx    i_line_after_crc                ok  ok  ok  ok  REJ ok   REJ       ok
+fx    i_no_final_nl                   ok  ok  ok  ok  ok  ok   ok        ok
+fx    i_sigbegin_trailing_ws          ok  ok  ok  ok  ok  ok   REJ       dev
+fx    i_trail_lf                      REJ REJ REJ REJ REJ REJ  REJ       ok
+fx    i_trail_text                    REJ REJ REJ REJ REJ REJ  REJ       ok
+fx    i_trail_ws                      REJ REJ REJ REJ REJ REJ  REJ       ok
+fx    i_unknown_goodfirst             ok  ok  ok  ok  ok  ok   ok        ok
+fx    i_unknown_unknownfirst          ok  ok  ok  ok  ok  ok   ok        ok
+fx2   xd_badsig_issuer_rewritten      REJ REJ REJ REJ ok  REJ  REJ(S1)   ok
+fx2   xd_blank_after_crc              ok  ok  ok  ok  ok  ok   ok        ok
+fx2   xd_control_good                 ok  ok  ok  ok  ok  ok   ok        ok
+fx2   xd_end_double_cr                ok  ok  ok  ok  ok  ok   ok        ok
+fx2   xd_endsuffix_nocrc              REJ REJ REJ REJ REJ REJ  REJ       ok
+fx2   xd_endx_nocrc                   REJ REJ REJ REJ REJ REJ  REJ       ok
+fx2   xd_good_plus_literal            REJ REJ REJ REJ REJ ok   REJ       ok
+fx2   xd_good_plus_v3garbage_A        REJ REJ REJ REJ REJ REJ  REJ       ok
+fx2   xd_hdrjunk_begin                REJ REJ REJ REJ REJ REJ  REJ       ok
+fx2   xd_twoblocks_good_unknown       ok  ok  ok  ok  ok  ok   REJ       dev
+fx2   xd_twoblocks_goodgood           ok  ok  ok  ok  ok  ok   REJ       dev
+fx2   xi_armor_hdr_nocolon            REJ REJ REJ REJ REJ REJ  REJ       ok
+fx2   xi_badsig_issuer_removed        REJ REJ REJ REJ ok  REJ  REJ(S1)   ok
+fx2   xi_badsig_issuer_rewritten      REJ REJ REJ REJ ok  REJ  REJ(S1)   ok
+fx2   xi_blank_after_crc              ok  ok  ok  ok  ok  ok   ok        ok
+fx2   xi_cleartext_comment_hdr        ok  ok  ok  ok  ok  ok   REJ       dev
+fx2   xi_control_good                 ok  ok  ok  ok  ok  ok   ok        ok
+fx2   xi_crc_forged_leading_ws        REJ REJ REJ REJ ok  REJ  REJ       ok
+fx2   xi_crc_trailing_ws              ok  ok  ok  ok  ok  ok   ok        ok
+fx2   xi_crit_only                    REJ REJ REJ REJ REJ REJ  REJ       ok
+fx2   xi_crit_plus_good               REJ REJ REJ REJ ok  REJ  REJ(S1)   ok
+fx2   xi_end_double_cr                ok  ok  ok  ok  ok  ok   ok        ok
+fx2   xi_endsuffix_nocrc              REJ REJ REJ REJ REJ REJ  REJ       ok
+fx2   xi_endx_nocrc                   REJ REJ REJ REJ REJ REJ  REJ       ok
+fx2   xi_good_plus_literal            REJ REJ REJ REJ REJ ok   REJ       ok
+fx2   xi_good_plus_marker             ok  ok  ok  ok  ok  REJ  REJ       ok
+fx2   xi_good_plus_unknownhash_A      ok  ok  ok  ok  REJ ok   REJ       ok
+fx2   xi_good_plus_unknownpk_A        ok  ok  ok  ok  ok  ok   REJ       dev
+fx2   xi_good_plus_v3garbage_A        REJ REJ REJ REJ REJ REJ  REJ       ok
+fx2   xi_good_plus_v3garbage_B        ok  ok  ok  ok  REJ ok   REJ       ok
+fx2   xi_goodsig_issuer_rewritten     REJ REJ ok  REJ ok  ok   REJ       ok
+fx2   xi_hash_none                    ok  ok  ok  ok  ok  ok   ok        ok
+fx2   xi_hash_sha1                    ok  ok  ok  ok  ok  ok   ok        ok
+fx2   xi_hash_sha512                  ok  ok  ok  ok  ok  ok   ok        ok
+fx2   xi_hdrjunk_begin                REJ REJ REJ REJ REJ REJ  REJ       ok
+fx2   xi_text_dash_escaped_extra      ok  ok  ok  ok  ok  ok   ok        ok
+fx2   xi_text_trailing_ws             ok  ok  ok  ok  ok  ok   ok        ok
+fx2   xi_two_crc_lines                ok  ok  ok  ok  REJ ok   REJ       ok
+fx2   xi_twoblocks_good_badsig        REJ REJ REJ REJ ok  REJ  REJ       ok
+fx2   xi_twoblocks_good_unknown       ok  ok  ok  ok  ok  ok   REJ       dev
+fx2   xi_twoblocks_goodgood           ok  ok  ok  ok  ok  ok   REJ       dev
+fx2   xi_unknown_armor_header         ok  ok  ok  ok  ok  ok   ok        ok
+fx3   x3d_armor_no_blank              ok  ok  ok  ok  ok  ok   REJ       dev
+fx3   x3d_badsig_unhashed_fpr_added   REJ REJ REJ REJ ok  REJ  REJ(S1)   ok
+fx3   x3d_bom                         REJ REJ REJ REJ REJ REJ  REJ       ok
+fx3   x3d_control_good                ok  ok  ok  ok  ok  ok   ok        ok
+fx3   x3d_end_cr_eof                  ok  ok  ok  ok  ok  ok   ok        ok
+fx3   x3i_after_end_cr_line           REJ REJ REJ REJ REJ REJ  REJ       ok
+fx3   x3i_armor_no_blank              ok  ok  ok  ok  ok  ok   REJ       dev
+fx3   x3i_badsig_unhashed_fpr_added   REJ REJ REJ REJ ok  REJ  REJ(S1)   ok
+fx3   x3i_control_good                ok  ok  ok  ok  ok  ok   ok        ok
+fx3   x3i_end_cr_eof                  ok  ok  ok  ok  ok  ok   ok        ok
+fx3   x3i_end_tab                     ok  ok  ok  ok  ok  ok   ok        ok
+fx3   x3i_goodsig_unhashed_fpr_added  ok  ok  ok  ok  ok  ok   REJ       dev
+fx3   x3i_hdr_blank_ws                ok  ok  ok  ok  ok  ok   ok        ok
+fx3   x3i_sha1_only                   REJ REJ REJ REJ REJ REJ  ok        UNSAFE
+fx3   x3i_sha1_plus_good              ok  ok  ok  ok  ok  ok   ok        ok
+fx3   x3i_subkey_bad_plus_good        REJ REJ REJ REJ ok  REJ  REJ(S1)   ok
+fx3   x3i_subkey_good                 ok  ok  ok  ok  ok  ok   ok        ok
+fx4   x4d_b64_invalid_char            ok  ok  ok  ok  REJ ok   REJ       ok
+fx4   x4d_control_good                ok  ok  ok  ok  ok  ok   ok        ok
+fx4   x4d_hdr_colon_nospace           REJ REJ REJ REJ REJ REJ  REJ       ok
+fx4   x4i_b64_invalid_char            ok  ok  ok  ok  REJ ok   REJ       ok
+fx4   x4i_b64_leading_space           ok  ok  ok  ok  ok  ok   ok        ok
+fx4   x4i_b64_line_76                 ok  ok  ok  ok  ok  ok   ok        ok
+fx4   x4i_control_good                ok  ok  ok  ok  ok  ok   ok        ok
+fx4   x4i_hdr_colon_nospace           REJ REJ REJ REJ REJ REJ  REJ       ok
+fx4   x4i_hdr_leading_space           ok  ok  ok  ok  ok  ok   ok        ok
+fx5   x5i_control_good                ok  ok  ok  ok  ok  ok   ok        ok
+fx5   x5i_hdr_ctrl                    ok  ok  ok  ok  ok  ok   ok        ok
+fx5   x5i_hdr_empty_value             ok  ok  ok  ok  REJ ok   REJ       ok
+fx5   x5i_hdr_no_key                  ok  ok  ok  ok  ok  ok   ok        ok
+fx5   x5i_hdr_space_in_key            ok  ok  ok  ok  ok  ok   ok        ok
+fx5   x5i_hdr_tab_after_colon         REJ REJ REJ REJ REJ REJ  REJ       ok
+fx5   x5i_hdr_utf8                    ok  ok  ok  ok  ok  ok   ok        ok
+fx5   x5i_hdr_version_multi           ok  ok  ok  ok  ok  ok   ok        ok
+fx6   x6i_control_good                ok  ok  ok  ok  ok  ok   ok        ok
+fx6   x6i_good_plus_emptyliteral      REJ REJ REJ REJ REJ ok   REJ       ok
+fx6   x6i_good_plus_trailing_zero     ok  ok  ok  ok  REJ ok   REJ       ok
+fx6   x6i_good_plus_unknowntag        ok  ok  ok  ok  REJ ok   REJ       ok
+fx6   x6i_good_plus_userid            ok  ok  ok  ok  REJ ok   REJ       ok
+```
+
+The `S1` marks are the controller's reading of which rows only S1 refuses (a bad signature from a known key, the critical notation, the issuer rewrites); Task 6's `pendingS1` starts from them, and any row the table test shows otherwise is corrected in the report, never forced.
