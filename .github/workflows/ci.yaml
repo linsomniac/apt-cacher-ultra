@@ -75,13 +75,17 @@ jobs:
           version: v2.14.0
           args: --build-tags e2ehooks ./cmd/...
       # The e2e harnesses and the package's maintainer scripts, among them
-      # e2e/live/smoke.sh, which runs only by hand. -x follows each
-      # `source` (e2e/flat/lib.sh, for both harnesses); without it
-      # ShellCheck reports SC1091. It does not report an upper-case setting
-      # or a function a sourced file stops defining. ShellCheck comes with
-      # the runner image.
+      # e2e/live/smoke.sh, which runs only by hand (the Makefile's
+      # shellcheck target, which `make lint` runs too). It runs ShellCheck
+      # from the pinned koalaman/shellcheck:v0.11.0 image, not the runner's:
+      # ShellCheck versions differ in what they flag (ubuntu-latest's 0.9.0
+      # and 0.10.0 report an SC2015 that 0.11.0 does not), so CI and every
+      # checkout run the one version. -x follows each `source`
+      # (e2e/flat/lib.sh, for both harnesses); without it ShellCheck reports
+      # SC1091. It does not report an upper-case setting or a function a
+      # sourced file stops defining.
       - name: shellcheck
-        run: shellcheck -x e2e/flat/*.sh e2e/live/*.sh e2e/deb/*.sh packaging/scripts/*.sh
+        run: make shellcheck
 
   # SPEC §12.4 docker-compose end-to-end test. Slower lane (~2 min for
   # the docker build + apt-get update inside ubuntu:noble), but it's

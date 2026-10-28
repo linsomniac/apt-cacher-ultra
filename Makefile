@@ -1,4 +1,4 @@
-.PHONY: build test test-race lint fmt deb e2e e2e-flat e2e-live deb-test apt-repo-test clean
+.PHONY: build test test-race lint shellcheck fmt deb e2e e2e-flat e2e-live deb-test apt-repo-test clean
 
 GO        ?= go
 BIN       := apt-cacher-ultra
@@ -28,8 +28,22 @@ test:
 test-race:
 	$(GO) test -race -timeout 10m ./...
 
-lint:
+# CI's lint job: golangci-lint, also over the e2ehooks build (e2e/flat's
+# test seam, cmd/apt-cacher-ultra/e2ehooks.go, compiles only with that tag),
+# and ShellCheck.
+lint: shellcheck
 	golangci-lint run ./...
+	golangci-lint run --build-tags e2ehooks ./cmd/...
+
+# ShellCheck over the e2e harnesses and the package's maintainer scripts,
+# from its pinned image (needs docker): ShellCheck versions differ in what
+# they flag (0.9.0, GitHub's ubuntu-latest, reports an SC2015 that 0.11.0
+# does not), so CI's lint job and every checkout run this one version.
+SHELLCHECK_IMAGE := koalaman/shellcheck:v0.11.0
+SHELL_SCRIPTS    := e2e/flat/*.sh e2e/live/*.sh e2e/deb/*.sh packaging/scripts/*.sh
+
+shellcheck:
+	docker run --rm -v "$(CURDIR):/mnt:ro" -w /mnt $(SHELLCHECK_IMAGE) -x $(SHELL_SCRIPTS)
 
 fmt:
 	gofmt -w .

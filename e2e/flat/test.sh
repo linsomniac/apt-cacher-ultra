@@ -740,8 +740,9 @@ upstream_down() {
     local debs others
     debs=$(log_lines "$SCENARIO_MARK" "$(event request)" '(^| )path=[^ ]*\.deb( |$)')
     others=$(grep -vE -- "$(kv outcome hit)" <<< "$debs" || true)
-    (($(grep -c . <<< "$debs") >= 2)) && [[ -z $others ]] ||
+    if (($(grep -c . <<< "$debs") < 2)) || [[ -n $others ]]; then
         fail "the fresh clients' .debs were not all cache hits: ${others:-$(grep -c . <<< "$debs") .deb request lines, want 2 or more}"
+    fi
     # The overview's H1 carry (parked item 12): main.go wires
     # admin.Config.CheckBackoff, without which a failing suite's row shows
     # only "checks failing ×k". A client-triggered check fails within a

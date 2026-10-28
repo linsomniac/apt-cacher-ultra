@@ -423,7 +423,7 @@ lists its other answers and what forgetting deletes.
 ```sh
 make build           # binary at ./build/apt-cacher-ultra
 make test            # unit tests
-make lint            # golangci-lint (must be installed)
+make lint            # golangci-lint (must be installed), plain and -tags e2ehooks, and ShellCheck (Docker)
 make deb             # .deb package (nfpm must be installed)
 make e2e-flat        # real apt against fixture repositories through the cache (Docker)
 make e2e-live        # the manual smoke against live flat repositories (Docker, network)
