@@ -395,6 +395,34 @@ func TestServeHTTP_StrictRecheckReadFaultKeepsTheRefusal(t *testing.T) {
 			})
 		}
 	}
+	// The D4/D5 re-review's Minor 1: a client that leaves between the two
+	// looks makes the second read fail with its context; that is a client
+	// abort (503 client_canceled, FW-5 (a)), not a read fault — no WARN and
+	// no refusal. The hit path only: the miss path's second look runs on
+	// the lifecycle context, which a client's leaving does not end.
+	t.Run("hit, client left", func(t *testing.T) {
+		a := &fakeAdoptions{}
+		h, logs, srvURL, scheme, canon := strictWaitRig(t, a)
+		blob := writeBlob(t, h, []byte("a cached .deb"))
+		if err := h.cache.PutURLPath(context.Background(), cache.URLPath{CanonicalScheme: scheme, CanonicalHost: canon,
+			Path: waitDebPath, BlobHash: &blob, UpstreamURL: srvURL + waitDebPath}); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		a.asked = cancel // the client leaves as the first look ends
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, proxyReq("GET", srvURL, waitDebPath).WithContext(ctx))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status %d body %q, want 503 (client_canceled)", rec.Code, rec.Body.String())
+		}
+		if warns, refused := logs.find("package_hash lookup failed"), logs.find("unvouched_deb_refused"); len(warns) != 0 || len(refused) != 0 {
+			t.Fatalf("%d package_hash lookup failed and %d unvouched_deb_refused lines, want none", len(warns), len(refused))
+		}
+		if lines := logs.find("request"); len(lines) != 1 || lines[0]["outcome"] != "client_canceled" {
+			t.Fatalf("request lines %v, want one with outcome client_canceled", lines)
+		}
+	})
 }
 
 // Spec C10: no wait without an adoption in flight; beyond 64 waiters per
