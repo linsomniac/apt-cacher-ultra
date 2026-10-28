@@ -271,15 +271,20 @@ func (f *firstFetchHook) Fetch(ctx context.Context, tg *fetch.Target, dst fetch.
 // the second finds no row on a strict host, and the .deb is refused as it
 // would have been before the download (502, Retry-After 60), not served
 // silently. With a signed adoption in flight that refusal waits for it,
-// as before a download, and the retry serves the .deb it vouched for.
+// as before a download, and the retry serves the .deb it vouched for. A
+// package file that is not a .deb is served: strict mode is .deb-only
+// (SPEC3 §6.1), after the download as before it (R4 re-review #2).
 func TestServeHTTP_StrictMissDecidesAfterAFailedPrefetchRead(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
+		path     string
 		inFlight bool
 		want     int
 	}{
-		{"nothing in flight: refused", false, http.StatusBadGateway},
-		{"an adoption in flight: waited for", true, http.StatusOK},
+		{"nothing in flight: refused", waitDebPath, false, http.StatusBadGateway},
+		{"an adoption in flight: waited for", waitDebPath, true, http.StatusOK},
+		{"a .udeb: served", "/pool/main/h/hello_1_amd64.udeb", false, http.StatusOK},
+		{"a .dsc: served", "/pool/main/h/hello_1.dsc", false, http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := &fakeAdoptions{inFlight: tc.inFlight, ok: true}
@@ -302,7 +307,7 @@ func TestServeHTTP_StrictMissDecidesAfterAFailedPrefetchRead(t *testing.T) {
 				}
 			}}
 			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, proxyReq("GET", srvURL, waitDebPath))
+			h.ServeHTTP(rec, proxyReq("GET", srvURL, tc.path))
 			if rec.Code != tc.want {
 				t.Fatalf("status %d body %q, want %d", rec.Code, rec.Body.String(), tc.want)
 			}
@@ -310,9 +315,11 @@ func TestServeHTTP_StrictMissDecidesAfterAFailedPrefetchRead(t *testing.T) {
 				t.Fatalf("package_hash_prefetch_lookup_failed lines %v, want one WARN", warns)
 			}
 			refused, lines := logs.find("unvouched_deb_refused"), logs.find("request")
-			if tc.inFlight {
-				if rec.Body.String() != "upstream bytes" || len(refused) != 0 || a.waits.Load() != 1 {
-					t.Fatalf("body %q, %d refusals, %d waits; want the vouched .deb after one wait", rec.Body.String(), len(refused), a.waits.Load())
+			if tc.want == http.StatusOK {
+				wantWaits := map[bool]int32{true: 1}[tc.inFlight]
+				if rec.Body.String() != "upstream bytes" || len(refused) != 0 || a.waits.Load() != wantWaits {
+					t.Fatalf("body %q, %d refusals, %d waits; want the file served after %d waits",
+						rec.Body.String(), len(refused), a.waits.Load(), wantWaits)
 				}
 				return
 			}
