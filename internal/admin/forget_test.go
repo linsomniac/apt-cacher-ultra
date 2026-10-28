@@ -237,6 +237,17 @@ func TestEndpoint_Forget(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("net/http did not cancel the request's context within 10 s of its client leaving")
 		}
+		// A forget context that follows the request's through a goroutine
+		// (context.AfterFunc(r.Context(), cancel), the idiom the handler
+		// uses for s.stopping) ends just after gone closes, not before it:
+		// give it 50 ms, a window that starts once net/http has cancelled
+		// instead of racing its detection as the old sleep did (the final
+		// review's R8 re-review, Minor 1). A forget that ended returns
+		// without the unblock, closing done.
+		select {
+		case <-stub.done:
+		case <-time.After(50 * time.Millisecond):
+		}
 		stub.unblock()
 		if err := stub.result(); err != nil {
 			t.Fatalf("the forget's context ended (%v) when its client disconnected; want the work done", err)
