@@ -115,5 +115,7 @@ The values to change sit at the top of `smoke.sh`:
 |---|---|---|
 | 2026-10-26, 19:00 and 19:21 UTC (planning, phase H3) | both runs: all 8 suites adopted (4 Kubernetes, inline; CUDA, libnvidia-container and Sublime Text inline; Jenkins detached), every update clean, 6 packages installed vouched, 5 strict refusals (the controls), no other refusal | build 51 and 20 s, smoke 245 and 240 s (adoptions 221 and 224 s) |
 | 2026-10-27, 14:00 UTC (planning, phase H3, with the host-root control) | the same, and both controls caught by the error grep | build 17 s, smoke 238 s (adoptions 223 s) |
+| 2026-10-27, 20:47 UTC (phase H3, the final review's gate at 2b21024) | all 8 suites adopted in their forms (CUDA 9,763 packages), every update clean, both controls caught, 6 packages installed vouched (`kubectl` 1.37.1 and 1.36.5, `cuda-toolkit-12-config-common` 12.9.79-1, `nvidia-container-toolkit-base` 1.20.1-1, `jenkins` 2.580.1, `sublime-merge` 2132), 5 strict refusals, no other refusal | build 21 s, smoke 244 s (adoptions 221 s) |
+| 2026-10-28, 01:57 UTC (phase H3, the final tree, 5381196) | the same (CUDA 9,768 packages) | build 19 s, smoke 243 s (adoptions 224 s) |
 
 Each run adds its row here.
