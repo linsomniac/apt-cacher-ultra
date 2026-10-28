@@ -435,8 +435,8 @@ func (g *GC) periodicTick(ctx context.Context) {
 	start := time.Now()
 	tick, err := g.runTick(ctx, "periodic")
 	passesDone = true
-	// passFailed's test: a pass stopped by the end of ctx (a shutdown) did
-	// not fail, whatever its error's shape.
+	// AIDEV-NOTE: passFailed's test: a pass stopped by the end of ctx (a
+	// shutdown) did not fail, whatever its error's shape.
 	if err != nil && ctx.Err() == nil {
 		g.cfg.Logger.Warn("gc_tick_failed", "err", err)
 	}

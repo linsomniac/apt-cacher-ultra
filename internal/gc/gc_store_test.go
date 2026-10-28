@@ -30,14 +30,14 @@ type fakeStore struct {
 	mu          sync.Mutex
 	batchPanics int           // RunSnapshotGCBatch panics on this many first calls
 	batchErrs   int           // RunSnapshotGCBatch fails on this many calls after the batchPanics ones
-	batchHook   func()        // called at the start of every RunSnapshotGCBatch call
+	batchHook   func()        // called on every RunSnapshotGCBatch call that does not panic, before it fails or answers
 	batches     int           // RunSnapshotGCBatch calls
 	chunkRows   []int         // maxRows of each RunRetiredSnapshotGCChunk call
 	chunkSleep  time.Duration // each chunk takes this long (virtual time in a bubble)
 	chunksMore  int
 	chunkPanics bool   // RunRetiredSnapshotGCChunk panics
 	chunkErrs   bool   // RunRetiredSnapshotGCChunk fails
-	chunkHook   func() // called at the start of every RunRetiredSnapshotGCChunk call
+	chunkHook   func() // called on every RunRetiredSnapshotGCChunk call that does not panic, before it fails or answers; runs under f.mu: it must not call the fake
 	hashPanic   string
 }
 
@@ -484,8 +484,8 @@ func TestPeriodicTick_AFailingPassDoesNotStarveTheNext(t *testing.T) {
 	}
 }
 
-// A pass stopped because the GC's context ended (shutdown) keeps the
-// rotation where it is, and logs no gc_tick_failed: it did not fail.
+// A pass whose batch fails because the GC's context ended (shutdown) keeps
+// the rotation where it is, and logs no gc_tick_failed: it did not fail.
 func TestPeriodicTick_AnEndedContextKeepsTheRotation(t *testing.T) {
 	logger, buf := captureLogger()
 	ctx, cancel := context.WithCancel(context.Background())

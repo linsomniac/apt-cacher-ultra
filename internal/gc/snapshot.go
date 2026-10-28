@@ -175,8 +175,8 @@ func (g *GC) retiredRun(ctx context.Context) {
 	batchesRun := 0
 	retired, deadlineHit, err := g.runSubJobC(ctx,
 		g.snapshotDeadline(start.Add(g.cfg.MaxTickDuration), phaseRetired, &batchesRun), &batchesRun)
-	// passFailed's test: a run stopped by the end of ctx (a shutdown) did
-	// not fail, whatever its error's shape.
+	// AIDEV-NOTE: passFailed's test: a run stopped by the end of ctx (a
+	// shutdown) did not fail, whatever its error's shape.
 	if err != nil && ctx.Err() == nil {
 		g.cfg.Logger.Warn("gc_tick_failed", "err", err)
 	}
