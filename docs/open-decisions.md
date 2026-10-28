@@ -15,14 +15,15 @@ flat-repositories spec](superpowers/specs/2026-09-27-flat-repositories-design.md
 ## Before the 1.1.0 release candidate
 
 Steps only the maintainer can take, since they need a push or a tag (delete
-this section once 1.1.0-rc1 is tagged). Before the first, decide whether
-1.1.0 takes the module bumps (*Open*, the `govulncheck` entry): a bump is a
-commit, and the pull request's CI run should include it.
+this section once 1.1.0-rc1 is tagged). More changes go into 1.1.0 before
+the candidate; each adds its entry to [Changelog.md](../Changelog.md).
 
-1. **Open a pull request from `feature/flat-repos` to `main`; its CI run
-   must be green in full** (raised 2026-10-26, the H2 plan's For H3 item
-   7). CI runs on pull requests and on pushes to `main` only (`ci.yaml`'s
-   `on:`), so pushing the branch alone runs nothing. It is the first run
+1. **The first CI run of the merged branch must be green in full**
+   (raised 2026-10-26, the H2 plan's For H3 item 7). The branch was
+   merged into `main` without a pull request (the maintainer,
+   2026-10-28), so that run is the one for the first push of `main`
+   (CI runs on pull requests and on pushes to `main`: `ci.yaml`'s `on:`).
+   It is the first run
    on GitHub's runners of the `e2e-flat` matrix (its `unsigned` boolean,
    the derived timeouts, the `timeout -s INT` wrapper), of the `test`
    job's `e2ehooks seam` step and its binary guard, of e2e/deb's
@@ -60,12 +61,12 @@ commit, and the pull request's CI run should include it.
    listeners wait for it); and, an hour later,
    `suite_reaper_run_complete`, the `suite_reaped` reasons and
    `gc_retired_run_complete`.
-5. **Tag `1.1.0-rc1`**, on `main` once the pull request is merged or on
-   the branch: the release notes' links name the tag, not a branch, so
-   they work either way. The release workflow's `Verify no e2e test seam`
-   step runs first on the tag: check it there.
-6. **The release notes** (`docs/release-notes/1.1.0.md`): paste them into
-   the GitHub release. Their links name the `1.1.0` tag; for a release
+5. **Tag `1.1.0-rc1`** on `main`. The release workflow's
+   `Verify no e2e test seam` step runs first on the tag: check it there.
+6. **The release notes** (`docs/release-notes/1.1.0.md`): bring them up
+   to date with what `Changelog.md` collected since this branch, then
+   paste them into the GitHub release. Their links name the `1.1.0` tag;
+   for a release
    candidate, paste them with that tag replaced by the candidate's:
    `sed 's|/blob/1\.1\.0/|/blob/1.1.0-rc1/|g' docs/release-notes/1.1.0.md`.
    The file is wrapped at about 72 columns: check the release editor's
@@ -77,18 +78,23 @@ commit, and the pull request's CI run should include it.
 
 ## Open
 
-- **`govulncheck`, dependabot and the module bumps** (raised 2026-09-08,
-  the security review's finding H-3; its report is not in git: the main
-  checkout's `docs/security-review-findings.md`). The review asks for
-  `govulncheck` and dependabot in CI, and for `golang.org/x/net`,
-  `golang.org/x/text` and `github.com/cloudflare/circl` at their latest
-  versions (`go.mod` pins v0.53.0, v0.36.0 and v1.6.2). Go 1.27
-  (*Decided*, below) brings the standard library's fixes, not these.
-  None of the workflows runs `govulncheck`, and there is no
-  `.github/dependabot.yml`. Recommendation: decide before the RC whether
-  1.1.0 takes the module bumps (`go get` of the three at `@latest`, then
-  the full gate); add a `govulncheck` step to CI either way. The review
-  also asks for a `toolchain` line in `go.mod` (there is none: a builder
+- **`govulncheck` and dependabot in CI, and `go 1.26` for the last
+  module fixes** (raised 2026-09-08, the security review's finding H-3;
+  its report is not in git: the main checkout's
+  `docs/security-review-findings.md`). The module bumps are done
+  (*Decided*, below). None of the workflows runs `govulncheck`, and
+  there is no `.github/dependabot.yml`. `govulncheck` under Go 1.27
+  (2026-10-28) finds no vulnerability the code reaches, and 10 in
+  required modules that it does not call (7 `golang.org/x/net`, 3
+  `golang.org/x/crypto`), fixed only in releases that require
+  `go 1.26.0` in `go.mod` (x/net 0.60.0, x/crypto 0.56.0): moving the
+  `go` line turns on Go 1.26's GODEBUG defaults (among them
+  `urlstrictcolons`, for a cache whose paths hold colons, as
+  pkgs.k8s.io's do), so it is a change of its own, with the full gate.
+  Recommendation: add a `govulncheck` step to CI (a failure on a
+  vulnerability the code reaches); move to `go 1.26.0` and those
+  releases in the next release, after checking each GODEBUG change. The
+  review also asks for a `toolchain` line in `go.mod` (there is none: a builder
   whose Go is older than 1.25 downloads exactly go1.25.0, which gets no
   fixes). Recommendation: leave it unset: it needs a bump at every Go
   patch release, and it makes any older local Go download a toolchain,
@@ -250,6 +256,18 @@ commit, and the pull request's CI run should include it.
 
 ## Decided
 
+- **Dependencies updated for 1.1.0** (the maintainer, 2026-10-28; raised
+  2026-09-08, the security review's finding H-3): `golang.org/x/net`
+  0.58.0, `golang.org/x/text` 0.41.0, `golang.org/x/crypto` 0.55.0,
+  `golang.org/x/sys` 0.47.0 and `github.com/cloudflare/circl` 1.6.5,
+  each the newest that keeps `go 1.25.0` (the toolchain entry, below).
+  `govulncheck` reported 16 vulnerabilities the code reaches before
+  (with go1.26.8), none after under go1.27.3; what remains is the
+  `govulncheck` entry under *Open*.
+- **Merge to `main` without a pull request; changes collect in
+  `Changelog.md`** (the maintainer, 2026-10-28): the flat-repositories
+  branch was merged into `main` directly, and `Changelog.md` lists each
+  change until 1.1.0-rc1, whose release notes take them in.
 - **The Go toolchain: Go 1.27** (the maintainer, 2026-10-26/27; raised
   2026-09-08 by the security review's finding H-3 and 2026-10-26 by the
   H2 final CI review, the H2 plan's For H3 item 11). Go supports a
