@@ -1145,7 +1145,10 @@ client's `Host`, set `htpasswd_file`, or have the proxy send
 TLS at the proxy (a page under another name fails the certificate
 check), or in a server block that matches the proxy's own name — never
 in a default or catch-all one, which would pass a rebinding page's
-requests on as if they named the address. The status page, `/metrics`, `/healthz` and the
+requests on as if they named the address. In nginx and Apache the only
+or first block on a port is its default whatever its name, so give the
+port a default block that refuses other names (nginx:
+`server { listen 80 default_server; return 444; }`). The status page, `/metrics`, `/healthz` and the
 profiling routes have no `Host` check, so a Prometheus server may scrape
 by name, and without `htpasswd_file` a rebinding page can still read
 them.

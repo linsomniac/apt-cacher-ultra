@@ -382,14 +382,17 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 // (whatever they are) are served verbatim to apt clients on every
 // subsequent fetch, which re-verify against the same key. What this
 // enforces: both bodies non-empty, the suite's trust set (pins first),
-// and one signature packet that passes the trust check and verifies.
+// and one signature packet that passes the trust check and verifies —
+// except under accept_any_signer with no pin matched, where one parseable
+// signature packet is enough (SPEC2 §7.6.2's bypass, below).
 // It does NOT accept only what apt accepts: the 2026-09 security review
 // found apt 3.3.2 rejecting shapes this accepts, all still open — bytes
 // or lines around the armor, two concatenated armor blocks and a binary
 // Release.gpg (VC-2; the binary form is documented), a forged `=CRC`
 // line (C-4), a second, bad signature from the same trusted key beside
 // a good one (VC-1: verifyAnyTrusted accepts on the first packet that
-// verifies), and weak digests or keys (C-3).
+// verifies), and weak digests or keys (C-3: VerifyDetachedSignature
+// runs with a nil config, no algorithm policy, so SHA-1 and RSA-1024 pass).
 func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef, releaseBytes, sigBytes []byte) ([]byte, error) {
 	_ = ctx
 
@@ -514,11 +517,14 @@ const clearsignBeginMarker = "-----BEGIN PGP SIGNED MESSAGE-----"
 // too — the first-line rule the handler's sniff applies before a body
 // earns a suite row or a signed-seen marker. Enforced for the inline form:
 // that first line, nothing but whitespace after END, a decodable envelope,
-// and one trusted signature packet that verifies. That is still not
-// exactly what apt accepts: the 2026-09 security review's VC-2 (apt 3.3.2
-// rejects any line after END, an empty one included), C-4 (a forged
-// `=CRC` line before END) and VC-1 (a second, bad signature from the same
-// trusted key beside a good one) are accepted here and open.
+// and one trusted signature packet that verifies (under accept_any_signer
+// with no pin matched, one parseable signature packet: SPEC2 §7.6.2's
+// bypass). That is still not exactly what apt accepts: the 2026-09
+// security review's VC-2 (apt 3.3.2 rejects any line after END, an empty
+// one included), C-4 (a forged `=CRC` line before END), VC-1 (a second,
+// bad signature from the same trusted key beside a good one) and C-3 (no
+// algorithm policy: a SHA-1 digest or an RSA-1024 key verifies) are
+// accepted here and open.
 //
 // A body without the marker returns nil: the decode step rejects it with
 // ErrMissingSignature.
