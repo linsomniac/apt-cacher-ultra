@@ -795,8 +795,13 @@ daemon refuses to start when `pool/` is missing, unreadable or empty, or
 when it holds none of the queued inline snapshots' files and none of a
 sample of the files the current snapshots use, two or more files checked
 (a foreign or unmounted pool; snapshots that share an `InRelease` share
-its one file). Mount or restore it, or wipe the cache directory to start
-empty. The audit then changes nothing, but the migration before it has:
+its one file). Mount or restore it, or, to start empty, stop the daemon
+and remove `cache.db` (with any `cache.db-wal` and `cache.db-shm`) and
+`pool/` from `cache.dir`. Keep `ca/`: unless `tls_mitm.ca_storage_dir` is
+set, it holds the MITM CA the cache generated, and a new one breaks TLS
+for every client that trusts the old one. The rest of `cache.dir`,
+`tmp/` and `staging/`, is scratch space that may go too. The audit then
+changes nothing, but the migration before it has:
 the database is at schema 7, which 1.0.x refuses, so going back to 1.0.x
 means restoring the `cache.db` copied before the upgrade: stop the
 daemon first (a refused start runs again every 5 seconds and would

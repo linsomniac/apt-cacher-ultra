@@ -225,6 +225,23 @@ var legacyAuditRefusalTail = fmt.Sprintf("The audit changed nothing, but the dat
 	"which 1.0.x refuses: to go back to 1.0.x, stop the daemon and restore the cache.db copied before the upgrade.",
 	cache.CurrentSchemaVersion)
 
+// legacyAuditStartEmpty is the way to start empty that the lost-pool
+// refusals offer beside mounting or restoring the pool, for cache.dir dir.
+//
+// AIDEV-NOTE: ruling PH3-33 (the R5 re-review's out-of-scope 1). Not "wipe
+// the cache directory": unless tls_mitm.ca_storage_dir is set, the
+// generated MITM CA lives in <cache.dir>/ca (config.EffectiveCaStorageDir),
+// and a new one breaks TLS for every client that trusts the old one. The
+// rest of cache.dir is cache.db with its -wal and -shm, pool/, and
+// cache.Open's scratch directories tmp/ and staging/; without the database
+// and the pool the next start creates an empty cache, and ca/ is loaded as
+// it is (cmd/apt-cacher-ultra's
+// TestServeListeners_RefusedStartStartsEmptyKeepingTheGeneratedCA).
+func legacyAuditStartEmpty(dir string) string {
+	return "to start empty instead, stop the daemon and remove cache.db (with any cache.db-wal and cache.db-shm) and pool/ from " +
+		dir + ", keeping ca/ (a generated MITM CA your clients trust)"
+}
+
 // legacyAuditPoolSample is how many pinned pool files outside the queue the
 // pre-flight checks once every queued inline anchor file is missing.
 const legacyAuditPoolSample = 16
@@ -249,7 +266,7 @@ const legacyAuditPoolSample = 16
 // quarantined anchor_missing. Two or more files checked, none present,
 // means a lost or foreign pool: refuse. A single file checked (one anchor
 // file and nothing else pinned) cannot tell one lost file from a lost
-// mount, and refusing would leave no recovery short of wiping the cache:
+// mount, and refusing would leave no recovery short of starting empty:
 // it is quarantined.
 func preflightLegacyAudit(ctx context.Context, c *cache.Cache) error {
 	items, err := c.LegacyAuditBatch(ctx, 0, 0)
@@ -286,7 +303,7 @@ func preflightLegacyAudit(ctx context.Context, c *cache.Cache) error {
 	// single anchor. A lone missing anchor in a NON-empty pool is still
 	// quarantined by the audit (spec §6.1).
 	if errors.Is(rerr, io.EOF) {
-		return fmt.Errorf("legacy trust audit: pool %s is empty but the audit queue holds inline snapshots (%d) — is the pool mounted? Mount or restore it and restart; to start without the pool, wipe the cache directory. %s", pool, queued, legacyAuditRefusalTail)
+		return fmt.Errorf("legacy trust audit: pool %s is empty but the audit queue holds inline snapshots (%d) — is the pool mounted? Mount or restore it and restart; %s. %s", pool, queued, legacyAuditStartEmpty(c.Dir()), legacyAuditRefusalTail)
 	}
 	if rerr != nil {
 		return fmt.Errorf("legacy trust audit: pool %s is not readable: %w. Fix it and restart. %s", pool, rerr, legacyAuditRefusalTail)
@@ -303,7 +320,7 @@ func preflightLegacyAudit(ctx context.Context, c *cache.Cache) error {
 		others[i] = c.BlobPath(h)
 	}
 	if len(anchors)+len(others) >= 2 && !anyPoolFileExists(others) {
-		return fmt.Errorf("legacy trust audit: none of the %d files checked exists under %s (%d queued inline anchors, %d other files current snapshots use) — is the pool mounted? Mount or restore it and restart; to start without the pool, wipe the cache directory. %s", len(anchors)+len(others), pool, len(anchors), len(others), legacyAuditRefusalTail)
+		return fmt.Errorf("legacy trust audit: none of the %d files checked exists under %s (%d queued inline anchors, %d other files current snapshots use) — is the pool mounted? Mount or restore it and restart; %s. %s", len(anchors)+len(others), pool, len(anchors), len(others), legacyAuditStartEmpty(c.Dir()), legacyAuditRefusalTail)
 	}
 	return nil
 }

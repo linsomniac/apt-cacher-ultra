@@ -469,19 +469,25 @@ func TestRunLegacyTrustAudit_RefusalsSayTheSchemaIsMigrated(t *testing.T) {
 		t.Fatal(err)
 	}
 	foreign := filepath.Join(pool, "ab", strings.Repeat("ab", 32))
+	// Ruling PH3-33: the refusals that offer to start empty name what to
+	// remove and what to keep, never "wipe the cache directory", which
+	// deletes a generated MITM CA (<cache.dir>/ca) the clients trust.
+	startEmpty := "to start empty instead, stop the daemon and remove cache.db (with any cache.db-wal and " +
+		"cache.db-shm) and pool/ from " + c.Dir() + ", keeping ca/ (a generated MITM CA your clients trust)"
 	for _, tc := range []struct {
-		name  string
-		setup func() error
+		name       string
+		setup      func() error
+		startEmpty bool
 	}{
-		{"missing", func() error { return nil }},
-		{"not a directory", func() error { return os.WriteFile(pool, nil, 0o644) }},
-		{"empty", func() error { return os.Mkdir(pool, 0o755) }},
+		{"missing", func() error { return nil }, false},
+		{"not a directory", func() error { return os.WriteFile(pool, nil, 0o644) }, false},
+		{"empty", func() error { return os.Mkdir(pool, 0o755) }, true},
 		{"foreign", func() error {
 			if err := os.MkdirAll(filepath.Dir(foreign), 0o755); err != nil {
 				return err
 			}
 			return os.WriteFile(foreign, []byte("another cache's blob"), 0o644)
-		}},
+		}, true},
 	} {
 		if err := tc.setup(); err != nil {
 			t.Fatal(err)
@@ -489,6 +495,9 @@ func TestRunLegacyTrustAudit_RefusalsSayTheSchemaIsMigrated(t *testing.T) {
 		_, err := RunLegacyTrustAudit(ctx, c, discardAuditLogger())
 		if err == nil || !strings.Contains(err.Error(), legacyAuditRefusalTail) || strings.Contains(strings.ToLower(err.Error()), "nothing was changed") {
 			t.Errorf("%s pool: err = %v, want a refusal ending %q", tc.name, err, legacyAuditRefusalTail)
+		}
+		if err != nil && (tc.startEmpty != strings.Contains(err.Error(), startEmpty) || strings.Contains(err.Error(), "wipe")) {
+			t.Errorf("%s pool: err = %v; want the start-empty advice %v, and no \"wipe\"", tc.name, err, tc.startEmpty)
 		}
 		if err := os.RemoveAll(pool); err != nil {
 			t.Fatal(err)
