@@ -60,7 +60,10 @@ import (
 //     last_success_at left at its previous value; the
 //     scheduler parks the suite until a slot it can use is released (a
 //     client check's suite is parked by the next tick: its pending
-//     change makes it due, see Checker.pendingChange).
+//     change makes it due, see Checker.pendingChange — unless it holds a
+//     failure record whose retry is not due: then once it goes stale, at
+//     the record's retry or by a later client check that wins a slot,
+//     spec C4's bound).
 //   - Spec C7 gate (retryGateFor, adopter wired only): while a failure
 //     record exists and next_retry_at has not come, the GET carries the
 //     failing content's validators when the record holds its own (a

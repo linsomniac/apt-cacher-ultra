@@ -474,8 +474,9 @@ func (c *Checker) suiteDue(s cache.SuiteFreshness, now time.Time) bool {
 // failure record (a record has its own retry time). With an adopter wired
 // this is the state a check that found no admission slot leaves behind
 // (spec C4: "A client-triggered check that is refused leaves the suite
-// due; the next tick parks it"); a successful adoption clears the stamp
-// in its flip transaction, and a failed one records a failure.
+// due; the next tick parks it", for a suite without a failure record: the
+// limit below); a successful adoption clears the stamp in its flip
+// transaction, and a failed one records a failure.
 //
 // AIDEV-NOTE: the rule is persisted state, not a hand-off from Check to
 // the Run loop, so it survives restarts (an adoption abandoned at
@@ -510,7 +511,11 @@ func (c *Checker) pendingChange(s cache.SuiteFreshness) bool {
 // C4 slot-driven re-offer). A client check that finds no slot leaves the
 // change pending, so the next tick queues the suite (suiteDue) and its
 // check, cooldown bypassed, parks it: such a suite starts waiting within
-// one tick. Admission is therefore work-conserving: N suites
+// one tick — unless it holds a failure record whose retry is not due
+// (pendingChange cannot tell the record's own content from the new one):
+// then it starts waiting once it goes stale (periodic_refresh), at the
+// record's retry (up to an hour, ±25 %) or when a later client check wins
+// a slot (spec C4's bound). Admission is therefore work-conserving: N suites
 // queued behind k usable slots are admitted within one tick + ⌈N/k⌉ ×
 // (A + D), A = adoption.max_duration + the spec C8 flip barrier (≤ 140 s:
 // flipgate.PhaseAMax + TokenWaitMax + HoldMax; an adoption keeps its
