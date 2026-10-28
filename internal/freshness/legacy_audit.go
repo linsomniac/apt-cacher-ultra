@@ -214,8 +214,16 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 // changes nothing of the audit's own but the database is no longer one
 // 1.0.x opens ("schema version 7 is newer than this binary supports"): an
 // operator who rolls the package back needs the cache.db copy the release
-// notes tell them to take before upgrading.
-const legacyAuditRefusalTail = "The audit changed nothing, but the database is already migrated to schema 7, which 1.0.x refuses: to go back to 1.0.x, restore the cache.db copied before the upgrade."
+// notes tell them to take before upgrading. The R5 re-review: the way back
+// starts by stopping the daemon — a refused start runs again every 5 s
+// (Restart=always) and migrates a restored copy again, and a copy put back
+// under a running daemon can be undone by its checkpoint. The schema is
+// cache.CurrentSchemaVersion, but "1.0.x" names the releases before schema
+// 7: revisit it with the next migration, since a deferred snapshot can stay
+// queued, and refuse a start, under a later release.
+var legacyAuditRefusalTail = fmt.Sprintf("The audit changed nothing, but the database is already migrated to schema %d, "+
+	"which 1.0.x refuses: to go back to 1.0.x, stop the daemon and restore the cache.db copied before the upgrade.",
+	cache.CurrentSchemaVersion)
 
 // legacyAuditPoolSample is how many pinned pool files outside the queue the
 // pre-flight checks once every queued inline anchor file is missing.

@@ -494,7 +494,11 @@ func TestRunLegacyTrustAudit_RefusalsSayTheSchemaIsMigrated(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, want := range []string{"changed nothing", "schema 7", "1.0.x", "restore the cache.db"} {
+	// The R5 re-review: the way back starts by stopping the daemon (a
+	// refused start runs again every 5 s and would migrate the restored copy
+	// again), and the schema named is the one cache.Open migrated to.
+	for _, want := range []string{"changed nothing", fmt.Sprintf("schema %d,", cache.CurrentSchemaVersion), "1.0.x",
+		"stop the daemon and restore the cache.db"} {
 		if !strings.Contains(legacyAuditRefusalTail, want) {
 			t.Errorf("refusal tail %q does not say %q", legacyAuditRefusalTail, want)
 		}
@@ -960,10 +964,12 @@ func (u urlConditional) Conditional(_ context.Context, tg *fetch.Target, etag, l
 	return &fetch.ConditionalResult{Status: 200, Body: b}, nil
 }
 
-// Spec §6.1 recovery: an R-1 quarantine heals on the first check, because
-// the cached (tampered) anchor never matches a clean upstream, and the
-// re-adopted snapshot carries no forged member. Without this, a quarantine
-// could leave the suite permanently unadopted.
+// Spec §6.1 recovery: an R-1 quarantine heals on the first check once a
+// client has fetched the suite's anchor — it re-adopts as a suite without a
+// snapshot does (C4 Dispatch 3, which never compares the cached copy with
+// upstream; the final review's R5 #4) — and the re-adopted snapshot carries
+// no forged member. Without this, a quarantine could leave the suite
+// permanently unadopted.
 func TestRunLegacyTrustAudit_QuarantinedR1SuiteReadoptsOnFirstCheck(t *testing.T) {
 	env := newAdoptionTestEnv(t)
 	ctx := context.Background()

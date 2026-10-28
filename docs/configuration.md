@@ -796,14 +796,18 @@ sample of the files the current snapshots use, two or more files checked
 its one file). Mount or restore it, or wipe the cache directory to start
 empty. The audit then changes nothing, but the migration before it has:
 the database is at schema 7, which 1.0.x refuses, so going back to 1.0.x
-means restoring the `cache.db` copied before the upgrade (the refusal
-says so). Otherwise a missing pool file does not stop the daemon, even
-when it belongs to the only queued snapshot, as long as the pool holds
-one of the files checked, or that file is the only one checked: that
-snapshot is quarantined. So is a
-snapshot whose file could not be read at an earlier start and was then
-removed, as long as the pool holds the current snapshots' files. A single pool
-file that cannot be read for another reason (permissions, I/O error) does
+means restoring the `cache.db` copied before the upgrade: stop the
+daemon first (a refused start runs again every 5 seconds and would
+migrate the copy again, and a copy put back under a running daemon can be
+undone by its checkpoint), install the 1.0.x package, put the copy back
+as `cache.db` (with its `cache.db-wal` if one was copied, and no other
+`-wal` or `-shm` file beside it), then start it; the refusal says to stop
+the daemon and restore the copy. Otherwise a missing pool file does not
+stop the daemon, even when it belongs to the only queued snapshot, as
+long as the pool holds one of the files checked, or that file is the only
+one checked: that snapshot is quarantined. So is a snapshot whose file
+could not be read at an earlier start and was then removed, on the same
+condition. A single pool file that cannot be read for another reason (permissions, I/O error) does
 not stop the daemon either: that snapshot keeps serving as before, a
 `legacy_trust_audit_deferred` error names it, and the next start retries it.
 The audit resumes if the start is interrupted and is a no-op afterwards. A
