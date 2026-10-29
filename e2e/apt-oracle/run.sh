@@ -133,6 +133,14 @@ if [[ -n $(LC_ALL=C uniq -d "$work/shapes") ]]; then
         "$(LC_ALL=C uniq -d "$work/shapes" | tr '\n' ' ')"
     exit 2
 fi
+# The detached shapes' names (classify: only a Release.gpg's refusal by
+# apt's own check may say no more than gpgv's NODATA).
+for f in ${shape_files[@]+"${shape_files[@]}"}; do
+    b=${f##*/}
+    case $b in
+    *.Release.gpg) echo "${b%.Release.gpg}" ;;
+    esac
+done > "$work/detached"
 
 start=$SECONDS
 echo "[e2e-apt-oracle] $nshapes shapes x ${#images[@]} images: ${images[*]}"
@@ -176,11 +184,18 @@ fi
 # one of apt's text-layer messages (gpgv.cc: SplitClearSignedFile's
 # "Splitting up", acquire's NOSPLIT, VerifyDetachedSignatureFile's dash,
 # binary, unclosed and stray-line messages, or its "got 'NODATA'" for a
-# Release.gpg without a BEGIN line), and a verifier's refusal none of them.
-# Task 9b's layer-T test holds the cache's port of apt's splitter to the
-# split rows of classes.txt.
+# Release.gpg without a BEGIN line — accepted for a detached shape only, the
+# names in $work/detached: an InRelease refused before the verifier ran with
+# no more than NODATA is a changed apt, the Task 9a review's 9A-M2), and a
+# verifier's refusal none of them. Task 9b's layer-T test
+# (TestAptTextLayer_RefusesExactlyTheSplitRows) holds the cache's port of
+# apt's splitter to the split rows of classes.txt.
 classify() {
-    awk -v img="$1" '
+    awk -v img="$1" -v detached="$work/detached" '
+    BEGIN {
+        while ((getline name < detached) > 0) isdetached[name] = 1
+        close(detached)
+    }
     function textlayer(s) {
         return s ~ /Splitting up .* into data and signature failed/ ||
             s ~ /Clearsigned file isn.t valid, got .NOSPLIT./ ||
@@ -202,7 +217,7 @@ classify() {
             if ($3 != "-") fail("accepted, yet asked whether apt ran its verifier")
             print $1, "-"
         } else if ($3 == "n") {
-            if (!textlayer(line) && line !~ /got .NODATA./)
+            if (!textlayer(line) && !(isdetached[$1] && line ~ /got .NODATA./))
                 fail("refused before apt ran its verifier, with no text-layer message")
             print $1, "split"
         } else if ($3 == "y") {

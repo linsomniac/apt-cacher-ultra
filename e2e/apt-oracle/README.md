@@ -319,7 +319,8 @@ once apt's own checks have passed the file on; the verdict and the line
 come from the first run, made as before. `run.sh` then checks the class
 against the words, so that a changed apt shows instead of shifting a class
 silently: a `split` refusal must print one of the text-layer messages
-above, and a refusal after the verifier ran none of them; `nodata`,
+above (`got 'NODATA'` only for a shape that is a `Release.gpg`), and a
+refusal after the verifier ran none of them; `nodata`,
 `badsig` and `other` come from the line. A disagreement, or a second run
 whose exit status differs from the first's, fails the run. The messages
 are the same in the six apt versions (their `gpgv.cc`, `methods/gpgv.cc`
