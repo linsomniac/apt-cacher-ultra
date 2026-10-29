@@ -57,7 +57,8 @@ type SuiteRef struct {
 //
 //   - VerifyInline accepts a clearsigned InRelease blob (the body
 //     between BEGIN PGP SIGNED MESSAGE / END PGP SIGNATURE markers).
-//     Returns the cleartext between the markers.
+//     Returns the signed text as apt's own splitter reads it (the
+//     hardening plan's DN-11: what the client's apt parses).
 //   - VerifyDetached accepts a Release file plus its detached
 //     Release.gpg signature. Returns releaseBytes verbatim — the
 //     Release file IS the verified plaintext, so there is nothing to
@@ -1082,10 +1083,10 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	priorForm, hadPrior := formOfSnapshot(prior)
 
 	// Step 1: GPG verify. The Verifier returns the verified Release-
-	// style plaintext (the cleartext between BEGIN/END markers in a
-	// clearsigned InRelease, or releaseBytes verbatim in detached
-	// mode). Both paths converge on "verified Release-equivalent text"
-	// for the §7.5 step 3 parse.
+	// style plaintext (a clearsigned InRelease's signed text, as apt's
+	// splitter reads it, or releaseBytes verbatim in detached mode).
+	// Both paths converge on "verified Release-equivalent text" for the
+	// §7.5 step 3 parse.
 	var (
 		releaseText []byte
 		verifyErr   error

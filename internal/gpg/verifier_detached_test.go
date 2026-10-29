@@ -550,11 +550,11 @@ func TestVerifyDetached_AcceptAnySigner_NoPin_PassThrough(t *testing.T) {
 
 // TestVerifyDetached_AcceptAnySigner_RawGarbage_StillRejected asserts
 // raw non-armored garbage under 64 KiB is refused on the bypass branch,
-// never propagated untouched into the pool. It was the
-// requireParseableSignature guard's case while decodeMaybeArmoredSignature
-// passed non-armored input through; since the shape checks (F1: the armor's
-// BEGIN line at byte 0) it is ErrMalformedSignature before any packet is
-// parsed. This regression case was missed by the original
+// never propagated untouched into the pool. It was the bypass's
+// parseable-signature guard's case while the decoder passed non-armored
+// input through; since the shape checks (now layer T's T1: no BEGIN line,
+// apt's NODATA) it is ErrMalformedSignature before any packet is parsed.
+// This regression case was missed by the original
 // TestVerifyDetached_AcceptAnySigner_GarbageSignature_StillRejected,
 // which only exercised the armored-frame structural rejection.
 func TestVerifyDetached_AcceptAnySigner_RawGarbage_StillRejected(t *testing.T) {
@@ -575,24 +575,21 @@ func TestVerifyDetached_AcceptAnySigner_RawGarbage_StillRejected(t *testing.T) {
 	garbage := []byte("not a valid pgp signature, just plain text bytes")
 
 	_, err = v.VerifyDetached(context.Background(), newSuite(), release, garbage)
-	if !errors.Is(err, ErrMalformedSignature) {
-		t.Fatalf("err = %v; want ErrMalformedSignature on raw non-armored garbage Release.gpg under accept_any_signer", err)
+	if !errors.Is(err, ErrMalformedSignature) || ruleOf(err) != "T1" {
+		t.Fatalf("err = %v (rule %q); want ErrMalformedSignature from T1 on raw non-armored garbage Release.gpg under accept_any_signer", err, ruleOf(err))
 	}
 }
 
 // TestVerifyDetached_AcceptAnySigner_EmptyArmorStillRejected: an armor
-// that holds no packet at all passes the shape checks — F6 refuses every
-// packet that is not a parseable signature, and there is none — so on the
-// bypass branch requireParseableSignature is what still refuses it, and
-// verifyAnyTrusted (ErrNoUsableSignature) on the trusted one.
+// that holds no packet at all is refused in both modes by layer A (A4: no
+// base64 line), as ErrMalformedSignature, before the trust set is read; the
+// bypass's "at least one signature packet" is layer A's and P's (A4 decodes
+// to one byte or more, P1 to one packet or more).
 func TestVerifyDetached_AcceptAnySigner_EmptyArmorStillRejected(t *testing.T) {
 	signer := newTestEntity(t, "Signer", "signer@example.com")
 	keyring := newKeyring(t, signer)
 	release := []byte(fakeReleasePlaintext)
 	empty := []byte("-----BEGIN PGP SIGNATURE-----\n\n-----END PGP SIGNATURE-----\n")
-	if _, err := decodeMaybeArmoredSignature(empty); err != nil {
-		t.Fatalf("test premise: the shape checks refuse an empty armor (%v); want them to pass it", err)
-	}
 	for _, anySigner := range []bool{false, true} {
 		v, err := NewVerifier(VerifierConfig{
 			Keyring:          keyring,
@@ -604,11 +601,8 @@ func TestVerifyDetached_AcceptAnySigner_EmptyArmorStillRejected(t *testing.T) {
 			t.Fatalf("NewVerifier: %v", err)
 		}
 		got, err := v.VerifyDetached(context.Background(), newSuite(), release, empty)
-		if err == nil || got != nil {
-			t.Errorf("accept_any_signer=%v: got %q, err %v; want an armor with no packet refused", anySigner, got, err)
-		}
-		if !anySigner && !errors.Is(err, ErrNoUsableSignature) {
-			t.Errorf("trusted path: err = %v; want ErrNoUsableSignature", err)
+		if !errors.Is(err, ErrMalformedSignature) || ruleOf(err) != "A4" || got != nil {
+			t.Errorf("accept_any_signer=%v: got %q, err %v (rule %q); want ErrMalformedSignature from A4", anySigner, got, err, ruleOf(err))
 		}
 	}
 }
@@ -633,14 +627,14 @@ func TestVerifyDetached_AcceptAnySigner_GarbageSignature_StillRejected(t *testin
 	}
 
 	release := []byte(fakeReleasePlaintext)
-	// "Garbage" that starts with an armor frame so decodeMaybeArmoredSignature
-	// tries armor.Decode first; the armor frame is malformed (no body),
-	// triggering the decode error path: ErrMalformedSignature.
+	// "Garbage" inside an armor frame: layer T passes it (no line outside
+	// the block, none inside starting with "-"), layer A refuses it (A2:
+	// a line that is no armor header, and no empty line before a body).
 	garbage := []byte("-----BEGIN PGP SIGNATURE-----\nthis is not a real signature\n-----END PGP SIGNATURE-----\n")
 
 	_, err = v.VerifyDetached(context.Background(), newSuite(), release, garbage)
-	if !errors.Is(err, ErrMalformedSignature) {
-		t.Fatalf("err = %v; want ErrMalformedSignature on garbage Release.gpg under accept_any_signer", err)
+	if !errors.Is(err, ErrMalformedSignature) || ruleOf(err) != "A2" {
+		t.Fatalf("err = %v (rule %q); want ErrMalformedSignature from A2 on garbage Release.gpg under accept_any_signer", err, ruleOf(err))
 	}
 }
 

@@ -57,9 +57,9 @@ const defaultMaxInReleaseBytes int64 = 4 << 20
 
 // defaultMaxReleaseGPGBytes caps the Release.gpg body read after a
 // detached Release change is observed. Real Release.gpg files are
-// 1–2 KiB; 64 KiB matches the ceiling decodeMaybeArmoredSignature
-// uses post-armor and bounds the cost of a hostile upstream that
-// pads the file.
+// 1–2 KiB; 64 KiB matches the ceiling the verifier's armor layer puts
+// on the decoded signature (internal/gpg's armorMaxPacketBytes) and
+// bounds the cost of a hostile upstream that pads the file.
 const defaultMaxReleaseGPGBytes int64 = 64 << 10
 
 // checkDeadline bounds the upstream part of one freshness check (spec C4,
