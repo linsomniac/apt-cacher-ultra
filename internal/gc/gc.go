@@ -159,8 +159,10 @@ const (
 
 // phaseStartup is runTick's phase for StartupPass's one-shot pass, the
 // pass main runs before any listener serves. The snapshot pass runs no
-// sub-job C in it (runSnapshotPass, ruling PF-15); the periodic ticks
-// ("periodic") do.
+// sub-job C in it (runSnapshotPass, ruling PF-15), and its sub-job B
+// deletes the displaced snapshots beyond keep_displaced; the periodic
+// ticks ("periodic") run C, and their B only retires those snapshots, for
+// C to delete (DN-7 of the GC and upstream hardening plan).
 const phaseStartup = "startup"
 
 // LastRunSummary is the SPEC5 §9.6 / §9.7.8 in-memory captured copy
@@ -507,7 +509,7 @@ func (g *GC) periodicTick(ctx context.Context) {
 // F-1, F-2) and make a tick or a pool-scan job panic (F-21). New sets it
 // to Config.Cache; the url_path and blob passes keep Config.Cache.
 type gcStore interface {
-	RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGraceSeconds int64, keepDisplaced int) (cache.SnapshotGCBatchResult, error)
+	RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGraceSeconds int64, keepDisplaced int, retireDisplaced bool) (cache.SnapshotGCBatchResult, error)
 	RunRetiredSnapshotGCChunk(ctx context.Context, maxRows int) (reaped int, more bool, err error)
 	HashKnown(ctx context.Context, hash string) (bool, error)
 }
@@ -627,8 +629,10 @@ type tickResult struct {
 // `phase` is phaseStartup ("startup", StartupPass) or "periodic" (Run).
 // It labels the gc_tick_deadline_reached events, so an operator can
 // correlate, and it selects behaviour: in phaseStartup the snapshot pass
-// runs no sub-job C (runSnapshotPass, ruling PF-15); any other phase runs
-// it.
+// runs no sub-job C (runSnapshotPass, ruling PF-15) and its sub-job B
+// deletes the displaced snapshots; any other phase runs C, and its B
+// retires them for C to delete (DN-7 of the GC and upstream hardening
+// plan).
 func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 	deadline := time.Now().Add(g.cfg.MaxTickDuration)
 

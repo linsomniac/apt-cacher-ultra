@@ -41,7 +41,7 @@ type fakeStore struct {
 	hashPanic   string
 }
 
-func (f *fakeStore) RunSnapshotGCBatch(context.Context, int, int64, int) (cache.SnapshotGCBatchResult, error) {
+func (f *fakeStore) RunSnapshotGCBatch(context.Context, int, int64, int, bool) (cache.SnapshotGCBatchResult, error) {
 	f.mu.Lock()
 	f.batches++
 	n := f.batches
@@ -407,9 +407,9 @@ type slowBatchStore struct {
 	batchSleep time.Duration
 }
 
-func (s slowBatchStore) RunSnapshotGCBatch(ctx context.Context, n int, g int64, k int) (cache.SnapshotGCBatchResult, error) {
+func (s slowBatchStore) RunSnapshotGCBatch(ctx context.Context, n int, g int64, k int, retire bool) (cache.SnapshotGCBatchResult, error) {
 	time.Sleep(s.batchSleep)
-	return s.fakeStore.RunSnapshotGCBatch(ctx, n, g, k)
+	return s.fakeStore.RunSnapshotGCBatch(ctx, n, g, k, retire)
 }
 
 // Deferred minor F-1 (execution review G-8): sub-job C checks the tick's

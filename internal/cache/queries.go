@@ -670,6 +670,10 @@ GROUP BY canonical_host, architecture`)
 // AdoptedTotal - WithCurrentSnapshot, which equals the number of
 // snapshots still on disk that are no longer the current adoption
 // for their suite.
+//
+// AIDEV-NOTE: `AdoptedTotal` includes retired snapshots (sub-job B's too,
+// until sub-job C deletes them), so `acu_snapshots_displaced` counts them
+// meanwhile.
 func (c *Cache) GetSuiteStats(ctx context.Context) (SuiteStats, error) {
 	var s SuiteStats
 	if err := c.db.QueryRowContext(ctx,

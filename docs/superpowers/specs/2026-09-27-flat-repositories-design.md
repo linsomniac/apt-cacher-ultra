@@ -1455,8 +1455,12 @@ with this guarantee and its residuals.
 
 **Snapshot retirement.** `suite_snapshot.retired_at` marks every snapshot of a
 suite incarnation that was reaped, evicted at the global cap or forgotten,
-in the same transaction that removes the suite row (`deleteSuiteTx`).
-Retired snapshots are invisible to everything that
+in the same transaction that removes the suite row (`deleteSuiteTx`). It
+also marks the displaced snapshots beyond `gc.keep_displaced` that a
+periodic GC run retired: snapshot-GC sub-job B retires them there, and
+sub-job C deletes them in chunks, while the startup pass's B still
+deletes them at once (the GC and upstream hardening plan of 2026-10-28,
+ruling HD-4). Retired snapshots are invisible to everything that
 reasons about a suite's history: the natural-key uniqueness (partial index
 `WHERE retired_at IS NULL`), `InsertCandidateSnapshot`'s collision lookup,
 `rollback_refused`, retained by-hash, `DeclaredHashesForPath`,

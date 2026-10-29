@@ -22,16 +22,21 @@ type snapshotPassResult struct {
 // runSnapshotPass implements SPEC4 §9.6.3: a per-tick batched reap
 // loop over orphan candidate snapshots (sub-job A) ∪ displaced
 // snapshots beyond keep-N (sub-job B). Each batch is a single writer-
-// tx that runs SELECT-inside-tx + cascade DELETE; the SELECT-DELETE
+// tx that runs SELECT-inside-tx + cascade DELETE of the orphans, and of
+// the displaced snapshots in the startup pass (phase phaseStartup); a
+// periodic tick's batch retires the displaced snapshots instead
+// (retireDisplaced: one UPDATE), for sub-job C to delete (DN-7 of the GC
+// and upstream hardening plan). The SELECT-DELETE (or -UPDATE)
 // liveness race is closed by single-writer ordering (heartbeat /
 // CommitAdoption / InsertCandidateSnapshot writes serialize through
 // the same writer goroutine — they cannot interleave between SELECT
 // and DELETE inside this tx). Once A ∪ B is drained, sub-job C (spec C9)
 // deletes the retired snapshots — those of reaped, evicted and forgotten
-// suites, and those the legacy trust audit quarantined — in chunks of at
-// most 10,000 rows per writer transaction; the startup pass (phase
-// phaseStartup) runs no sub-job C, and its periodic ticks do (ruling
-// PF-15), as does retiredRun, once, an hour after the start.
+// suites, those the legacy trust audit quarantined, and the displaced
+// snapshots a periodic tick's B retired — in chunks of at most 10,000
+// rows per writer transaction; the startup pass runs no sub-job C, and
+// its periodic ticks do (ruling PF-15), as does retiredRun, once, an hour
+// after the start.
 //
 // AIDEV-NOTE: ruling PF-15 (final review concurrency m1). StartupPass runs
 // before any listener serves, and retired snapshots never serve, so
@@ -52,6 +57,23 @@ type snapshotPassResult struct {
 // retiredRun runs C once an hour after the start too, so a daemon
 // restarted more often than gc.interval still deletes them (the final
 // review's R3 #2; retiredRun's AIDEV-NOTE).
+//
+// AIDEV-NOTE: rulings HD-4, HD-7 (DN-7 of the GC and upstream hardening
+// plan; the H3 final review R3 #4). A periodic tick's B only retires the
+// displaced snapshots beyond keep_displaced (retireDisplaced = phase !=
+// phaseStartup), and C deletes them in this same pass, 10,000 rows a
+// transaction: B's cascade DELETE held the writer — every miss's store,
+// every flip's commit — for seconds on a large suite while the listeners
+// served. The startup pass's B still deletes them: it runs before the
+// freshness scheduler and the listeners (main), so its long transactions
+// hold up no other writer and no request, and a daemon that never lives
+// until C runs (min(1 h, gc.interval)) still deletes them, their blobs in
+// this start's blob pass. Residual: when a periodic tick's C hits its
+// deadline, the snapshots its B retired are no longer B-selectable at the
+// next start (retired_at), so they wait for the next periodic tick or
+// retiredRun, an hour after a start, as a reaped suite's do (R3 #2's
+// residual). Such a snapshot counts twice: in displaced_reaped when B
+// retires it, in retired_reaped when C deletes it.
 //
 // Returns:
 //   - the cumulative counts (orphan, displaced, retired),
@@ -80,6 +102,7 @@ func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase stri
 			g.cfg.SnapshotBatchSize,
 			staleGraceSeconds,
 			g.cfg.KeepDisplaced,
+			phase != phaseStartup,
 		)
 		if err != nil {
 			return acc, false, fmt.Errorf("snapshot gc batch: %w", err)
@@ -168,7 +191,11 @@ const phaseRetired = "retired"
 // which the startup pass ran an hour before — work a restart would then
 // pay twice. This run is only C, bounded and chunked as in a tick, on Run's
 // goroutine (never beside a tick). Its blobs are reclaimed by the next
-// blob pass: the next start's or the next periodic tick's.
+// blob pass: the next start's or the next periodic tick's. C also deletes
+// the displaced snapshots a periodic tick's sub-job B retired (DN-7 of the
+// GC and upstream hardening plan): normally that tick's own C does, and
+// this run takes those a tick's C left at its deadline, which the startup
+// pass's B no longer selects.
 func (g *GC) retiredRun(ctx context.Context) {
 	defer g.recoverPanic("retired")
 	start := time.Now()

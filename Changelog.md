@@ -61,3 +61,6 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   churn no longer starves the writer.
 - A GC pass that fails at every tick no longer keeps the passes after it,
   the blob pass included, from running.
+- GC no longer holds every database write for seconds while it deletes old
+  snapshots: periodic runs retire the displaced snapshots beyond
+  `gc.keep_displaced` and delete them 10,000 rows a transaction.

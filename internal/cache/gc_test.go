@@ -3,8 +3,11 @@ package cache
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -930,7 +933,7 @@ func TestRunSnapshotGCBatch_FiveAdopted_KeepDisplaced3_ReapsOldest(t *testing.T)
 
 	defer stubNow(t, 1_000_000)() // way past the heartbeat grace; orphan path won't fire
 
-	res, err := c.RunSnapshotGCBatch(ctx, 100, 1800 /*30m*/, 3)
+	res, err := c.RunSnapshotGCBatch(ctx, 100, 1800 /*30m*/, 3, true)
 	if err != nil {
 		t.Fatalf("RunSnapshotGCBatch: %v", err)
 	}
@@ -942,6 +945,10 @@ func TestRunSnapshotGCBatch_FiveAdopted_KeepDisplaced3_ReapsOldest(t *testing.T)
 	if res.OrphanReaped != 0 {
 		t.Errorf("OrphanReaped = %d, want 0", res.OrphanReaped)
 	}
+	// A periodic tick's B retires, and sub-job C deletes (DN-7 of the GC
+	// and upstream hardening plan).
+	assertRetired(t, c, []int64{id1}, []int64{id2, id3, id4, id5})
+	drainRetired(t, c)
 	if snapshotExists(t, c, id1) {
 		t.Errorf("snapshot id1 should be reaped")
 	}
@@ -971,13 +978,17 @@ func TestRunSnapshotGCBatch_KeepDisplaced0_ReapsAllDisplaced(t *testing.T) {
 
 	defer stubNow(t, 1_000_000)()
 
-	res, err := c.RunSnapshotGCBatch(ctx, 100, 1800, 0)
+	res, err := c.RunSnapshotGCBatch(ctx, 100, 1800, 0, true)
 	if err != nil {
 		t.Fatalf("RunSnapshotGCBatch: %v", err)
 	}
 	if res.DisplacedReaped != 4 {
 		t.Errorf("DisplacedReaped = %d, want 4", res.DisplacedReaped)
 	}
+	// A periodic tick's B retires, and sub-job C deletes (DN-7 of the GC
+	// and upstream hardening plan).
+	assertRetired(t, c, []int64{id1, id2, id3, id4}, []int64{id5})
+	drainRetired(t, c)
 	if !snapshotExists(t, c, id5) {
 		t.Errorf("current snapshot id5 should be preserved")
 	}
@@ -1008,7 +1019,7 @@ func TestRunSnapshotGCBatch_NullCurrent_AllAdoptedReaped(t *testing.T) {
 
 	defer stubNow(t, 1_000_000)()
 
-	res, err := c.RunSnapshotGCBatch(ctx, 100, 1800, 0)
+	res, err := c.RunSnapshotGCBatch(ctx, 100, 1800, 0, true)
 	if err != nil {
 		t.Fatalf("RunSnapshotGCBatch: %v", err)
 	}
@@ -1016,6 +1027,10 @@ func TestRunSnapshotGCBatch_NullCurrent_AllAdoptedReaped(t *testing.T) {
 	if res.DisplacedReaped != 5 {
 		t.Errorf("DisplacedReaped = %d, want 5", res.DisplacedReaped)
 	}
+	// A periodic tick's B retires, and sub-job C deletes (DN-7 of the GC
+	// and upstream hardening plan).
+	assertRetired(t, c, []int64{id1, id2, id3, id4, id5}, nil)
+	drainRetired(t, c)
 	for _, id := range []int64{id1, id2, id3, id4, id5} {
 		if snapshotExists(t, c, id) {
 			t.Errorf("snapshot %d should be reaped (no current → all displaced)", id)
@@ -1042,13 +1057,17 @@ func TestRunSnapshotGCBatch_TieBreakOnSnapshotIDDesc(t *testing.T) {
 
 	defer stubNow(t, 1_000_000)()
 
-	res, err := c.RunSnapshotGCBatch(ctx, 100, 1800, 1)
+	res, err := c.RunSnapshotGCBatch(ctx, 100, 1800, 1, true)
 	if err != nil {
 		t.Fatalf("RunSnapshotGCBatch: %v", err)
 	}
 	if res.DisplacedReaped != 2 {
 		t.Errorf("DisplacedReaped = %d, want 2", res.DisplacedReaped)
 	}
+	// A periodic tick's B retires, and sub-job C deletes (DN-7 of the GC
+	// and upstream hardening plan).
+	assertRetired(t, c, []int64{id1, id2}, []int64{id3})
+	drainRetired(t, c)
 	// id3 has the highest snapshot_id; the (adopted_at DESC, snapshot_id
 	// DESC) tie-break makes it rank 1.
 	if !snapshotExists(t, c, id3) {
@@ -1061,26 +1080,34 @@ func TestRunSnapshotGCBatch_TieBreakOnSnapshotIDDesc(t *testing.T) {
 	}
 }
 
+// An orphan candidate is deleted at once in both modes, a periodic tick's
+// (retireDisplaced) included: only CommitAdoption inserts child rows, in
+// the transaction that sets adopted_at, so it holds a header only (DN-7 of
+// the GC and upstream hardening plan).
 func TestRunSnapshotGCBatch_OrphanReap_HeartbeatStale(t *testing.T) {
-	c := openCache(t)
-	ctx := context.Background()
+	for _, retireDisplaced := range []bool{false, true} {
+		t.Run(fmt.Sprintf("retireDisplaced=%v", retireDisplaced), func(t *testing.T) {
+			c := openCache(t)
+			ctx := context.Background()
 
-	defer stubNow(t, 100_000)()
+			defer stubNow(t, 100_000)()
 
-	r := seedBlob(t, c, "orphan-stale rel")
-	// heartbeat_at = 50_000; staleGrace = 30_000; cutoff = 70_000;
-	// 50_000 < 70_000 → eligible.
-	id := orphanCandidate(t, c, "http", "or.example", "/p", r, 50_000)
+			r := seedBlob(t, c, "orphan-stale rel")
+			// heartbeat_at = 50_000; staleGrace = 30_000; cutoff = 70_000;
+			// 50_000 < 70_000 → eligible.
+			id := orphanCandidate(t, c, "http", "or.example", "/p", r, 50_000)
 
-	res, err := c.RunSnapshotGCBatch(ctx, 100, 30_000, 0)
-	if err != nil {
-		t.Fatalf("RunSnapshotGCBatch: %v", err)
-	}
-	if res.OrphanReaped != 1 {
-		t.Errorf("OrphanReaped = %d, want 1", res.OrphanReaped)
-	}
-	if snapshotExists(t, c, id) {
-		t.Errorf("orphan snapshot %d should be reaped", id)
+			res, err := c.RunSnapshotGCBatch(ctx, 100, 30_000, 0, retireDisplaced)
+			if err != nil {
+				t.Fatalf("RunSnapshotGCBatch: %v", err)
+			}
+			if res.OrphanReaped != 1 {
+				t.Errorf("OrphanReaped = %d, want 1", res.OrphanReaped)
+			}
+			if snapshotExists(t, c, id) {
+				t.Errorf("orphan snapshot %d should be reaped", id)
+			}
+		})
 	}
 }
 
@@ -1095,7 +1122,7 @@ func TestRunSnapshotGCBatch_OrphanReap_HeartbeatFresh_Excluded(t *testing.T) {
 	// 90_000 >= 70_000 → not eligible.
 	id := orphanCandidate(t, c, "http", "of.example", "/p", r, 90_000)
 
-	res, err := c.RunSnapshotGCBatch(ctx, 100, 30_000, 0)
+	res, err := c.RunSnapshotGCBatch(ctx, 100, 30_000, 0, false)
 	if err != nil {
 		t.Fatalf("RunSnapshotGCBatch: %v", err)
 	}
@@ -1119,7 +1146,7 @@ func TestRunSnapshotGCBatch_OrphanReap_ExcludesCurrentSnapshot(t *testing.T) {
 	id := orphanCandidate(t, c, "http", "oc.example", "/p", r, 1)
 	setCurrentSnapshot(t, c, "http", "oc.example", "/p", id)
 
-	res, err := c.RunSnapshotGCBatch(ctx, 100, 30_000, 0)
+	res, err := c.RunSnapshotGCBatch(ctx, 100, 30_000, 0, false)
 	if err != nil {
 		t.Fatalf("RunSnapshotGCBatch: %v", err)
 	}
@@ -1129,6 +1156,285 @@ func TestRunSnapshotGCBatch_OrphanReap_ExcludesCurrentSnapshot(t *testing.T) {
 	if !snapshotExists(t, c, id) {
 		t.Errorf("current snapshot %d must not be reaped", id)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// DN-7 of the GC and upstream hardening plan (rulings HD-4, HD-7; the H3
+// final review R3 #4): a periodic tick's sub-job B retires the displaced
+// snapshots beyond keep_displaced, and sub-job C deletes them in chunks;
+// the startup pass's B still deletes them.
+// ---------------------------------------------------------------------------
+
+// childRowsByTable counts snapshot id's snapshot_member,
+// snapshot_skipped_member and package_hash rows, in that order (childRows,
+// snapshot_gc_retired_test.go, gives their sum).
+func childRowsByTable(t *testing.T, c *Cache, id int64) [3]int {
+	t.Helper()
+	var n [3]int
+	for i, table := range []string{"snapshot_member", "snapshot_skipped_member", "package_hash"} {
+		if err := c.db.QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE snapshot_id = ?`, id).Scan(&n[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return n
+}
+
+// snapshotRetiredAt returns snapshot id's retired_at and whether it is set
+// (false for a snapshot that is gone, too).
+func snapshotRetiredAt(t *testing.T, c *Cache, id int64) (int64, bool) {
+	t.Helper()
+	var at sql.NullInt64
+	err := c.db.QueryRow(`SELECT retired_at FROM suite_snapshot WHERE snapshot_id = ?`, id).Scan(&at)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		t.Fatal(err)
+	}
+	return at.Int64, at.Valid
+}
+
+// assertRetired fails unless each of retired is still there with retired_at
+// set — retired by sub-job B, its rows waiting for sub-job C — and each of
+// kept is there with retired_at NULL.
+func assertRetired(t *testing.T, c *Cache, retired, kept []int64) {
+	t.Helper()
+	for _, id := range retired {
+		if _, ok := snapshotRetiredAt(t, c, id); !ok || !snapshotExists(t, c, id) {
+			t.Fatalf("snapshot %d: header %v, retired %v; want it retired, not deleted", id, snapshotExists(t, c, id), ok)
+		}
+	}
+	for _, id := range kept {
+		if _, ok := snapshotRetiredAt(t, c, id); ok || !snapshotExists(t, c, id) {
+			t.Fatalf("snapshot %d: header %v, retired %v; want it kept as it was", id, snapshotExists(t, c, id), ok)
+		}
+	}
+}
+
+// drainRetired runs sub-job C — RunRetiredSnapshotGCChunk with the cache's
+// own chunk, as the snapshot pass does — until no retired snapshot is
+// left, and returns the headers it deleted.
+func drainRetired(t *testing.T, c *Cache) int {
+	t.Helper()
+	deleted := 0
+	for i := 0; ; i++ {
+		if i == 100 { // a stuck more = true fails here, not at the test timeout
+			t.Fatal("sub-job C still reports more after 100 calls")
+		}
+		n, more, err := c.RunRetiredSnapshotGCChunk(context.Background(), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		deleted += n
+		if !more {
+			return deleted
+		}
+	}
+}
+
+// displacedSuite creates key's suite and gives it six adopted snapshots,
+// oldest first: five displaced and the current one (the last). Each holds
+// wholeChildRows: two snapshot_member rows (InRelease and main/Packages),
+// one snapshot_skipped_member row and two package_hash rows. It returns
+// their ids and InRelease hashes (the content of their natural keys).
+func displacedSuite(t *testing.T, c *Cache, key SuiteKey) (ids []int64, anchors []string) {
+	t.Helper()
+	seedRow(t, c, key, 1)
+	for i := range 6 {
+		id, hashes := adoptWith(t, c, key, map[string]string{
+			"InRelease":     fmt.Sprintf("anchor %d of %s", i, key.SuitePath),
+			"main/Packages": fmt.Sprintf("index %d of %s", i, key.SuitePath),
+		})
+		for j := range 2 {
+			seedPackageHash(t, c, key.CanonicalScheme, key.CanonicalHost, fmt.Sprintf("/r/pool/p%d.deb", j),
+				hashes["main/Packages"], id, fmt.Sprintf("p%d", j), "amd64", "1")
+		}
+		if _, err := c.db.Exec(`INSERT INTO snapshot_skipped_member (snapshot_id, path, declared_sha256, size, reason, skipped_at)
+VALUES (?, 'main/skipped', ?, 1, '4xx', 1)`, id, hashes["main/Packages"]); err != nil {
+			t.Fatal(err)
+		}
+		ids, anchors = append(ids, id), append(anchors, hashes["InRelease"])
+	}
+	for _, id := range ids {
+		if got := childRowsByTable(t, c, id); got != wholeChildRows {
+			t.Fatalf("premise: snapshot %d has child rows %v, want %v", id, got, wholeChildRows)
+		}
+	}
+	return ids, anchors
+}
+
+// wholeChildRows is each displacedSuite snapshot's childRowsByTable.
+var wholeChildRows = [3]int{2, 1, 2}
+
+// DN-7: a periodic tick's sub-job B (retireDisplaced) only retires the
+// displaced snapshots beyond keep_displaced, in one short UPDATE —
+// retired_at is the batch's clock, and every child row stays — and leaves
+// the others as they were; the next batch selects nothing (B's selection
+// has retired_at IS NULL); and sub-job C then deletes the retired
+// snapshots' rows and headers, and nothing else.
+func TestRunSnapshotGCBatch_RetiresTheDisplacedBeyondKeep(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	stubNow(t, evictNow)
+	ids, _ := displacedSuite(t, c, sk("h", "/r/dists/x"))
+	stubNow(t, evictNow+evictDay) // the batch's clock
+	res, err := c.RunSnapshotGCBatch(ctx, 10, 1800, 3, true)
+	if err != nil || res.DisplacedReaped != 2 || res.OrphanReaped != 0 {
+		t.Fatalf("RunSnapshotGCBatch = %+v, %v; want the 2 displaced snapshots beyond keep_displaced = 3 retired", res, err)
+	}
+	for i, id := range ids {
+		beyond := i < 2 // the two oldest of the five displaced
+		at, retired := snapshotRetiredAt(t, c, id)
+		if !snapshotExists(t, c, id) || retired != beyond || (beyond && at != evictNow+evictDay) || childRowsByTable(t, c, id) != wholeChildRows {
+			t.Fatalf("snapshot %d (beyond keep_displaced: %v): header %v, retired_at %d (set %v), child rows %v; "+
+				"want the header, retired_at %d only beyond keep_displaced, and child rows %v",
+				id, beyond, snapshotExists(t, c, id), at, retired, childRowsByTable(t, c, id), evictNow+evictDay, wholeChildRows)
+		}
+	}
+	if res, err := c.RunSnapshotGCBatch(ctx, 10, 1800, 3, true); err != nil || res.Total() != 0 {
+		t.Fatalf("a second batch = %+v, %v; want nothing (B never selects what it retired)", res, err)
+	}
+	if n := drainRetired(t, c); n != 2 {
+		t.Fatalf("sub-job C deleted %d headers, want the 2 retired snapshots'", n)
+	}
+	for i, id := range ids {
+		beyond, want := i < 2, wholeChildRows
+		if beyond {
+			want = [3]int{}
+		}
+		if _, retired := snapshotRetiredAt(t, c, id); snapshotExists(t, c, id) == beyond || retired || childRowsByTable(t, c, id) != want {
+			t.Fatalf("after sub-job C, snapshot %d (beyond keep_displaced: %v): header %v, retired %v, child rows %v; "+
+				"want it deleted, rows and header, only beyond keep_displaced, and the others whole (%v)",
+				id, beyond, snapshotExists(t, c, id), retired, childRowsByTable(t, c, id), wholeChildRows)
+		}
+	}
+}
+
+// DN-7: without retireDisplaced (the startup pass, which runs before the
+// freshness scheduler and the listeners), sub-job B deletes the displaced
+// snapshots beyond keep_displaced, rows and headers, in its own
+// transaction, as it always did, and retires nothing: sub-job C finds
+// nothing to delete.
+func TestRunSnapshotGCBatch_DeletesTheDisplacedWhenNotRetiring(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	stubNow(t, evictNow)
+	ids, _ := displacedSuite(t, c, sk("h", "/r/dists/x"))
+	res, err := c.RunSnapshotGCBatch(ctx, 10, 1800, 3, false)
+	if err != nil || res.DisplacedReaped != 2 || res.OrphanReaped != 0 {
+		t.Fatalf("RunSnapshotGCBatch = %+v, %v; want the 2 displaced snapshots beyond keep_displaced = 3 deleted", res, err)
+	}
+	for i, id := range ids {
+		beyond, want := i < 2, wholeChildRows
+		if beyond {
+			want = [3]int{}
+		}
+		if _, retired := snapshotRetiredAt(t, c, id); snapshotExists(t, c, id) == beyond || retired || childRowsByTable(t, c, id) != want {
+			t.Fatalf("snapshot %d (beyond keep_displaced: %v): header %v, retired %v, child rows %v; "+
+				"want it deleted, rows and header, only beyond keep_displaced, and none retired",
+				id, beyond, snapshotExists(t, c, id), retired, childRowsByTable(t, c, id))
+		}
+	}
+	if n, more, err := c.RunRetiredSnapshotGCChunk(ctx, 0); err != nil || n != 0 || more {
+		t.Fatalf("RunRetiredSnapshotGCChunk = %d, %v, %v; want nothing retired to delete", n, more, err)
+	}
+}
+
+// DN-7, why retiring is safe: every reader that judges a suite's history
+// or serves a snapshot other than the current one filters retired_at, so a
+// displaced snapshot a periodic tick's sub-job B retired is invisible to it
+// exactly as one the startup pass's B deleted: each read gives the same
+// answer after the retirement as after the deletion — never-downgrade's
+// signed history (signedHistorySnapshotSQL), retained by-hash
+// (DisplacedSnapshotMembers: the handler's search, keep_displaced + 1
+// snapshots) and the natural key behind rollback_refused
+// (InsertCandidateSnapshot).
+func TestRunSnapshotGCBatch_ARetiredDisplacedSnapshotIsNoLongerRead(t *testing.T) {
+	modes := []struct {
+		name            string
+		retireDisplaced bool
+	}{{"retired", true}, {"deleted", false}}
+	t.Run("signed history", func(t *testing.T) {
+		for _, m := range modes {
+			t.Run(m.name, func(t *testing.T) {
+				c := openCache(t)
+				ctx := context.Background()
+				stubNow(t, evictNow)
+				// The suite's only signed history: two displaced inline
+				// snapshots (raw headers: no signed-seen marker), no current.
+				for i := range 2 {
+					adoptCandidate(t, c, "http", "h", "/r/dists/x", seedBlob(t, c, fmt.Sprintf("signed anchor %d", i)), evictNow-int64(2-i)*evictDay)
+				}
+				setCurrentSnapshot(t, c, "http", "h", "/r/dists/x", 0)
+				if err := c.CheckUnsignedDowngrade(ctx, "h", "/r/dists/x"); !errors.Is(err, ErrUnsignedDowngradeRefused) {
+					t.Fatalf("premise: CheckUnsignedDowngrade = %v, want refused by the displaced signed snapshots", err)
+				}
+				if res, err := c.RunSnapshotGCBatch(ctx, 10, 1800, 0, m.retireDisplaced); err != nil || res.DisplacedReaped != 2 {
+					t.Fatalf("RunSnapshotGCBatch(keep_displaced 0) = %+v, %v; want both displaced snapshots %s", res, err, m.name)
+				}
+				if err := c.CheckUnsignedDowngrade(ctx, "h", "/r/dists/x"); err != nil {
+					t.Fatalf("CheckUnsignedDowngrade = %v, want admitted: no signed history is left", err)
+				}
+			})
+		}
+	})
+	t.Run("retained by-hash", func(t *testing.T) {
+		for _, m := range modes {
+			t.Run(m.name, func(t *testing.T) {
+				c := openCache(t)
+				ctx := context.Background()
+				stubNow(t, evictNow)
+				ids, _ := displacedSuite(t, c, sk("h", "/r/dists/x"))
+				// The handler's search (tryDisplacedByHash): the newest
+				// keep_displaced + 1 displaced snapshots that hold the path.
+				lookup := func() []int64 {
+					t.Helper()
+					rows, err := c.DisplacedSnapshotMembers(ctx, "http", "h", "/r/dists/x", "main/Packages", ids[5], 3+1)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var got []int64
+					for _, r := range rows {
+						got = append(got, r.SnapshotID)
+					}
+					return got
+				}
+				if got, want := lookup(), []int64{ids[4], ids[3], ids[2], ids[1]}; !slices.Equal(got, want) {
+					t.Fatalf("premise: DisplacedSnapshotMembers = %v, want %v", got, want)
+				}
+				if res, err := c.RunSnapshotGCBatch(ctx, 10, 1800, 3, m.retireDisplaced); err != nil || res.DisplacedReaped != 2 {
+					t.Fatalf("RunSnapshotGCBatch(keep_displaced 3) = %+v, %v; want 2 displaced snapshots %s", res, err, m.name)
+				}
+				if got, want := lookup(), []int64{ids[4], ids[3], ids[2]}; !slices.Equal(got, want) {
+					t.Fatalf("DisplacedSnapshotMembers = %v, want the kept snapshots' %v only", got, want)
+				}
+			})
+		}
+	})
+	t.Run("rollback", func(t *testing.T) {
+		for _, m := range modes {
+			t.Run(m.name, func(t *testing.T) {
+				c := openCache(t)
+				ctx := context.Background()
+				stubNow(t, evictNow)
+				ids, anchors := displacedSuite(t, c, sk("h", "/r/dists/x"))
+				candidate := func(anchor string) (int64, bool, error) {
+					return c.InsertCandidateSnapshot(ctx, SnapshotCandidate{CanonicalScheme: "http", CanonicalHost: "h",
+						SuitePath: "/r/dists/x", InReleaseHash: &anchor})
+				}
+				var adopted *NaturalKeyAdoptedError
+				if _, _, err := candidate(anchors[0]); !errors.As(err, &adopted) || adopted.SnapshotID != ids[0] {
+					t.Fatalf("premise: the oldest snapshot's content again = %v, want *NaturalKeyAdoptedError for %d", err, ids[0])
+				}
+				if res, err := c.RunSnapshotGCBatch(ctx, 10, 1800, 3, m.retireDisplaced); err != nil || res.DisplacedReaped != 2 {
+					t.Fatalf("RunSnapshotGCBatch(keep_displaced 3) = %+v, %v; want 2 displaced snapshots %s", res, err, m.name)
+				}
+				if id, reused, err := candidate(anchors[0]); err != nil || reused || id <= ids[5] {
+					t.Fatalf("the %s snapshot's content again = %d, reused %v, %v; want a new candidate", m.name, id, reused, err)
+				}
+				if _, _, err := candidate(anchors[2]); !errors.As(err, &adopted) || adopted.SnapshotID != ids[2] {
+					t.Fatalf("a kept snapshot's content again = %v, want *NaturalKeyAdoptedError for %d (rollback_refused)", err, ids[2])
+				}
+			})
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------

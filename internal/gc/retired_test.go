@@ -134,7 +134,12 @@ func TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs(t *testing.T) {
 // pass (ruling PF-15) and a start that stops a second short of its hour,
 // and is deleted an hour into the next start, which logs
 // gc_retired_run_complete; no periodic tick ran (no periodic
-// gc_run_complete).
+// gc_run_complete). Another suite's displaced snapshot beyond
+// keep_displaced is deleted by the first start's startup pass, which
+// deletes it rather than retiring it (DN-7 of the GC and upstream
+// hardening plan: retired, it would wait for a run an hour into a start,
+// which a daemon that never lives an hour never reaches), so the run an
+// hour into the second start deletes only the forgotten suite's.
 func TestRun_DeletesRetiredSnapshotsAnHourAfterTheStart(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		c := openTestCache(t)
@@ -149,6 +154,13 @@ func TestRun_DeletesRetiredSnapshotsAnHourAfterTheStart(t *testing.T) {
 		}
 		if res, err := c.ForgetSuite(ctx, key, &id); err != nil || !res.Deleted {
 			t.Fatalf("ForgetSuite = %+v, %v", res, err)
+		}
+		var displaced int64 // the oldest of five: beyond the current one and keep_displaced = 3
+		for i := range 5 {
+			if sid := adoptSnapshot(t, c, "http", "h", "/r/dists/z", putPoolBlob(t, c, fmt.Sprintf("z anchor %d", i)),
+				[]string{putPoolBlob(t, c, fmt.Sprintf("z member %d", i))}); i == 0 {
+				displaced = sid
+			}
 		}
 		cfg := Config{Cache: c, Logger: logger, Enabled: true, Interval: 24 * time.Hour, BatchSize: 100,
 			SnapshotBatchSize: 10, MaxTickDuration: time.Minute, BlobGrace: time.Minute, KeepDisplaced: 3,
@@ -172,6 +184,9 @@ func TestRun_DeletesRetiredSnapshotsAnHourAfterTheStart(t *testing.T) {
 		start(time.Hour - time.Second)
 		if !snapshotRowExists(t, db, id) {
 			t.Fatal("the retired snapshot was deleted before an hour had passed")
+		}
+		if snapshotRowExists(t, db, displaced) {
+			t.Fatal("the displaced snapshot beyond keep_displaced survived the startup pass, which deletes it")
 		}
 		start(time.Hour + time.Second)
 		if snapshotRowExists(t, db, id) {
@@ -197,6 +212,61 @@ func TestRun_DeletesRetiredSnapshotsAnHourAfterTheStart(t *testing.T) {
 			t.Fatalf("gc_retired_run_complete lines %v, want one at INFO: retired_reaped 1, deadline_reached false", retiredRuns)
 		}
 	})
+}
+
+// DN-7 of the GC and upstream hardening plan (rulings HD-4, HD-7; the H3
+// final review R3 #4): one periodic tick's snapshot pass retires the
+// displaced snapshots beyond keep_displaced (sub-job B, one short UPDATE)
+// and deletes them in chunks (sub-job C), and the same tick's blob pass
+// reclaims their blobs once blob_grace has passed. Its gc_run_complete
+// counts them twice — in displaced_reaped when retired, in retired_reaped
+// when deleted — and so does LastRunSummary (the status page's GC
+// figures).
+func TestPeriodicTick_RetiresAndDeletesTheDisplacedSnapshots(t *testing.T) {
+	c := openTestCache(t)
+	logger, buf := captureLogger()
+	db := dbOf(t, c)
+	var (
+		ids   []int64
+		blobs [][2]string // each snapshot's anchor and member
+	)
+	for i := range 6 { // the current one and five displaced: two beyond keep_displaced = 3
+		anchor, member := putPoolBlob(t, c, fmt.Sprintf("anchor %d", i)), putPoolBlob(t, c, fmt.Sprintf("member %d", i))
+		ids = append(ids, adoptSnapshot(t, c, "http", "h", "/r/dists/x", anchor, []string{member}))
+		blobs = append(blobs, [2]string{anchor, member})
+	}
+	for _, b := range blobs[:2] { // unpinned since their snapshots' displacement: past blob_grace
+		fastForwardZeroedAt(t, db, b[0])
+		fastForwardZeroedAt(t, db, b[1])
+	}
+	g, err := New(Config{Cache: c, Logger: logger, Enabled: true, Interval: time.Hour, BatchSize: 100,
+		SnapshotBatchSize: 10, MaxTickDuration: time.Minute, BlobGrace: time.Minute, KeepDisplaced: 3,
+		PoolScanWorkers: 2, HeartbeatStaleGrace: 30 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.periodicTick(context.Background())
+	for i, id := range ids {
+		beyond := i < 2
+		if snapshotRowExists(t, db, id) == beyond {
+			t.Fatalf("after one periodic tick, snapshot %d (beyond keep_displaced: %v) kept %v", id, beyond, !beyond)
+		}
+		for _, h := range blobs[i] {
+			if blobRowExists(t, db, h) == beyond || fileExists(t, c.BlobPath(h)) == beyond {
+				t.Fatalf("blob %s of snapshot %d (beyond keep_displaced: %v): row %v, file %v; want both gone only beyond it",
+					h, id, beyond, blobRowExists(t, db, h), fileExists(t, c.BlobPath(h)))
+			}
+		}
+	}
+	runs := gcEvents(t, buf, "gc_run_complete")
+	if len(runs) != 1 || runs[0]["phase"] != "periodic" || runs[0]["displaced_reaped"] != float64(2) ||
+		runs[0]["retired_reaped"] != float64(2) {
+		t.Fatalf("gc_run_complete lines %v; want the periodic tick's, displaced_reaped 2 (retired) and "+
+			"retired_reaped 2 (deleted)", runs)
+	}
+	if s, ok := g.LastRunSummary(); !ok || s.DisplacedReaped != 2 || s.RetiredReaped != 2 {
+		t.Fatalf("LastRunSummary = %+v, %v; want displaced_reaped 2 and retired_reaped 2", s, ok)
+	}
 }
 
 // Deferred minor A-3: the GC's run stamps (gc_run_complete's
