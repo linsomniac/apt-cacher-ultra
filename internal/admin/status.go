@@ -1117,7 +1117,7 @@ func reasonTooltip(reason string) string {
 	case "malformed_clearsign":
 		return "InRelease starts like a clearsigned message but is not one in the shape apt accepts: its signature frame does not decode, or a line follows the signature, its armor checksum is forged, its armor is damaged, or it carries packets apt refuses."
 	case "malformed_signature":
-		return "The upstream Release.gpg is not one ASCII-armored signature block as apt requires — bytes around it, a binary signature, or a damaged armor."
+		return "The upstream Release.gpg is not one ASCII-armored signature block as apt requires — bytes around it, a binary signature, a damaged armor, or packets apt refuses."
 	case "ambiguous_keyid":
 		return "Two or more keys in the trust set share the same 8-byte keyid; the short-keyid fallback refuses to guess."
 	case "crypto_verify_failed":

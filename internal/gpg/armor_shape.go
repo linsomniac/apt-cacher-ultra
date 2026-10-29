@@ -8,12 +8,14 @@ package gpg
 //
 // AIDEV-NOTE: go-crypto's decoders are lenient where apt is not — the armor
 // reader skips a header line without a colon to the next BEGIN line, ends the
-// body at any line starting "-----END ", takes any line with a colon as a
-// header, and ignores the CRC (RFC 9580); clearsign.Decode cuts the armor at
-// the first substring "\n-----END PGP SIGNATURE-----". These checks run on the
-// raw bytes beside the decode, so what the decoder skipped cannot reach the
-// pool. Re-check them when go-crypto is upgraded (the table test and the
-// oracle pin them).
+// body at a line that starts "-----END " once bytes.TrimSpace has trimmed it
+// and at a trimmed five-character line starting "=" (its CRC line), takes any
+// line with a colon as a header, and ignores the CRC (RFC 9580);
+// clearsign.Decode cuts the armor at the first substring
+// "\n-----END PGP SIGNATURE-----". These checks run on the raw bytes beside
+// the decode, so what the decoder skipped cannot reach the pool (F3 and F4
+// trim as the reader does: checkSignatureArmor's note). Re-check them when
+// go-crypto is upgraded (the table test and the oracle pin them).
 //
 // This file holds F0 and F2–F5, both forms; F1 is the callers'
 // (requireBareClearsigned inline, isArmoredSignature detached) and F6 is

@@ -338,6 +338,8 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 		if err := requireInlineSignatureShape(inRelease, sigBytes); err != nil {
 			return nil, err
 		}
+		// F6 passes an armor with no packet at all: this refuses it
+		// (TestVerifyInline_AcceptAnySigner_EmptyArmorStillRejected).
 		if err := requireParseableSignature(bytes.NewReader(sigBytes)); err != nil {
 			return nil, fmt.Errorf("clearsigned signature body: %w", err)
 		}

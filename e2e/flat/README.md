@@ -270,9 +270,10 @@ both:
 - **A binary detached `Release.gpg`.** apt (2.2 to 3.2) refuses one
   ("unsupported binary format"), so Jitsi's binary signature sits beside
   an `InRelease` that apt uses. Two Go tests cover the cache's side:
-  `TestSniffReleaseGPG` (the sniff's binary cases) and
-  `TestVerifyDetached_HappyPath_Binary` (verifying a binary detached
-  signature).
+  `TestSniffReleaseGPG` (the sniff's binary cases: the handler still
+  marks such a suite signed, the fail-safe direction) and
+  `TestVerifyDetached_RefusesABinarySignature` (the verifier refuses a
+  binary `Release.gpg`, reason `malformed_signature`, as apt does).
 - **The 403 unsigned variant's first adoption.** It needs an hour, past
   any bounded run.
   `TestCheckFirst_UnsignedAfterADeniedSignatureWaitsAnHour` covers it.

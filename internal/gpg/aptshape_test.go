@@ -347,6 +347,50 @@ func TestCRC24_RFC4880CheckValue(t *testing.T) {
 	}
 }
 
+// TestCheckSignatureArmor_BlankLinesAreSpacesTabsAndCRs pins the two places
+// checkSignatureArmor asks whether a line is blank — the line that ends the
+// armor headers (F5) and the lines after the CRC line (F3) — to isBlankLine,
+// spaces, tabs and CRs only, not bytes.TrimSpace, which also trims a
+// vertical tab, a form feed, U+0085 and U+00A0 (ruling HD-13 keeps the
+// after-CRC test so; F5's header end makes the same choice). A "\v" line in
+// either place is refused; spaces, a tab and a CR there pass.
+func TestCheckSignatureArmor_BlankLinesAreSpacesTabsAndCRs(t *testing.T) {
+	decoded := []byte("the bytes the CRC line covers; the checks never parse them")
+	good := string(armorSignature(t, decoded))
+	const begin = "-----BEGIN PGP SIGNATURE-----\n\n"
+	const end = "\n-----END PGP SIGNATURE-----"
+	if !strings.HasPrefix(good, begin) || strings.Count(good, end) != 1 {
+		t.Fatalf("test premise: an unexpected armor %q", good)
+	}
+	check := func(text string) error {
+		b := []byte(text)
+		return checkSignatureArmor(b, splitLines(b), 0, decoded)
+	}
+	headersEnd := func(blank string) string {
+		return strings.Replace(good, begin, "-----BEGIN PGP SIGNATURE-----\n"+blank+"\n", 1)
+	}
+	afterCRC := func(blank string) string {
+		return strings.Replace(good, end, "\n"+blank+end, 1)
+	}
+	for name, text := range map[string]string{
+		"the armor as written":               good,
+		"headers ended by spaces, tab, CR":   headersEnd("  \t\r"),
+		"spaces, tab, CR after the CRC line": afterCRC("  \t\r"),
+	} {
+		if err := check(text); err != nil {
+			t.Errorf("%s: %v; want it accepted", name, err)
+		}
+	}
+	for name, text := range map[string]string{
+		"headers ended by a vertical tab (F5)":   headersEnd("\v"),
+		"a vertical tab after the CRC line (F3)": afterCRC("\v"),
+	} {
+		if err := check(text); err == nil {
+			t.Errorf("%s: accepted; want refused (a blank line is spaces, tabs and CRs only)", name)
+		}
+	}
+}
+
 // TestRequireSignaturePacketsOnly_Framing pins F6's framing walk on what
 // the corpus does not hold: one signature packet framed in each of the
 // six length encodings of RFC 9580 §4.2 is accepted, and a partial or an

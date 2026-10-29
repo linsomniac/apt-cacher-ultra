@@ -1006,9 +1006,10 @@ func (a *Adopter) Run(ctx context.Context, suite SuiteRef, inRelease []byte, eta
 
 // RunDetached executes the §7.5 adoption flow for a detached-form
 // suite. releaseBytes is the Release file body, sigBytes is the
-// Release.gpg body (armored or binary). etag/lastmod are validators
-// from the Release fetch response; subsequent freshness checks
-// conditional-GET Release with these.
+// Release.gpg body: one ASCII-armored signature block, since the
+// verifier refuses a binary one (malformed_signature), as apt does.
+// etag/lastmod are validators from the Release fetch response;
+// subsequent freshness checks conditional-GET Release with these.
 //
 // SPEC2 §7.6.3 calls for both forms; this is the "Release +
 // Release.gpg" branch invoked when an upstream returns 404 on

@@ -1024,7 +1024,9 @@ func TestVerifier_AcceptAnySigner_LogsOncePerSuite(t *testing.T) {
 // guard, a clearsigned envelope whose armored body is garbage would
 // silently adopt under the bypass. The guard was requireParseableSignature;
 // F6 (requireSignaturePacketsOnly, structural, so on the bypass too) now
-// refuses it first, as ErrMalformedClearsign.
+// refuses it first, as ErrMalformedClearsign. requireParseableSignature
+// still refuses an armor with no packet at all, which F6 passes:
+// TestVerifyInline_AcceptAnySigner_EmptyArmorStillRejected pins it.
 func TestVerifier_AcceptAnySigner_MalformedSignatureBody_StillRejected(t *testing.T) {
 	other := newTestEntity(t, "Other", "other@example.com")
 	keyring := newKeyring(t, other)
@@ -1051,6 +1053,57 @@ func TestVerifier_AcceptAnySigner_MalformedSignatureBody_StillRejected(t *testin
 	_, err = v.VerifyInline(context.Background(), newSuite(), body)
 	if !errors.Is(err, ErrMalformedClearsign) {
 		t.Fatalf("err = %v; want ErrMalformedClearsign on clearsigned envelope with malformed signature body under accept_any_signer", err)
+	}
+}
+
+// TestVerifyInline_AcceptAnySigner_EmptyArmorStillRejected is the inline
+// twin of TestVerifyDetached_AcceptAnySigner_EmptyArmorStillRejected: an
+// InRelease whose signature armor holds no packet at all passes the shape
+// checks — F1 and F0, the decode, and F2–F6 (F6 refuses every packet that is
+// not a parseable signature, and there is none) — so on the
+// accept_any_signer bypass requireParseableSignature is what refuses it
+// ("clearsigned signature body: … no signature packet"), and on the trusted
+// path verifyAnyTrusted (ErrNoUsableSignature).
+func TestVerifyInline_AcceptAnySigner_EmptyArmorStillRejected(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	keyring := newKeyring(t, signer)
+	body, err := assembleClearsignedBlock([]byte(fakeReleasePlaintext), nil)
+	if err != nil {
+		t.Fatalf("assembleClearsignedBlock: %v", err)
+	}
+	if err := requireBareClearsigned(body); err != nil {
+		t.Fatalf("test premise: F1 or F0 refuses the empty armor: %v", err)
+	}
+	block, err := decodeClearsigned(body)
+	if err != nil || block == nil {
+		t.Fatalf("test premise: the envelope does not decode (block %v, err %v)", block, err)
+	}
+	sigBytes, err := readArmoredSignature(block.ArmoredSignature.Body)
+	if err != nil || len(sigBytes) != 0 {
+		t.Fatalf("test premise: the armor holds %d bytes (err %v), want none", len(sigBytes), err)
+	}
+	if err := requireInlineSignatureShape(body, sigBytes); err != nil {
+		t.Fatalf("test premise: F2–F6 refuse the empty armor (%v); want them to pass it", err)
+	}
+	for _, anySigner := range []bool{false, true} {
+		v, err := NewVerifier(VerifierConfig{
+			Keyring:          keyring,
+			RequireSignature: true,
+			AcceptAnySigner:  anySigner,
+			Logger:           silentLogger(),
+		})
+		if err != nil {
+			t.Fatalf("NewVerifier: %v", err)
+		}
+		got, err := v.VerifyInline(context.Background(), newSuite(), body)
+		switch {
+		case err == nil || got != nil:
+			t.Errorf("accept_any_signer=%v: got %q, err %v; want an armor with no packet refused", anySigner, got, err)
+		case anySigner && (!strings.Contains(err.Error(), "clearsigned signature body") || !strings.Contains(err.Error(), "no signature packet")):
+			t.Errorf("bypass: err = %v; want requireParseableSignature's refusal (clearsigned signature body: … no signature packet)", err)
+		case !anySigner && !errors.Is(err, ErrNoUsableSignature):
+			t.Errorf("trusted path: err = %v; want ErrNoUsableSignature", err)
+		}
 	}
 }
 
