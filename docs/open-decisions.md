@@ -11,6 +11,12 @@ block (`docs/superpowers/plans/2026-09-28-flat-repositories-00-overview.md`).
 Design follow-ups that are not decisions yet are listed in [the
 flat-repositories spec](superpowers/specs/2026-09-27-flat-repositories-design.md),
 §10.
+The GC and upstream hardening plan of 2026-10-28 (the hardening plan
+below; `docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md`)
+worked five *Open* entries of this file for 1.1.0, now under *Decided*.
+Its rulings HD-1 to HD-10 are in its *Design notes and rulings*; HD-11
+to HD-14 were made while it was carried out, and the *Decided* entries
+of its work say what each decided.
 
 ## Before the 1.1.0 release candidate
 
@@ -188,42 +194,6 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   slot contention. Recommendation: leave it; if it is ever reported, an
   in-memory mark set by a queued client check (like `absentAnswered`)
   makes the suite due at the next tick.
-- **GC's sub-job B deletes displaced snapshots in one transaction**
-  (raised 2026-10-27, the H3 final review R3 #4; unchanged since 1.0.x).
-  `RunSnapshotGCBatch` (`internal/cache/gc.go`) deletes up to
-  `gc.snapshot_batch_size` snapshots' `package_hash` rows at once: six
-  snapshots of 70,000 rows held the writer 4.7 s in a probe, so a full
-  batch holds every write (a miss's store, a flip's commit) about 8 s.
-  Sub-job C was chunked for this reason (10,000 rows a transaction).
-  Recommendation: have B retire displaced snapshots beyond
-  `keep_displaced` and let C delete them in chunks.
-- **A GC pass that fails at every tick starves the passes after it**
-  (raised 2026-10-27, the H3 final review R3 #5; unchanged since 1.0.x
-  for the url_path pass and sub-jobs A and B). `runTick`
-  (`internal/gc/gc.go`) moves the pass rotation on after a panic but not
-  after an error, so a pass that errors each time (a fault limited to its
-  tables) keeps the blob pass from running; the only sign is WARN
-  `gc_tick_failed` per tick. Recommendation: advance the rotation after
-  an error too, as after a panic.
-- **The inline verifier accepts three shapes apt rejects** (raised
-  2026-09-08, the security review's theme one: VC-2, C-4, VC-1; confirmed
-  2026-10-27 by the H3 final review R6 #2). `VerifyInline`
-  (`internal/gpg/verifier.go`) accepts a valid `InRelease` followed by
-  blank lines, a forged CRC line, and an extra bad signature from the
-  same trusted key; its comments now say what is enforced. None makes the
-  cache serve unsigned content as signed. Recommendation: tighten each in
-  a later release, one test per shape, after checking what apt 2.2–3.2
-  do with it.
-- **No limit on an upstream body's size** (raised 2026-09-08, the
-  security review's A-2 and VA-3; raised again 2026-10-27, the H3 final
-  review R6 #3). An unsigned `Release` declares its own members' sizes,
-  and the size check runs after the download; with `adopt_unsigned = true`
-  (the default) a client that fetches an unsigned repository through the
-  cache makes it adopt that repository's members, so this reach is new in
-  1.1.0 (`docs/configuration.md`, the unsigned threat notes, says bytes
-  are not bounded). Recommendation:
-  cap each member's download at its declared size (plus a margin) and
-  turn off transparent gzip decoding for members, in the next release.
 - **CI keeps e2e/flat's full logs** (raised 2026-10-27, the H3 final
   review R8 #3). A failed `e2e-flat` job leaves only the harness's
   80-line tail (now without `admin_request` lines): `e2e/flat/run.sh`
@@ -251,17 +221,305 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   in `serve_until_cleanup_test.go`'s `AIDEV-NOTE` is checked by the H3
   plan's census, not by a test. Recommendation: fix the first three with
   the next packaging change; the rest when their code is next touched.
-- **A vouched `.deb` whose snapshot is retired during its download**
-  (raised 2026-10-27, the H3 final review's R6 re-review; unchanged since
-  1.0.x). On a strict host, a `.deb` miss that was vouched before its
-  download is served unchecked once if its vouching snapshot is retired
-  while it downloads.
-  Recommendation: in the read after the download, treat a `.deb` that
-  was vouched before it and has no row now as a strict refusal, not a
-  pass, with a test that retires the snapshot mid-download.
+- **Downloads with no declared size have no byte limit** (raised 2026-10-28,
+  the hardening plan's DN-1). Adoption stops a member's download at its
+  declared size (*Decided*, below), but a client request's miss, hot
+  prefetch's `.deb`s and the handler's re-fetch of a snapshot member whose
+  pool file is gone (`runSnapshotMemberFetch`,
+  `internal/handler/handler.go`) have no size to stop at: their
+  `fetch.Target` sets no `MaxBytes`, and they are bounded only by a
+  response's `Content-Length`, which the body must match, and by
+  `upstream.total_timeout` (5 minutes by default). A cap needs a size per
+  file, which `snapshot_member` and `package_hash` lack: a schema change.
+  Recommendation: keep `Content-Length` and `upstream.total_timeout` as
+  their bounds; `runSnapshotMemberFetch` could take a cap from the blob
+  row's size when that row survives.
+- **`accept_any_signer`'s bypass applies no S1** (raised 2026-10-28, the
+  hardening plan's DN-8). Under `adoption.accept_any_signer` with no pin
+  matched, the verifier checks an anchor's structure (F0–F6) and that it
+  holds a parseable signature packet, and verifies no signature, so S1,
+  which refuses a bad signature from a key in the host keyring, is not
+  applied: it would be the bypass's only signature check (the AIDEV-NOTE in
+  `VerifyInline`'s bypass; `docs/configuration.md`, *Trust and signer
+  pins*). The cache can then adopt an anchor that a client holding the key
+  refuses. Recommendation: leave it, since the bypass makes the clients' own
+  verification the trust boundary, as `docs/configuration.md` says.
+- **The `Release.gpg` sniff still passes a binary signature** (raised
+  2026-10-28, the hardening plan's DN-8). The verifier now refuses a
+  `Release.gpg` that does not start with its armor's BEGIN line, a binary
+  one included, as every measured apt does, but the sniff the handler and
+  the freshness probe share (`aptpath.SniffReleaseGPG`, spec C3;
+  `TestSniffReleaseGPG`) still passes a binary signature, or blank lines
+  before the armor: such a file still earns its suite a signed-seen marker,
+  and the probe still takes a suite without an `InRelease` for a detached
+  one, whose adoption the verifier then refuses (`malformed_signature`).
+  Both only keep the suite from adopting unsigned, the fail-safe direction,
+  and the four vendors in the vendor survey of the hardening plan's security
+  review (2026-10-28) that publish a binary `Release.gpg` all publish an
+  `InRelease`, which the check prefers. Recommendation: leave it.
+- **The cache is stricter than `debian:13`'s apt** (raised 2026-10-28, the
+  hardening plan's DN-2 and DN-3). `debian:13`'s apt 3.0.3 verifies with
+  Sequoia's `sqv` (the image has no gpgv) and accepts 27 of the corpus' 168
+  shapes that every gpgv-based apt refuses, among them a forged CRC line, a
+  bad signature from a known key beside a good one and an expired key's
+  signature alone (`verdicts.txt`). The cache now refuses all 27
+  (ruling HD-2: what any supported apt refuses is refused), so it does not
+  adopt such an anchor — the suite keeps its previous snapshot, if it has
+  one — where a `debian:13` client fetching directly accepts it: stricter
+  than that client, never looser. Recommendation: keep the rule.
+- **Fourteen anchor shapes every apt accepts are refused** (raised
+  2026-10-28, the hardening plan's DN-6 and ruling HD-9; two more by
+  ruling HD-13 and one by HD-14). `aptShapeDeviations`
+  (`internal/gpg/aptshape_test.go`) lists them with their reasons: a second
+  armor block, which neither decoder reads, so neither S1 nor S2 can check
+  it (4 shapes); go-crypto's clearsign decoder, which refuses spaces or a
+  second CR after the signature's BEGIN line and an armor header other than
+  `Hash` before the signed text (3); an armor with no blank line before its
+  body, which F5 refuses too (2); a packet go-crypto cannot parse, of an
+  unknown public-key algorithm or with zero bytes inside its declared length
+  (3); and two packets with rewritten issuer subpackets, where go-crypto
+  verifies by another subpacket than gpgv reads
+  (`x3i_goodsig_unhashed_fpr_added`, `t7g7b_33junk_33A`). The reasons record
+  that no surveyed vendor publishes a second block or zero bytes inside a
+  packet. Recommendation: keep them; revisit one when a vendor's anchor is
+  refused for it, or when go-crypto changes (the go-crypto entry below).
+- **Weak digests and keys (C-3), and the rest of C-1** (raised 2026-09-08,
+  the security review's C-3 and C-1; left out of the hardening plan, its
+  DN-1). C-3: the verifier applies no digest or key-size policy
+  (`VerifyDetachedSignature` runs with a nil config, so a SHA-1 signature,
+  or one by an RSA-1024 key, counts as good where apt does not count it),
+  and so adopts `x3i_sha1_only`, an `InRelease` whose only signature uses
+  SHA-1, which all six measured apt refuse: the table test's one
+  known-unsafe shape (`aptShapeKnownUnsafe`); only the signer can make it.
+  C-1: the `Date` rules and `rollback_refused` (spec C5) protect a suite
+  from a replayed anchor after its first adoption, but nothing checks
+  `Valid-Until`, and a replaying man in the middle can choose a suite's
+  first snapshot (the flat-repositories spec, §10 item 5). Recommendation:
+  in a later release, refuse what apt refuses for weak digests and keys,
+  with a corpus row each, and take up the spec's §10 item 5 (`Valid-Until`
+  and per-suite identity pinning).
+- **S1 covers only the keys the cache holds** (raised 2026-10-28, the
+  hardening plan's DN-5). S1 refuses an anchor that carries a bad signature
+  from a key in the cache's host keyring, and ignores one from a key the
+  keyring lacks (gpgv's NO_PUBKEY); a client that trusts such a key still
+  refuses the anchor, so the cache adopts what that client refuses.
+  `docs/configuration.md` (*Trust and signer pins*) asks the operator to
+  install in the cache every key the clients' `signed-by` names.
+  Recommendation: leave it (inherent: the cache checks the keys it holds).
+- **S2's key-ID collision quirk** (raised 2026-10-28, the hardening plan's
+  ruling HD-10). S2 (`verifyAnyTrusted`, `internal/gpg/verifier.go`),
+  unchanged, verifies a packet whose issuer fingerprint is trusted against
+  the whole trust set at once, and go-crypto's `VerifyDetachedSignature`
+  hashes once and tries each key holding the packet's key ID with that one
+  hash, which only the first can pass: a host key that shares the signer's
+  key ID and is loaded ahead of it makes S2 refuse a valid anchor
+  (`crypto_verify_failed`), as before the hardening plan. S1 tries each
+  entity alone
+  (`TestRequireKnownSignaturesVerify_AKeyIDCollisionDoesNotFailAValidSignature`,
+  which notes that S2 still refuses). Recommendation: if it is ever met,
+  verify S2's fingerprint path against the single entity that owns the
+  issuer fingerprint, with a test.
+- **Displaced snapshots a periodic tick retired but did not delete wait**
+  (raised 2026-10-28, the hardening plan's DN-7). When a periodic tick's
+  snapshot pass stops before its sub-job C has deleted what its sub-job B
+  retired — at its deadline, at a shutdown, or on a batch or chunk that
+  failed or panicked — those snapshots, which have `retired_at`, are no
+  longer B's to delete at the next start: they wait for a later periodic
+  tick's snapshot pass or the retired run an hour after a start, so a daemon
+  that never lives that long keeps them, as it keeps a reaped suite's (the
+  H3 final review's R3 #2 residual; `runSnapshotPass`'s AIDEV-NOTE,
+  `internal/gc/snapshot.go`). They never serve meanwhile. Recommendation:
+  leave it; look again if a daemon that restarts often is seen to keep them.
+- **Sub-job C's chunk size** (raised 2026-10-28, the hardening plan's
+  Task 2; ruling HD-11). Sub-job C deletes 10,000 rows a writer transaction
+  (spec C9; `retiredChunkRows`, `internal/cache/gc.go`), and a chunk holds
+  every write while it runs: Task 2 measured 120–240 ms a chunk (median
+  149–191 ms; no `-race`, a loaded 12-thread laptop, 700,000 `package_hash`
+  rows), where the plan had expected under 200 ms and phase F had measured
+  about 80 ms. Ruling HD-11 kept 10,000 rows: the aim was that GC never
+  holds the writer for seconds, which this meets. Recommendation: re-measure
+  on a staging host before deciding; a chunk under 10,000 rows is a change
+  to spec C9 (pinned by
+  `TestRunRetiredSnapshotGCChunk_TheChunkIsTenThousandRows`).
+- **A vouched `.deb` is stored unchecked when the read after its download
+  fails** (raised 2026-10-28, the hardening plan's Task 4 review, Minor 3;
+  the posture predates that plan). When the read before a `.deb` miss's
+  download found it vouched (one declared hash) and the read after the
+  download fails, `runFetch` (`internal/handler/handler.go`) logs WARN
+  `package_hash validate lookup failed` and stores and serves the file with
+  no hash constraint (`Finalize`), on any host: it fails open, as the hit
+  path does, so that a database fault does not refuse every package. The
+  hash the first read found is not kept. Recommendation: keep it, and
+  finalize with it (`FinalizeExpectingHash`), which refuses only bytes that
+  do not match it, so it adds no flood of refusals.
+- **Some shape refusals are reported as `crypto_verify_failed`** (raised
+  2026-10-29, the hardening plan's Task 6 review, Minor 4). A base64 error
+  in a signature's armor body (`x4i_b64_invalid_char`,
+  `x4d_b64_invalid_char`) is refused, in both forms, with a plain error
+  rather than the `malformed_*` reasons the other shape refusals get, and so
+  are `accept_any_signer`'s bypass's refusal of an armor that holds no
+  signature packet (`signature body contains no signature packet`) and a
+  signature over the verifier's 64 KiB cap. `ClassifyVerifyErr` reports each
+  as `crypto_verify_failed`, whose tooltip on the status page ("The
+  signature's issuer was trusted but the cryptographic verification itself
+  failed.") is wrong for them. Recommendation: wrap the base64 error and the
+  empty armor's refusal in `ErrMalformedClearsign` and
+  `ErrMalformedSignature`, with a `TestClassifyVerifyErr` row each.
+- **S1 and S2 verify each packet as go-crypto writes it again** (raised
+  2026-10-29, the hardening plan's ruling HD-14). Both re-serialize a
+  signature packet (`sig.Serialize`) to verify it alone, and go-crypto then
+  declares the packet's length from each subpacket's length in its shortest
+  form, so a legitimately signed packet whose hashed area writes a length in
+  more octets than it needs comes out framed wrong and fails where gpgv
+  verifies it (the AIDEV-NOTE in `requireKnownSignaturesVerify`). Strict,
+  not unsafe: nothing passes that should fail, and no real signer writes
+  such lengths. Recommendation: leave it unless a vendor's anchor is refused
+  for it.
+- **Anchor shapes beyond the corpus are unmeasured** (raised 2026-10-29, the
+  hardening plan's Tasks 6 and 7). The cache adopts no anchor a supported
+  apt refuses, but for `x3i_sha1_only`, only as far as the corpus' 168
+  shapes go (`e2e/apt-oracle/README.md`, *What the oracle checks*). Tasks 6
+  and 7 each found shapes beyond the plan's 135 that the cache adopted and
+  some apt refused (batches fx8 and fx9, rulings HD-13 and HD-14), and their
+  reviews searched no further; the hardening plan's final review searches
+  for more that need no key, measured with the oracle. Recommendation: add
+  each shape a search, a review or a vendor turns up to the corpus with its
+  measured row, and then fix the verifier or list the shape with its reason.
+- **A go-crypto upgrade can move the verifier's verdicts** (raised
+  2026-10-29, the hardening plan's rulings HD-13 and HD-14). Several of the
+  fourteen strict deviations come from go-crypto: its clearsign decoder
+  (`i_sigbegin_trailing_ws`, `x7i_sigbegin_double_cr`,
+  `xi_cleartext_comment_hdr`; `x3i_armor_no_blank` and `x3d_armor_no_blank`
+  stay refused by F5 whatever it does), its packet reader
+  (`xi_good_plus_unknownpk_A`, `gi_p3_inner_zero_bytes`,
+  `gd_p3_inner_zero_bytes`) and the issuer subpacket it verifies by
+  (`x3i_goodsig_unhashed_fpr_added`, `t7g7b_33junk_33A`); and F0–F6 run
+  beside its lenient armor readers (`armor_shape.go`'s AIDEV-NOTE). A
+  go-crypto that reads these otherwise can turn a deviation into an
+  agreement with apt, or a refusal some apt shares into an acceptance.
+  Recommendation: at every go-crypto upgrade run the table test
+  (`go test ./internal/gpg`) and `make e2e-apt-oracle`
+  (`e2e/apt-oracle/README.md`, *When to run it*), and update
+  `aptShapeDeviations` from what they show.
 
 ## Decided
 
+- **A GC pass that fails at every tick no longer starves the passes after
+  it** (the maintainer, 2026-10-28: worked for 1.1.0; raised 2026-10-27, the
+  H3 final review R3 #5; unchanged since 1.0.x for the url_path pass and
+  sub-jobs A and B). `runTick` (`internal/gc/gc.go`) moved the pass rotation
+  on after a panic but not after an error, so a pass that failed at every
+  tick (a fault limited to its tables) kept the blob pass from running. Its
+  three error returns now go through `passFailed`, which moves the rotation
+  past the failed pass, as `skipPanickedPass` does after a panic, unless the
+  GC's context has ended (a shutdown stopped the pass: it did not fail);
+  `periodicTick` and the retired run log WARN `gc_tick_failed` on the same
+  test (its row in `docs/log-fields.md`). A url_path or snapshot pass that
+  fails at every tick now runs every other tick, the passes after it in
+  between. Done in the hardening plan's Task 1 (commits 38eb75a and
+  85407b1), pinned by `TestPeriodicTick_AFailingPassDoesNotStarveTheNext`
+  and `TestPassFailed_MovesPastEachPassUnlessTheContextEnded`.
+- **Periodic GC retires displaced snapshots instead of deleting them in one
+  transaction** (the maintainer, 2026-10-28: worked for 1.1.0; raised
+  2026-10-27, the H3 final review R3 #4; unchanged since 1.0.x).
+  `RunSnapshotGCBatch` (`internal/cache/gc.go`) deleted up to
+  `gc.snapshot_batch_size` displaced snapshots' rows in one writer
+  transaction, which held every write (a miss's store, a flip's commit) for
+  seconds on a large suite. Ruling HD-4: in a periodic tick, sub-job B now
+  gives the displaced snapshots beyond `gc.keep_displaced` their
+  `retired_at` in one `UPDATE`, and sub-job C deletes them, 10,000 rows a
+  transaction, normally in the same snapshot pass; every reader that serves,
+  vouches or judges history filters `retired_at` or reads current snapshots
+  only. The startup pass still deletes them at once (ruling HD-7): it runs
+  before the freshness scheduler and the listeners, so it holds up no other
+  writer and no request, and a daemon that never lives
+  min(1 h, `gc.interval`) still deletes them at every start. A snapshot
+  retired so counts twice, in `displaced_reaped` and then in
+  `retired_reaped`. Measured in the hardening plan's Task 2 (six displaced
+  snapshots of 70,000 `package_hash` rows, 700,000 in the table; no `-race`;
+  a loaded 12-thread laptop): a retiring batch took 4.6–8.5 ms, the startup
+  pass's delete of the same six 3.6–4.7 s, and each sub-job C chunk
+  120–240 ms (median 149–191 ms). The chunk stays 10,000 rows (ruling HD-11:
+  the aim was a writer never held for seconds, which this meets; the plan's
+  200 ms a chunk was an estimate), and its re-measure is under *Open*. Done
+  in that task (commits 68111f9 and 908963f), pinned by
+  `TestRunSnapshotGCBatch_RetiresTheDisplacedBeyondKeep`,
+  `TestRunSnapshotGCBatch_ARetiredDisplacedSnapshotIsNoLongerRead` and
+  `TestPeriodicTick_RetiresAndDeletesTheDisplacedSnapshots`.
+- **Adoption stops a member's download at its declared size, and nothing is
+  decompressed in transit** (the maintainer, 2026-10-28: worked for 1.1.0;
+  raised 2026-09-08, the security review's A-2, VA-3 and VA-4; raised again
+  2026-10-27, the H3 final review R6 #3). An unsigned `Release` declares its
+  own members' sizes, and the size check ran after the download; with
+  `adopt_unsigned = true` (the default) a client that fetches an unsigned
+  repository through the cache makes it adopt that repository's members.
+  Ruling HD-5: the upstream transport sets `DisableCompression` (Go asked
+  every upstream for gzip and decoded it, so a decoded body had no declared
+  length and skipped the size check, and a resumed one appended compressed
+  bytes to a decoded prefix); `fetch.Target` gains `MaxBytes`, which fails a
+  declared length over it before the body is read, and a body that runs past
+  it as soon as it does, with `ErrBodyTooLarge` (outcome `body_too_large`,
+  never retried); adoption sets it to each member's declared size, one byte
+  for a member declared empty (`memberMaxBytes`), on the by-hash probe and
+  the plain path, which repair and reconcile share. There is no margin: a
+  member of any other size fails its verification anyway. Ruling HD-12: the
+  long-member test asserts that the cache read exactly the declared size and
+  one byte more, that the upstream's endless body then fails to write, and
+  that `adoptMember` returns within 15 s, but no byte count at the upstream,
+  which loopback buffering varies. `docs/configuration.md`'s unsigned threat
+  note now says each file's download stops at its declared size. Done in the
+  hardening plan's Task 3 (commits 391eac2 and c45cd74), pinned by
+  `TestAdoptMember_AMemberLongerThanDeclaredStopsAtItsSize` and the
+  `TestFetch_MaxBytes…` tests. Downloads with no declared size are under
+  *Open*.
+- **A vouched `.deb` whose snapshot is retired during its download is
+  refused on a strict host** (the maintainer, 2026-10-28: worked for 1.1.0;
+  raised 2026-10-27, the H3 final review's R6 re-review; unchanged since
+  1.0.x). On a strict host, a `.deb` miss that was vouched before its
+  download was served unchecked once if its vouching snapshot was retired,
+  or displaced by one that does not list it, while it downloaded. Ruling
+  HD-6: `prefetchCheck` reports the path vouched when its read, or
+  `prefetchRecheck`'s second look, found it so; when `runFetch`'s read after
+  the download then finds no row, strict mode decides there
+  (`strictAfterDownload`, `internal/handler/handler.go`), as it already did
+  after a failed read before the download: refused (502, `Retry-After: 60`),
+  or, with a signed adoption in flight on the host, waited for and retried
+  once; a host whose coverage is incomplete passes it through, and a host
+  without strict mode serves it as before. A read after the download that
+  fails still fails open (WARN `package_hash validate lookup failed`). Done
+  in the hardening plan's Task 4 (commits 5c27a97 and 7c3aca0), pinned by
+  `TestServeHTTP_StrictMissDecidesWhenVouchingEndsDuringTheDownload`.
+- **The verifier refuses the anchor shapes apt rejects** (the maintainer,
+  2026-10-28: worked for 1.1.0; raised 2026-09-08, the security review's
+  theme one: VC-2, C-4, VC-1; confirmed 2026-10-27 by the H3 final review
+  R6 #2). `VerifyInline` (`internal/gpg/verifier.go`) accepted a valid
+  `InRelease` followed by blank lines, a forged CRC line and an extra bad
+  signature from the same trusted key; `VerifyDetached`, lines around a
+  `Release.gpg`'s armor, a second armor block and a binary signature
+  (ruling HD-1: both forms). The rule (ruling HD-2): refuse a shape any
+  supported apt refuses, accept one all of them accept, with listed
+  exceptions. apt's verdicts are measured on 168 byte-exact shapes in the
+  six client images (apt 2.2 to 3.2; `internal/gpg/testdata/aptshapes`,
+  `e2e/apt-oracle/README.md`), which `TestVerifier_FollowsTheAptShapeTable`
+  holds the cache to and `make e2e-apt-oracle` re-measures; the plan's
+  Appendix A stays as measured on 2026-10-28 (135 shapes), and the README
+  and `verdicts.txt` record the 33 since (batches fx8 and fx9). Structure,
+  F0–F6 (rulings HD-8 and HD-13; HD-13 reads armor lines as go-crypto trims
+  them), in both forms and under `accept_any_signer`'s bypass too: nothing
+  after the END line, a CRC line that matches, no `-` line or header without
+  `: ` inside the armor, signature packets only, a `Release.gpg` that starts
+  with its BEGIN line (new reason `malformed_signature`). S1 (rulings HD-3,
+  HD-8 and HD-14; HD-14 reads the issuer as gpgv does), on the trusted path
+  only: a signature packet from a key in the host keyring that fails
+  verification refuses the anchor (new reason `bad_signature`). S2 is
+  unchanged (ruling HD-10); one armor block is read (HD-9). The exceptions,
+  each under *Open*: 14 strict deviations (DN-6's eleven, two of HD-13's
+  shapes, one of HD-14's) and one known-unsafe shape, `x3i_sha1_only` (C-3).
+  Two of the plan's statements are corrected here (the plan stays as
+  written): fourteen deviations, not eleven; key E expired on 2020-12-31,
+  not in 2021 (DN-2). Done in the hardening plan's Tasks 5 to 7: the corpus
+  and oracle (commits dc6c8ee and 3c54a22), F0–F6 (80af12b, b51ee0e and
+  132ebe6) and S1 (8d2900d, fdfa2b0, 40d3614, 276d60d and a900dbd).
 - **Dependencies updated for 1.1.0** (the maintainer, 2026-10-28; raised
   2026-09-08, the security review's finding H-3): `golang.org/x/net`
   0.58.0, `golang.org/x/text` 0.41.0, `golang.org/x/crypto` 0.55.0,

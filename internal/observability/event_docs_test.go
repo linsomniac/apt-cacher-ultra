@@ -58,7 +58,6 @@ var mainEventsWithoutARow = []string{
 	"gc_pool_unlink_skipped_invalid_hash",
 	"gc_run_complete",
 	"gc_tick_deadline_reached",
-	"gc_tick_failed",
 	"hash_validation_failure",
 	"hit_path_hash_evicted",
 	"hot_prefetch_budget_unbounded",
