@@ -32,8 +32,9 @@ import (
 // Another set of images is another set of columns: change it with them.
 const aptShapeColumns = 6
 
-// aptShapeDeviations are DN-6's strict deviations: shapes every measured apt
-// accepts and the cache refuses (ruling HD-9), each with its reason.
+// aptShapeDeviations are the strict deviations: shapes every measured apt
+// accepts and the cache refuses, each with its reason — DN-6's eleven
+// (ruling HD-9) and ruling HD-13's two (batch fx8's p3).
 var aptShapeDeviations = map[string]string{
 	"xi_twoblocks_goodgood":          aptShapeOneArmorBlock,
 	"xi_twoblocks_good_unknown":      aptShapeOneArmorBlock,
@@ -46,11 +47,14 @@ var aptShapeDeviations = map[string]string{
 	"x3d_armor_no_blank":             aptShapeNoBlankLine,
 	"xi_good_plus_unknownpk_A":       "go-crypto cannot parse an unknown public-key algorithm, so the packet cannot be told from garbage (F6); a vendor adding a signature with an algorithm go-crypto v1.4.1 lacks is refused until go-crypto supports it",
 	"x3i_goodsig_unhashed_fpr_added": "today's S2 refuses it already (the unhashed fingerprint overrides the issuer go-crypto looks up)",
+	"gi_p3_inner_zero_bytes":         aptShapePaddingInsidePacket,
+	"gd_p3_inner_zero_bytes":         aptShapePaddingInsidePacket,
 }
 
 const (
-	aptShapeOneArmorBlock = "one armor block: the decoders read only the first, so S1 and S2 cannot check a second; no surveyed vendor publishes two (2026-10-28)"
-	aptShapeNoBlankLine   = "go-crypto's decoder refuses the shape, and so does F5 (with no blank line, every armor line counts as a header without \": \"): a go-crypto upgrade accepting it would leave it refused"
+	aptShapePaddingInsidePacket = "go-crypto reads zero bytes inside a packet's declared length as the next packet's header, so F6 refuses the signature; every apt skips them; no surveyed vendor publishes padding inside a packet (2026-10-29)"
+	aptShapeOneArmorBlock       = "one armor block: the decoders read only the first, so S1 and S2 cannot check a second; no surveyed vendor publishes two (2026-10-28)"
+	aptShapeNoBlankLine         = "go-crypto's decoder refuses the shape, and so does F5 (with no blank line, every armor line counts as a header without \": \"): a go-crypto upgrade accepting it would leave it refused"
 )
 
 // aptShapeKnownUnsafe is DN-6's one known-unsafe shape: every measured apt

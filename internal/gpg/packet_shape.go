@@ -19,13 +19,14 @@ package gpg
 // per-packet count each refuse what Next() would skip, so dropping one of
 // those two shows in no corpus row — keep both.
 //
-// AIDEV-NOTE: measured 2026-10-29, beyond the corpus: bytes inside a
-// signature packet's declared length, after its fields, which gpgv and sqv
-// skip, are read by go-crypto as the next packet's header. A marker or an
-// unknown-tag packet there is then skipped (one packet framed, one parsed),
-// and the anchor is adopted as all six apt adopt it; zero bytes there make
-// NextWithUnsupported fail, so F6 refuses an anchor all six apt accept — a
-// strict deviation the corpus does not hold.
+// AIDEV-NOTE: bytes inside a signature packet's declared length, after its
+// fields, which gpgv and sqv skip, are read by go-crypto as the next
+// packet's header (measured 2026-10-29; batch fx8, ruling HD-13). A marker
+// or an unknown-tag packet there is then skipped (one packet framed, one
+// parsed), and the anchor is adopted as all six apt adopt it
+// (gi_/gd_p1_inner_marker, gi_/gd_p2_inner_unknowntag); zero bytes there
+// make NextWithUnsupported fail, so F6 refuses an anchor all six apt accept
+// (gi_/gd_p3_inner_zero_bytes, listed strict deviations).
 
 import (
 	"bytes"

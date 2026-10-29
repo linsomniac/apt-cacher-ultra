@@ -1,6 +1,6 @@
 # apt's verdicts on the shapes of internal/gpg/testdata/aptshapes, one
 # row per shape: ok (apt-get update succeeded) or REJ (it failed), in
-# each client image. Measured 2026-10-29 03:45 UTC by
+# each client image. Measured 2026-10-29 05:38 UTC by
 # bash e2e/apt-oracle/run.sh --record (e2e/apt-oracle/README.md); the
 # fixtures and this file are one measurement. The columns, after the
 # shape's name:
@@ -29,6 +29,26 @@ d_no_final_nl ok ok ok ok ok ok
 d_trail_lf REJ REJ REJ REJ REJ REJ
 d_twoblocks REJ REJ REJ REJ ok REJ
 d_unknown_goodfirst ok ok ok ok ok ok
+gd_c1_junk_line_control REJ REJ REJ REJ REJ REJ
+gd_c2_endx_junk_control REJ REJ REJ REJ REJ REJ
+gd_c3_repadded_control ok ok ok ok ok ok
+gd_g1_space_endx_junk REJ REJ REJ REJ REJ REJ
+gd_g2_tab_end_junk REJ REJ REJ REJ ok REJ
+gd_g3_vt_eq_line_junk REJ REJ REJ REJ REJ REJ
+gd_g4_space_endx_only REJ REJ REJ REJ REJ REJ
+gd_p1_inner_marker ok ok ok ok ok ok
+gd_p2_inner_unknowntag ok ok ok ok ok ok
+gd_p3_inner_zero_bytes ok ok ok ok ok ok
+gi_c1_junk_line_control REJ REJ REJ REJ REJ REJ
+gi_c2_endx_junk_control REJ REJ REJ REJ REJ REJ
+gi_c3_repadded_control ok ok ok ok ok ok
+gi_g1_space_endx_junk REJ REJ REJ REJ REJ REJ
+gi_g2_tab_end_junk REJ REJ REJ REJ ok REJ
+gi_g3_vt_eq_line_junk REJ REJ REJ REJ REJ REJ
+gi_g4_space_endx_only REJ REJ REJ REJ REJ REJ
+gi_p1_inner_marker ok ok ok ok ok ok
+gi_p2_inner_unknowntag ok ok ok ok ok ok
+gi_p3_inner_zero_bytes ok ok ok ok ok ok
 i_badsig_badfirst REJ REJ REJ REJ ok REJ
 i_badsig_goodfirst REJ REJ REJ REJ ok REJ
 i_badsig_only REJ REJ REJ REJ REJ REJ

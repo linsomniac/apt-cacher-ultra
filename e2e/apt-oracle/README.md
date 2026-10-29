@@ -42,8 +42,8 @@ with only some of the images, a corpus file missing.
 
 | File | What it is |
 |---|---|
-| `<name>.InRelease` | an inline shape (94 of them): the whole `InRelease`, its signed text included |
-| `<name>.Release.gpg` | a detached shape (41): a `Release.gpg` that signs the shared `Release` |
+| `<name>.InRelease` | an inline shape (104 of them): the whole `InRelease`, its signed text included |
+| `<name>.Release.gpg` | a detached shape (51): a `Release.gpg` that signs the shared `Release` |
 | `Release` | the shared `Release`, a flat repository's: the SHA256 line of an empty `Packages`, a fixed `Date:` in the past (2026-10-01), no `Valid-Until` |
 | `keys.gpg` | the public keys A, E and S, in binary: the clients' `signed-by` here, and the host keyring of the verifier's table test (the hardening plan's Task 6) |
 | `verdicts.txt` | apt's verdicts: a `#` header naming the measurement's date and each image's apt and verifier versions, then one row per shape, `<name>` and one verdict per image in the order of *The images* below, `ok` (`apt-get update` exited 0) or `REJ` |
@@ -55,7 +55,8 @@ file here `-text`, so no checkout or commit converts their line ends,
 whatever `core.autocrlf` says: several shapes differ from their controls
 only in CRs.
 
-The 135 shapes are those the hardening plan measured on 2026-10-28
+There are 155 shapes. The first 135 are those the hardening plan measured
+on 2026-10-28
 (`docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md`: DN-2
 sorts them into classes, Appendix A gives each one's verdicts), rebuilt by
 `gen_shapes.py` as the plan's throwaway generators built them, from one
@@ -66,10 +67,24 @@ base64 lines changed, packets added beside the good signature, a
 signature's unhashed area rewritten. A few needed the signer: a critical
 notation, SHA-1, a dash-escaped END line in the signed text. A name says
 the shape: `i_` and `d_` are the plan's first batch (inline and detached),
-`xi_`, `xd_` and `x3i_` to `x7d_` its later ones; `i_trail_lf` is a blank
-line after the END line, `xd_good_plus_literal` a literal-data packet
-beside a good detached signature, a `*_control_good` its batch's
-unmodified control.
+`xi_`, `xd_` and `x3i_` to `x7d_` its later ones, `gi_` and `gd_` batch
+fx8; `i_trail_lf` is a blank line after the END line,
+`xd_good_plus_literal` a literal-data packet beside a good detached
+signature, a `*_control_good` its batch's unmodified control.
+
+Batch fx8's 20 (ruling HD-13) were found and measured in the plan's
+Task 6, beyond Appendix A, and are cut without a key from the fx7
+controls. In `g1` to `g4` a line inserted before the CRC line is one that
+go-crypto's armor reader stops reading at once it has trimmed it
+(`" -----END X-----"`, `"\v=AAAA"`, a tab before an END marker); `c1` and
+`c2` are their controls, an ordinary junk line and an untrimmed
+`-----END X-----`. In `p1` to `p3` the signature packet is framed again
+with a marker, an unknown-tag packet or two zero bytes inside its declared
+length, which gpgv and sqv skip and go-crypto reads as the next packet;
+`c3` is the packet framed again with nothing added (the control's very
+bytes). Every apt refuses `g1`, `g3` and `g4`, which the cache adopted
+until that ruling; every apt accepts `p3`, which the cache refuses (a
+strict deviation of the table test).
 
 The keys are made in a temporary GnuPG home that the generator deletes
 when the run ends, by an error, Ctrl-C, SIGTERM or SIGHUP too (only
@@ -96,7 +111,12 @@ secret key is written anywhere else, and the generator checks that
 2. Regenerate the whole corpus:
    `python3 -I e2e/apt-oracle/gen_shapes.py internal/gpg/testdata/aptshapes`.
    Each run makes new keys and new signatures, so every fixture changes;
-   `verdicts.txt` is left in place, and is now stale.
+   `verdicts.txt` is left in place, and is now stale. A shape cut without a
+   key from the fx7 controls can go in a `FROM_CONTROLS` batch instead, as
+   fx8's do; `python3 -I e2e/apt-oracle/gen_shapes.py --from-controls
+   internal/gpg/testdata/aptshapes` then writes those batches alone, from
+   the committed controls, and every other fixture keeps its bytes (so in
+   step 4 every other row must come out unchanged).
 3. Re-measure: `bash e2e/apt-oracle/run.sh --record`.
 4. Review `git diff --no-ext-diff internal/gpg/testdata/aptshapes/verdicts.txt`:
    the new row, and no other row changed. An old row that changed is apt
@@ -134,7 +154,7 @@ the exceptions the test lists, each with its reason.
 That guarantee — the cache adopts no anchor a supported apt refuses, but
 for the one known-unsafe shape the test lists (`x3i_sha1_only`: weak
 digests are outside the plan) — is only as wide as the corpus: it holds
-for these 135 shapes. An anchor shaped in a way the corpus lacks is
+for these 155 shapes. An anchor shaped in a way the corpus lacks is
 unmeasured, and the cache may adopt it while some apt refuses it. When a
 new shape turns up (a vendor's anchor, a go-crypto change, a review), add
 it.
@@ -203,3 +223,4 @@ regenerate and re-record them together (*Adding a shape*).
 | Date | Tree | Result | Time |
 |---|---|---|---|
 | 2026-10-29, 03:45 UTC (the hardening plan's Task 5) | the commit that adds the corpus, on 7c3aca0 | `--record`: 135 shapes in 6 images, every verdict the one Appendix A of the plan gives (2026-10-28); then `make e2e-apt-oracle`: PASS. apt 2.2.4, 2.4.14, 2.8.3, 2.6.1, 3.0.3 and 3.2.0 (*The images*) | 11 s each run, images cached |
+| 2026-10-29, 05:38 UTC (ruling HD-13, after the plan's Task 6) | the commit that adds batch fx8, on 80af12b | `--from-controls` wrote fx8's 20 shapes and nothing else; `--record`: 155 shapes in 6 images, the 135 earlier rows unchanged and the 20 new ones as Task 6 measured them; then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 12 s each run, images cached |

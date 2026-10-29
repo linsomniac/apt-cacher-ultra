@@ -50,7 +50,7 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
 4. **`make e2e-apt-oracle`** on the tree you tag
    (`e2e/apt-oracle/README.md`; add its row to that file's *Results*):
    the real apt of the six client images must still give the verdicts
-   recorded for the verifier's 135 signature-shape fixtures; about 10
+   recorded for the verifier's 155 signature-shape fixtures; about 10
    seconds with the images cached. The GC and upstream hardening plan
    recorded them (2026-10-29).
 5. **Run the release candidate once on a copy of a production 1.0.x

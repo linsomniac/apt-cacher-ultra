@@ -109,33 +109,34 @@ func requireEndMarkerBeginsLastLine(b []byte, lines []lineSpan) error {
 //
 //   - F2: the first line after the BEGIN line that is the END marker followed
 //     only by spaces, tabs and CRs is the END line, and it is the last line.
-//   - F3: the first line after the headers whose trimmed form (spaces, tabs
-//     and CRs trimmed) starts with "=" is the CRC line: "=" and four base64
-//     characters, the CRC-24 of decoded; only blank lines follow it before
-//     the END line. No CRC line passes (RFC 9580 makes it optional).
+//   - F3: the first line after the headers that starts with "=" once
+//     bytes.TrimSpace has trimmed it is the CRC line: "=" and four base64
+//     characters, the CRC-24 of decoded; only blank lines (spaces, tabs and
+//     CRs) follow it before the END line. No CRC line passes (RFC 9580
+//     makes it optional).
 //   - F4: no line strictly between the BEGIN line and the END line starts
-//     with "-".
+//     with "-" once bytes.TrimSpace has trimmed it.
 //   - F5: every non-blank line between the BEGIN line and the first blank
 //     line (the armor headers) contains ": ".
 //
-// AIDEV-NOTE: F4 refuses the lines inside the armor at which go-crypto's
-// armor reader would end the body early ("-----END X-----",
-// "-----END PGP SIGNATURE-----x": xi_endx_nocrc, the endsuffix shapes) or
-// a second BEGIN line; F3 constrains what follows the CRC line, where the
-// reader stops too. F5 refuses the colon-less header that makes
-// armor.Decode jump (goto TryNextBlock) and the colon-only one (Junk:junk)
-// gpgv refuses; and with no blank line every base64 line counts as a header,
-// so x3*_armor_no_blank is refused here too, whatever the decoder does.
-//
-// AIDEV-NOTE: known gap, open (found and measured 2026-10-29, beyond the
-// corpus): go-crypto trims a line with bytes.TrimSpace before its END and
-// CRC tests, these checks (as DN-3 words F3 and F4) do not. A line inside
-// the armor such as " -----END X-----" (leading blank) or "\v=AAAA" ends
-// go-crypto's body, so the lines after it go unread and unchecked: the
-// cache adopts such an anchor, inline or detached, and all six measured apt
-// refuse it (NODATA; sqv: "Invalid ASCII Armor footer"). The fix proposed:
-// F4 on the line as bytes.TrimSpace leaves it, and the CRC line found and
-// read the same way — pending a ruling and a corpus row.
+// AIDEV-NOTE: F4 and the CRC line's test read each line as bytes.TrimSpace
+// leaves it, exactly as go-crypto's armor reader trims a line before its
+// END test (a "-----END " prefix) and its CRC test (five characters
+// starting "="), the two places where it stops reading the body. So no
+// line the decoder stops at goes unchecked: it is the END line, or the CRC
+// line with only blank lines after it, or the armor is refused. Ruling
+// HD-13 (2026-10-29): with F3 and F4 as DN-3 first worded them (the line
+// trimmed of spaces, tabs and CRs; the raw line), " -----END X-----" or
+// "\v=AAAA" inside the armor ended go-crypto's body unseen, and the lines
+// after it went unchecked; every measured apt refuses those anchors
+// (g1_space_endx_junk, g3_vt_eq_line_junk, g4_space_endx_only, gi_ and gd_
+// in the corpus). F4 still refuses the ordinary early ends
+// ("-----END X-----", "-----END PGP SIGNATURE-----x": xi_endx_nocrc, the
+// endsuffix shapes) and a second BEGIN line; F3 constrains what follows
+// the CRC line. F5 refuses the colon-less header that makes armor.Decode
+// jump (goto TryNextBlock) and the colon-only one (Junk:junk) gpgv
+// refuses; and with no blank line every base64 line counts as a header, so
+// x3*_armor_no_blank is refused here too, whatever the decoder does.
 func checkSignatureArmor(b []byte, lines []lineSpan, begin int, decoded []byte) error {
 	end := -1
 	for i := begin + 1; i < len(lines); i++ {
@@ -159,7 +160,7 @@ func checkSignatureArmor(b []byte, lines []lineSpan, begin int, decoded []byte) 
 	crc := -1
 	for i := begin + 1; i < end; i++ {
 		l := lineAt(b, lines, i)
-		if bytes.HasPrefix(l, []byte("-")) {
+		if bytes.HasPrefix(bytes.TrimSpace(l), []byte("-")) {
 			return fmt.Errorf("line %d, inside the armor, starts with \"-\"", i+1)
 		}
 		if inHeaders {
@@ -172,16 +173,15 @@ func checkSignatureArmor(b []byte, lines []lineSpan, begin int, decoded []byte) 
 			}
 			continue
 		}
-		t := bytes.Trim(l, " \t\r")
-		if crc >= 0 && len(t) > 0 {
+		if crc >= 0 && !isBlankLine(l) {
 			return fmt.Errorf("line %d follows the CRC line (line %d) before the END line", i+1, crc+1)
 		}
-		if bytes.HasPrefix(t, []byte("=")) {
+		if bytes.HasPrefix(bytes.TrimSpace(l), []byte("=")) {
 			crc = i
 		}
 	}
 	if crc >= 0 {
-		t := bytes.Trim(lineAt(b, lines, crc), " \t\r")
+		t := bytes.TrimSpace(lineAt(b, lines, crc))
 		sum, err := base64.StdEncoding.DecodeString(string(t[1:]))
 		if len(t) != 5 || err != nil || len(sum) != 3 {
 			return fmt.Errorf("the CRC line (line %d) is not \"=\" and four base64 characters", crc+1)

@@ -36,8 +36,8 @@ and ``keys.gpg`` is checked to hold public packets only.
 - S, an RSA-3072 primary that only certifies, with an RSA-3072 signing
   subkey: a signature by a subkey (``x3i_subkey_*``).
 
-The 135 shapes are the planning measurement's (2026-10-28; DN-2 and
-Appendix A of docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md),
+155 shapes. The first 135 are the planning measurement's (2026-10-28; DN-2
+and Appendix A of docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md),
 by the same names and built as its throwaway generators built them (the
 plan's PE/gen.py, gen2.py to gen6.py with pgp.py, and rereview/gen7.py,
 kept outside the tree): the controller's batch fx, the security review's
@@ -49,7 +49,11 @@ armor and armor() below write the same bytes), ``d_good`` and every
 ``x*d_control_good`` another. The second block of the two-block shapes
 is a second gpg signing (sig_a2, det_a2), as in the planning; one made in
 the same second as the first is byte-identical to it (the planning's
-was), and either way it is a second good signature.
+was), and either way it is a second good signature. Batch fx8's 20
+(``gi_`` inline, ``gd_`` detached; ruling HD-13) were found and measured
+in the plan's Task 6, beyond Appendix A: lines and packets that
+go-crypto's readers see otherwise than apt does, cut without a key from
+the fx7 controls.
 
 AIDEV-NOTE: the fixtures and verdicts.txt are one measurement. Each run
 makes new keys, new signatures and new random bytes (the v3 garbage
@@ -57,9 +61,13 @@ packets), so a regenerated corpus must be re-measured before it is
 committed: regenerate, run ``bash e2e/apt-oracle/run.sh --record``,
 review verdicts.txt's diff (a changed row is a finding: see
 e2e/apt-oracle/README.md), and commit fixtures and verdicts.txt together.
-Never edit a fixture by hand.
+Never edit a fixture by hand. ``--from-controls`` makes no key: it writes
+only the batches cut from OUT's committed fx7 controls (FROM_CONTROLS:
+fx8), and every other file keeps its bytes, so --record must leave every
+other row of verdicts.txt as it was.
 
 Usage: python3 -I e2e/apt-oracle/gen_shapes.py OUT
+       python3 -I e2e/apt-oracle/gen_shapes.py --from-controls OUT
 """
 
 from __future__ import annotations
@@ -327,6 +335,16 @@ def set_algo(sig: bytes, pk: int | None = None, h: int | None = None) -> bytes:
     return packet(2, bytes(b))
 
 
+def pad_packet(sig: bytes, inner: bytes) -> bytes:
+    """sig, one signature packet in the old-format two-octet framing gpg
+    writes, framed again with inner inside its declared length, after the
+    signature's fields (inner empty: the same bytes)."""
+    if not sig or sig[0] != 0x89:
+        raise ValueError(f"want gpg's old-format two-octet framing, got {sig[:3]!r}")
+    body = one_signature(sig) + inner
+    return b"\x89" + struct.pack(">H", len(body)) + body
+
+
 # --- Byte surgery on armored text --------------------------------------------
 
 
@@ -368,6 +386,16 @@ def armor_with_header(packets: bytes, hdr: bytes) -> bytes:
         b"-----BEGIN PGP SIGNATURE-----\n" + hdr,
         1,
     )
+
+
+def before_crc(text: bytes, lines: list[bytes]) -> bytes:
+    """text with lines (each then ended by a newline) inserted before its
+    CRC line, the one line of text that starts with "="."""
+    ls = text.split(b"\n")
+    crc = [i for i, line in enumerate(ls) if line.startswith(b"=")]
+    if len(crc) != 1:
+        raise ValueError(f"want one CRC line, found {len(crc)}")
+    return b"\n".join(ls[: crc[0]] + lines + ls[crc[0] :])
 
 
 # --- GnuPG --------------------------------------------------------------------
@@ -866,6 +894,57 @@ def batch_fx7(m: Material) -> tuple[Shapes, Shapes]:
     return inline, detached
 
 
+def batch_fx8_from(
+    inline_control: bytes, detached_control: bytes
+) -> tuple[Shapes, Shapes]:
+    """Ruling HD-13's 20 shapes (gi_ inline, gd_ detached), found and
+    measured in the hardening plan's Task 6, beyond the planning corpus; cut
+    without a key from the fx7 controls (x7i_control_good and
+    x7d_control_good) as Task 6's probe cut them.
+
+    g1 to g4: lines inserted before the CRC line, the first of which
+    go-crypto's armor reader stops at once bytes.TrimSpace has trimmed it (a
+    "-----END " prefix, or five characters starting "="), so that what
+    follows it goes unread; c1 and c2 their controls, an ordinary junk line
+    and an untrimmed "-----END X-----". p1 to p3: the signature packet framed
+    again with bytes inside its declared length, after its fields (gpgv and
+    sqv skip them; go-crypto reads them as the next packet); c3 the packet
+    framed again with nothing added, the same bytes as the control.
+    """
+    begin = b"-----BEGIN PGP SIGNATURE-----"
+    head = inline_control[: inline_control.index(begin)]
+    sig_a, det_a = sig_packets(inline_control), sig_packets(detached_control)
+    lines = {
+        "c1_junk_line_control": [b"junk"],
+        "c2_endx_junk_control": [b"-----END X-----", b"junk"],
+        "g1_space_endx_junk": [b" -----END X-----", b"junk junk junk"],
+        "g2_tab_end_junk": [b"\t-----END PGP SIGNATURE-----", b"junk"],
+        "g3_vt_eq_line_junk": [b"\v=AAAA", b"junk"],
+        "g4_space_endx_only": [b" -----END X-----"],
+    }
+    inner = {
+        "c3_repadded_control": b"",
+        "p1_inner_marker": packet(10, b"PGP"),
+        "p2_inner_unknowntag": packet(60, b"\x00"),
+        "p3_inner_zero_bytes": b"\x00\x00",
+    }
+    inline: Shapes = {}
+    detached: Shapes = {}
+    for name, added in lines.items():
+        inline["gi_" + name] = before_crc(inline_control, added)
+        detached["gd_" + name] = before_crc(detached_control, added)
+    for name, data in inner.items():
+        inline["gi_" + name] = head + armor(pad_packet(sig_a, data))
+        detached["gd_" + name] = armor(pad_packet(det_a, data))
+    return inline, detached
+
+
+def batch_fx8(m: Material) -> tuple[Shapes, Shapes]:
+    """Ruling HD-13's batch, cut from the fx7 controls as batch_fx7 builds
+    them (``--from-controls`` cuts it from OUT's committed ones instead)."""
+    return batch_fx8_from(m.head + armor(m.sig_a), armor(m.det_a))
+
+
 BATCHES: list[Callable[[Material], tuple[Shapes, Shapes]]] = [
     batch_fx,
     batch_fx2,
@@ -874,7 +953,16 @@ BATCHES: list[Callable[[Material], tuple[Shapes, Shapes]]] = [
     batch_fx5,
     batch_fx6,
     batch_fx7,
+    batch_fx8,
 ]
+
+# The batches cut without a key from the committed fx7 controls, which
+# ``--from-controls`` writes alone: (inline control, detached control) ->
+# shapes. Each is also in BATCHES, by a wrapper that builds the controls.
+FROM_CONTROLS: list[Callable[[bytes, bytes], tuple[Shapes, Shapes]]] = [
+    batch_fx8_from,
+]
+CONTROL_FILES = ("x7i_control_good.InRelease", "x7d_control_good.Release.gpg")
 
 
 def build_shapes(m: Material) -> tuple[Shapes, Shapes]:
@@ -927,6 +1015,36 @@ def write_corpus(out: Path, inline: Shapes, detached: Shapes, keyring: bytes) ->
         (out / f"{name}.Release.gpg").write_bytes(data)
 
 
+def write_from_controls(out: Path) -> tuple[int, int]:
+    """Writes into OUT the FROM_CONTROLS batches, cut from OUT's committed
+    fx7 controls, and nothing else: no key is made, so every measured
+    fixture keeps its bytes. Returns (inline, detached) shape counts."""
+    names = {p.name for p in corpus_entries(out)}
+    for f in CONTROL_FILES:
+        if f not in names:
+            raise SystemExit(f"{out}: no {f} to cut from: generate the corpus first")
+    inline_control = (out / CONTROL_FILES[0]).read_bytes()
+    detached_control = (out / CONTROL_FILES[1]).read_bytes()
+    files: dict[str, bytes] = {}
+    n_inline = n_detached = 0
+    for batch in FROM_CONTROLS:
+        inline, detached = batch(inline_control, detached_control)
+        for shapes, suffix in ((inline, ".InRelease"), (detached, ".Release.gpg")):
+            for name, data in shapes.items():
+                if not NAME_RE.fullmatch(name):
+                    raise ValueError(f"shape name {name!r}: want [A-Za-z0-9_]+")
+                if name + ".InRelease" in files or name + ".Release.gpg" in files:
+                    raise ValueError(f"shape {name} is defined twice")
+                if name + suffix in CONTROL_FILES:
+                    raise ValueError(f"shape {name} would overwrite a control")
+                files[name + suffix] = data
+        n_inline += len(inline)
+        n_detached += len(detached)
+    for file, data in files.items():
+        (out / file).write_bytes(data)
+    return n_inline, n_detached
+
+
 def exit_on_signal(signum: int, _frame: FrameType | None) -> None:
     """SIGTERM or SIGHUP: unwind with exit status 128 + signum. Once: later
     ones are ignored, so a second cannot cut the clean-up short."""
@@ -943,10 +1061,26 @@ def main(argv: list[str]) -> int:
     # kills the gpg it waits for. Only SIGKILL still leaves the home.
     for s in EXIT_SIGNALS:
         signal.signal(s, exit_on_signal)
-    if len(argv) != 2:
-        print("usage: python3 -I e2e/apt-oracle/gen_shapes.py OUT", file=sys.stderr)
+    args = argv[1:]
+    from_controls = bool(args) and args[0] == "--from-controls"
+    if from_controls:
+        args = args[1:]
+    if len(args) != 1:
+        print(
+            "usage: python3 -I e2e/apt-oracle/gen_shapes.py [--from-controls] OUT",
+            file=sys.stderr,
+        )
         return 2
-    out = Path(argv[1])
+    out = Path(args[0])
+    if from_controls:
+        n_inline, n_detached = write_from_controls(out)
+        print(
+            f"wrote {n_inline + n_detached} shapes ({n_inline} inline, "
+            f"{n_detached} detached) cut from {out}'s fx7 controls; every other "
+            "file is as it was: measure the new rows with "
+            "bash e2e/apt-oracle/run.sh --record"
+        )
+        return 0
     corpus_entries(out)  # refuse a wrong OUT before making keys
     g = GnuPG()
     try:
