@@ -885,9 +885,39 @@ func TestRequireKnownSignaturesVerify_AKeyIDCollisionDoesNotFailAValidSignature(
 //
 // The v4 and v6 packets are framed by hand (a creation time, the
 // subpackets given, a dummy signature value) and parsed by go-crypto; the
-// last cases are go-crypto's own v4 and v6 signatures.
+// last cases are go-crypto's own v4 and v6 signatures. A long notation
+// before the issuer subpackets makes the areas' walk cross a two-octet
+// subpacket length (in both areas) and a five-octet one (in the hashed
+// area: Serialize writes the unhashed one again in the shortest form),
+// and the latter makes a packet of 8384 bytes or more, whose
+// re-serialization has a five-octet header.
 func TestHashedIssuer(t *testing.T) {
-	sub := func(typ byte, data ...byte) []byte { return append([]byte{byte(1 + len(data)), typ}, data...) }
+	// sub frames a subpacket, its length in the shortest form (RFC 9580
+	// §5.2.3.7): one octet below 192, two below 16320, else five.
+	sub := func(typ byte, data ...byte) []byte {
+		var l []byte
+		switch n := 1 + len(data); {
+		case n < 192:
+			l = []byte{byte(n)}
+		case n < 16320:
+			l = []byte{byte((n-192)>>8) + 192, byte(n - 192)}
+		default:
+			l = binary.BigEndian.AppendUint32([]byte{0xff}, uint32(n))
+		}
+		return append(append(l, typ), data...)
+	}
+	// note is a notation subpacket (20) whose value is n bytes: a long
+	// subpacket go-crypto parses (RFC 9580 §5.2.3.24).
+	note := func(n int) []byte {
+		const name = "pad@example.invalid"
+		d := binary.BigEndian.AppendUint16([]byte{0x80, 0, 0, 0}, uint16(len(name)))
+		d = binary.BigEndian.AppendUint16(d, uint16(n))
+		return sub(20, append(append(d, name...), bytes.Repeat([]byte{'x'}, n)...)...)
+	}
+	note2, note5 := note(300), note(16400) // two- and five-octet lengths
+	if note2[0] < 192 || note2[0] == 255 || note5[0] != 255 {
+		t.Fatalf("test premise: the notations' length octets % x and % x", note2[:2], note5[:5])
+	}
 	created := sub(2, 0x65, 0x00, 0x00, 0x00) // signature creation time, 2023-09-12
 	keyIDOf := func(id uint64) []byte { return binary.BigEndian.AppendUint64(nil, id) }
 	v4fpr := func(id uint64) []byte { // a v4 fingerprint: its key ID is its last 8 bytes
@@ -915,10 +945,17 @@ func TestHashedIssuer(t *testing.T) {
 			body = append(body, unhashed...)
 			body = append(body, 0x12, 0x34, 0x00, 0x08, 0xff)
 		}
-		if len(body) >= 192 {
-			t.Fatalf("test premise: a %d-byte body needs a longer length encoding", len(body))
+		// A new-format header: a one-, two- or five-octet length.
+		var header []byte
+		switch n := len(body); {
+		case n < 192:
+			header = []byte{0xc2, byte(n)}
+		case n < 8384:
+			header = []byte{0xc2, byte((n-192)>>8) + 192, byte(n - 192)}
+		default:
+			header = binary.BigEndian.AppendUint32([]byte{0xc2, 0xff}, uint32(n))
 		}
-		p, err := packet.Read(bytes.NewReader(append([]byte{0xc2, byte(len(body))}, body...)))
+		p, err := packet.Read(bytes.NewReader(append(header, body...)))
 		sig, ok := p.(*packet.Signature)
 		if err != nil || !ok || sig.Version != version {
 			t.Fatalf("test premise: go-crypto parses %T, %v; want a v%d *packet.Signature", p, err, version)
@@ -959,6 +996,8 @@ func TestHashedIssuer(t *testing.T) {
 		{"v6: hashed 33", 6, joined(created, sub(33, v6fpr(idA)...)), nil, a, none, idA},
 		{"v6: a v4-form 33", 6, joined(created, sub(33, v4fpr(idA)...)), nil, none, none, idA},
 		{"v6: hashed 33, unhashed 16", 6, joined(created, sub(33, v6fpr(idA)...)), sub(16, keyIDOf(idB)...), a, b, idA},
+		{"a two-octet-length notation before the issuers, in both areas", 4, joined(created, note2, sub(33, v4fpr(idA)...)), joined(note2, sub(16, keyIDOf(idB)...)), a, b, idB},
+		{"a five-octet-length notation before the hashed 33; a packet of 8384 bytes or more", 4, joined(created, note5, sub(33, v4fpr(idA)...)), sub(16, keyIDOf(idB)...), a, b, idB},
 	} {
 		sig := parse(tc.version, tc.hashed, tc.unhashed)
 		var goCryptoID uint64
@@ -968,10 +1007,14 @@ func TestHashedIssuer(t *testing.T) {
 		if goCryptoID != tc.goCryptoID {
 			t.Errorf("%s: test premise: go-crypto's IssuerKeyId %016X, want %016X", tc.name, goCryptoID, tc.goCryptoID)
 		}
+		one := reSerialized(sig)
+		if big := len(one) >= 8384; big != (one[1] == 0xff) || big != (len(tc.hashed) > 16320) {
+			t.Errorf("%s: test premise: a %d-byte re-serialization with header % x", tc.name, len(one), one[:2])
+		}
 		if id, ok := hashedIssuer(sig); (issuer{id, ok}) != tc.fpr {
 			t.Errorf("%s: hashedIssuer = %016X, %v; want %016X, %v", tc.name, id, ok, tc.fpr.id, tc.fpr.ok)
 		}
-		if id, ok := firstIssuerKeyID(sig, reSerialized(sig)); (issuer{id, ok}) != tc.keyID {
+		if id, ok := firstIssuerKeyID(sig, one); (issuer{id, ok}) != tc.keyID {
 			t.Errorf("%s: firstIssuerKeyID = %016X, %v; want %016X, %v", tc.name, id, ok, tc.keyID.id, tc.keyID.ok)
 		}
 	}

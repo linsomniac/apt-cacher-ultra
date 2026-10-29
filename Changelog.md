@@ -49,6 +49,9 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   repositories; `adoption.adopt_unsigned` does.
 - A database error creating a suite's row now fails the request (502).
 - Six 1.0.x log messages are replaced by snake_case events.
+- A signature from a key the cache knows that fails verification is now
+  reported as `bad_signature` (it was `crypto_verify_failed`) in the status
+  page's adoption reasons.
 - Built with Go 1.27; `golang.org/x/net`, `x/text`, `x/crypto`, `x/sys` and
   `github.com/cloudflare/circl` updated (`govulncheck`: no known
   vulnerability the code reaches).

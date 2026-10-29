@@ -549,7 +549,8 @@ The default trust set combines bundled archive keys with `.gpg`/`.asc` files in
 `keyring_dirs`. Keys are read at startup. Without a matching signer pin, any
 loaded trusted key can verify a suite; the cache does not derive per-source
 restrictions from a client's `Signed-By` configuration. The cache refuses an
-anchor that carries a bad signature from any key in its keyring, as apt does;
+anchor that carries a bad signature from any key in its keyring, as apt does,
+except under `accept_any_signer`'s bypass, which verifies no signature;
 install in the cache every key your clients' `signed-by` names, so that it
 refuses what they would.
 
