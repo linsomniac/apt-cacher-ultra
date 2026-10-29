@@ -64,3 +64,6 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 - GC no longer holds every database write for seconds while it deletes old
   snapshots: periodic runs retire the displaced snapshots beyond
   `gc.keep_displaced` and delete them 10,000 rows a transaction.
+- Upstream downloads are no longer decompressed in transit (a gzip-encoded
+  body skipped the size check, and a resumed one could be corrupted), and
+  adoption stops a member's download at the size its `Release` declares.

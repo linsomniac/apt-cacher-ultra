@@ -40,6 +40,8 @@ func TestClassifyFetchOutcome_AllSentinels(t *testing.T) {
 		{"ErrInvalidURL", ErrInvalidURL, "invalid_url"},
 		{"ErrRedirectBlocked", ErrRedirectBlocked, "redirect_blocked"},
 		{"ErrCacheWriteFailed", ErrCacheWriteFailed, "cache_write_failed"},
+		// As Fetch wraps it (streamBody, a body past Target.MaxBytes).
+		{"ErrBodyTooLarge", fmt.Errorf("%w: more than %d bytes", ErrBodyTooLarge, 10000), "body_too_large"},
 		{"ErrSizeMismatch", ErrSizeMismatch, "size_mismatch"},
 		{"ErrInvalidContentRange", ErrInvalidContentRange, "invalid_content_range"},
 		{"ErrTotalSizeMismatch", ErrTotalSizeMismatch, "total_size_mismatch"},
@@ -124,7 +126,8 @@ func TestClassifyConditionalOutcome_StatusBranches(t *testing.T) {
 // TestClassifyConditionalOutcome_BodyTooLarge verifies the
 // Conditional-specific sentinel surfaces correctly. Fetch path does
 // not classify ErrConditionalBodyTooLarge as body_too_large; it
-// would fall to "error" because Fetch never produces it.
+// would fall to "error" because Fetch never produces it. (Fetch's own
+// ErrBodyTooLarge is body_too_large: TestClassifyFetchOutcome_AllSentinels.)
 func TestClassifyConditionalOutcome_BodyTooLarge(t *testing.T) {
 	if got := ClassifyConditionalOutcome(nil, ErrConditionalBodyTooLarge); got != "body_too_large" {
 		t.Errorf("Conditional body-too-large = %q, want body_too_large", got)

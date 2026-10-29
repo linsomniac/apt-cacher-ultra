@@ -2148,6 +2148,18 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 	return a.fetchMemberURL(ctx, suite, m, m.Path)
 }
 
+// memberMaxBytes is a member download's limit (fetch.Target.MaxBytes): its
+// declared size (ruling HD-5), so a member never downloads past what its
+// Release declares — for an unsigned Release, what the repository itself
+// declares. A member declared empty gets one byte, since 0 means no limit:
+// any byte means it is not the declared member, which verifyMember rejects.
+func memberMaxBytes(m ReleaseMember) int64 {
+	if m.Size < 1 {
+		return 1
+	}
+	return m.Size
+}
+
 // tryByHashFetch attempts to fetch a member from its content-addressed
 // by-hash URL (byHashRelPath). It is a probe: unlike fetchMemberURL it
 // emits no adoption_member_skipped WARN, increments no skip metric, and —
@@ -2167,6 +2179,7 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 	target := &fetch.Target{
 		CanonicalHost: suite.CanonicalHost,
 		URL:           buildMemberURL(suite, byHashRelPath),
+		MaxBytes:      memberMaxBytes(m),
 	}
 	// A local fault (the temp blob, the blob row) is ErrAdoptionDBFailed,
 	// as on the plain path, so the caller fails the member instead of
@@ -2191,8 +2204,9 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 
 // fetchMemberURL fetches one Release member from a specific suite-
 // relative URL (either the plain declared path or its by-hash alias),
-// verifies the bytes against the member's declared Size + SHA256, and
-// PutBlobs them. The host slot is held by the caller (adoptMember).
+// downloading at most its declared size (memberMaxBytes), verifies the
+// bytes against the member's declared Size + SHA256, and PutBlobs them.
+// The host slot is held by the caller (adoptMember).
 //
 // Error semantics are the authoritative member-fetch rules: a 404/410
 // returns errAdoptionMemberSkipped (SPEC2 §7.5.2 "declared but does not
@@ -2208,6 +2222,7 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 	target := &fetch.Target{
 		CanonicalHost: suite.CanonicalHost,
 		URL:           upstreamURL,
+		MaxBytes:      memberMaxBytes(m),
 	}
 
 	w, err := newMemberWriter(a.cache)
@@ -2269,7 +2284,10 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 	// Content-Length internally, so the case where they diverge is
 	// genuinely abnormal — surface it as a member-fetch error rather
 	// than a hash mismatch (the bytes might still hash correctly,
-	// but a length mismatch is its own integrity violation).
+	// but a length mismatch is its own integrity violation). Only a
+	// shorter declared length can trip it: a longer one, declared or
+	// sent, already failed the fetch with fetch.ErrBodyTooLarge
+	// (memberMaxBytes).
 	if m.Size > 0 && res.ContentLength > 0 && res.ContentLength != m.Size {
 		return "", newMemberErr(ErrAdoptionMemberFetchFailed, m.Path,
 			fmt.Sprintf("served %d vs declared %d", res.ContentLength, m.Size))

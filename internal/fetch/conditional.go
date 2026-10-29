@@ -145,8 +145,7 @@ func (c *Client) Conditional(
 		// A declared Content-Length over the cap fails before any of the
 		// body is read (ruling PG-29): reading maxBody+1 bytes only to
 		// drop them cost the whole cap per request. ContentLength is -1
-		// when unknown (and when the transport decompresses), so such a
-		// body is read and capped below.
+		// when unknown, so such a body is read and capped below.
 		if resp.ContentLength > maxBody {
 			return nil, fmt.Errorf("%w: >%d bytes", ErrConditionalBodyTooLarge, maxBody)
 		}

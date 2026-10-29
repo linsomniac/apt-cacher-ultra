@@ -59,12 +59,15 @@ func ClassifyConditionalOutcome(res *ConditionalResult, err error) string {
 // out for ClassifyFetchOutcome is conservative — Fetch could in
 // principle wrap a Conditional error in a future refactor, and we'd
 // rather classify it specifically than fall to the catch-all.
+// body_too_large is now also a Fetch outcome, whatever `conditional`
+// says: Fetch's own ErrBodyTooLarge (a body over Target.MaxBytes) is
+// classified for both callers.
 //
-// The 23 rows below mirror SPEC5 §10.4.2 precedence in execution
+// The 24 rows below mirror SPEC5 §10.4.2 precedence in execution
 // order. Specific sentinels first, status-code carriers next, broad
 // sentinels third, net dial errors last, catch-all final.
 func classifyError(err error, conditional bool) string {
-	// Rows 4-12: explicit sentinels in specific-cause-first order.
+	// Rows 4-13: explicit sentinels in specific-cause-first order.
 	switch {
 	case errors.Is(err, ErrHostNotAllowed):
 		return "host_not_allowed"
@@ -81,6 +84,8 @@ func classifyError(err error, conditional bool) string {
 	switch {
 	case errors.Is(err, ErrCacheWriteFailed):
 		return "cache_write_failed"
+	case errors.Is(err, ErrBodyTooLarge):
+		return "body_too_large"
 	case errors.Is(err, ErrSizeMismatch):
 		return "size_mismatch"
 	case errors.Is(err, ErrInvalidContentRange):
@@ -89,7 +94,7 @@ func classifyError(err error, conditional bool) string {
 		return "total_size_mismatch"
 	}
 
-	// Row 13: host_unreachable BEFORE row 20 (unavailable). The
+	// Row 14: host_unreachable BEFORE row 21 (unavailable). The
 	// dialer wraps both sentinels on a cooldown-probe failure
 	// (`%w: %w: ...` at dialer.go:163); putting host_unreachable
 	// first surfaces the diagnostic label. Inverting this order
@@ -99,7 +104,7 @@ func classifyError(err error, conditional bool) string {
 		return "host_unreachable"
 	}
 
-	// Rows 14-15: context errors.
+	// Rows 15-16: context errors.
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		return "timeout"
@@ -107,7 +112,7 @@ func classifyError(err error, conditional bool) string {
 		return "canceled"
 	}
 
-	// Rows 16-17: StatusError carriers (specific code class first).
+	// Rows 17-18: StatusError carriers (specific code class first).
 	// errors.As recovers the code from any wrap depth; this comes
 	// BEFORE the bare-sentinel checks below so a fetch that wrapped
 	// %w with StatusError surfaces the code-class label, not the
@@ -122,7 +127,7 @@ func classifyError(err error, conditional bool) string {
 		}
 	}
 
-	// Rows 18-19: bare upstream-status sentinels (without
+	// Rows 19-20: bare upstream-status sentinels (without
 	// StatusError in chain).
 	switch {
 	case errors.Is(err, ErrUpstreamServerError):
@@ -131,12 +136,12 @@ func classifyError(err error, conditional bool) string {
 		return "4xx"
 	}
 
-	// Row 20: ErrUpstreamUnavailable AFTER ErrHostUnreachable.
+	// Row 21: ErrUpstreamUnavailable AFTER ErrHostUnreachable.
 	if errors.Is(err, ErrUpstreamUnavailable) {
 		return "unavailable"
 	}
 
-	// Rows 21-22: net dial errors. *net.OpError can wrap a DNS
+	// Rows 22-23: net dial errors. *net.OpError can wrap a DNS
 	// failure (*net.DNSError) or a connect failure (no DNSError in
 	// chain). Check DNSError first so dns_failed wins when both
 	// types are present in the chain.
@@ -149,6 +154,6 @@ func classifyError(err error, conditional bool) string {
 		return "connect_failed"
 	}
 
-	// Row 23: catch-all.
+	// Row 24: catch-all.
 	return "error"
 }

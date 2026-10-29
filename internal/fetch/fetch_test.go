@@ -2,6 +2,7 @@ package fetch
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/x509"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -633,6 +635,7 @@ func TestIsRetryable(t *testing.T) {
 		{fmt.Errorf("%w: status=500", ErrUpstreamServerError), true},
 		{fmt.Errorf("%w: bad", ErrInvalidContentRange), true},
 		{fmt.Errorf("%w: short", ErrSizeMismatch), true},
+		{fmt.Errorf("%w: more than 10000 bytes", ErrBodyTooLarge), false},
 		{fmt.Errorf("%w: redir", ErrRedirectBlocked), false},
 		{fmt.Errorf("%w: scheme \"ftp\"", ErrInvalidURL), false},
 		{errors.New("some IO error"), true},
@@ -1129,5 +1132,402 @@ func TestNormalizeHost(t *testing.T) {
 		if got := normalizeHost(tc.in); got != tc.want {
 			t.Errorf("normalizeHost(%q): got %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// gzipped returns b gzip-compressed: the body of a Content-Encoding: gzip
+// response.
+func gzipped(t *testing.T, b []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(b); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// gzipWhenAskedUpstream answers every request with body, gzip-encoded (gz)
+// only when the request's Accept-Encoding asks for gzip, as a web server
+// that compresses on the fly does. It records each request's
+// Accept-Encoding values and protocol major version.
+type gzipWhenAskedUpstream struct {
+	body, gz []byte
+
+	mu       sync.Mutex
+	encoding [][]string // r.Header.Values("Accept-Encoding"), per request
+	proto    []int      // r.ProtoMajor, per request
+}
+
+func (u *gzipWhenAskedUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	values := r.Header.Values("Accept-Encoding")
+	u.mu.Lock()
+	u.encoding = append(u.encoding, values)
+	u.proto = append(u.proto, r.ProtoMajor)
+	u.mu.Unlock()
+	for _, v := range values {
+		if strings.Contains(v, "gzip") {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("Content-Length", fmt.Sprint(len(u.gz)))
+			_, _ = w.Write(u.gz)
+			return
+		}
+	}
+	w.Header().Set("Content-Length", fmt.Sprint(len(u.body)))
+	_, _ = w.Write(u.body)
+}
+
+func (u *gzipWhenAskedUpstream) seen() (encoding [][]string, proto []int) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([][]string(nil), u.encoding...), append([]int(nil), u.proto...)
+}
+
+// TestFetch_SendsNoAcceptEncoding: the upstream transport asks for no
+// Content-Encoding (the 2026-09 security review's VA-3, ruling HD-5), so an
+// upstream that compresses only when asked sends the identity body, and
+// that is what lands in dst. Go's default transport sends
+// "Accept-Encoding: gzip" and decodes the answer, which left the decoded
+// body without a declared length.
+func TestFetch_SendsNoAcceptEncoding(t *testing.T) {
+	body := []byte(strings.Repeat("Package: identity\n", 64))
+	up := &gzipWhenAskedUpstream{body: body, gz: gzipped(t, body)}
+	srv := httptest.NewServer(up)
+	defer srv.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	dst := &bufDst{}
+	if _, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL + "/dists/stable/main/binary-amd64/Packages",
+	}, dst); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	encoding, _ := up.seen()
+	if len(encoding) != 1 {
+		t.Fatalf("upstream saw %d requests, want 1", len(encoding))
+	}
+	if len(encoding[0]) != 0 {
+		t.Errorf("Accept-Encoding sent: %q, want none", encoding[0])
+	}
+	if dst.String() != string(body) {
+		t.Errorf("dst holds %d bytes, want the %d-byte identity body", dst.Written(), len(body))
+	}
+}
+
+// TestFetch_SendsNoAcceptEncodingOverHTTP2 is TestFetch_SendsNoAcceptEncoding
+// over HTTP/2: the HTTP/2 transport honours DisableCompression too.
+func TestFetch_SendsNoAcceptEncodingOverHTTP2(t *testing.T) {
+	body := []byte(strings.Repeat("Package: identity over h2\n", 64))
+	up := &gzipWhenAskedUpstream{body: body, gz: gzipped(t, body)}
+	srv := httptest.NewUnstartedServer(up)
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+
+	// newTransport reads the pool once, at construction: install it before
+	// building the client (dialer_tls_seam_test.go).
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.Certificate())
+	restore := SetRootCAsForTest(pool)
+	defer restore()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	dst := &bufDst{}
+	if _, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL + "/dists/stable/main/binary-amd64/Packages",
+	}, dst); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	encoding, proto := up.seen()
+	if len(proto) != 1 || proto[0] != 2 {
+		t.Fatalf("upstream saw requests of HTTP major versions %v, want one HTTP/2 request", proto)
+	}
+	if len(encoding[0]) != 0 {
+		t.Errorf("Accept-Encoding sent over HTTP/2: %q, want none", encoding[0])
+	}
+	if dst.String() != string(body) {
+		t.Errorf("dst holds %d bytes, want the %d-byte identity body", dst.Written(), len(body))
+	}
+}
+
+// TestFetch_StoresAGzipBodyItDidNotAskFor: an upstream that answers with
+// Content-Encoding: gzip unasked (an Apache serving a .gz file that way)
+// has its bytes stored as sent, compressed, with their declared length —
+// not decoded, as the bytes of the file it names are those compressed
+// bytes.
+func TestFetch_StoresAGzipBodyItDidNotAskFor(t *testing.T) {
+	gz := gzipped(t, []byte(strings.Repeat("Package: compressed\n", 64)))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Length", fmt.Sprint(len(gz)))
+		_, _ = w.Write(gz)
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	dst := &bufDst{}
+	res, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL + "/dists/stable/main/binary-amd64/Packages.gz",
+	}, dst)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if !bytes.Equal(dst.buf.Bytes(), gz) {
+		t.Errorf("dst holds %d bytes, want the %d compressed bytes the upstream sent, unchanged", dst.Written(), len(gz))
+	}
+	if res.ContentLength != int64(len(gz)) {
+		t.Errorf("ContentLength = %d, want the declared %d", res.ContentLength, len(gz))
+	}
+}
+
+// writeFlushedBody answers a 200 without a Content-Length and writes n
+// bytes in 4 KiB writes, flushing after each, so the body goes out chunked.
+// It stops at the first failed write.
+func writeFlushedBody(w http.ResponseWriter, n int) {
+	flusher := w.(http.Flusher)
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+	chunk := bytes.Repeat([]byte("x"), 4096)
+	for left := n; left > 0; left -= len(chunk) {
+		if left < len(chunk) {
+			chunk = chunk[:left]
+		}
+		if _, err := w.Write(chunk); err != nil {
+			return
+		}
+		flusher.Flush()
+	}
+}
+
+// cutChunked200 answers with a chunked 200 that carries an ETag, sends n
+// body bytes in one chunk and drops the connection: a download cut
+// mid-body, which Fetch resumes with a Range request.
+func cutChunked200(t *testing.T, w http.ResponseWriter, n int) {
+	conn, bw, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		t.Errorf("Hijack: %v", err)
+		return
+	}
+	defer func() { _ = conn.Close() }()
+	_, _ = fmt.Fprintf(bw, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nETag: \"v1\"\r\n\r\n%x\r\n", n)
+	_, _ = bw.Write(bytes.Repeat([]byte("c"), n))
+	_, _ = bw.WriteString("\r\n")
+	_ = bw.Flush()
+}
+
+// TestFetch_MaxBytesStopsAChunkedBodyThatRunsOver: a body without a
+// declared length that runs past Target.MaxBytes fails with
+// ErrBodyTooLarge as soon as it does (the 2026-09 security review's A-2),
+// and is not retried.
+func TestFetch_MaxBytesStopsAChunkedBodyThatRunsOver(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		writeFlushedBody(w, 1<<20)
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	dst := &bufDst{}
+	_, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL + "/big",
+		MaxBytes:      10000,
+	}, dst)
+	if !errors.Is(err, ErrBodyTooLarge) {
+		t.Fatalf("Fetch error = %v, want ErrBodyTooLarge", err)
+	}
+	if dst.Written() > 10001 {
+		t.Errorf("dst.Written() = %d, want at most 10001 (MaxBytes and the one byte that shows the body runs over)", dst.Written())
+	}
+	if got := requests.Load(); got != 1 {
+		t.Errorf("upstream saw %d requests, want 1 (ErrBodyTooLarge is not retried)", got)
+	}
+}
+
+// TestFetch_MaxBytesRefusesADeclaredLengthOverIt: a Content-Length over
+// Target.MaxBytes fails before any of the body is read.
+func TestFetch_MaxBytesRefusesADeclaredLengthOverIt(t *testing.T) {
+	var requests atomic.Int32
+	body := bytes.Repeat([]byte("d"), 50000)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Length", "50000")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	dst := &bufDst{}
+	_, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL + "/declared-big",
+		MaxBytes:      10000,
+	}, dst)
+	if !errors.Is(err, ErrBodyTooLarge) {
+		t.Fatalf("Fetch error = %v, want ErrBodyTooLarge", err)
+	}
+	if dst.Written() != 0 {
+		t.Errorf("dst.Written() = %d, want 0 (refused before the body is read)", dst.Written())
+	}
+	if got := requests.Load(); got != 1 {
+		t.Errorf("upstream saw %d requests, want 1 (ErrBodyTooLarge is not retried)", got)
+	}
+}
+
+// TestFetch_MaxBytesAcceptsABodyOfExactlyIt: a body of exactly
+// Target.MaxBytes bytes passes, declared or not.
+func TestFetch_MaxBytesAcceptsABodyOfExactlyIt(t *testing.T) {
+	body := bytes.Repeat([]byte("e"), 10000)
+	for _, declared := range []bool{true, false} {
+		t.Run(fmt.Sprintf("Content-Length=%t", declared), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if declared {
+					w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+				} else {
+					w.WriteHeader(http.StatusOK)
+					w.(http.Flusher).Flush() // headers out first: the body goes chunked
+				}
+				_, _ = w.Write(body)
+			}))
+			defer srv.Close()
+
+			client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+			dst := &bufDst{}
+			res, err := client.Fetch(context.Background(), &Target{
+				CanonicalHost: "127.0.0.1",
+				URL:           srv.URL + "/exact",
+				MaxBytes:      10000,
+			}, dst)
+			if err != nil {
+				t.Fatalf("Fetch: %v", err)
+			}
+			if !bytes.Equal(dst.buf.Bytes(), body) {
+				t.Errorf("dst holds %d bytes, want the %d-byte body", dst.Written(), len(body))
+			}
+			wantLength := int64(-1)
+			if declared {
+				wantLength = int64(len(body))
+			}
+			if res.ContentLength != wantLength {
+				t.Errorf("ContentLength = %d, want %d (the response's declared length)", res.ContentLength, wantLength)
+			}
+		})
+	}
+}
+
+// TestFetch_MaxBytesRefusesAResumeDeclaringMore: a chunked 200 cut after
+// 5,000 bytes is resumed, and a 206 whose Content-Range declares a total
+// over Target.MaxBytes fails with ErrBodyTooLarge before its body is read,
+// and is not retried.
+func TestFetch_MaxBytesRefusesAResumeDeclaringMore(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch requests.Add(1) {
+		case 1:
+			cutChunked200(t, w, 5000)
+		case 2:
+			if got := r.Header.Get("Range"); got != "bytes=5000-" {
+				t.Errorf("resume Range = %q, want bytes=5000-", got)
+			}
+			w.Header().Set("Content-Range", "bytes 5000-49999/50000")
+			w.Header().Set("Content-Length", "45000")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(bytes.Repeat([]byte("r"), 45000))
+		default:
+			http.Error(w, "unexpected request", http.StatusServiceUnavailable)
+		}
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	dst := &bufDst{}
+	_, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL + "/resumed",
+		MaxBytes:      10000,
+	}, dst)
+	if !errors.Is(err, ErrBodyTooLarge) {
+		t.Fatalf("Fetch error = %v, want ErrBodyTooLarge", err)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Errorf("upstream saw %d requests, want 2 (the cut 200 and its resume; ErrBodyTooLarge is not retried)", got)
+	}
+	if dst.Written() != 5000 {
+		t.Errorf("dst.Written() = %d, want 5000 (the 206 is refused before its body is read)", dst.Written())
+	}
+}
+
+// TestFetch_MaxBytesStopsAResumedBodyThatRunsOver: the resume of a cut
+// chunked 200 whose 206 declares a range within Target.MaxBytes but whose
+// body runs past it fails with ErrBodyTooLarge as soon as it does, and is
+// not retried. Without the cap at the 206's read it would end as
+// ErrSizeMismatch, which is retried.
+func TestFetch_MaxBytesStopsAResumedBodyThatRunsOver(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch requests.Add(1) {
+		case 1:
+			cutChunked200(t, w, 5000)
+		case 2:
+			if got := r.Header.Get("Range"); got != "bytes=5000-" {
+				t.Errorf("resume Range = %q, want bytes=5000-", got)
+			}
+			w.Header().Set("Content-Range", "bytes 5000-9999/*")
+			w.WriteHeader(http.StatusPartialContent)
+			w.(http.Flusher).Flush() // headers out first: the body goes chunked
+			_, _ = w.Write(bytes.Repeat([]byte("o"), 20000))
+		default:
+			http.Error(w, "unexpected request", http.StatusServiceUnavailable)
+		}
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	dst := &bufDst{}
+	_, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL + "/resumed-long",
+		MaxBytes:      10000,
+	}, dst)
+	if !errors.Is(err, ErrBodyTooLarge) {
+		t.Fatalf("Fetch error = %v, want ErrBodyTooLarge", err)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Errorf("upstream saw %d requests, want 2 (the cut 200 and its resume; ErrBodyTooLarge is not retried)", got)
+	}
+	if dst.Written() > 10001 {
+		t.Errorf("dst.Written() = %d, want at most 10001", dst.Written())
+	}
+}
+
+// TestFetch_ZeroMaxBytesIsNoLimit: Target.MaxBytes 0 sets no limit.
+func TestFetch_ZeroMaxBytesIsNoLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeFlushedBody(w, 100000)
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	dst := &bufDst{}
+	res, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL + "/unlimited",
+		MaxBytes:      0,
+	}, dst)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if dst.Written() != 100000 {
+		t.Errorf("dst.Written() = %d, want 100000", dst.Written())
+	}
+	if res.ContentLength != -1 {
+		t.Errorf("ContentLength = %d, want -1 (the body is chunked)", res.ContentLength)
 	}
 }

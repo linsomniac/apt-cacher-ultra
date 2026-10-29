@@ -690,10 +690,11 @@ adopts unsigned. Under the default allow-all upstream policy
 with adoption enabled, a LAN client can make the cache adopt unsigned
 directories it controls; that is bounded by the per-host adoption slot,
 the reserved slot, `max_duration`, the 1,000-file cap and
-`freshness.max_suites`, but not in bytes: each file can be as large as
-its server sends within `upstream.total_timeout` (no response-body
-ceiling, and gzip is decompressed in transit: the 2026-09 security
-review's A-2 and VA-3, open), and an adopted file stays while its
+`freshness.max_suites`, and in bytes by the sizes its own
+`Release` declares: each file's download stops at its declared
+size, and nothing is decompressed in transit (the 2026-09 security
+review's A-2 and VA-3), but an unsigned `Release` declares what its
+server wants, and an adopted file stays while its
 snapshot is current or kept displaced, until the suite is reaped or
 forgotten. To harden, set `adopt_unsigned = false` (unsigned
 suites already adopted then stay at their last snapshot, see safeguard 1)
