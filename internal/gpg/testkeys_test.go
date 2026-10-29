@@ -3,6 +3,7 @@ package gpg
 import (
 	"bytes"
 	"crypto"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -317,6 +318,41 @@ func inlineWithSignatures(t *testing.T, packets ...[]byte) []byte {
 		t.Fatalf("assembleClearsignedBlock: %v", err)
 	}
 	return body
+}
+
+// withUnhashedSubpacket returns sig, one v4 signature packet as go-crypto
+// frames it (a new-format header), with the subpacket sub (its length,
+// type and data) appended to its unhashed area, framed again with a
+// five-octet length. The unhashed area is not signed, so a valid
+// signature stays valid: an on-path attacker can do this without a key.
+func withUnhashedSubpacket(t *testing.T, sig, sub []byte) []byte {
+	t.Helper()
+	if len(sig) < 2 || sig[0] != 0xc2 {
+		t.Fatalf("test premise: not a new-format signature packet: % x", sig[:min(len(sig), 2)])
+	}
+	var hl, n int
+	switch l0 := int(sig[1]); {
+	case l0 < 192:
+		hl, n = 2, l0
+	case l0 < 224:
+		hl, n = 3, (l0-192)<<8+int(sig[2])+192
+	case l0 == 255:
+		hl, n = 6, int(binary.BigEndian.Uint32(sig[2:6]))
+	default:
+		t.Fatalf("test premise: a partial length")
+	}
+	body := sig[hl : hl+n]
+	if len(body) < 6 || body[0] != 4 {
+		t.Fatalf("test premise: not a v4 signature")
+	}
+	h := int(binary.BigEndian.Uint16(body[4:6]))
+	u := int(binary.BigEndian.Uint16(body[6+h : 8+h]))
+	out := append([]byte{}, body[:6+h]...)
+	out = binary.BigEndian.AppendUint16(out, uint16(u+len(sub)))
+	out = append(out, body[8+h:8+h+u]...)
+	out = append(out, sub...)
+	out = append(out, body[8+h+u:]...)
+	return append(binary.BigEndian.AppendUint32([]byte{0xc2, 0xff}, uint32(len(out))), out...)
 }
 
 // readArmoredBlockBody pulls the binary signature bytes out of a

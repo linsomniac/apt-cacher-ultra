@@ -745,6 +745,70 @@ func TestVerifyInline_ACriticalNotationFailsS1(t *testing.T) {
 	}
 }
 
+// TestVerifyInline_AnUnhashedIssuerContradictingTheHashedOneFailsS1 pins
+// S1's contradiction rule (DN-5), which no corpus row pins: there
+// go-crypto's own lookup by the rewritten unhashed issuer fails the packet
+// anyway. Here the unhashed issuer names another key of the same entity,
+// the one that made the signature. X's signing subkey signs with a hashed
+// issuer fingerprint that names X's primary key (the signer controls the
+// hashed area), and an unhashed issuer key ID naming the subkey is added
+// (no key needed). go-crypto looks the key up by that unhashed key ID and
+// verifies the packet; gpgv looks it up by the hashed fingerprint, X's
+// primary key, and reports BADSIG (measured 2026-10-29 with the oracle's
+// in-container.sh: every gpgv-based apt refuses this shape, debian:13's sqv
+// accepts it). So the anchor, whose only signature this is, is refused
+// (ErrBadSignature); without the rule S1 would pass it and S2 accept it.
+func TestVerifyInline_AnUnhashedIssuerContradictingTheHashedOneFailsS1(t *testing.T) {
+	x := newTestEntity(t, "X", "x@example.com")
+	if err := x.AddSigningSubkey(&packet.Config{
+		Algorithm: packet.PubKeyAlgoRSA,
+		RSABits:   2048,
+		Time:      func() time.Time { return time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC) },
+	}); err != nil {
+		t.Fatalf("AddSigningSubkey: %v", err)
+	}
+	sub := x.Subkeys[len(x.Subkeys)-1]
+	v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t, x), RequireSignature: true, Logger: silentLogger()})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	// The subkey signs; its private key names X's primary key as the
+	// issuer fingerprint while it signs (clearsign takes the issuer from
+	// the signing key).
+	fpr := sub.PublicKey.Fingerprint
+	sub.PublicKey.Fingerprint = x.PrimaryKey.Fingerprint
+	signed := clearsignWithConfig(t, &openpgp.Entity{PrivateKey: sub.PrivateKey}, []byte(fakeReleasePlaintext),
+		&packet.Config{DefaultHash: crypto.SHA256, Time: time.Now})
+	sub.PublicKey.Fingerprint = fpr
+	unhashed16 := append([]byte{9, 16}, binary.BigEndian.AppendUint64(nil, sub.PublicKey.KeyId)...)
+	contradicting := withUnhashedSubpacket(t, signaturePacketsOf(t, signed), unhashed16)
+	body := inlineWithSignatures(t, contradicting)
+
+	// Premises: the hashed issuer is X's primary key, go-crypto's is the
+	// subkey, and go-crypto verifies the packet against X.
+	p, err := packet.Read(bytes.NewReader(contradicting))
+	sig, ok := p.(*packet.Signature)
+	if err != nil || !ok {
+		t.Fatalf("test premise: the packet parses as %T, %v", p, err)
+	}
+	if id, hashed := hashedIssuer(sig); !hashed || id != x.PrimaryKey.KeyId || sig.IssuerKeyId == nil || *sig.IssuerKeyId != sub.PublicKey.KeyId {
+		t.Fatalf("test premise: hashed issuer %016X (%v), go-crypto's %v; want X's primary key %016X and the subkey %016X",
+			id, hashed, sig.IssuerKeyId, x.PrimaryKey.KeyId, sub.PublicKey.KeyId)
+	}
+	block, err := decodeClearsigned(body)
+	if err != nil || block == nil {
+		t.Fatalf("test premise: the InRelease does not decode (block %v, err %v)", block, err)
+	}
+	if got, _, verr := openpgp.VerifyDetachedSignature(v.keyring.EntityList(), bytes.NewReader(block.Bytes), bytes.NewReader(contradicting), nil); got == nil || verr != nil {
+		t.Fatalf("test premise: go-crypto on the packet: signature %v, err %v; want it verified (by the unhashed key ID)", got != nil, verr)
+	}
+
+	got, err := v.VerifyInline(context.Background(), newSuite(), body)
+	if !errors.Is(err, ErrBadSignature) || !strings.Contains(err.Error(), "contradicts") || got != nil {
+		t.Fatalf("got %q, err %v (reason %q); want ErrBadSignature: the unhashed issuer contradicts the hashed one", got, err, ClassifyVerifyErr(err))
+	}
+}
+
 // TestRequireKnownSignaturesVerify_AKeyIDCollisionDoesNotFailAValidSignature:
 // S1 verifies each packet against one keyring entity at a time (DN-5). Two
 // entities share the signer's key ID, the colliding one loaded first, and
