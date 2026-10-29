@@ -26,7 +26,10 @@ bash e2e/apt-oracle/run.sh --record                    # all six: rewrite verdic
 It needs Docker and GNU `timeout`, and the six images (pulled on first
 use; the containers themselves run with `--network none`). The images run
 in parallel, one `apt-get update` per shape in each; with the images
-cached a run takes about 10 seconds on a 12-core machine.
+cached a run takes about 10 seconds on a 12-core machine. To measure
+today's apt, `docker pull` the six images first: `docker run` never
+refreshes a cached tag, and the version lines a run prints show which apt
+it measured.
 
 The exit status is 0 when apt gives the recorded verdicts (or `--record`
 wrote them), 1 when apt changed or a container failed, and 2 for a usage
@@ -47,7 +50,10 @@ with only some of the images, a corpus file missing.
 
 A detached shape that signs another text than the shared `Release` would
 carry it as `<name>.Release`, which `in-container.sh` then serves in its
-place; none does today.
+place; none does today. The repository's `.gitattributes` marks every
+file here `-text`, so no checkout or commit converts their line ends,
+whatever `core.autocrlf` says: several shapes differ from their controls
+only in CRs.
 
 The 135 shapes are those the hardening plan measured on 2026-10-28
 (`docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md`: DN-2
@@ -66,8 +72,10 @@ beside a good detached signature, a `*_control_good` its batch's
 unmodified control.
 
 The keys are made in a temporary GnuPG home that the generator deletes
-when it is done; no secret key is written anywhere else, and the generator
-checks that `keys.gpg` holds public packets only, of exactly A, E and S.
+when the run ends, by an error, Ctrl-C, SIGTERM or SIGHUP too (only
+SIGKILL leaves it, and a home it cannot delete is named on stderr); no
+secret key is written anywhere else, and the generator checks that
+`keys.gpg` holds public packets only, of exactly A, E and S.
 
 | Key | What it is | Why |
 |---|---|---|
@@ -82,7 +90,9 @@ checks that `keys.gpg` holds public packets only, of exactly A, E and S.
    function, listed in `BATCHES`) that cuts it from `Material` — the good
    inline signature (`head`, `sig_a`), the detached one (`det_a`) and the
    others — with `replace`, `armor` and the packet helpers. Its name says
-   what it is; the generator refuses a name used twice.
+   what it is; the generator refuses a name used twice. A detached shape
+   that signs another text than the shared `Release` needs `write_corpus`
+   extended to write its `<name>.Release` (no shape does today).
 2. Regenerate the whole corpus:
    `python3 -I e2e/apt-oracle/gen_shapes.py internal/gpg/testdata/aptshapes`.
    Each run makes new keys and new signatures, so every fixture changes;
@@ -177,9 +187,9 @@ flake (`E2E_APT_ORACLE_IMAGES=<image> make e2e-apt-oracle`); then:
 
 1. Record it: `bash e2e/apt-oracle/run.sh --record`, and check that
    `verdicts.txt`'s diff holds only the changed cells.
-2. Update the shape's row where the planning verdicts are kept (the
-   hardening plan's Appendix A, or the record that succeeds it), and add
-   a row to *Results* below with the date.
+2. Update the shape's row in the record that succeeds the hardening
+   plan's Appendix A (the plan itself stays as measured on 2026-10-28),
+   and add a row to *Results* below with the date.
 3. Run the verifier's table test: the cache's verdict may now be a
    deviation to list (a refusal all six apt now accept), or a refusal to
    add (a shape some apt now refuses).

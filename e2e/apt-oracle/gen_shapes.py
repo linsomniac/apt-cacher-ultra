@@ -15,8 +15,10 @@ Writes into OUT (internal/gpg/testdata/aptshapes in the tree):
 ``verdicts.txt`` beside them is not written here: it is apt's measurement
 of these bytes (``bash e2e/apt-oracle/run.sh --record``).
 
-The keys are made in a temporary GnuPG home, deleted at exit; no secret
-key leaves it, and ``keys.gpg`` is checked to hold public packets only.
+The keys are made in a temporary GnuPG home, deleted when the run ends:
+on an error, Ctrl-C, SIGTERM or SIGHUP too (only SIGKILL leaves it, and a
+home that cannot be deleted is named on stderr). No secret key leaves it,
+and ``keys.gpg`` is checked to hold public packets only.
 
 - A, RSA-3072, signs: the repository's key. Every shape carries a
   signature by A but ``i_expired_only`` (E's) and ``x3i_subkey_good``
@@ -68,6 +70,7 @@ import hashlib
 import os
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -76,6 +79,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from email.utils import formatdate
 from pathlib import Path
+from types import FrameType
 from typing import Literal
 
 # A signature subpacket: (type, critical, data).
@@ -100,6 +104,10 @@ OTHER_TEXT = b"some other text\n"
 # Key E: made at E_MADE and valid one year; signs at E_SIGNS.
 E_MADE = "20200101T000000!"
 E_SIGNS = "20200601T000000!"
+
+# SIGTERM (kill, timeout) and SIGHUP (a closed terminal) end a run as Ctrl-C
+# does, by an exception: main installs exit_on_signal for them.
+EXIT_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
 
 NAME_RE = re.compile(r"[A-Za-z0-9_]+")
 # The files of a corpus directory, besides the shapes'.
@@ -439,17 +447,32 @@ class GnuPG:
 
     def close(self) -> None:
         """Stops the home's agent and deletes the home (its secret keys with
-        it) and the socket dir gpg made for it under /run/user."""
-        for args in (["--kill", "all"], ["--remove-socketdir"]):
-            try:
-                subprocess.run(
-                    ["gpgconf", "--homedir", str(self.home), *args],
-                    capture_output=True,
-                    check=False,
+        it) and the socket dir gpg made for it under /run/user; says so on
+        stderr when the home survives."""
+        # AIDEV-NOTE: Ctrl-C, SIGTERM and SIGHUP are held until the home is
+        # gone (one arriving now is delivered when the mask is restored):
+        # each raises an exception, which would leave this clean-up half
+        # done, the secret keys behind.
+        held = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, *EXIT_SIGNALS})
+        try:
+            for args in (["--kill", "all"], ["--remove-socketdir"]):
+                try:
+                    subprocess.run(
+                        ["gpgconf", "--homedir", str(self.home), *args],
+                        capture_output=True,
+                        check=False,
+                    )
+                except OSError:
+                    pass  # no gpgconf: the home is still deleted below
+            shutil.rmtree(self.home, ignore_errors=True)
+            if self.home.exists():
+                print(
+                    f"gen_shapes.py: could not delete {self.home}, the temporary"
+                    " GnuPG home with this run's secret keys: delete it by hand",
+                    file=sys.stderr,
                 )
-            except OSError:
-                pass  # no gpgconf: the home is still deleted below
-        shutil.rmtree(self.home, ignore_errors=True)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, held)
 
 
 @dataclass(frozen=True)
@@ -904,7 +927,22 @@ def write_corpus(out: Path, inline: Shapes, detached: Shapes, keyring: bytes) ->
         (out / f"{name}.Release.gpg").write_bytes(data)
 
 
+def exit_on_signal(signum: int, _frame: FrameType | None) -> None:
+    """SIGTERM or SIGHUP: unwind with exit status 128 + signum. Once: later
+    ones are ignored, so a second cannot cut the clean-up short."""
+    for s in EXIT_SIGNALS:
+        signal.signal(s, signal.SIG_IGN)
+    raise SystemExit(128 + signum)
+
+
 def main(argv: list[str]) -> int:
+    # AIDEV-NOTE: Python's default SIGTERM and SIGHUP kill the process
+    # without unwinding: the finally below would not run close(), leaving
+    # the GnuPG home, its secret keys and its agent (the Task 5 review saw
+    # it). As an exception, the signal unwinds through it; subprocess.run
+    # kills the gpg it waits for. Only SIGKILL still leaves the home.
+    for s in EXIT_SIGNALS:
+        signal.signal(s, exit_on_signal)
     if len(argv) != 2:
         print("usage: python3 -I e2e/apt-oracle/gen_shapes.py OUT", file=sys.stderr)
         return 2

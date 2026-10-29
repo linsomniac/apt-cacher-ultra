@@ -1,0 +1,4 @@
+# The apt-shape fixtures are byte-exact (several differ from their controls
+# only in CRs): no end-of-line conversion on any checkout or commit,
+# whatever core.autocrlf says (e2e/apt-oracle/README.md).
+internal/gpg/testdata/aptshapes/** -text
