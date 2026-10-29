@@ -356,27 +356,33 @@ func TestServeHTTP_StrictMissDecidesAfterAFailedPrefetchRead(t *testing.T) {
 // (here POST /forget's final step retires the vouching suite once the
 // upstream body is written) is decided on that read as strict mode decides
 // before a download: refused on a strict host (502, Retry-After 60, logged
-// once, the line saying the upstream was asked), never served unchecked;
-// with a signed adoption in flight that vouches the same bytes on a suite
-// of its own, the miss waits and its retry serves the .deb, validated
-// against that suite. With strict mode off the file is served, unchecked,
-// as before.
+// once, the line saying the upstream was asked); with a signed adoption in
+// flight that vouches the same bytes on a suite of its own, the miss waits
+// and its retry serves the .deb, validated against that suite; on a host
+// whose coverage is incomplete it is passed through, unchecked, with one
+// unvouched_deb_passthrough_no_coverage line naming the incomplete
+// snapshot (the Task 4 review's Minor 4). With strict mode off the file is
+// served, unchecked, as before.
 func TestServeHTTP_StrictMissDecidesWhenVouchingEndsDuringTheDownload(t *testing.T) {
 	debHash := sha256Hex([]byte("upstream bytes")) // the rig upstream's body
 	for _, tc := range []struct {
-		name     string
-		strict   bool
-		inFlight bool
+		name   string
+		strict bool
+		// incomplete: the rig's snapshot (/dists/noble) has incomplete
+		// coverage, so strict mode passes an unvouched .deb through.
+		incomplete bool
+		inFlight   bool
 		// late: no row vouches the .deb before the request; the vouching
 		// suite commits as the refusal asks whether an adoption is in
 		// flight, so only the second look (prefetchRecheck) finds it.
 		late bool
 		want int
 	}{
-		{"vouched before the request, nothing in flight: refused", true, false, false, http.StatusBadGateway},
-		{"vouched before the request, an adoption in flight: waited for", true, true, false, http.StatusOK},
-		{"vouched at the second look, nothing in flight: refused", true, false, true, http.StatusBadGateway},
-		{"strict mode off: served", false, false, false, http.StatusOK},
+		{name: "vouched before the request, nothing in flight: refused", strict: true, want: http.StatusBadGateway},
+		{name: "vouched before the request, an adoption in flight: waited for", strict: true, inFlight: true, want: http.StatusOK},
+		{name: "vouched at the second look, nothing in flight: refused", strict: true, late: true, want: http.StatusBadGateway},
+		{name: "incomplete coverage: passed through", strict: true, incomplete: true, want: http.StatusOK},
+		{name: "strict mode off: served", want: http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := &fakeAdoptions{inFlight: tc.inFlight, ok: true}
@@ -384,16 +390,18 @@ func TestServeHTTP_StrictMissDecidesWhenVouchingEndsDuringTheDownload(t *testing
 				h                     *Handler
 				logs                  *strictLogBuf
 				srvURL, scheme, canon string
+				noble                 int64 // the rig snapshot's id, outside strictWaitRig
 			)
-			if tc.strict {
+			if tc.strict && !tc.incomplete {
 				h, logs, srvURL, scheme, canon = strictWaitRig(t, a)
 			} else {
-				// strictWaitRig's host and complete snapshot, strict mode off.
+				// strictWaitRig's host and snapshot, with strict mode off or
+				// the snapshot's coverage incomplete.
 				var srv *httptest.Server
-				h, srv, logs = newPhase3StrictHandlerCapturing(t, false, true, nil)
+				h, srv, logs = newPhase3StrictHandlerCapturing(t, tc.strict, true, nil)
 				s, host, port := splitURL(t, srv.URL)
 				srvURL, scheme, canon = srv.URL, s, hostKey(host, port)
-				adoptCoverageComplete(t, h, scheme, canon, "/dists/noble", true)
+				noble = adoptCoverageComplete(t, h, scheme, canon, "/dists/noble", !tc.incomplete)
 				h.adoptions = a
 			}
 			const vouching = "/dists/new"
@@ -436,10 +444,20 @@ func TestServeHTTP_StrictMissDecidesWhenVouchingEndsDuringTheDownload(t *testing
 			if len(lines) != 1 {
 				t.Fatalf("request lines %v, want one", lines)
 			}
+			// The decision after the download passes the .deb through only
+			// where the host's coverage is incomplete, and says so once.
+			pass := logs.find("unvouched_deb_passthrough_no_coverage")
+			if tc.incomplete {
+				if len(pass) != 1 || pass[0]["incomplete_snapshot_id"] != float64(noble) {
+					t.Fatalf("passthrough lines %v, want one naming snapshot %d", pass, noble)
+				}
+			} else if len(pass) != 0 {
+				t.Fatalf("unexpected passthrough lines %v", pass)
+			}
 			if tc.want == http.StatusOK {
 				// The retry's download is checked against the suite the
-				// adoption committed; with strict mode off the file is served
-				// unchecked, its vouching gone.
+				// adoption committed; passed through, or with strict mode
+				// off, the file is served unchecked, its vouching gone.
 				wantWaits := map[bool]int32{true: 1}[tc.inFlight]
 				validated, _ := lines[0]["validated_hash"].(bool)
 				if rec.Body.String() != "upstream bytes" || len(refused) != 0 || a.waits.Load() != wantWaits || validated != tc.inFlight {

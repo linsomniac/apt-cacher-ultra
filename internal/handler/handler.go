@@ -2000,9 +2000,12 @@ func (h *Handler) respondRecoveryError(w http.ResponseWriter, r *http.Request, r
 //
 // SPEC2 §6.2 .deb miss-path validation: the authoritative declared-
 // hash query happens AFTER the fetch and BEFORE promotion (per
-// SPEC2.md §6.2). A pre-fetch query is also performed, but only as a
-// bandwidth optimization for the conflict case (≥ 2 distinct declared
-// hashes); the post-fetch result is what drives the Finalize variant.
+// SPEC2.md §6.2). A pre-fetch query is also performed, as a bandwidth
+// optimization for the conflict case (≥ 2 distinct declared hashes) and
+// as strict mode's check (prefetchCheck): it makes the strict refusal
+// before the download, and its result decides whether the 0-rows case
+// below consults strict mode. The post-fetch result is what drives the
+// Finalize variant.
 //
 // Why post-fetch is authoritative: if adoption flips
 // current_snapshot_id while the fetch is in flight, the pre-fetch
@@ -2015,7 +2018,9 @@ func (h *Handler) respondRecoveryError(w http.ResponseWriter, r *http.Request, r
 // Dispatch (post-fetch):
 //
 //   - 0 declared rows  → Phase 1 trust-upstream regime, unconstrained
-//     Finalize.
+//     Finalize — except a .deb whose check before the download could not
+//     read its vouching or found it vouched: strict mode decides
+//     (strictAfterDownload).
 //   - 1 declared row, observed matches → FinalizeExpectingHash
 //     promotes (defense-in-depth even though the hashes already
 //     agree).
@@ -2153,7 +2158,9 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 				// the vouching hashes, or when it found the path vouched and the
 				// vouching is gone now (its snapshot retired, or displaced by one
 				// that does not list it, during the download) — a .deb that was
-				// vouched is never served unchecked on a strict host.
+				// vouched is not served unchecked on a strict host because its
+				// vouching ended (a read that fails still fails open, logged
+				// WARN).
 				if (prefetchUnread || prefetchVouched) && isDebPath(req.Path) {
 					if res, end := h.strictAfterDownload(ctx, req); end {
 						res.status = fres.Status
