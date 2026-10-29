@@ -357,9 +357,12 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   every tick never pages: its tick still logs `gc_run_complete` and sets
   `acu_gc_last_run_unixtime`, so the GC alert in the 1.1.0 release notes,
   on that gauge's age, stays quiet, and WARN `gc_tick_failed` is the only
-  sign (`docs/log-fields.md`). Since ruling HD-15 the passes after a failed
-  one run (*Decided*, below), but the failed pass's own work waits until its
-  fault is fixed. Recommendation: a counter,
+  sign (`docs/log-fields.md`); since the final fix wave's follow-up a
+  startup pass in which a pass failed sets the gauge too, so one that fails
+  at every start of a daemon that never runs a periodic tick never pages
+  either. Since ruling HD-15 the passes after a failed one run (*Decided*,
+  below), but the failed pass's own work waits until its fault is fixed.
+  Recommendation: a counter,
   `acu_gc_pass_failures_total{pass}`, and an alert line on it in the
   release notes, in a later release.
 - **A vouched `.deb` is stored unchecked when the read after its download
@@ -435,21 +438,27 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   three error paths now go through `passFailed`, which moves the rotation
   past the failed pass, as `skipPanickedPass` does after a panic, unless the
   GC's context has ended (a shutdown stopped the pass: it did not fail);
-  `periodicTick` and the retired run log WARN `gc_tick_failed` on the same
-  test (its row in `docs/log-fields.md`). Ruling HD-15: a failed pass no
-  longer ends its tick either — the passes after it run under the same
-  deadline, and `runTick` returns the first failure — in the startup pass
-  as in a periodic tick. A daemon restarted more often than `gc.interval`
-  never runs a periodic tick and begins the rotation afresh at every start,
-  so the rotation alone left a pass that failed at every start starving the
-  passes after it there (G-I1); such a daemon now runs every pass at every
-  start. And a pass that fails at every tick is retried at every tick, the
-  others keeping their cadence, where it ran every other tick, the passes
-  after it in between (G-M5). Safe: each pass re-checks its own predicates.
-  Done in the hardening plan's Task 1 (commits 38eb75a and 85407b1) and its
-  final fix wave, pinned by
+  each pass that fails logs WARN `gc_tick_failed` as it fails, on the same
+  test, and so does the retired run (its row in `docs/log-fields.md`).
+  Ruling HD-15: a failed pass no longer ends its tick either — the passes
+  after it run under the same deadline, and `runTick` returns the first
+  failure — in the startup pass as in a periodic tick. A daemon restarted
+  more often than `gc.interval` never runs a periodic tick and begins the
+  rotation afresh at every start, so the rotation alone left a pass that
+  failed at every start starving the passes after it there (G-I1); such a
+  daemon now runs every pass at every start. And a pass that fails at every
+  tick is retried at every tick, the others keeping their cadence, where it
+  ran every other tick, the passes after it in between (G-M5). Safe: each
+  pass re-checks its own predicates. The fix wave's follow-up: every failed
+  pass logs its own line, where a tick logged only its first failure, and a
+  startup pass in which a pass failed still logs `gc_run_complete` and sets
+  its metrics and last-run summary, where it wrote none. Done in the
+  hardening plan's Task 1 (commits 38eb75a and 85407b1) and its final fix
+  wave (commit d91c8e1 and the fix wave's follow-up), pinned by
   `TestPeriodicTick_AFailingPassDoesNotStarveTheNext`,
-  `TestStartupPass_AFailingSnapshotPassLeavesTheBlobPassToRun` and
+  `TestStartupPass_AFailingSnapshotPassLeavesTheBlobPassToRun`,
+  `TestPeriodicTick_LogsEveryFailedPass`,
+  `TestStartupPass_AFailedPassStillReportsItsWork` and
   `TestPassFailed_MovesPastEachPassUnlessTheContextEnded`.
 - **Periodic GC retires displaced snapshots instead of deleting them in one
   transaction** (the maintainer, 2026-10-28: worked for 1.1.0; raised
@@ -515,7 +524,8 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   no byte count at the upstream, which loopback buffering varies.
   `docs/configuration.md`'s unsigned threat note now says each file's
   download stops at its declared size. Done in the hardening plan's Task 3
-  (commits 391eac2 and c45cd74) and its final fix wave, pinned by
+  (commits 391eac2 and c45cd74) and its final fix wave (commit a8a8d20),
+  pinned by
   `TestAdoptMember_AMemberLongerThanDeclaredStopsAtItsSize`,
   `TestAdoptMember_APlainPathMemberShortOfItsDeclaredSizeIsRefused` and the
   `TestFetch_MaxBytes…` tests. Downloads with no declared size are under

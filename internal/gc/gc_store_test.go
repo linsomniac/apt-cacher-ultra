@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 )
 
 // fakeStore is a gcStore whose snapshot batches find nothing (A ∪ B
@@ -517,7 +519,9 @@ func TestPeriodicTick_AnEndedContextKeepsTheRotation(t *testing.T) {
 // Ruling HD-15 (the hardening plan's final review, G-I1): the startup pass
 // goes on past a failed pass too — the blob pass after a failed snapshot
 // pass runs in the same start — and StartupPass still returns the failure
-// (main logs it). The first periodic tick retries the failed pass.
+// (main logs it). The failed pass logs its own gc_tick_failed line, at the
+// start as in a tick (the fix wave's follow-up); the first periodic tick
+// retries it, and logs none, since it succeeds.
 func TestStartupPass_AFailingPassDoesNotStarveTheNext(t *testing.T) {
 	logger, buf := captureLogger()
 	f := &fakeStore{batchErrs: 1}
@@ -530,12 +534,19 @@ func TestStartupPass_AFailingPassDoesNotStarveTheNext(t *testing.T) {
 	if blobRowExists(t, dbOf(t, c), dead) {
 		t.Fatal("the dead blob is still there: the startup pass's blob pass did not run after its failed snapshot pass")
 	}
+	ev := gcEvents(t, buf, "gc_tick_failed")
+	if len(ev) != 1 {
+		t.Fatalf("after the start, gc_tick_failed lines %v, want one, the failed snapshot pass's", ev)
+	}
+	if msg, _ := ev[0]["err"].(string); !strings.Contains(msg, "snapshot gc batch") {
+		t.Fatalf("gc_tick_failed err %q, want the snapshot batch's failure", msg)
+	}
 	g.periodicTick(context.Background())
 	if f.batches != 2 {
 		t.Fatalf("%d snapshot batches after the first periodic tick, want 2: the tick retries the pass that failed at the start", f.batches)
 	}
-	if ev := gcEvents(t, buf, "gc_tick_failed"); len(ev) != 0 {
-		t.Fatalf("gc_tick_failed lines %v, want none: the retried pass succeeded", ev)
+	if ev := gcEvents(t, buf, "gc_tick_failed"); len(ev) != 1 {
+		t.Fatalf("gc_tick_failed lines %v, want only the start's: the retried pass succeeded", ev)
 	}
 }
 
@@ -585,8 +596,8 @@ func TestPassFailed_MovesPastEachPassUnlessTheContextEnded(t *testing.T) {
 // same tick: its sub-jobs B and C delete the displaced snapshot beyond
 // keep_displaced. The blob pass, whose reachability predicate reads
 // url_path too, then fails in turn and moves the rotation back to the
-// url-path pass; the tick logs one gc_tick_failed line, for its first
-// failure, the url-path pass's.
+// url-path pass; each failed pass logs its own gc_tick_failed line, the
+// url-path pass's first.
 func TestPeriodicTick_AFailingURLPathPassMovesToTheSnapshotPass(t *testing.T) {
 	logger, buf := captureLogger()
 	g, c := storeGC(t, nil, 2, logger)
@@ -603,11 +614,11 @@ func TestPeriodicTick_AFailingURLPathPassMovesToTheSnapshotPass(t *testing.T) {
 	}
 	g.periodicTick(context.Background())
 	ev := gcEvents(t, buf, "gc_tick_failed")
-	if len(ev) != 1 {
-		t.Fatalf("gc_tick_failed lines %v, want one (the url-path pass's)", ev)
+	if len(ev) != 2 {
+		t.Fatalf("gc_tick_failed lines %v, want two (the url-path pass's, then the blob pass's)", ev)
 	}
 	if msg, _ := ev[0]["err"].(string); !strings.Contains(msg, "url_path gc batch") {
-		t.Fatalf("gc_tick_failed err %q, want the url-path batch's failure", msg)
+		t.Fatalf("first gc_tick_failed err %q, want the url-path batch's failure", msg)
 	}
 	if snapshotRowExists(t, db, ids[0]) {
 		t.Fatal("the displaced snapshot beyond keep_displaced is still there: the snapshot pass did not run after the failed url-path pass")
@@ -642,29 +653,38 @@ func TestPeriodicTick_AFailingBlobPassMovesToTheURLPathPass(t *testing.T) {
 	}
 }
 
-// Ruling HD-15: a tick whose passes all fail still runs each of them, and
-// logs one gc_tick_failed line, for its first failure. With url_path
-// unreadable the url-path pass fails, then the snapshot pass (failing behind
-// the seam), then the blob pass, whose reachability predicate reads url_path
-// too: the line is the url-path pass's.
-func TestPeriodicTick_LogsTheFirstFailedPass(t *testing.T) {
+// Ruling HD-15 and the fix wave's follow-up: a tick in which two passes fail
+// runs each of them, and each failed pass logs its own WARN gc_tick_failed
+// line, once, so the second failure is not hidden behind the first. With
+// url_path and blob unreadable the url-path pass fails, the snapshot pass
+// (healthy behind the seam) runs, and the blob pass fails: two lines, the
+// url-path pass's, then the blob pass's.
+func TestPeriodicTick_LogsEveryFailedPass(t *testing.T) {
 	logger, buf := captureLogger()
-	f := &fakeStore{batchErrs: 1000}
+	f := &fakeStore{}
 	g, c := storeGC(t, f, 2, logger)
 	g.cfg.URLPathTTL = time.Hour
-	if _, err := dbOf(t, c).Exec(`ALTER TABLE url_path RENAME TO url_path_unreadable`); err != nil {
-		t.Fatal(err)
+	db := dbOf(t, c)
+	for _, stmt := range []string{
+		`ALTER TABLE url_path RENAME TO url_path_unreadable`,
+		`ALTER TABLE blob RENAME TO blob_unreadable`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
 	}
 	g.periodicTick(context.Background())
 	if f.batches != 1 {
-		t.Fatalf("%d snapshot batches, want 1: the snapshot pass runs after the failed url-path pass", f.batches)
+		t.Fatalf("%d snapshot batches, want 1: the snapshot pass runs between the two failed passes", f.batches)
 	}
 	ev := gcEvents(t, buf, "gc_tick_failed")
-	if len(ev) != 1 {
-		t.Fatalf("gc_tick_failed lines %v, want one, for the tick's first failure", ev)
+	if len(ev) != 2 {
+		t.Fatalf("gc_tick_failed lines %v, want two, one for each failed pass", ev)
 	}
-	if msg, _ := ev[0]["err"].(string); !strings.Contains(msg, "url_path gc batch") {
-		t.Fatalf("gc_tick_failed err %q, want the tick's first failure, the url-path pass's", msg)
+	for i, want := range []string{"url_path gc batch", "blob gc batch"} {
+		if msg, _ := ev[i]["err"].(string); ev[i]["level"] != "WARN" || !strings.Contains(msg, want) {
+			t.Fatalf("gc_tick_failed line %d: %v, want a WARN whose err names %q", i, ev[i], want)
+		}
 	}
 	if g.nextPass != urlPathPass {
 		t.Fatalf("after the tick the rotation is at pass %d, want the url-path pass (%d): every pass ran", g.nextPass, urlPathPass)
@@ -766,6 +786,108 @@ func TestStartupPass_AFailingSnapshotPassLeavesTheBlobPassToRun(t *testing.T) {
 		if row, file := blobRowExists(t, db, dead), fileExists(t, c.BlobPath(dead)); row || file {
 			t.Fatalf("after start %d the dead blob is still there (row %v, file %v): want it reaped at the first start", start, row, file)
 		}
+	}
+}
+
+// gcMetricValue is the value of the exposition series line — the metric
+// name with its labels exactly as metrics.Default renders it, e.g.
+// `acu_gc_runs_total{phase="startup"}` — or 0 when the series does not
+// exist yet. The registry is the process's, so callers compare before and
+// after (this package's tests run one at a time).
+func gcMetricValue(t *testing.T, series string) float64 {
+	t.Helper()
+	var buf bytes.Buffer
+	metrics.Default.Render(&buf)
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if v, ok := strings.CutPrefix(line, series+" "); ok {
+			f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+			if err != nil {
+				t.Fatalf("parse %q: %v", line, err)
+			}
+			return f
+		}
+	}
+	return 0
+}
+
+// The fix wave's follow-up of ruling HD-15: a startup pass in which a pass
+// failed still reports what its passes did — its gc_run_complete line
+// (phase startup), its metrics and the last-run summary — and still
+// returns the first failure, which main logs (gc startup pass failed);
+// each failed pass has logged its own gc_tick_failed line. With url_path
+// unreadable the url-path pass fails, the snapshot pass deletes the two
+// displaced snapshots beyond keep_displaced, and the blob pass, whose
+// reachability predicate reads url_path too, fails, so the dead blob stays;
+// with snapshot_skipped_member unreadable the snapshot pass fails and the
+// blob pass reaps the dead blob.
+func TestStartupPass_AFailedPassStillReportsItsWork(t *testing.T) {
+	for _, tc := range []struct {
+		table      string        // renamed away
+		urlPathTTL time.Duration // 0: the url-path pass is off
+		failed     []string      // the gc_tick_failed lines' err prefixes, in order
+		displaced  int           // displaced_reaped: the snapshot pass's work
+		blobs      int           // blobs_reaped: the blob pass's work
+	}{
+		{"url_path", time.Hour, []string{"url_path gc batch", "blob gc batch"}, 2, 0},
+		{"snapshot_skipped_member", 0, []string{"snapshot gc batch"}, 0, 1},
+	} {
+		t.Run(tc.table+" unreadable", func(t *testing.T) {
+			c := openTestCache(t)
+			db := dbOf(t, c)
+			for i := range 6 { // the current snapshot and five displaced: two beyond keep_displaced = 3
+				adoptSnapshot(t, c, "http", "h", "/r/dists/x",
+					putPoolBlob(t, c, fmt.Sprintf("anchor %d", i)), []string{putPoolBlob(t, c, fmt.Sprintf("member %d", i))})
+			}
+			dead := putPoolBlob(t, c, "a dead blob nothing references")
+			fastForwardZeroedAt(t, db, dead)
+			if _, err := db.Exec(`ALTER TABLE ` + tc.table + ` RENAME TO ` + tc.table + `_unreadable`); err != nil {
+				t.Fatal(err)
+			}
+			logger, buf := captureLogger()
+			g := freshStartGC(t, c, logger, tc.urlPathTTL)
+			runs0 := gcMetricValue(t, `acu_gc_runs_total{phase="startup"}`)
+			displaced0 := gcMetricValue(t, "acu_gc_displaced_reaped_total")
+			blobs0 := gcMetricValue(t, "acu_gc_blobs_reaped_total")
+
+			err := g.StartupPass(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tc.failed[0]) {
+				t.Fatalf("StartupPass = %v, want its first failure, %q", err, tc.failed[0])
+			}
+			failed := gcEvents(t, buf, "gc_tick_failed")
+			if len(failed) != len(tc.failed) {
+				t.Fatalf("gc_tick_failed lines %v, want %d, one for each failed pass", failed, len(tc.failed))
+			}
+			for i, want := range tc.failed {
+				if msg, _ := failed[i]["err"].(string); !strings.Contains(msg, want) {
+					t.Fatalf("gc_tick_failed line %d err %q, want %q", i, msg, want)
+				}
+			}
+			runs := gcEvents(t, buf, "gc_run_complete")
+			if len(runs) != 1 || runs[0]["phase"] != "startup" ||
+				runs[0]["displaced_reaped"] != float64(tc.displaced) || runs[0]["blobs_reaped"] != float64(tc.blobs) {
+				t.Fatalf("gc_run_complete lines %v, want the startup pass's, displaced_reaped %d and blobs_reaped %d",
+					runs, tc.displaced, tc.blobs)
+			}
+			if s, ok := g.LastRunSummary(); !ok || s.Phase != "startup" || s.DisplacedReaped != tc.displaced || s.BlobsReaped != tc.blobs {
+				t.Fatalf("LastRunSummary = %+v, %v; want the startup pass's, displaced %d, blobs %d", s, ok, tc.displaced, tc.blobs)
+			}
+			for _, m := range []struct {
+				series string
+				before float64
+				want   int
+			}{
+				{`acu_gc_runs_total{phase="startup"}`, runs0, 1},
+				{"acu_gc_displaced_reaped_total", displaced0, tc.displaced},
+				{"acu_gc_blobs_reaped_total", blobs0, tc.blobs},
+			} {
+				if got := gcMetricValue(t, m.series) - m.before; got != float64(m.want) {
+					t.Errorf("%s rose by %v, want %d", m.series, got, m.want)
+				}
+			}
+			if kept := blobRowExists(t, db, dead); kept != (tc.blobs == 0) {
+				t.Errorf("the dead blob kept: %v, want %v", kept, tc.blobs == 0)
+			}
+		})
 	}
 }
 

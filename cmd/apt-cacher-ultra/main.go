@@ -534,9 +534,11 @@ func serveListeners(
 		// is loud but not fatal — the daemon can still serve. Log
 		// and continue. A failed pool scan ends the startup pass
 		// before its GC passes, and the next process restart re-runs
-		// it; a failed GC pass did not keep the passes after it from
-		// running (ruling HD-15). The periodic ticks run every pass
-		// again, the failed one included.
+		// it. A failed GC pass did not keep the passes after it from
+		// running (ruling HD-15): each failed pass logged its own
+		// gc_tick_failed, the startup pass its gc_run_complete, and
+		// err is the first failure. The periodic ticks run every
+		// pass again, the failed one included.
 		logger.Warn("gc startup pass failed", "err", err)
 	}
 

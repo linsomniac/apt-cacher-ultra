@@ -276,8 +276,12 @@ func New(cfg Config) (*GC, error) {
 // the passes after it have run too (runTick, ruling HD-15: a failed pass
 // no longer ends the one-shot pass, so a daemon restarted more often than
 // gc.interval, which never runs a periodic tick, still runs every pass at
-// every start); partial progress is preserved (DB rows / pool files reaped
-// before cancel are real). The one-shot pass runs no snapshot-GC sub-job C
+// every start) and the pass has written its gc_run_complete line, metrics
+// and last-run summary, as a periodic tick does: each failed pass logged
+// its own gc_tick_failed line (runTick), and main logs the returned first
+// failure as the startup pass's (the fix wave's follow-up of HD-15).
+// Partial progress is preserved (DB rows / pool files reaped before cancel
+// are real). The one-shot pass runs no snapshot-GC sub-job C
 // (spec C9's retired snapshots): Run does, an hour after the start when
 // gc.interval is longer (retiredRun), and the periodic ticks, normally the
 // first — a later one when an earlier pass, this one's blob pass say, hits
@@ -314,13 +318,12 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 
 	// Step 6: one-shot GC pass — without snapshot-GC sub-job C, which Run
 	// runs an hour after the start (retiredRun) and in the periodic ticks
-	// (ruling PF-15: runSnapshotPass).
+	// (ruling PF-15: runSnapshotPass). A failed pass is returned after the
+	// line, the metrics and the summary below, which report what the passes
+	// that ran did, as a periodic tick's do.
 	passesDone = false
-	tick, err := g.runTick(ctx, phaseStartup)
+	tick, tickErr := g.runTick(ctx, phaseStartup)
 	passesDone = true
-	if err != nil {
-		return fmt.Errorf("gc startup: tick: %w", err)
-	}
 
 	duration := time.Since(start)
 	endUnix := wallclock.Unix()
@@ -381,6 +384,9 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 		PoolUnlinkErrors:        tick.poolUnlinkErrors + scan.unlinkErrors,
 		DeadlineReached:         tick.deadlineReached,
 	})
+	if tickErr != nil {
+		return fmt.Errorf("gc startup: tick: %w", tickErr)
+	}
 	return nil
 }
 
@@ -442,14 +448,11 @@ func (g *GC) periodicTick(ctx context.Context) {
 	defer g.skipPanickedPass(&passesDone)
 	defer g.recoverPanic("tick")
 	start := time.Now()
-	tick, err := g.runTick(ctx, "periodic")
+	// Each failed pass logged its own WARN gc_tick_failed as it failed
+	// (runTick's failed); the first failure, which runTick returns, is for
+	// StartupPass's caller, so a tick logs none of its own for it.
+	tick, _ := g.runTick(ctx, "periodic")
 	passesDone = true
-	// AIDEV-NOTE: passFailed's test: a pass stopped by the end of ctx (a
-	// shutdown) did not fail, whatever its error's shape. err is the tick's
-	// first failure; the passes after it ran too (runTick, ruling HD-15).
-	if err != nil && ctx.Err() == nil {
-		g.cfg.Logger.Warn("gc_tick_failed", "err", err)
-	}
 	duration := time.Since(start)
 	endUnix := wallclock.Unix()
 	g.cfg.Logger.Info("gc_run_complete",
@@ -570,9 +573,11 @@ func (g *GC) skipPass() {
 // periodic tick alike, and returns the first failure; a failing pass is
 // retried at every tick, and the others keep their full cadence. Safe:
 // each pass re-checks its own predicates (the blob pass's reachability
-// holds whatever the url-path or snapshot pass did or failed to do). A
-// failed url-path pass resumes, next time, at the cursor its last deadline
-// saved.
+// holds whatever the url-path or snapshot pass did or failed to do). Each
+// failed pass logs its own WARN gc_tick_failed, as it fails (runTick's
+// failed), and a startup pass in which one failed still writes its
+// gc_run_complete line (StartupPass): the fix wave's follow-up. A failed
+// url-path pass resumes, next time, at the cursor its last deadline saved.
 func (g *GC) passFailed(ctx context.Context, err error) error {
 	if ctx.Err() == nil {
 		g.skipPass()
@@ -643,11 +648,12 @@ type tickResult struct {
 // runTick resumes ordered URL-path, snapshot, and blob passes under a
 // single shared deadline. A completed pass is not repeated until all
 // following passes have drained, even if that takes multiple ticks. A
-// pass that fails while ctx lives does not end the tick (ruling HD-15):
-// passFailed moves the rotation past it, as if it had completed, and the
-// passes after it run, under the same deadline; runTick returns the
-// tick's first failure. A pass that fails once ctx has ended (a shutdown)
-// ends the tick at once, the rotation as it is.
+// pass that fails while ctx lives does not end the tick (ruling HD-15): it
+// logs WARN gc_tick_failed, passFailed moves the rotation past it, as if it
+// had completed, and the passes after it run, under the same deadline;
+// runTick returns the tick's first failure. A pass that fails once ctx has
+// ended (a shutdown) ends the tick at once, the rotation as it is, and logs
+// nothing.
 //
 // `phase` is phaseStartup ("startup", StartupPass) or "periodic" (Run).
 // It labels the gc_tick_deadline_reached events, so an operator can
@@ -665,15 +671,31 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 		firstErr error
 	)
 	// failed takes a pass that failed with err: passFailed moves the
-	// rotation past it unless ctx has ended, and err is kept unless an
-	// earlier pass of this tick failed first. It reports whether the tick
-	// goes on: not once ctx has ended, which never comes undone, so a tick
-	// whose rotation passFailed left as it was always ends there.
+	// rotation past it unless ctx has ended, err is kept unless an earlier
+	// pass of this tick failed first, and, while ctx lives, the pass logs
+	// WARN gc_tick_failed. It reports whether the tick goes on: not once ctx
+	// has ended, which never comes undone, so a tick whose rotation
+	// passFailed left as it was always ends there.
+	//
+	// AIDEV-NOTE: passFailed's test: a pass stopped by the end of ctx (a
+	// shutdown) did not fail, whatever its error's shape, and logs nothing.
+	// Each pass that fails logs its own line here, as it fails, in the
+	// startup pass and a periodic tick alike — and nowhere else, so each
+	// failure is logged once — so a second failed pass is not hidden behind
+	// the first, nor a failure behind a shutdown later in the tick (ruling
+	// HD-15's follow-up in the hardening plan's final fix wave). runTick
+	// returns the first for StartupPass's caller, which logs it once more,
+	// as the startup pass's failure.
 	failed := func(err error) bool {
-		if e := g.passFailed(ctx, err); firstErr == nil {
+		e := g.passFailed(ctx, err)
+		if firstErr == nil {
 			firstErr = e
 		}
-		return ctx.Err() == nil
+		if ctx.Err() != nil {
+			return false
+		}
+		g.cfg.Logger.Warn("gc_tick_failed", "err", e)
+		return true
 	}
 
 	// URL-path TTL pass — runs first so any refcount decrements

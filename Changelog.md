@@ -66,7 +66,9 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 - Idle SQLite read connections are kept between requests, so connection
   churn no longer starves the writer.
 - A GC pass that fails at every tick no longer keeps the passes after it,
-  the blob pass included, from running.
+  the blob pass included, from running; each failed pass logs
+  `gc_tick_failed`, at startup too, and a startup pass in which one failed
+  still logs `gc_run_complete` and sets the GC metrics.
 - GC no longer holds every database write for seconds while it deletes old
   snapshots: periodic runs retire the displaced snapshots beyond
   `gc.keep_displaced` and delete them 10,000 rows a transaction.
