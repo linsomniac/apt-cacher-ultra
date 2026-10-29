@@ -76,9 +76,10 @@ var aptShapeKnownUnsafe = map[string]string{
 var pendingS1 = map[string]bool{}
 
 // pendingHybrid holds the shapes of batches fx10 to fx13 (the final review's
-// and DN-11's, the hardening plan's Task 9a) that the verifier of Tasks 6
-// and 7 gets wrong: the table test skips each, naming it, until the hybrid
-// verifier (Task 9b) empties the map. Each value says what that verifier
+// and DN-11's, the hardening plan's Task 9a) and fx14 (Task 9b's
+// measurements) that the verifier of Tasks 6 and 7 gets wrong: the table
+// test skips each, naming it, until the hybrid verifier (Task 9b) empties
+// the map. Each value says what that verifier
 // does with the shape; TestAptShapeDeviations_NameShapesInTheTable checks it
 // against apt's verdicts.
 //
@@ -194,6 +195,10 @@ var pendingHybrid = map[string]string{
 	"sx_i_straddle_v3garbageA":      pendingAdopted,
 	"v6_d_v6unknown_plus_good":      pendingAdopted,
 	"v6_i_v6unknown_plus_good":      pendingAdopted,
+	// Batch fx14 (Task 9b's measurements). (3)
+	"n_d_b64_pad_bits":    pendingAdopted,
+	"n_i_b64_pad_bits":    pendingAdopted,
+	"n_d_unknown01_first": pendingAdopted,
 
 	// Refused, though every apt accepts them. (29)
 	"a_b64_irregular":            pendingRefused,
@@ -225,6 +230,9 @@ var pendingHybrid = map[string]string{
 	"s_hash_hdr_trail_tab":       pendingRefused,
 	"vm3_d_end_marker_in_header": pendingRefused,
 	"vm3_i_end_marker_in_header": pendingRefused,
+	// Batch fx14 (Task 9b's measurements). (2)
+	"n_d_good_then_badA01": pendingRefused,
+	"n_i_good_then_badA00": pendingRefused,
 
 	// Refused only after go-crypto allocates gibibytes (the AIDEV-NOTE above). (4)
 	"vc2_d_v4_embedded_v6_1g": pendingAllocates,

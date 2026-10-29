@@ -40,12 +40,12 @@ only some of the images, a corpus file missing.
 
 ## The corpus
 
-`internal/gpg/testdata/aptshapes/` holds 498 files, about 610 KiB:
+`internal/gpg/testdata/aptshapes/` holds 506 files, about 620 KiB:
 
 | File | What it is |
 |---|---|
-| `<name>.InRelease` | an inline shape (346 of them): the whole `InRelease`, its signed text included |
-| `<name>.Release.gpg` | a detached shape (144): a `Release.gpg` that signs the shared `Release`, or its own |
+| `<name>.InRelease` | an inline shape (350 of them): the whole `InRelease`, its signed text included |
+| `<name>.Release.gpg` | a detached shape (148): a `Release.gpg` that signs the shared `Release`, or its own |
 | `<name>.Release` | a detached shape's own `Release` (4: `a_d_release_crlf`, `a_d_release_extra_nl`, `a_d_release_no_final_nl`, `o2_textmode_detached_release_crlf`), which `in-container.sh` serves in the shared one's place |
 | `Release` | the shared `Release`, a flat repository's: the SHA256 line of an empty `Packages`, a fixed `Date:` in the past (2026-10-01), no `Valid-Until` |
 | `keys.gpg` | the public keys A, E, S and O, in binary: the clients' `signed-by` here, and the host keyring of the verifier's table test (the hardening plan's Task 6), which loads the file whole, so every key in it is a trusted signer there |
@@ -56,7 +56,7 @@ The repository's `.gitattributes` marks every file here `-text`, so no
 checkout or commit converts their line ends, whatever `core.autocrlf`
 says: several shapes differ from their controls only in CRs.
 
-There are 490 shapes, in thirteen batches. The first 135 are those the
+There are 498 shapes, in fourteen batches. The first 135 are those the
 hardening plan measured on 2026-10-28
 (`docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md`: DN-2
 sorts them into classes, Appendix A gives each one's verdicts), rebuilt by
@@ -70,7 +70,7 @@ notation, SHA-1, a dash-escaped END line in the signed text. A name says
 the shape: `i_` and `d_` are the plan's first batch (inline and detached),
 `xi_`, `xd_` and `x3i_` to `x7d_` its later ones, `gi_` and `gd_` batch
 fx8, `t7c_` and `t7g` batch fx9, `a_` to `s_` batch fx10, `sx_` to `vm3_`
-batch fx11, `n_` batches fx12 and fx13, `o_` and `o2_` batch fx13;
+batch fx11, `n_` batches fx12 to fx14, `o_` and `o2_` batch fx13;
 `i_trail_lf` is a blank line after the END line, `xd_good_plus_literal` a
 literal-data packet beside a good detached signature, a `*_control*` its
 batch's unmodified control.
@@ -165,6 +165,26 @@ binary-mode packet first (`n_i_unknown00_first`: gpgv then reports B's
 missing key and no good signature from A), and every apt accepts an END
 marker in an armor header (`vm3_*`).
 
+Batch fx14, 8 shapes (`n_`, the plan's Task 9b), measures what the
+hybrid verifier's rules rest on, cut without a key from committed
+fixtures:
+
+- text-mode and binary-mode packets in one anchor (A's good packet, B's,
+  or A's good one with its signature type changed, so a bad one from A),
+  inline and detached, the good one first or second: gpgv hashes the data
+  as the first packet's type says and, when the types differ, checks the
+  first packet only ("multiple signatures detected. Only the first will
+  be checked", g10/mainproc.c), so every gpgv-based apt refuses the
+  anchor when that first packet is not a good one (`n_i_badA00_then_good`,
+  `n_d_badA01_then_good`: BADSIG; `n_d_unknown01_first`: NO_PUBKEY, as
+  `n_i_unknown00_first`) and every apt accepts it when it is, whatever
+  follows (`n_i_good_then_unknown00`, `n_i_good_then_badA00`,
+  `n_d_good_then_badA01`);
+- base64 whose last character before its padding has its unused bits set
+  (`n_i_b64_pad_bits`, `n_d_b64_pad_bits`: `p_good_old4`'s armor and its
+  detached twin): the same bytes to gpgv, refused by `debian:13`'s sqv
+  ("DecodeError: Invalid last symbol").
+
 The keys are made in a temporary GnuPG home that the generator deletes
 when the run ends, by an error, Ctrl-C, SIGTERM or SIGHUP too (only
 SIGKILL leaves it, and a home it cannot delete is named on stderr); no
@@ -189,7 +209,7 @@ secret key is written anywhere else, and the generator checks that
      `CONTROL_FILES` names — the fx7 controls, A's and S's subkey's bad
      signatures, B's, E's and S's subkey's packets beside A's, the v3 and
      unknown-hash packets, S's fingerprint from `keys.gpg`, the shared
-     `Release`): a `FROM_CONTROLS` batch, as fx8 to fx12 are.
+     `Release`): a `FROM_CONTROLS` batch, as fx8 to fx12 and fx14 are.
      `python3 -I e2e/apt-oracle/gen_shapes.py --from-controls
      internal/gpg/testdata/aptshapes` writes those batches alone, from the
      committed fixtures, and every other file keeps its bytes.
@@ -370,3 +390,4 @@ together (*Adding a shape*).
 | 2026-10-29, 05:38 UTC (ruling HD-13, after the plan's Task 6) | the commit that adds batch fx8, on 80af12b | `--from-controls` wrote fx8's 20 shapes and nothing else; `--record`: 155 shapes in 6 images, the 135 earlier rows unchanged and the 20 new ones as Task 6 measured them; then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 12 s each run, images cached |
 | 2026-10-29, 07:43 UTC (ruling HD-14, the plan's Task 7) | the commit that adds batch fx9, on 40d3614 | `--from-controls` wrote fx9's 13 shapes and nothing else (fx8's 20 again, byte for byte); `--record`: 168 shapes in 6 images, the 155 earlier rows unchanged and the 13 new ones as Task 7 measured them; then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 13 s each run, images cached |
 | 2026-10-29, 15:30 UTC (the plan's Task 9a) | the commit that adds batches fx10 to fx13 and `classes.txt`, on 78175bb | `--from-controls` wrote fx10 to fx12's 307 shapes (fx8's and fx9's 33 again, byte for byte), `--own-key` fx13's 15 and key O; `--record`: 490 shapes in 6 images, the 168 earlier rows unchanged, the 309 the final review measured as it measured them, and the error classes of every refusal; then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 51 s and 50 s, images cached |
+| 2026-10-29, 16:23 UTC (the plan's Task 9b) | the commit that adds batch fx14, on 9efa08d | `--from-controls` wrote fx14's 8 shapes (fx8 to fx12's 340 again, byte for byte); `--record`: 498 shapes in 6 images, the 490 earlier rows and their error classes unchanged; then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 51 s and 54 s, images cached |

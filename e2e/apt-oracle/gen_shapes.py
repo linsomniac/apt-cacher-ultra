@@ -45,7 +45,7 @@ and ``keys.gpg`` is checked to hold public packets only.
   batch can be made again alone (``--own-key``) once the other keys'
   secrets are gone, as they are after every run.
 
-490 shapes, in 13 batches. The first 135 are the planning measurement's
+498 shapes, in 14 batches. The first 135 are the planning measurement's
 (2026-10-28; DN-2 and Appendix A of
 docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md), by the
 same names and built as its throwaway generators built them (the plan's
@@ -89,6 +89,12 @@ outside the tree) and DN-11's new controls:
 - fx13, 15: the adversarial lens's own-key batches b3 and b7, by its
   names, and DN-11's new controls that need a signer, made with key O.
 
+Batch fx14, 8 (``n_``), is the plan's Task 9b's: the measurements its
+rules rest on, cut without a key from committed fixtures: text-mode and
+binary-mode packets mixed in one anchor, which gpgv checks the first of
+only, and base64 whose last character has its unused bits set, which
+debian:13's sqv refuses.
+
 AIDEV-NOTE: the fixtures, verdicts.txt and classes.txt are one
 measurement. Each run makes new keys, new signatures and new random bytes
 (the v3 garbage packets), so a regenerated corpus must be re-measured
@@ -99,8 +105,8 @@ files together. Never edit a fixture by hand. Two modes write some of the
 corpus and leave every other file's bytes as they are, so that --record
 must leave every other row as it was: ``--from-controls`` makes no key and
 writes only the batches cut from OUT's committed fixtures (FROM_CONTROLS:
-fx8 to fx12, from CONTROL_FILES); ``--own-key`` makes key O alone and
-writes only batch fx13 and O's public key in keys.gpg (the other keys'
+fx8 to fx12 and fx14, from CONTROL_FILES); ``--own-key`` makes key O alone
+and writes only batch fx13 and O's public key in keys.gpg (the other keys'
 packets keep their bytes).
 
 Usage: python3 -I e2e/apt-oracle/gen_shapes.py OUT
@@ -2315,6 +2321,88 @@ def batch_fx12_from(c: Controls) -> Batch:
     return inline, detached, {}
 
 
+def retyped(sig: bytes, sigtype: int) -> bytes:
+    """sig, one v4 signature packet in gpg's old-format two-octet framing,
+    with its signature type octet set to sigtype (the type is hashed, so a
+    good signature so changed is a bad one; no key can check an unknown
+    key's either way)."""
+    if not sig or sig[0] != 0x89 or len(frames(sig)) != 1 or sig[3] != 4:
+        raise ValueError(f"want one v4 packet in gpg's framing, got {sig[:4]!r}")
+    return sig[:4] + bytes([sigtype]) + sig[5:]
+
+
+B64_ALPHABET = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+
+def with_pad_bits(arm: bytes) -> bytes:
+    """arm, an armor whose base64 ends in one padding "=", with the unused
+    low bits of the character before that "=" set: the same bytes to a
+    decoder that drops those bits (gpgv's radix64 reader), none to a strict
+    one."""
+    lines = arm.split(b"\n")
+    term = lines.index(b"")  # the end of the armor headers
+    crc = next(i for i, line in enumerate(lines) if line.startswith(b"="))
+    last = lines[crc - 1]
+    if not last.endswith(b"=") or last.endswith(b"=="):
+        raise ValueError(f"want one padding character, got {last[-4:]!r}")
+    v = B64_ALPHABET.index(last[-2:-1])
+    if v & 3:
+        raise ValueError("the character before the padding has its low bits set")
+    before = b"".join(lines[term + 1 : crc])
+    lines[crc - 1] = last[:-2] + B64_ALPHABET[v | 1 : (v | 1) + 1] + b"="
+    after = b"".join(lines[term + 1 : crc])
+    if after == before or base64.b64decode(after) != base64.b64decode(before):
+        raise ValueError("the pad bits did not keep the decoded bytes")
+    return b"\n".join(lines)
+
+
+def batch_fx14_from(c: Controls) -> Batch:
+    """Task 9b's measurements (the hardening plan's DN-11, HD-16), cut
+    without a key from committed fixtures.
+
+    Mixed signature types (n_i_unknown00_first's family, batch fx12): gpgv
+    hashes the data as the first packet's signature type says and, when the
+    packets' types differ, checks the first packet only (gnupg 2.2.27 to
+    2.4.8, g10/mainproc.c, proc_tree's multiple_ok: "multiple signatures
+    detected.  Only the first will be checked"). Each shape mixes text
+    (0x01) and binary (0x00) packets: B's packet, or A's good one retyped
+    (so a bad one from A), before or after A's good one, inline and
+    detached. (A's detached packet signs the shared Release, which is the
+    inline controls' signed text byte for byte.)
+
+    Base64 pad bits: p_good_old4 (A's inline packet framed with an
+    old-format four-octet length, 440 octets: its base64 ends in one "=")
+    with the unused bits of its last base64 character set, and its detached
+    twin: the same bytes to gpgv's radix64 reader, which drops those bits;
+    a strict decoder refuses them.
+    """
+    head, sig_a, det_a = c.head, c.sig_a, c.det_a
+    whole = sig_packets(c.read("i_unknown_unknownfirst.InRelease"))
+    sig_b = whole[: len(whole) - len(sig_a)]
+    dwhole = sig_packets(c.read("d_unknown_goodfirst.Release.gpg"))
+    det_b = dwhole[len(det_a) :]
+    if whole[len(sig_b) :] != sig_a or dwhole[: len(det_a)] != det_a:
+        raise ValueError("the unknown-key controls do not hold A's good packet")
+    if sig_a[4] != 0x01 or det_a[4] != 0x00:
+        raise ValueError(
+            "A's inline packet is not text-mode, or its detached one binary"
+        )
+    inline = {
+        "n_i_good_then_unknown00": head + armor(sig_a + retyped(sig_b, 0x00)),
+        "n_i_badA00_then_good": head + armor(retyped(sig_a, 0x00) + sig_a),
+        "n_i_good_then_badA00": head + armor(sig_a + retyped(sig_a, 0x00)),
+        "n_i_b64_pad_bits": head
+        + with_pad_bits(armor(old_frame(one_signature(sig_a), 4))),
+    }
+    detached = {
+        "n_d_unknown01_first": armor(retyped(det_b, 0x01) + det_a),
+        "n_d_badA01_then_good": armor(retyped(det_a, 0x01) + det_a),
+        "n_d_good_then_badA01": armor(det_a + retyped(det_a, 0x01)),
+        "n_d_b64_pad_bits": with_pad_bits(armor(old_frame(one_signature(det_a), 4))),
+    }
+    return inline, detached, {}
+
+
 @dataclass(frozen=True)
 class OwnMaterial:
     """What batch fx13 is cut from: key O's signatures (see the module
@@ -2462,6 +2550,7 @@ FROM_CONTROLS: list[Callable[[Controls], Batch]] = [
     batch_fx10_from,
     batch_fx11_from,
     batch_fx12_from,
+    batch_fx14_from,
 ]
 
 
