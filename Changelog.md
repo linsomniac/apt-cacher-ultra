@@ -34,6 +34,9 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 - New status-page and JSON fields, log events and metrics.
 - Tests: `make e2e-flat` (real apt clients on six Debian and Ubuntu images,
   in CI) and `make e2e-live` (a manual smoke against live vendors).
+- `make e2e-apt-oracle`: checks that the real apt of six client images
+  still gives the recorded verdicts on the verifier's 135 signature-shape
+  fixtures (manual).
 
 ### Changed
 

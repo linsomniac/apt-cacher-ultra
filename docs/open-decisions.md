@@ -47,7 +47,13 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
 3. **`make e2e-live`** on the tree you tag (`e2e/live/README.md`; add its
    row to that file's *Results*): the H3 plan ran it during planning and
    again on its final tree.
-4. **Run the release candidate once on a copy of a production 1.0.x
+4. **`make e2e-apt-oracle`** on the tree you tag
+   (`e2e/apt-oracle/README.md`; add its row to that file's *Results*):
+   the real apt of the six client images must still give the verdicts
+   recorded for the verifier's 135 signature-shape fixtures; about 10
+   seconds with the images cached. The GC and upstream hardening plan
+   recorded them (2026-10-29).
+5. **Run the release candidate once on a copy of a production 1.0.x
    cache** (raised 2026-10-27, the H3 final review R5 #5): every test
    builds its 1.0.x database by hand, so only a real `cache.db` and
    `pool/` show what the trust audit makes of real vendors' `InRelease`
@@ -61,9 +67,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
    listeners wait for it); and, an hour later,
    `suite_reaper_run_complete`, the `suite_reaped` reasons and
    `gc_retired_run_complete`.
-5. **Tag `1.1.0-rc1`** on `main`. The release workflow's
+6. **Tag `1.1.0-rc1`** on `main`. The release workflow's
    `Verify no e2e test seam` step runs first on the tag: check it there.
-6. **The release notes** (`docs/release-notes/1.1.0.md`): bring them up
+7. **The release notes** (`docs/release-notes/1.1.0.md`): bring them up
    to date with what `Changelog.md` collected since this branch, then
    paste them into the GitHub release. Their links name the `1.1.0` tag;
    for a release
