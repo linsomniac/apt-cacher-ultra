@@ -1,6 +1,6 @@
 # apt's verdicts on the shapes of internal/gpg/testdata/aptshapes, one
 # row per shape: ok (apt-get update succeeded) or REJ (it failed), in
-# each client image. Measured 2026-10-29 05:38 UTC by
+# each client image. Measured 2026-10-29 07:43 UTC by
 # bash e2e/apt-oracle/run.sh --record (e2e/apt-oracle/README.md); the
 # fixtures and this file are one measurement. The columns, after the
 # shape's name:
@@ -77,6 +77,19 @@ i_trail_text REJ REJ REJ REJ REJ REJ
 i_trail_ws REJ REJ REJ REJ REJ REJ
 i_unknown_goodfirst ok ok ok ok ok ok
 i_unknown_unknownfirst ok ok ok ok ok ok
+t7c_bad_a_as_is REJ REJ REJ REJ ok REJ
+t7c_good_alone ok ok ok ok ok ok
+t7c_nohashed_unh16A REJ REJ REJ REJ ok REJ
+t7c_nohashed_unh33B_16A REJ REJ REJ REJ ok REJ
+t7g1_nohashed_unh16A_33B REJ REJ REJ REJ ok REJ
+t7g3_hashed16A_16B REJ REJ REJ REJ ok REJ
+t7g3b_hashed16B_16A ok ok ok ok ok ok
+t7g4_v6fpr_unh16A REJ REJ REJ REJ ok REJ
+t7g5_s_primary ok ok ok ok ok ok
+t7g6_hashed33B_unh16A REJ REJ ok REJ ok ok
+t7g6b_hashed33B_16A REJ REJ ok REJ ok ok
+t7g7_33junk_33B_unh16A REJ REJ REJ REJ ok REJ
+t7g7b_33junk_33A ok ok ok ok ok ok
 x3d_armor_no_blank ok ok ok ok ok ok
 x3d_badsig_unhashed_fpr_added REJ REJ REJ REJ ok REJ
 x3d_bom REJ REJ REJ REJ REJ REJ

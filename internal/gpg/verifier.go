@@ -225,10 +225,10 @@ var (
 	// substitute for the intended signer. Fail closed.
 	ErrAmbiguousKeyID = errors.New("ambiguous short issuer keyid in trust set")
 
-	// ErrBadSignature means a signature packet whose hashed issuer names a
-	// signing key in the host keyring failed its cryptographic check,
-	// carried a critical notation go-crypto does not know, or carried an
-	// unhashed issuer that contradicts the hashed one (S1,
+	// ErrBadSignature means a signature packet whose issuer, as gpgv reads
+	// it, names a signing key in the host keyring failed its cryptographic
+	// check, carried a critical notation go-crypto does not know, or
+	// carried another issuer subpacket that contradicts it (S1,
 	// requireKnownSignaturesVerify): gpgv's BADSIG, which makes apt refuse
 	// the anchor even beside a good signature (the 2026-09 security
 	// review's VC-1).
@@ -759,31 +759,33 @@ func readArmoredSignature(r io.Reader) ([]byte, error) {
 }
 
 // requireKnownSignaturesVerify applies apt's rule that a bad signature from a
-// known key is fatal (VC-1; rulings HD-3, HD-8): every signature packet whose
-// hashed issuer names a signing key in the host keyring must pass its
+// known key is fatal (VC-1; rulings HD-3, HD-8, HD-14): every signature
+// packet whose issuer, read as the strictest supported gpgv reads it
+// (s1Issuer), names a signing key in the host keyring must pass its
 // cryptographic check against one of the keyring's entities holding that key
-// ID, and its unhashed issuer must not contradict the hashed one. A packet
+// ID, and the issuer go-crypto verifies by must not contradict it. A packet
 // whose check passes but whose key or signature is expired or revoked passes
 // (gpgv's EXPKEYSIG and REVKEYSIG, which apt ignores beside a good
 // signature); an unknown critical notation fails (gpgv's BADSIG); a packet
 // whose issuer the keyring lacks is ignored (gpgv's NO_PUBKEY).
 //
 // AIDEV-NOTE: go-crypto takes the issuer from the last issuer subpacket it
-// parses, unhashed after hashed, and looks keys up by that key ID only; gpgv
-// uses the hashed issuer. So "known" is read from sig.HashSuffix
-// (hashedIssuer), and a contradicting unhashed issuer is a failure — else an
-// on-path attacker rewrites a bad signature's unhashed issuer and it is
-// ignored here while every gpgv-based apt reports BADSIG
-// (xi_badsig_issuer_rewritten). openpgp.VerifyDetachedSignature returns a
-// non-nil signature exactly when the cryptographic check passed, then reports
-// expiry, revocation or an unknown critical notation as its error (go-crypto
-// v1.4.1 openpgp/read.go, verifyDetachedSignature and
-// checkMessageSignatureDetails). Each candidate entity is tried alone: the
-// library hashes once and tries every key with that one hash, which only the
-// first candidate can pass. The host keyring, not the suite's trust set: a
-// client that installed any of the cache's keys sees the BADSIG. Re-check all
-// of this when go-crypto is upgraded (the table test and this file's tests
-// pin it).
+// parses, unhashed after hashed, and looks keys up by that key ID only
+// (sig.IssuerKeyId); gpgv reads another subpacket (s1Issuer's AIDEV-NOTE).
+// So "known" is S1's issuer, and a packet whose sig.IssuerKeyId differs
+// from it fails — else an on-path attacker rewrites a bad signature's
+// issuer subpackets and it is ignored here, or verified by another key,
+// while every gpgv-based apt reports BADSIG (xi_badsig_issuer_rewritten,
+// TestVerifyInline_AnUnhashedIssuerContradictingTheHashedOneFailsS1).
+// openpgp.VerifyDetachedSignature returns a non-nil signature exactly when
+// the cryptographic check passed, then reports expiry, revocation or an
+// unknown critical notation as its error (go-crypto v1.4.1 openpgp/read.go,
+// verifyDetachedSignature and checkMessageSignatureDetails). Each candidate
+// entity is tried alone: the library hashes once and tries every key with
+// that one hash, which only the first candidate can pass. The host keyring,
+// not the suite's trust set: a client that installed any of the cache's keys
+// sees the BADSIG. Re-check all of this when go-crypto is upgraded (the
+// table test and this file's tests pin it).
 func (v *Verifier) requireKnownSignaturesVerify(signed, sigBytes []byte) error {
 	keyring := v.keyring.EntityList()
 	reader := packet.NewReader(bytes.NewReader(sigBytes))
@@ -799,23 +801,26 @@ func (v *Verifier) requireKnownSignaturesVerify(signed, sigBytes []byte) error {
 		if !ok {
 			continue // unreachable: F6 has refused every other packet
 		}
-		id, hashed := hashedIssuer(sig)
-		if !hashed {
-			if sig.IssuerKeyId == nil {
-				continue
-			}
-			id = *sig.IssuerKeyId
+		// AIDEV-NOTE: S1 verifies the packet, and reads its unhashed area,
+		// as go-crypto's Serialize writes it again, not as it came: the
+		// hashed area as it came (sig.HashSuffix) and the unhashed
+		// subpackets in their order, but the packet's length declared from
+		// every subpacket's length in its shortest form. A packet whose
+		// hashed area writes a length in more octets than it needs thus
+		// comes out framed wrong, and fails here although gpgv verifies it:
+		// strict, not unsafe (nothing passes that should fail); S2
+		// (verifyAnyTrusted, verifyAgainst) shares it; no signer writes such
+		// lengths.
+		var one bytes.Buffer
+		if err := sig.Serialize(&one); err != nil {
+			return fmt.Errorf("re-serialize signature packet: %w", err)
 		}
-		keys := keyring.KeysByIdUsage(id, packet.KeyFlagSign)
+		id, keys := s1Issuer(keyring, sig, one.Bytes())
 		if len(keys) == 0 {
 			continue
 		}
 		if sig.IssuerKeyId == nil || *sig.IssuerKeyId != id {
-			return fmt.Errorf("%w: issuer %016X: an unhashed issuer contradicts the hashed one", ErrBadSignature, id)
-		}
-		var one bytes.Buffer
-		if err := sig.Serialize(&one); err != nil {
-			return fmt.Errorf("re-serialize signature packet: %w", err)
+			return fmt.Errorf("%w: issuer %016X: another issuer subpacket contradicts it", ErrBadSignature, id)
 		}
 		passed := false
 		tried := make(map[*openpgp.Entity]bool, len(keys))
@@ -837,74 +842,233 @@ func (v *Verifier) requireKnownSignaturesVerify(signed, sigBytes []byte) error {
 	}
 }
 
-// hashedIssuer returns the key ID that sig's hashed subpacket area names: an
-// issuer fingerprint (subpacket 33) first — its key ID is bytes 12–19 of a
-// v4 fingerprint, 0–7 of a v6 one — else an issuer key ID (16); false when
-// the area names neither. The area is read from sig.HashSuffix, where
-// go-crypto keeps it verbatim (bytes [6:6+len] of a v4 signature's, [8:8+len]
-// of a v6's), because sig.IssuerKeyId is the last issuer subpacket go-crypto
-// parsed, the unhashed area's after the hashed one's (TestHashedIssuer).
+// s1Issuer returns the key ID S1 checks sig against and the host keyring's
+// signing keys that hold it — none when sig names no key the keyring holds
+// (gpgv's NO_PUBKEY: S1 ignores the packet) — reading sig's issuer as the
+// strictest supported gpgv reads it, in its order:
+//  1. the first hashed issuer fingerprint, in the signature's version form
+//     (hashedIssuer), if the keyring holds its key ID;
+//  2. else the first issuer key ID, hashed then unhashed
+//     (firstIssuerKeyID), if the keyring holds it;
+//  3. else, when neither names an issuer, go-crypto's sig.IssuerKeyId.
 //
-// AIDEV-NOTE: the first matching subpacket counts, as in gpgv (whose
-// parse_sig_subpkt returns the first match): of two hashed issuer key IDs
-// the first names the issuer, so a forged packet that puts a known key's ID
-// before an unknown one is still known here, and then contradicts
-// sig.IssuerKeyId, the last. (The security review's prototype of this rule
-// kept the last 16 and the first 33; no real signer writes two.) A hashed
-// area that does not parse returns false; go-crypto's own parse, which F6
-// requires, has already refused it.
-func hashedIssuer(sig *packet.Signature) (uint64, bool) {
+// serialized is sig as go-crypto's Serialize writes it.
+//
+// AIDEV-NOTE: ruling HD-14, measured on the corpus' batch fx9. The cache
+// refuses what any supported apt refuses (HD-2), so S1 reads the issuer as
+// the strictest supported gpgv does. gpgv looks the key up by the first
+// hashed issuer fingerprint (33) when it is in its version's form, and else
+// by the first issuer key ID (16), hashed then unhashed: gpgv 2.4 when there
+// is no such fingerprint, gpgv 2.2 also when the fingerprint names a key it
+// lacks (debian:11, ubuntu:22.04 and debian:12 refuse t7g6 and t7g6b; 2.4
+// reports NO_PUBKEY). It reads the first matching subpacket at each step:
+// a 33 in another version's form names no key (t7g4), a later 33 is not
+// read (t7g7), nor a second 16 (t7g3 refused, as by every gpgv-based apt;
+// t7g3b adopted, as by every apt). go-crypto's sig.IssuerKeyId is instead
+// the last issuer subpacket it parsed, a 33 of any form or a 16. Read so,
+// a forged packet whose last issuer subpacket names an unknown key would be
+// ignored here while the one gpgv reads names a known key and every
+// gpgv-based apt reports BADSIG (xi_badsig_issuer_rewritten,
+// x3i_badsig_unhashed_fpr_added: the hashed fingerprint's; t7g1, t7g3: the
+// first 16's). t7g4 and t7g7 are refused through their 16 either way —
+// the form and first-33 rules leave step 1 empty, the 2.2 fallback passes
+// its unknown fingerprint on — so the table shows neither rule's loss
+// alone: TestHashedIssuer pins step 1's. Step 3 takes go-crypto's issuer
+// where gpgv attributes the packet to no key: strict, a forged packet only
+// (t7g7b, a listed deviation). Whatever S1 reads, go-crypto verifies by
+// sig.IssuerKeyId, so requireKnownSignaturesVerify fails a packet whose
+// IssuerKeyId differs.
+func s1Issuer(keyring openpgp.EntityList, sig *packet.Signature, serialized []byte) (uint64, []openpgp.Key) {
+	named := false
+	if id, ok := hashedIssuer(sig); ok {
+		if keys := keyring.KeysByIdUsage(id, packet.KeyFlagSign); len(keys) > 0 {
+			return id, keys
+		}
+		named = true // gpgv 2.2 then looks the key up by the first 16
+	}
+	if id, ok := firstIssuerKeyID(sig, serialized); ok {
+		if keys := keyring.KeysByIdUsage(id, packet.KeyFlagSign); len(keys) > 0 {
+			return id, keys
+		}
+		named = true
+	}
+	if !named && sig.IssuerKeyId != nil {
+		id := *sig.IssuerKeyId
+		return id, keyring.KeysByIdUsage(id, packet.KeyFlagSign)
+	}
+	return 0, nil
+}
+
+// hashedIssuer returns the key ID of sig's first hashed issuer fingerprint
+// (subpacket 33) when that subpacket is in the signature's version form — a
+// v4 fingerprint (version 4, 20 bytes) in a v4 signature, its key ID bytes
+// 12–19; a v6 one (version 6, 32 bytes) in a v6 signature, bytes 0–7 — and
+// false when the hashed area has no 33 or its first is in another form (a
+// later 33 is never read, as by gpgv). S1's step 1 (s1Issuer). The area is
+// read from sig.HashSuffix, where go-crypto keeps it verbatim (hashedArea).
+func hashedIssuer(sig *packet.Signature) (id uint64, ok bool) {
+	area, have := hashedArea(sig)
+	if !have {
+		return 0, false
+	}
+	seen33 := false
+	for len(area) > 0 {
+		typ, data, rest, valid := nextSubpacket(area)
+		if !valid {
+			return 0, false
+		}
+		if typ == 33 && !seen33 {
+			switch {
+			case sig.Version == 4 && len(data) == 21 && data[0] == 4:
+				id, ok = binary.BigEndian.Uint64(data[13:21]), true
+			case sig.Version == 6 && len(data) == 33 && data[0] == 6:
+				id, ok = binary.BigEndian.Uint64(data[1:9]), true
+			}
+			seen33 = true // gpgv reads the first 33 only
+		}
+		area = rest
+	}
+	return id, ok
+}
+
+// firstIssuerKeyID returns sig's first issuer key ID (subpacket 16): the
+// hashed area's, else the unhashed area's, read from serialized (sig as
+// go-crypto's Serialize writes it: unhashedArea), as gpgv reads it. S1's
+// step 2 (s1Issuer).
+//
+// AIDEV-NOTE: the first 16 of an area counts, as in gpgv (whose
+// parse_sig_subpkt returns the first match): of two the first names the
+// issuer, so a forged packet that puts a known key's ID before an unknown
+// one is still known here, and then contradicts sig.IssuerKeyId, the last
+// (t7g3). The security review's prototype of S1 kept the last 16; no real
+// signer writes two.
+func firstIssuerKeyID(sig *packet.Signature, serialized []byte) (uint64, bool) {
+	if area, ok := hashedArea(sig); ok {
+		if id, found := firstKeyID(area); found {
+			return id, true
+		}
+	}
+	if area, ok := unhashedArea(sig.Version, serialized); ok {
+		return firstKeyID(area)
+	}
+	return 0, false
+}
+
+// firstKeyID returns the first issuer key ID subpacket (16) of a subpacket
+// area, false when it has none or does not parse.
+func firstKeyID(area []byte) (id uint64, found bool) {
+	for len(area) > 0 {
+		typ, data, rest, valid := nextSubpacket(area)
+		if !valid {
+			return 0, false
+		}
+		if typ == 16 && len(data) == 8 && !found {
+			id, found = binary.BigEndian.Uint64(data), true
+		}
+		area = rest
+	}
+	return id, found
+}
+
+// hashedArea returns sig's hashed subpacket area, which go-crypto keeps
+// verbatim in sig.HashSuffix: bytes [6:6+len] of a v4 signature's, [8:8+len]
+// of a v6's; false for another version or a suffix too short.
+func hashedArea(sig *packet.Signature) ([]byte, bool) {
 	hs := sig.HashSuffix
-	var area []byte
 	switch {
 	case sig.Version == 4 && len(hs) >= 6:
 		if n := int(binary.BigEndian.Uint16(hs[4:6])); n <= len(hs)-6 {
-			area = hs[6 : 6+n]
+			return hs[6 : 6+n], true
 		}
 	case sig.Version == 6 && len(hs) >= 8:
 		if n := uint64(binary.BigEndian.Uint32(hs[4:8])); n <= uint64(len(hs)-8) {
-			area = hs[8 : 8+int(n)]
+			return hs[8 : 8+int(n)], true
 		}
 	}
-	var keyID uint64
-	haveKeyID := false
-	for len(area) > 0 {
-		// A subpacket: its length in one, two or five octets (RFC 9580
-		// §5.2.3.7), then its type (the critical bit masked) and data.
-		var n, hl int
-		switch l0 := int(area[0]); {
-		case l0 < 192:
-			n, hl = l0, 1
-		case l0 < 255:
-			if len(area) < 2 {
-				return 0, false
-			}
-			n, hl = (l0-192)<<8+int(area[1])+192, 2
-		default:
-			if len(area) < 5 {
-				return 0, false
-			}
-			l := uint64(binary.BigEndian.Uint32(area[1:5]))
-			if l > uint64(len(area)) {
-				return 0, false
-			}
-			n, hl = int(l), 5
-		}
-		if n == 0 || n > len(area)-hl {
-			return 0, false
-		}
-		typ, data := area[hl]&0x7f, area[hl+1:hl+n]
-		switch {
-		case typ == 33 && len(data) == 21 && data[0] == 4:
-			return binary.BigEndian.Uint64(data[13:21]), true
-		case typ == 33 && len(data) == 33 && data[0] == 6:
-			return binary.BigEndian.Uint64(data[1:9]), true
-		case typ == 16 && len(data) == 8 && !haveKeyID:
-			keyID, haveKeyID = binary.BigEndian.Uint64(data), true
-		}
-		area = area[hl+n:]
+	return nil, false
+}
+
+// unhashedArea returns the unhashed subpacket area of serialized, one v4 or
+// v6 signature packet as go-crypto's Serialize writes it: a new-format
+// header, then the body — version, type and algorithms, the hashed area's
+// length (two octets; four in v6) and the area, then the unhashed area's
+// length and the area. false when serialized is not so.
+func unhashedArea(version int, serialized []byte) ([]byte, bool) {
+	if len(serialized) < 2 || serialized[0] != 0xc0|packetTagSignature {
+		return nil, false
 	}
-	return keyID, haveKeyID
+	var header int
+	switch l0 := serialized[1]; {
+	case l0 < 192:
+		header = 2
+	case l0 < 224:
+		header = 3
+	case l0 == 255:
+		header = 6
+	default:
+		return nil, false // a partial length: go-crypto never writes one
+	}
+	lenOctets := 2
+	if version == 6 {
+		lenOctets = 4
+	}
+	if len(serialized) < header+4 || serialized[header] != byte(version) {
+		return nil, false
+	}
+	body := serialized[header:]
+	at := 4
+	area := func() ([]byte, bool) { // the area whose length is at body[at:]
+		if len(body) < at+lenOctets {
+			return nil, false
+		}
+		var n uint64
+		for _, b := range body[at : at+lenOctets] {
+			n = n<<8 | uint64(b)
+		}
+		at += lenOctets
+		if n > uint64(len(body)-at) {
+			return nil, false
+		}
+		a := body[at : at+int(n)]
+		at += int(n)
+		return a, true
+	}
+	if _, ok := area(); !ok { // the hashed area
+		return nil, false
+	}
+	return area()
+}
+
+// nextSubpacket cuts the first subpacket off a subpacket area: its type (the
+// critical bit masked), its data and the rest of the area; valid is false
+// when the area does not start with a whole subpacket (go-crypto's own
+// parse, which F6 requires, refuses such an area first).
+func nextSubpacket(area []byte) (typ byte, data, rest []byte, valid bool) {
+	// The length in one, two or five octets (RFC 9580 §5.2.3.7), then the
+	// type octet and the data.
+	var n, hl int
+	switch l0 := int(area[0]); {
+	case l0 < 192:
+		n, hl = l0, 1
+	case l0 < 255:
+		if len(area) < 2 {
+			return 0, nil, nil, false
+		}
+		n, hl = (l0-192)<<8+int(area[1])+192, 2
+	default:
+		if len(area) < 5 {
+			return 0, nil, nil, false
+		}
+		l := uint64(binary.BigEndian.Uint32(area[1:5]))
+		if l > uint64(len(area)) {
+			return 0, nil, nil, false
+		}
+		n, hl = int(l), 5
+	}
+	if n == 0 || n > len(area)-hl {
+		return 0, nil, nil, false
+	}
+	return area[hl] & 0x7f, area[hl+1 : hl+n], area[hl+n:], true
 }
 
 // verifyAnyTrusted enumerates every signature packet in sigBytes and

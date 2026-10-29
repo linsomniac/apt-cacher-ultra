@@ -871,58 +871,96 @@ func TestRequireKnownSignaturesVerify_AKeyIDCollisionDoesNotFailAValidSignature(
 	}
 }
 
-// TestHashedIssuer pins S1's issuer (DN-5): the key ID the hashed subpacket
-// area names, read from sig.HashSuffix — an issuer fingerprint (subpacket
-// 33) first, else an issuer key ID (16), the first of two as gpgv reads
-// them — and false when it names neither. go-crypto's own sig.IssuerKeyId
-// is the last issuer subpacket it parsed, the unhashed area's after the
-// hashed one's, which an on-path attacker rewrites without a key. The v4
-// packets are framed by hand (a creation time, the subpackets given, a
-// dummy signature value) and parsed by go-crypto, which builds the
-// HashSuffix hashedIssuer reads; the last two cases are go-crypto's own v4
-// and v6 signatures.
+// TestHashedIssuer pins how S1 reads a signature packet's issuer
+// subpackets, as gpgv reads them (ruling HD-14; s1Issuer's AIDEV-NOTE),
+// where go-crypto's sig.IssuerKeyId is the last issuer subpacket it
+// parsed, hashed area first:
+//   - hashedIssuer, S1's step 1: the key ID of the first hashed issuer
+//     fingerprint (33), and only when that subpacket is in the signature's
+//     version form (v4 in a v4 signature, v6 in a v6); a later 33 is never
+//     read;
+//   - firstIssuerKeyID, step 2: the first issuer key ID (16), the hashed
+//     area's, else the unhashed area's, read from go-crypto's
+//     re-serialization of the packet, as S1 reads it.
+//
+// The v4 and v6 packets are framed by hand (a creation time, the
+// subpackets given, a dummy signature value) and parsed by go-crypto; the
+// last cases are go-crypto's own v4 and v6 signatures.
 func TestHashedIssuer(t *testing.T) {
 	sub := func(typ byte, data ...byte) []byte { return append([]byte{byte(1 + len(data)), typ}, data...) }
 	created := sub(2, 0x65, 0x00, 0x00, 0x00) // signature creation time, 2023-09-12
 	keyIDOf := func(id uint64) []byte { return binary.BigEndian.AppendUint64(nil, id) }
-	fprNaming := func(id uint64) []byte { // a v4 fingerprint: its key ID is its last 8 bytes
+	v4fpr := func(id uint64) []byte { // a v4 fingerprint: its key ID is its last 8 bytes
 		return append(append([]byte{4}, bytes.Repeat([]byte{0xab}, 12)...), keyIDOf(id)...)
 	}
-	const hashedID, unhashedID = uint64(0x1111222233334444), uint64(0x5555666677778888)
-	parse := func(hashed, unhashed []byte) *packet.Signature {
+	v6fpr := func(id uint64) []byte { // a v6 fingerprint: its key ID is its first 8 bytes
+		return append(append([]byte{6}, keyIDOf(id)...), bytes.Repeat([]byte{0xcd}, 24)...)
+	}
+	const idA, idB = uint64(0x1111222233334444), uint64(0x5555666677778888)
+	parse := func(version int, hashed, unhashed []byte) *packet.Signature {
 		t.Helper()
-		body := []byte{4, byte(packet.SigTypeBinary), byte(packet.PubKeyAlgoRSA), 8} // v4, SHA-256
-		body = binary.BigEndian.AppendUint16(body, uint16(len(hashed)))
-		body = append(body, hashed...)
-		body = binary.BigEndian.AppendUint16(body, uint16(len(unhashed)))
-		body = append(body, unhashed...)
-		body = append(body, 0x12, 0x34, 0x00, 0x08, 0xff) // the hash tag, an 8-bit MPI
+		var body []byte
+		if version == 6 { // Ed25519, SHA-256: the hash tag, a 16-byte salt, the 64-byte signature
+			body = []byte{6, byte(packet.SigTypeBinary), byte(packet.PubKeyAlgoEd25519), 8}
+			body = binary.BigEndian.AppendUint32(body, uint32(len(hashed)))
+			body = append(body, hashed...)
+			body = binary.BigEndian.AppendUint32(body, uint32(len(unhashed)))
+			body = append(body, unhashed...)
+			body = append(append(body, 0x12, 0x34, 16), bytes.Repeat([]byte{0x5a}, 16+64)...)
+		} else { // v4, RSA, SHA-256: the hash tag, an 8-bit MPI
+			body = []byte{4, byte(packet.SigTypeBinary), byte(packet.PubKeyAlgoRSA), 8}
+			body = binary.BigEndian.AppendUint16(body, uint16(len(hashed)))
+			body = append(body, hashed...)
+			body = binary.BigEndian.AppendUint16(body, uint16(len(unhashed)))
+			body = append(body, unhashed...)
+			body = append(body, 0x12, 0x34, 0x00, 0x08, 0xff)
+		}
 		if len(body) >= 192 {
 			t.Fatalf("test premise: a %d-byte body needs a longer length encoding", len(body))
 		}
 		p, err := packet.Read(bytes.NewReader(append([]byte{0xc2, byte(len(body))}, body...)))
 		sig, ok := p.(*packet.Signature)
-		if err != nil || !ok {
-			t.Fatalf("test premise: go-crypto parses %T, %v; want a *packet.Signature", p, err)
+		if err != nil || !ok || sig.Version != version {
+			t.Fatalf("test premise: go-crypto parses %T, %v; want a v%d *packet.Signature", p, err, version)
 		}
 		return sig
 	}
+	type issuer struct {
+		id uint64
+		ok bool
+	}
+	none, a, b := issuer{}, issuer{idA, true}, issuer{idB, true}
+	reSerialized := func(sig *packet.Signature) []byte {
+		t.Helper()
+		var one bytes.Buffer
+		if err := sig.Serialize(&one); err != nil {
+			t.Fatalf("Serialize: %v", err)
+		}
+		return one.Bytes()
+	}
 	for _, tc := range []struct {
 		name             string
+		version          int
 		hashed, unhashed []byte
-		wantID           uint64
-		wantOK           bool
+		fpr, keyID       issuer // hashedIssuer's and firstIssuerKeyID's
 		goCryptoID       uint64 // *sig.IssuerKeyId, 0 when nil
 	}{
-		{"hashed 33 only", joined(created, sub(33, fprNaming(hashedID)...)), nil, hashedID, true, hashedID},
-		{"hashed 16 only", joined(created, sub(16, keyIDOf(hashedID)...)), nil, hashedID, true, hashedID},
-		{"hashed 33, unhashed 16", joined(created, sub(33, fprNaming(hashedID)...)), sub(16, keyIDOf(unhashedID)...), hashedID, true, unhashedID},
-		{"hashed 16 then 33 naming another key", joined(created, sub(16, keyIDOf(unhashedID)...), sub(33, fprNaming(hashedID)...)), nil, hashedID, true, hashedID},
-		{"two hashed 16s: the first, as gpgv", joined(created, sub(16, keyIDOf(hashedID)...), sub(16, keyIDOf(unhashedID)...)), nil, hashedID, true, unhashedID},
-		{"hashed nothing, unhashed 16", created, sub(16, keyIDOf(unhashedID)...), 0, false, unhashedID},
-		{"hashed nothing, unhashed 33", created, sub(33, fprNaming(unhashedID)...), 0, false, unhashedID},
+		{"hashed 33", 4, joined(created, sub(33, v4fpr(idA)...)), nil, a, none, idA},
+		{"hashed 16", 4, joined(created, sub(16, keyIDOf(idA)...)), nil, none, a, idA},
+		{"hashed 33, unhashed 16", 4, joined(created, sub(33, v4fpr(idA)...)), sub(16, keyIDOf(idB)...), a, b, idB},
+		{"hashed 16, then 33", 4, joined(created, sub(16, keyIDOf(idB)...), sub(33, v4fpr(idA)...)), nil, a, b, idA},
+		{"a v6-form 33 in a v4 signature", 4, joined(created, sub(33, v6fpr(idA)...)), nil, none, none, idA},
+		{"a first 33 in v6 form, then a v4 one", 4, joined(created, sub(33, v6fpr(idB)...), sub(33, v4fpr(idA)...)), nil, none, none, idA},
+		{"two hashed 16s", 4, joined(created, sub(16, keyIDOf(idA)...), sub(16, keyIDOf(idB)...)), nil, none, a, idB},
+		{"a hashed 16 before an unhashed one", 4, joined(created, sub(16, keyIDOf(idA)...)), sub(16, keyIDOf(idB)...), none, a, idB},
+		{"nothing hashed; unhashed 16, then 33", 4, created, joined(sub(16, keyIDOf(idA)...), sub(33, v4fpr(idB)...)), none, a, idB},
+		{"nothing hashed; two unhashed 16s", 4, created, joined(sub(16, keyIDOf(idA)...), sub(16, keyIDOf(idB)...)), none, a, idB},
+		{"nothing hashed; unhashed 33", 4, created, sub(33, v4fpr(idA)...), none, none, idA},
+		{"v6: hashed 33", 6, joined(created, sub(33, v6fpr(idA)...)), nil, a, none, idA},
+		{"v6: a v4-form 33", 6, joined(created, sub(33, v4fpr(idA)...)), nil, none, none, idA},
+		{"v6: hashed 33, unhashed 16", 6, joined(created, sub(33, v6fpr(idA)...)), sub(16, keyIDOf(idB)...), a, b, idA},
 	} {
-		sig := parse(tc.hashed, tc.unhashed)
+		sig := parse(tc.version, tc.hashed, tc.unhashed)
 		var goCryptoID uint64
 		if sig.IssuerKeyId != nil {
 			goCryptoID = *sig.IssuerKeyId
@@ -930,8 +968,11 @@ func TestHashedIssuer(t *testing.T) {
 		if goCryptoID != tc.goCryptoID {
 			t.Errorf("%s: test premise: go-crypto's IssuerKeyId %016X, want %016X", tc.name, goCryptoID, tc.goCryptoID)
 		}
-		if id, ok := hashedIssuer(sig); id != tc.wantID || ok != tc.wantOK {
-			t.Errorf("%s: hashedIssuer = %016X, %v; want %016X, %v", tc.name, id, ok, tc.wantID, tc.wantOK)
+		if id, ok := hashedIssuer(sig); (issuer{id, ok}) != tc.fpr {
+			t.Errorf("%s: hashedIssuer = %016X, %v; want %016X, %v", tc.name, id, ok, tc.fpr.id, tc.fpr.ok)
+		}
+		if id, ok := firstIssuerKeyID(sig, reSerialized(sig)); (issuer{id, ok}) != tc.keyID {
+			t.Errorf("%s: firstIssuerKeyID = %016X, %v; want %016X, %v", tc.name, id, ok, tc.keyID.id, tc.keyID.ok)
 		}
 	}
 	v6, err := openpgp.NewEntity("V6", "", "v6@example.com", &packet.Config{V6Keys: true, Algorithm: packet.PubKeyAlgoEd25519})
@@ -947,6 +988,14 @@ func TestHashedIssuer(t *testing.T) {
 		if id, ok := hashedIssuer(sig); id != e.PrimaryKey.KeyId || !ok {
 			t.Errorf("go-crypto's v%d signature: hashedIssuer = %016X, %v; want the signer's key ID %016X, true",
 				sig.Version, id, ok, e.PrimaryKey.KeyId)
+		}
+		// go-crypto writes a hashed 16 in a v4 signature, none in a v6.
+		want := issuer{e.PrimaryKey.KeyId, true}
+		if sig.Version == 6 {
+			want = none
+		}
+		if id, ok := firstIssuerKeyID(sig, reSerialized(sig)); (issuer{id, ok}) != want {
+			t.Errorf("go-crypto's v%d signature: firstIssuerKeyID = %016X, %v; want %016X, %v", sig.Version, id, ok, want.id, want.ok)
 		}
 	}
 }

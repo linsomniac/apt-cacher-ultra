@@ -34,7 +34,8 @@ const aptShapeColumns = 6
 
 // aptShapeDeviations are the strict deviations: shapes every measured apt
 // accepts and the cache refuses, each with its reason — DN-6's eleven
-// (ruling HD-9) and ruling HD-13's two (batch fx8's p3).
+// (ruling HD-9), ruling HD-13's two (batch fx8's p3) and ruling HD-14's one
+// (batch fx9's t7g7b).
 var aptShapeDeviations = map[string]string{
 	"xi_twoblocks_goodgood":          aptShapeOneArmorBlock,
 	"xi_twoblocks_good_unknown":      aptShapeOneArmorBlock,
@@ -46,9 +47,10 @@ var aptShapeDeviations = map[string]string{
 	"x3i_armor_no_blank":             aptShapeNoBlankLine,
 	"x3d_armor_no_blank":             aptShapeNoBlankLine,
 	"xi_good_plus_unknownpk_A":       "go-crypto cannot parse an unknown public-key algorithm, so the packet cannot be told from garbage (F6); a vendor adding a signature with an algorithm go-crypto v1.4.1 lacks is refused until go-crypto supports it",
-	"x3i_goodsig_unhashed_fpr_added": "today's S2 refuses it already (the unhashed fingerprint overrides the issuer go-crypto looks up)",
+	"x3i_goodsig_unhashed_fpr_added": "S1's contradiction rule refuses it: the unhashed issuer fingerprint, the last issuer subpacket and so the one go-crypto verifies by, contradicts the hashed one gpgv reads (ruling HD-14); before S1, S2 refused it already (the unhashed fingerprint overrides the issuer go-crypto looks up)",
 	"gi_p3_inner_zero_bytes":         aptShapePaddingInsidePacket,
 	"gd_p3_inner_zero_bytes":         aptShapePaddingInsidePacket,
+	"t7g7b_33junk_33A":               "its first hashed issuer fingerprint is in another version's form, so gpgv attributes the packet to no key, while S1, unable to attribute it as gpgv does, takes go-crypto's issuer (the second fingerprint, A's) and the forged packet fails against A (ruling HD-14); no real signer writes it",
 }
 
 const (

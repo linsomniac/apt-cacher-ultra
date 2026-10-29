@@ -42,7 +42,7 @@ with only some of the images, a corpus file missing.
 
 | File | What it is |
 |---|---|
-| `<name>.InRelease` | an inline shape (104 of them): the whole `InRelease`, its signed text included |
+| `<name>.InRelease` | an inline shape (117 of them): the whole `InRelease`, its signed text included |
 | `<name>.Release.gpg` | a detached shape (51): a `Release.gpg` that signs the shared `Release` |
 | `Release` | the shared `Release`, a flat repository's: the SHA256 line of an empty `Packages`, a fixed `Date:` in the past (2026-10-01), no `Valid-Until` |
 | `keys.gpg` | the public keys A, E and S, in binary: the clients' `signed-by` here, and the host keyring of the verifier's table test (the hardening plan's Task 6) |
@@ -55,7 +55,7 @@ file here `-text`, so no checkout or commit converts their line ends,
 whatever `core.autocrlf` says: several shapes differ from their controls
 only in CRs.
 
-There are 155 shapes. The first 135 are those the hardening plan measured
+There are 168 shapes. The first 135 are those the hardening plan measured
 on 2026-10-28
 (`docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md`: DN-2
 sorts them into classes, Appendix A gives each one's verdicts), rebuilt by
@@ -68,9 +68,9 @@ signature's unhashed area rewritten. A few needed the signer: a critical
 notation, SHA-1, a dash-escaped END line in the signed text. A name says
 the shape: `i_` and `d_` are the plan's first batch (inline and detached),
 `xi_`, `xd_` and `x3i_` to `x7d_` its later ones, `gi_` and `gd_` batch
-fx8; `i_trail_lf` is a blank line after the END line,
-`xd_good_plus_literal` a literal-data packet beside a good detached
-signature, a `*_control_good` its batch's unmodified control.
+fx8, `t7c_` and `t7g` batch fx9; `i_trail_lf` is a blank line after the
+END line, `xd_good_plus_literal` a literal-data packet beside a good
+detached signature, a `*_control_good` its batch's unmodified control.
 
 Batch fx8's 20 (ruling HD-13) were found and measured in the plan's
 Task 6, beyond Appendix A, and are cut without a key from the fx7
@@ -86,6 +86,26 @@ bytes). Every apt refuses `g1`, `g3` and `g4`, which the cache adopted
 until that ruling; every apt accepts `p3`, which the cache refuses (a
 strict deviation of the table test).
 
+Batch fx9's 13 (ruling HD-14) were found and measured in the plan's
+Task 7, beyond Appendix A, and are cut without a key from committed
+fixtures: A's bad signature packet (`i_badsig_only`'s) with its issuer
+subpackets rewritten, before A's good one (`x7i_control_good`'s), and in
+`t7g5` S's subkey's bad packet (`x3i_subkey_bad_plus_good`'s) naming S's
+primary key, which only certifies. They ask which issuer subpacket gpgv
+looks the key up by, where go-crypto takes the last one it parses: gpgv
+reads the first hashed issuer fingerprint in its version's form (`t7g4`:
+a v6-form one in a v4 signature is none; `t7g7`: a later one is not
+read), else the first issuer key ID, hashed then unhashed (`t7g1`,
+`t7g3`, `t7g3b`); gpgv 2.2 also falls back to that key ID when the
+fingerprint names a key it lacks (`t7g6`, `t7g6b`: debian:11,
+ubuntu:22.04 and debian:12 refuse them, the other three images accept
+them).
+`t7c_*` are controls (`t7c_good_alone` is the control's very bytes).
+Until that ruling the cache adopted `t7g1`, `t7g4`, `t7g6`, `t7g6b` and
+`t7g7`, which every gpgv-based apt (for `t7g6` and `t7g6b`, every 2.2
+one) refuses; every apt accepts `t7g7b`, which the cache refuses (a strict
+deviation of the table test).
+
 The keys are made in a temporary GnuPG home that the generator deletes
 when the run ends, by an error, Ctrl-C, SIGTERM or SIGHUP too (only
 SIGKILL leaves it, and a home it cannot delete is named on stderr); no
@@ -97,7 +117,7 @@ secret key is written anywhere else, and the generator checks that
 | A | RSA-3072, signs | the repository's key: every shape but `i_expired_only` and `x3i_subkey_good` carries a signature by A |
 | B | RSA-3072, signs; not in `keys.gpg` | a key the clients do not know: an extra signature apt ignores (`i_unknown_*`, `d_unknown_goodfirst`, `x*_twoblocks_good_unknown`), and a garbage packet naming it (`xi_good_plus_v3garbage_B`) |
 | E | RSA-3072, signs; made at 2020-01-01, valid one year (it expired at 2020-12-31); its signatures made at 2020-06-01 | a key in `signed-by` that has expired: its good or bad signature beside a good one, and its good one alone (`i_expired_*`, `i_good_plus_expired_good`) |
-| S | an RSA-3072 primary that only certifies, with an RSA-3072 signing subkey | a signature by a subkey (`x3i_subkey_*`) |
+| S | an RSA-3072 primary that only certifies, with an RSA-3072 signing subkey | a signature by a subkey (`x3i_subkey_*`), and a forged packet naming the primary (`t7g5_s_primary`) |
 
 ### Adding a shape
 
@@ -112,10 +132,12 @@ secret key is written anywhere else, and the generator checks that
    `python3 -I e2e/apt-oracle/gen_shapes.py internal/gpg/testdata/aptshapes`.
    Each run makes new keys and new signatures, so every fixture changes;
    `verdicts.txt` is left in place, and is now stale. A shape cut without a
-   key from the fx7 controls can go in a `FROM_CONTROLS` batch instead, as
-   fx8's do; `python3 -I e2e/apt-oracle/gen_shapes.py --from-controls
+   key from committed fixtures (the generator's `Controls`: the fx7
+   controls, A's and S's subkey's bad signatures, S's fingerprint from
+   `keys.gpg`) can go in a `FROM_CONTROLS` batch instead, as fx8's and
+   fx9's do; `python3 -I e2e/apt-oracle/gen_shapes.py --from-controls
    internal/gpg/testdata/aptshapes` then writes those batches alone, from
-   the committed controls, and every other fixture keeps its bytes (so in
+   the committed fixtures, and every other fixture keeps its bytes (so in
    step 4 every other row must come out unchanged).
 3. Re-measure: `bash e2e/apt-oracle/run.sh --record`.
 4. Review `git diff --no-ext-diff internal/gpg/testdata/aptshapes/verdicts.txt`:
@@ -154,7 +176,7 @@ the exceptions the test lists, each with its reason.
 That guarantee — the cache adopts no anchor a supported apt refuses, but
 for the one known-unsafe shape the test lists (`x3i_sha1_only`: weak
 digests are outside the plan) — is only as wide as the corpus: it holds
-for these 155 shapes. An anchor shaped in a way the corpus lacks is
+for these 168 shapes. An anchor shaped in a way the corpus lacks is
 unmeasured, and the cache may adopt it while some apt refuses it. When a
 new shape turns up (a vendor's anchor, a go-crypto change, a review), add
 it.
@@ -224,3 +246,4 @@ regenerate and re-record them together (*Adding a shape*).
 |---|---|---|---|
 | 2026-10-29, 03:45 UTC (the hardening plan's Task 5) | the commit that adds the corpus, on 7c3aca0 | `--record`: 135 shapes in 6 images, every verdict the one Appendix A of the plan gives (2026-10-28); then `make e2e-apt-oracle`: PASS. apt 2.2.4, 2.4.14, 2.8.3, 2.6.1, 3.0.3 and 3.2.0 (*The images*) | 11 s each run, images cached |
 | 2026-10-29, 05:38 UTC (ruling HD-13, after the plan's Task 6) | the commit that adds batch fx8, on 80af12b | `--from-controls` wrote fx8's 20 shapes and nothing else; `--record`: 155 shapes in 6 images, the 135 earlier rows unchanged and the 20 new ones as Task 6 measured them; then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 12 s each run, images cached |
+| 2026-10-29, 07:43 UTC (ruling HD-14, the plan's Task 7) | the commit that adds batch fx9, on 40d3614 | `--from-controls` wrote fx9's 13 shapes and nothing else (fx8's 20 again, byte for byte); `--record`: 168 shapes in 6 images, the 155 earlier rows unchanged and the 13 new ones as Task 7 measured them; then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 13 s each run, images cached |

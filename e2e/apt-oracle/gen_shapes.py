@@ -34,9 +34,10 @@ and ``keys.gpg`` is checked to hold public packets only.
   ``i_good_plus_expired_good``; apt takes EXPKEYSIG beside a good
   signature).
 - S, an RSA-3072 primary that only certifies, with an RSA-3072 signing
-  subkey: a signature by a subkey (``x3i_subkey_*``).
+  subkey: a signature by a subkey (``x3i_subkey_*``), and a forged packet
+  naming the primary (``t7g5_s_primary``).
 
-155 shapes. The first 135 are the planning measurement's (2026-10-28; DN-2
+168 shapes. The first 135 are the planning measurement's (2026-10-28; DN-2
 and Appendix A of docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md),
 by the same names and built as its throwaway generators built them (the
 plan's PE/gen.py, gen2.py to gen6.py with pgp.py, and rereview/gen7.py,
@@ -53,7 +54,11 @@ was), and either way it is a second good signature. Batch fx8's 20
 (``gi_`` inline, ``gd_`` detached; ruling HD-13) were found and measured
 in the plan's Task 6, beyond Appendix A: lines and packets that
 go-crypto's readers see otherwise than apt does, cut without a key from
-the fx7 controls.
+the fx7 controls. Batch fx9's 13 (``t7c_`` controls, ``t7g`` gaps; ruling
+HD-14) were found and measured in its Task 7: A's bad signature packet
+with its issuer subpackets rewritten, beside A's good one, for which
+subpacket gpgv takes the key from where go-crypto takes another; cut
+without a key from committed fixtures (Controls).
 
 AIDEV-NOTE: the fixtures and verdicts.txt are one measurement. Each run
 makes new keys, new signatures and new random bytes (the v3 garbage
@@ -62,9 +67,9 @@ committed: regenerate, run ``bash e2e/apt-oracle/run.sh --record``,
 review verdicts.txt's diff (a changed row is a finding: see
 e2e/apt-oracle/README.md), and commit fixtures and verdicts.txt together.
 Never edit a fixture by hand. ``--from-controls`` makes no key: it writes
-only the batches cut from OUT's committed fx7 controls (FROM_CONTROLS:
-fx8), and every other file keeps its bytes, so --record must leave every
-other row of verdicts.txt as it was.
+only the batches cut from OUT's committed fixtures (FROM_CONTROLS: fx8 and
+fx9, from CONTROL_FILES), and every other file keeps its bytes, so
+--record must leave every other row of verdicts.txt as it was.
 
 Usage: python3 -I e2e/apt-oracle/gen_shapes.py OUT
        python3 -I e2e/apt-oracle/gen_shapes.py --from-controls OUT
@@ -571,6 +576,7 @@ class Material:
     det_b: bytes  # B's detached signature of RELEASE
     keyid_a: bytes
     keyid_b: bytes
+    fpr_s: bytes  # S's primary key's fingerprint (20 bytes)
 
 
 def make_material(g: GnuPG, k: Keys) -> Material:
@@ -616,6 +622,7 @@ def make_material(g: GnuPG, k: Keys) -> Material:
         det_b=det_b,
         keyid_a=bytes.fromhex(k.a[-16:]),
         keyid_b=bytes.fromhex(k.b[-16:]),
+        fpr_s=bytes.fromhex(k.s),
     )
 
 
@@ -894,9 +901,72 @@ def batch_fx7(m: Material) -> tuple[Shapes, Shapes]:
     return inline, detached
 
 
-def batch_fx8_from(
-    inline_control: bytes, detached_control: bytes
-) -> tuple[Shapes, Shapes]:
+@dataclass(frozen=True)
+class Controls:
+    """What the batches cut without a key start from: in a run that makes
+    keys, its Material (controls_from_material); with --from-controls, OUT's
+    committed fixtures (controls_from_corpus), which hold the same bytes."""
+
+    inline: bytes  # x7i_control_good: head + armor(sig_a)
+    detached: bytes  # x7d_control_good: armor(det_a)
+    sig_a_other: bytes  # A's signature of OTHER_TEXT: i_badsig_only's packet
+    sig_s_other: bytes  # S's subkey's of OTHER_TEXT: x3i_subkey_bad_plus_good's first
+    fpr_s: bytes  # S's primary key's fingerprint: keys.gpg's primary with a subkey
+
+
+def controls_from_material(m: Material) -> Controls:
+    """The Controls of a run that makes keys, as its batches build them."""
+    return Controls(
+        inline=m.head + armor(m.sig_a),
+        detached=armor(m.det_a),
+        sig_a_other=m.sig_a_other,
+        sig_s_other=m.sig_s_other,
+        fpr_s=m.fpr_s,
+    )
+
+
+def subkeyed_primary(keyring: bytes) -> bytes:
+    """The fingerprint of keyring's one primary key that has a subkey (S)."""
+    with_subkey: list[str] = []
+    primary = ""
+    for tag, body in split_packets(keyring):
+        if tag == 6:
+            primary = v4_fingerprint(body)
+        elif tag == 14 and primary and primary not in with_subkey:
+            with_subkey.append(primary)
+    if len(with_subkey) != 1:
+        raise ValueError(f"want one primary key with a subkey, got {with_subkey}")
+    return bytes.fromhex(with_subkey[0])
+
+
+def controls_from_corpus(out: Path) -> Controls:
+    """The Controls cut from OUT's committed fixtures (CONTROL_FILES)."""
+    names = {p.name for p in corpus_entries(out)}
+    for f in CONTROL_FILES:
+        if f not in names:
+            raise SystemExit(f"{out}: no {f} to cut from: generate the corpus first")
+    inline, detached, badsig, subkey_bad, keyring = (
+        (out / f).read_bytes() for f in CONTROL_FILES
+    )
+    begin = b"-----BEGIN PGP SIGNATURE-----"
+    head = inline[: inline.index(begin)]
+    for name, text in (
+        ("i_badsig_only", badsig),
+        ("x3i_subkey_bad_plus_good", subkey_bad),
+    ):
+        if text[: text.index(begin)] != head:
+            raise ValueError(f"{name}: its signed text is not the controls'")
+    s_tag, s_body = split_packets(sig_packets(subkey_bad))[0]
+    return Controls(
+        inline=inline,
+        detached=detached,
+        sig_a_other=sig_packets(badsig),
+        sig_s_other=packet(s_tag, s_body),
+        fpr_s=subkeyed_primary(keyring),
+    )
+
+
+def batch_fx8_from(c: Controls) -> tuple[Shapes, Shapes]:
     """Ruling HD-13's 20 shapes (gi_ inline, gd_ detached), found and
     measured in the hardening plan's Task 6, beyond the planning corpus; cut
     without a key from the fx7 controls (x7i_control_good and
@@ -911,6 +981,7 @@ def batch_fx8_from(
     sqv skip them; go-crypto reads them as the next packet); c3 the packet
     framed again with nothing added, the same bytes as the control.
     """
+    inline_control, detached_control = c.inline, c.detached
     begin = b"-----BEGIN PGP SIGNATURE-----"
     head = inline_control[: inline_control.index(begin)]
     sig_a, det_a = sig_packets(inline_control), sig_packets(detached_control)
@@ -942,7 +1013,92 @@ def batch_fx8_from(
 def batch_fx8(m: Material) -> tuple[Shapes, Shapes]:
     """Ruling HD-13's batch, cut from the fx7 controls as batch_fx7 builds
     them (``--from-controls`` cuts it from OUT's committed ones instead)."""
-    return batch_fx8_from(m.head + armor(m.sig_a), armor(m.det_a))
+    return batch_fx8_from(controls_from_material(m))
+
+
+def with_issuers(
+    sig: bytes, hashed: list[Subpacket], unhashed: list[Subpacket]
+) -> bytes:
+    """sig, one v4 signature packet, with both its subpacket areas replaced
+    (its hash no longer covers what it signed: a bad signature's subpackets,
+    issuers included, can be rewritten so without a key); new-format framing."""
+    s = parse_v4_sig(one_signature(sig))
+    return packet(
+        2, build_v4_sig(V4Sig(s.head, build_subpackets(hashed), [], s.rest), unhashed)
+    )
+
+
+def batch_fx9_from(c: Controls) -> tuple[Shapes, Shapes]:
+    """Ruling HD-14's 13 shapes (t7c_ controls, t7g gaps), found and measured
+    in the hardening plan's Task 7, beyond the planning corpus: which issuer
+    subpacket gpgv takes a bad signature packet's key from, where go-crypto
+    takes another. Each is A's bad signature packet (A's signature of
+    OTHER_TEXT, i_badsig_only's), its issuer subpackets rewritten, before
+    A's good one (x7i_control_good's); t7g5 is S's subkey's bad packet
+    naming S's primary key, which only certifies. Cut without a key, as
+    Task 7's scratch generators (gapgen.py, gapgen2.py) cut them.
+
+    B is a v4 fingerprint, X a v6-form one (version 6, 32 bytes), that no
+    key has; "unh" names the unhashed area. gpgv reads the first hashed 33
+    in the form its version knows (t7g4: a v6 form in a v4 signature is no
+    fingerprint; t7g7: a later 33 is not read), else the first 16, hashed
+    then unhashed (t7g1, t7g3, t7g3b); gpgv 2.2 also falls back to that 16
+    when the fingerprint names a key it lacks (t7g6, t7g6b; 2.4 does not).
+    """
+    begin = b"-----BEGIN PGP SIGNATURE-----"
+    head = c.inline[: c.inline.index(begin)]
+    sig_a = sig_packets(c.inline)
+    bad_a = c.sig_a_other
+    hashed_a = subpackets(parse_v4_sig(one_signature(bad_a)).hashed_raw)
+    fpr_a = next(d for t, _, d in hashed_a if t == 33)[1:]
+    kid_a = fpr_a[12:]
+    no_issuer = [sp for sp in hashed_a if sp[0] not in (16, 33)]
+    hashed_s = subpackets(parse_v4_sig(one_signature(c.sig_s_other)).hashed_raw)
+    s_no_issuer = [sp for sp in hashed_s if sp[0] not in (16, 33)]
+    fpr_b = b"\x04" + bytes.fromhex("00112233445566778899aabbccddeeff01234567")
+    fpr_x = b"\x06" + bytes.fromhex("8899aabbccddeeff0011223344556677" * 2)
+    kid_b = bytes.fromhex("0123456789abcdef")
+    a16: Subpacket = (16, False, kid_a)
+    b16: Subpacket = (16, False, kid_b)
+    b33: Subpacket = (33, False, fpr_b)
+    x33: Subpacket = (33, False, fpr_x)
+    bad = {
+        # Controls: packets gpgv and the cache both take as A's.
+        "t7c_bad_a_as_is": bad_a,
+        "t7c_nohashed_unh16A": with_issuers(bad_a, no_issuer, [a16]),
+        "t7c_nohashed_unh33B_16A": with_issuers(bad_a, no_issuer, [b33, a16]),
+        # Nothing hashed; unhashed 16 = A, then B's fingerprint (go-crypto's
+        # issuer is the last: B's).
+        "t7g1_nohashed_unh16A_33B": with_issuers(bad_a, no_issuer, [a16, b33]),
+        # Two hashed 16s: gpgv reads the first.
+        "t7g3_hashed16A_16B": with_issuers(bad_a, no_issuer + [a16, b16], []),
+        "t7g3b_hashed16B_16A": with_issuers(bad_a, no_issuer + [b16, a16], []),
+        # A v6-form fingerprint in a v4 signature, as gpg wrote the rest.
+        "t7g4_v6fpr_unh16A": with_issuers(bad_a, no_issuer + [x33], [a16]),
+        # S's certify-only primary key named.
+        "t7g5_s_primary": with_issuers(
+            c.sig_s_other,
+            s_no_issuer + [(33, False, b"\x04" + c.fpr_s)],
+            [(16, False, c.fpr_s[12:])],
+        ),
+        # A fingerprint no key has, then (or with) A's 16.
+        "t7g6_hashed33B_unh16A": with_issuers(bad_a, no_issuer + [b33], [a16]),
+        "t7g6b_hashed33B_16A": with_issuers(bad_a, no_issuer + [b33, a16], []),
+        # A first hashed 33 in v6 form, then a v4 one.
+        "t7g7_33junk_33B_unh16A": with_issuers(bad_a, no_issuer + [x33, b33], [a16]),
+        "t7g7b_33junk_33A": with_issuers(
+            bad_a, no_issuer + [x33, (33, False, b"\x04" + fpr_a)], []
+        ),
+    }
+    inline = {name: head + armor(p + sig_a) for name, p in bad.items()}
+    inline["t7c_good_alone"] = head + armor(sig_a)
+    return inline, {}
+
+
+def batch_fx9(m: Material) -> tuple[Shapes, Shapes]:
+    """Ruling HD-14's batch, cut from the same Controls a run's Material
+    gives (``--from-controls`` cuts it from OUT's committed fixtures)."""
+    return batch_fx9_from(controls_from_material(m))
 
 
 BATCHES: list[Callable[[Material], tuple[Shapes, Shapes]]] = [
@@ -954,15 +1110,24 @@ BATCHES: list[Callable[[Material], tuple[Shapes, Shapes]]] = [
     batch_fx6,
     batch_fx7,
     batch_fx8,
+    batch_fx9,
 ]
 
-# The batches cut without a key from the committed fx7 controls, which
-# ``--from-controls`` writes alone: (inline control, detached control) ->
-# shapes. Each is also in BATCHES, by a wrapper that builds the controls.
-FROM_CONTROLS: list[Callable[[bytes, bytes], tuple[Shapes, Shapes]]] = [
+# The batches cut without a key from committed fixtures, which
+# ``--from-controls`` writes alone: Controls -> shapes. Each is also in
+# BATCHES, by a wrapper that builds its Controls from the Material.
+FROM_CONTROLS: list[Callable[[Controls], tuple[Shapes, Shapes]]] = [
     batch_fx8_from,
+    batch_fx9_from,
 ]
-CONTROL_FILES = ("x7i_control_good.InRelease", "x7d_control_good.Release.gpg")
+# The committed fixtures controls_from_corpus reads, in Controls' order.
+CONTROL_FILES = (
+    "x7i_control_good.InRelease",
+    "x7d_control_good.Release.gpg",
+    "i_badsig_only.InRelease",
+    "x3i_subkey_bad_plus_good.InRelease",
+    "keys.gpg",
+)
 
 
 def build_shapes(m: Material) -> tuple[Shapes, Shapes]:
@@ -1017,18 +1182,14 @@ def write_corpus(out: Path, inline: Shapes, detached: Shapes, keyring: bytes) ->
 
 def write_from_controls(out: Path) -> tuple[int, int]:
     """Writes into OUT the FROM_CONTROLS batches, cut from OUT's committed
-    fx7 controls, and nothing else: no key is made, so every measured
-    fixture keeps its bytes. Returns (inline, detached) shape counts."""
-    names = {p.name for p in corpus_entries(out)}
-    for f in CONTROL_FILES:
-        if f not in names:
-            raise SystemExit(f"{out}: no {f} to cut from: generate the corpus first")
-    inline_control = (out / CONTROL_FILES[0]).read_bytes()
-    detached_control = (out / CONTROL_FILES[1]).read_bytes()
+    fixtures (CONTROL_FILES), and nothing else: no key is made, so every
+    measured fixture keeps its bytes. Returns (inline, detached) shape
+    counts."""
+    controls = controls_from_corpus(out)
     files: dict[str, bytes] = {}
     n_inline = n_detached = 0
     for batch in FROM_CONTROLS:
-        inline, detached = batch(inline_control, detached_control)
+        inline, detached = batch(controls)
         for shapes, suffix in ((inline, ".InRelease"), (detached, ".Release.gpg")):
             for name, data in shapes.items():
                 if not NAME_RE.fullmatch(name):
@@ -1076,7 +1237,7 @@ def main(argv: list[str]) -> int:
         n_inline, n_detached = write_from_controls(out)
         print(
             f"wrote {n_inline + n_detached} shapes ({n_inline} inline, "
-            f"{n_detached} detached) cut from {out}'s fx7 controls; every other "
+            f"{n_detached} detached) cut from {out}'s committed fixtures; every other "
             "file is as it was: measure the new rows with "
             "bash e2e/apt-oracle/run.sh --record"
         )
