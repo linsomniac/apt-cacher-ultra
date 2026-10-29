@@ -2150,12 +2150,12 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 }
 
 // memberMaxBytes is a member download's limit (fetch.Target.MaxBytes): its
-// declared size (ruling HD-5), so a member's download stops one byte past
-// what its Release declares — for an unsigned Release, what the repository
-// itself declares: the fetch reads the declared size and one byte more,
-// which shows the body runs over, and fails. A member declared empty gets
-// one byte, since 0 means no limit: any byte means it is not the declared
-// member, which verifyMember rejects.
+// declared size (ruling HD-5), so a member's download stops at most one
+// byte past what its Release declares — for an unsigned Release, what the
+// repository itself declares: the fetch reads the declared size and one
+// byte more, which shows the body runs over, and fails. A member declared
+// empty gets one byte, since 0 means no limit: any byte means it is not
+// the declared member, which verifyMember rejects.
 func memberMaxBytes(m ReleaseMember) int64 {
 	if m.Size < 1 {
 		return 1
@@ -2207,9 +2207,10 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 
 // fetchMemberURL fetches one Release member from a specific suite-
 // relative URL (either the plain declared path or its by-hash alias),
-// stopping its download one byte past its declared size (memberMaxBytes),
-// verifies the bytes against the member's declared Size + SHA256, and
-// PutBlobs them. The host slot is held by the caller (adoptMember).
+// stopping its download at most one byte past its declared size
+// (memberMaxBytes), verifies the bytes against the member's declared Size
+// + SHA256, and PutBlobs them. The host slot is held by the caller
+// (adoptMember).
 //
 // Error semantics are the authoritative member-fetch rules: a 404/410
 // returns errAdoptionMemberSkipped (SPEC2 §7.5.2 "declared but does not
@@ -2290,13 +2291,21 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 	// but a length mismatch is its own integrity violation). Only a
 	// shorter declared length can trip it: a longer one, declared or
 	// sent, already failed the fetch with fetch.ErrBodyTooLarge
-	// (memberMaxBytes).
+	// (memberMaxBytes). A shorter body sent without a Content-Length
+	// (chunked) fails verifyMember's size check below instead.
 	if m.Size > 0 && res.ContentLength > 0 && res.ContentLength != m.Size {
 		return "", newMemberErr(ErrAdoptionMemberFetchFailed, m.Path,
 			fmt.Sprintf("served %d vs declared %d", res.ContentLength, m.Size))
 	}
 
-	hashHex, err := verifyMember(w, m, res.ContentLength, a.rehashPooledBlob(suite, m))
+	// AIDEV-NOTE: the declared Size, as tryByHashFetch passes, never the
+	// response's ContentLength (the hardening plan's final review, F-M6):
+	// a chunked response has none (-1), which skipped the size check, so a
+	// Release declaring the right hash with too large a Size adopted the
+	// member here when it came chunked, and was refused when it came with a
+	// Content-Length. A correct member is exactly m.Size bytes; m.Size 0 (a
+	// member declared empty) still skips the check, its hash deciding.
+	hashHex, err := verifyMember(w, m, m.Size, a.rehashPooledBlob(suite, m))
 	var mm *memberHashMismatch
 	switch {
 	case errors.Is(err, ErrAdoptionDBFailed):

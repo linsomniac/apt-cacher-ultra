@@ -1550,6 +1550,84 @@ func TestFetch_MaxBytesStopsAResumedBodyThatRunsOver(t *testing.T) {
 	}
 }
 
+// TestFetch_MaxBytesOnARestartedDownload: a chunked 200 cut after 5,000
+// bytes is resumed, and the upstream answers the Range with a new 200 (a
+// new ETag: the file was republished), which restarts the download from
+// byte 0 (SPEC §6.3). Target.MaxBytes bounds the new file alone, never the
+// 5,000 bytes the restart discards: a new body of exactly MaxBytes passes,
+// declared or chunked, and dst holds just its bytes; one over it fails with
+// ErrBodyTooLarge — a declared one before any of its body is read, a
+// chunked one at MaxBytes and the one byte that shows it runs over — and is
+// not retried (the hardening plan's final review, F-M1).
+func TestFetch_MaxBytesOnARestartedDownload(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		n        int  // the new file's size
+		declared bool // the new 200 carries a Content-Length
+		over     bool // n is over MaxBytes
+	}{
+		{"exactly MaxBytes, declared", 10000, true, false},
+		{"exactly MaxBytes, chunked", 10000, false, false},
+		{"over MaxBytes, declared", 50000, true, true},
+		{"over MaxBytes, chunked", 1 << 20, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var requests atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch requests.Add(1) {
+				case 1:
+					cutChunked200(t, w, 5000)
+				case 2:
+					if got := r.Header.Get("Range"); got != "bytes=5000-" {
+						t.Errorf("resume Range = %q, want bytes=5000-", got)
+					}
+					w.Header().Set("ETag", `"v2"`)
+					if tc.declared {
+						w.Header().Set("Content-Length", fmt.Sprint(tc.n))
+						_, _ = w.Write(bytes.Repeat([]byte("x"), tc.n))
+						return
+					}
+					writeFlushedBody(w, tc.n) // x bytes, chunked
+				default:
+					http.Error(w, "unexpected request", http.StatusServiceUnavailable)
+				}
+			}))
+			defer srv.Close()
+
+			client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+			dst := &bufDst{}
+			_, err := client.Fetch(context.Background(), &Target{
+				CanonicalHost: "127.0.0.1",
+				URL:           srv.URL + "/republished",
+				MaxBytes:      10000,
+			}, dst)
+			if got := requests.Load(); got != 2 {
+				t.Errorf("upstream saw %d requests, want 2 (the cut 200 and the restarting one; ErrBodyTooLarge is not retried)", got)
+			}
+			switch {
+			case !tc.over:
+				if err != nil {
+					t.Fatalf("Fetch: %v, want the restarted body of exactly MaxBytes to pass", err)
+				}
+				if !bytes.Equal(dst.buf.Bytes(), bytes.Repeat([]byte("x"), tc.n)) {
+					t.Errorf("dst holds %d bytes, want just the new file's %d", dst.Written(), tc.n)
+				}
+			case !errors.Is(err, ErrBodyTooLarge):
+				t.Fatalf("Fetch error = %v, want ErrBodyTooLarge", err)
+			case tc.declared:
+				if bytes.Contains(dst.buf.Bytes(), []byte("x")) {
+					t.Errorf("dst holds %d bytes of the new file, want none: a declared length over MaxBytes is refused before its body is read",
+						bytes.Count(dst.buf.Bytes(), []byte("x")))
+				}
+			default:
+				if dst.Written() != 10001 {
+					t.Errorf("dst.Written() = %d, want 10001: MaxBytes of the new file and the one byte that shows it runs over", dst.Written())
+				}
+			}
+		})
+	}
+}
+
 // TestFetch_MaxBytesAtMaxInt64ReadsTheWholeBody: Target.MaxBytes
 // math.MaxInt64 is a limit no body reaches. The one byte past it that
 // streamBody reads, to tell "runs over" from "ends there", must not wrap

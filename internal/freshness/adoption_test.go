@@ -3349,3 +3349,152 @@ func TestAdoptMember_AMemberLongerThanDeclaredStopsAtItsSize(t *testing.T) {
 		t.Errorf("upstream saw %d requests for the member, want 1", got)
 	}
 }
+
+// newRealClientAdopter is an Adopter over a fresh cache whose member
+// fetches go through a real fetch.Client to srv, reached as a forward
+// proxy for archive.example.com, as in
+// TestAdoptMember_AMemberLongerThanDeclaredStopsAtItsSize (fakeFetcher
+// ignores fetch.Target.MaxBytes).
+func newRealClientAdopter(t *testing.T, srv *httptest.Server) (*Adopter, *cache.Cache) {
+	t.Helper()
+	client, err := fetch.New(fetch.Options{Proxy: srv.URL, AllowedHostRegex: []string{`^archive\.example\.com$`}})
+	if err != nil {
+		t.Fatalf("fetch.New: %v", err)
+	}
+	env := newAdoptionTestEnv(t)
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:       env.cache,
+		Fetcher:     client,
+		Verifier:    passThroughVerifier{},
+		HostLimiter: hostsem.New(8),
+		Logger:      discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+	return ad, env.cache
+}
+
+// TestAdoptMember_AByHashFileLongerThanDeclaredFallsBackToThePlainPath: a
+// by-hash URL that serves a file longer than the member's declared size (a
+// newer file, say) fails the probe with fetch.ErrBodyTooLarge — chunked, or
+// refused at its Content-Length — and adoption falls back to the plain
+// path, as after any failure of the probe's upstream or bytes: the member
+// adopts with its declared hash, after the probe and the plain path's
+// request, and nothing is left in tmp/ (the hardening plan's final review,
+// F-M2; ruling HD-5).
+func TestAdoptMember_AByHashFileLongerThanDeclaredFallsBackToThePlainPath(t *testing.T) {
+	for _, declared := range []bool{false, true} {
+		t.Run(fmt.Sprintf("by-hash Content-Length=%t", declared), func(t *testing.T) {
+			body := bytes.Repeat([]byte("Package: declared\n"), 600) // 10,800 bytes
+			longer := append(append([]byte(nil), body...), bytes.Repeat([]byte("Package: newer\n"), 600)...)
+			m := ReleaseMember{Path: "main/binary-amd64/Packages", SHA256: shaOf(body), Size: int64(len(body))}
+			suite := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.example.com", SuitePath: "/debian/dists/stable"}
+			byHash := "/debian/dists/stable/main/binary-amd64/by-hash/SHA256/" + m.SHA256
+			plain := "/debian/dists/stable/main/binary-amd64/Packages"
+
+			var (
+				mu   sync.Mutex
+				seen []string
+			)
+			requests := func() []string {
+				mu.Lock()
+				defer mu.Unlock()
+				return append([]string(nil), seen...)
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				seen = append(seen, r.URL.Path)
+				mu.Unlock()
+				switch r.URL.Path {
+				case byHash:
+					if declared {
+						w.Header().Set("Content-Length", fmt.Sprint(len(longer)))
+					} else {
+						w.WriteHeader(http.StatusOK)
+						w.(http.Flusher).Flush() // headers out first: the body goes chunked
+					}
+					_, _ = w.Write(longer)
+				case plain:
+					w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+					_, _ = w.Write(body)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			ad, c := newRealClientAdopter(t, srv)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			hash, err := ad.adoptMember(ctx, suite, m, true)
+			if err != nil {
+				t.Fatalf("adoptMember: %v (requests %v), want the plain path's bytes adopted", err, requests())
+			}
+			if hash != m.SHA256 {
+				t.Errorf("adopted hash %s, want the declared %s", hash, m.SHA256)
+			}
+			if got := requests(); len(got) != 2 || got[0] != byHash || got[1] != plain {
+				t.Errorf("requests %v, want the by-hash probe, then the plain path", got)
+			}
+			if tmp, err := os.ReadDir(filepath.Join(c.Dir(), "tmp")); err != nil || len(tmp) != 0 {
+				t.Errorf("tmp/ holds %d files (err %v), want none", len(tmp), err)
+			}
+			if n := blobsInPool(t, c); n != 1 {
+				t.Errorf("pool/ holds %d files, want 1 (the declared member)", n)
+			}
+		})
+	}
+}
+
+// TestAdoptMember_APlainPathMemberShortOfItsDeclaredSizeIsRefused: a
+// Release that declares a member's right SHA-256 with a Size larger than
+// the file (self-inconsistent; apt checks a file's size against its
+// Release too) has the member refused on the plain path whatever its
+// framing: with a Content-Length, by the size check against the response;
+// chunked, where no length is declared, by verifyMember's check against the
+// declared Size, as on the by-hash probe. Before, verifyMember checked the
+// response's Content-Length, so a chunked body was checked by its hash
+// alone and adopted (the hardening plan's final review, F-M6).
+func TestAdoptMember_APlainPathMemberShortOfItsDeclaredSizeIsRefused(t *testing.T) {
+	for _, declared := range []bool{false, true} {
+		t.Run(fmt.Sprintf("Content-Length=%t", declared), func(t *testing.T) {
+			body := bytes.Repeat([]byte("Package: real\n"), 500) // 7,000 bytes
+			m := ReleaseMember{Path: "main/binary-amd64/Packages", SHA256: shaOf(body), Size: int64(len(body)) + 100}
+			suite := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.example.com", SuitePath: "/debian/dists/stable"}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/debian/dists/stable/main/binary-amd64/Packages" {
+					http.NotFound(w, r)
+					return
+				}
+				if declared {
+					w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+				} else {
+					w.WriteHeader(http.StatusOK)
+					w.(http.Flusher).Flush() // headers out first: the body goes chunked
+				}
+				_, _ = w.Write(body)
+			}))
+			defer srv.Close()
+			ad, c := newRealClientAdopter(t, srv)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_, err := ad.adoptMember(ctx, suite, m, false)
+			if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
+				t.Fatalf("adoptMember error = %v, want ErrAdoptionMemberFetchFailed: the file is %d bytes, its Release declares %d",
+					err, len(body), m.Size)
+			}
+			var me *AdoptionMemberError
+			if !errors.As(err, &me) || !strings.Contains(me.Detail, "7000") || !strings.Contains(me.Detail, "7100") {
+				t.Errorf("adoptMember error = %v, want an *AdoptionMemberError whose detail names both sizes", err)
+			}
+			if n := blobsInPool(t, c); n != 0 {
+				t.Errorf("pool/ holds %d files, want none", n)
+			}
+			if tmp, err := os.ReadDir(filepath.Join(c.Dir(), "tmp")); err != nil || len(tmp) != 0 {
+				t.Errorf("tmp/ holds %d files (err %v), want none", len(tmp), err)
+			}
+		})
+	}
+}

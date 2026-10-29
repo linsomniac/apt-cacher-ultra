@@ -955,7 +955,12 @@ failed`, and `package_hash validate lookup failed` after a download). A
 miss reads the hashes before its download and again after it: when only
 the first read fails (WARN `package_hash_prefetch_lookup_failed`), the
 second decides, and a package strict mode refuses is refused after its
-download rather than served. A read fault never overturns a refusal
+download rather than served; and when the first read found the package
+vouched but no current snapshot vouches it after the download (its
+snapshot retired, or replaced by one that no longer lists it,
+meanwhile), it is decided then as any unvouched package: refused, or
+waited for while a signed adoption runs on its host. A read fault never
+overturns a refusal
 already decided: before refusing a package while no adoption runs on its
 host, the cache reads its hashes once more, in case an adoption has just
 vouched for it, and only hashes found there change the answer — a fault

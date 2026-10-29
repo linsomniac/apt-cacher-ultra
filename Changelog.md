@@ -74,8 +74,9 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   body skipped the size check, and a resumed one could be corrupted), and
   adoption stops a member's download at the size its `Release` declares.
 - With `integrity.refuse_unvouched_debs`, a `.deb` whose vouching snapshot
-  is retired or replaced while it downloads is refused like any unvouched
-  `.deb`, instead of being served unchecked.
+  is retired, or replaced by one that no longer lists it, while it
+  downloads is refused like any unvouched `.deb`, instead of being served
+  unchecked.
 - Adoption refuses an `InRelease` or `Release.gpg` that apt rejects: a
   line after the signature, a forged armor checksum, damaged armor lines,
   packets apt refuses, a `Release.gpg` with bytes around its armor, or a

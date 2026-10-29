@@ -228,8 +228,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   pool file is gone (`runSnapshotMemberFetch`,
   `internal/handler/handler.go`) have no size to stop at: their
   `fetch.Target` sets no `MaxBytes`, and they are bounded only by a
-  response's `Content-Length`, which the body must match, and by
-  `upstream.total_timeout` (5 minutes by default). A cap needs a size per
+  response's `Content-Length`, when it sends one, which the body must
+  match, and by `upstream.total_timeout` (5 minutes by default), which
+  alone bounds a chunked body. A cap needs a size per
   file, which `snapshot_member` and `package_hash` lack: a schema change.
   Recommendation: keep `Content-Length` and `upstream.total_timeout` as
   their bounds; `runSnapshotMemberFetch` could take a cap from the blob
@@ -493,14 +494,30 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   never retried); adoption sets it to each member's declared size, one byte
   for a member declared empty (`memberMaxBytes`), on the by-hash probe and
   the plain path, which repair and reconcile share. There is no margin: a
-  member of any other size fails its verification anyway. Ruling HD-12: the
-  long-member test asserts that the cache read exactly the declared size and
-  one byte more, that the upstream's endless body then fails to write, and
-  that `adoptMember` returns within 15 s, but no byte count at the upstream,
-  which loopback buffering varies. `docs/configuration.md`'s unsigned threat
-  note now says each file's download stops at its declared size. Done in the
-  hardening plan's Task 3 (commits 391eac2 and c45cd74), pinned by
-  `TestAdoptMember_AMemberLongerThanDeclaredStopsAtItsSize` and the
+  member of any other size fails its verification anyway (the plain path
+  checks the declared size since the hardening plan's final review, F-M6,
+  where it checked the response's length, so a chunked body, which
+  declares none, was checked by its hash alone). It costs two things (the
+  final review's F-M5, measured 2026-10-29 over the security review's 81
+  vendors). Nine of them answer an uncompressed member gzip-encoded when
+  asked, so those downloads are now full size (hashicorp's
+  `main/binary-amd64/Packages`: 2,027,475 bytes, which came gzip-encoded
+  and chunked while Go asked for gzip). And an upstream that sends
+  `Content-Encoding: gzip` unasked now has its bytes stored as sent, so an
+  uncompressed index member served so fails its hash, which Go's decoding
+  used to rescue, and its suite stops adopting; no measured vendor does
+  (no answer to a request without `Accept-Encoding` carried one: the 81
+  anchors, and 239 members of 69 vendors), and every supported apt fails
+  such a file too ("File has unexpected size", in the six client images).
+  Ruling HD-12: the long-member test asserts that the cache read
+  exactly the declared size and one byte more, that the upstream's endless
+  body then fails to write, and that `adoptMember` returns within 15 s, but
+  no byte count at the upstream, which loopback buffering varies.
+  `docs/configuration.md`'s unsigned threat note now says each file's
+  download stops at its declared size. Done in the hardening plan's Task 3
+  (commits 391eac2 and c45cd74) and its final fix wave, pinned by
+  `TestAdoptMember_AMemberLongerThanDeclaredStopsAtItsSize`,
+  `TestAdoptMember_APlainPathMemberShortOfItsDeclaredSizeIsRefused` and the
   `TestFetch_MaxBytes…` tests. Downloads with no declared size are under
   *Open*.
 - **A vouched `.deb` whose snapshot is retired during its download is
