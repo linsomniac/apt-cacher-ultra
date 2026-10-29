@@ -15,7 +15,7 @@ The GC and upstream hardening plan of 2026-10-28 (the hardening plan
 below; `docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md`)
 worked five *Open* entries of this file for 1.1.0, now under *Decided*.
 Its rulings HD-1 to HD-10 are in its *Design notes and rulings*; HD-11
-to HD-14 were made while it was carried out, and the *Decided* entries
+to HD-15 were made while it was carried out, and the *Decided* entries
 of its work say what each decided.
 
 ## Before the 1.1.0 release candidate
@@ -328,8 +328,18 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   tick's snapshot pass or the retired run an hour after a start, so a daemon
   that never lives that long keeps them, as it keeps a reaped suite's (the
   H3 final review's R3 #2 residual; `runSnapshotPass`'s AIDEV-NOTE,
-  `internal/gc/snapshot.go`). They never serve meanwhile. Recommendation:
-  leave it; look again if a daemon that restarts often is seen to keep them.
+  `internal/gc/snapshot.go`). They never serve meanwhile. And sub-job C
+  deletes the oldest retired snapshot first (`RunRetiredSnapshotGCChunk`,
+  `internal/cache/gc.go`), so one whose chunk fails at every call stops the
+  deletion of every later retired snapshot, B's displaced ones included,
+  with their rows and the blobs they keep, until it is fixed, where a
+  periodic B used to delete them itself whatever C did (the hardening
+  plan's final review, G-M1: probed with a trigger standing in for a fault
+  confined to one snapshot's rows, the only cause the review found; WARN
+  `gc_tick_failed` with `retired snapshot gc chunk:` shows it).
+  Recommendation: leave it; look again if a daemon that restarts often is
+  seen to keep them, and if a chunk is seen to fail at every call, let C
+  step past a snapshot whose chunk failed for the rest of its pass.
 - **Sub-job C's chunk size** (raised 2026-10-28, the hardening plan's
   Task 2; ruling HD-11). Sub-job C deletes 10,000 rows a writer transaction
   (spec C9; `retiredChunkRows`, `internal/cache/gc.go`), and a chunk holds
@@ -341,6 +351,16 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   on a staging host before deciding; a chunk under 10,000 rows is a change
   to spec C9 (pinned by
   `TestRunRetiredSnapshotGCChunk_TheChunkIsTenThousandRows`).
+- **No metric counts a failed GC pass** (raised 2026-10-29, the hardening
+  plan's final review, G-M6; unchanged since 1.0.x). A pass that fails at
+  every tick never pages: its tick still logs `gc_run_complete` and sets
+  `acu_gc_last_run_unixtime`, so the GC alert in the 1.1.0 release notes,
+  on that gauge's age, stays quiet, and WARN `gc_tick_failed` is the only
+  sign (`docs/log-fields.md`). Since ruling HD-15 the passes after a failed
+  one run (*Decided*, below), but the failed pass's own work waits until its
+  fault is fixed. Recommendation: a counter,
+  `acu_gc_pass_failures_total{pass}`, and an alert line on it in the
+  release notes, in a later release.
 - **A vouched `.deb` is stored unchecked when the read after its download
   fails** (raised 2026-10-28, the hardening plan's Task 4 review, Minor 3;
   the posture predates that plan). When the read before a `.deb` miss's
@@ -406,19 +426,30 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
 
 - **A GC pass that fails at every tick no longer starves the passes after
   it** (the maintainer, 2026-10-28: worked for 1.1.0; raised 2026-10-27, the
-  H3 final review R3 #5; unchanged since 1.0.x for the url_path pass and
+  H3 final review R3 #5, and again 2026-10-29, the hardening plan's final
+  review, G-I1 and G-M5; unchanged since 1.0.x for the url_path pass and
   sub-jobs A and B). `runTick` (`internal/gc/gc.go`) moved the pass rotation
   on after a panic but not after an error, so a pass that failed at every
   tick (a fault limited to its tables) kept the blob pass from running. Its
-  three error returns now go through `passFailed`, which moves the rotation
+  three error paths now go through `passFailed`, which moves the rotation
   past the failed pass, as `skipPanickedPass` does after a panic, unless the
   GC's context has ended (a shutdown stopped the pass: it did not fail);
   `periodicTick` and the retired run log WARN `gc_tick_failed` on the same
-  test (its row in `docs/log-fields.md`). A url_path or snapshot pass that
-  fails at every tick now runs every other tick, the passes after it in
-  between. Done in the hardening plan's Task 1 (commits 38eb75a and
-  85407b1), pinned by `TestPeriodicTick_AFailingPassDoesNotStarveTheNext`
-  and `TestPassFailed_MovesPastEachPassUnlessTheContextEnded`.
+  test (its row in `docs/log-fields.md`). Ruling HD-15: a failed pass no
+  longer ends its tick either — the passes after it run under the same
+  deadline, and `runTick` returns the first failure — in the startup pass
+  as in a periodic tick. A daemon restarted more often than `gc.interval`
+  never runs a periodic tick and begins the rotation afresh at every start,
+  so the rotation alone left a pass that failed at every start starving the
+  passes after it there (G-I1); such a daemon now runs every pass at every
+  start. And a pass that fails at every tick is retried at every tick, the
+  others keeping their cadence, where it ran every other tick, the passes
+  after it in between (G-M5). Safe: each pass re-checks its own predicates.
+  Done in the hardening plan's Task 1 (commits 38eb75a and 85407b1) and its
+  final fix wave, pinned by
+  `TestPeriodicTick_AFailingPassDoesNotStarveTheNext`,
+  `TestStartupPass_AFailingSnapshotPassLeavesTheBlobPassToRun` and
+  `TestPassFailed_MovesPastEachPassUnlessTheContextEnded`.
 - **Periodic GC retires displaced snapshots instead of deleting them in one
   transaction** (the maintainer, 2026-10-28: worked for 1.1.0; raised
   2026-10-27, the H3 final review R3 #4; unchanged since 1.0.x).

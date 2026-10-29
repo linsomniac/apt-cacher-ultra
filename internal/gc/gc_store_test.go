@@ -463,25 +463,37 @@ func TestSkipPanickedPass_MovesPastEachPass(t *testing.T) {
 	}
 }
 
-// The H3 final review R3 #5: a pass that fails at every tick (a fault
-// limited to its tables) moves the rotation on as a panicking one does, so
-// the blob pass keeps reclaiming disk while the fault waits for its fix.
+// The H3 final review R3 #5 and ruling HD-15 (the hardening plan's final
+// review, G-M5): a pass that fails at every tick (a fault limited to its
+// tables) no longer ends its tick: the rotation moves past it and the
+// passes after it run in the same tick — the blob pass, which reclaims
+// disk, at every tick — while the failing pass is retried at every tick,
+// which logs gc_tick_failed for it each time.
 func TestPeriodicTick_AFailingPassDoesNotStarveTheNext(t *testing.T) {
 	logger, buf := captureLogger()
 	f := &fakeStore{batchErrs: 1000}
-	g, _ := storeGC(t, f, 2, logger)
+	g, c := storeGC(t, f, 2, logger)
+	db := dbOf(t, c)
 	ctx := context.Background()
-	g.periodicTick(ctx) // the url-path pass (off: no TTL), then the snapshot pass fails
-	if g.nextPass != blobPass {
-		t.Fatalf("after a failed snapshot pass the rotation is at pass %d, want the blob pass (%d)", g.nextPass, blobPass)
-	}
-	g.periodicTick(ctx) // the blob pass
-	if g.nextPass != urlPathPass {
-		t.Fatalf("after the blob pass the rotation is at pass %d, want the url-path pass (%d)", g.nextPass, urlPathPass)
-	}
-	g.periodicTick(ctx) // the snapshot pass fails again
-	if n := len(gcEvents(t, buf, "gc_tick_failed")); n != 2 {
-		t.Fatalf("%d gc_tick_failed lines, want 2 (the snapshot pass, twice)", n)
+	for tick := 1; tick <= 2; tick++ {
+		dead := seedReapableBlob(t, c, fmt.Sprintf("a dead blob for tick %d", tick))
+		g.periodicTick(ctx) // the url-path pass (off: no TTL), the snapshot pass fails, then the blob pass
+		if f.batches != tick {
+			t.Fatalf("after %d ticks the snapshot pass has run %d times, want once a tick (retried at every tick)", tick, f.batches)
+		}
+		if blobRowExists(t, db, dead) {
+			t.Fatalf("tick %d: the dead blob is still there: the blob pass did not run after the failed snapshot pass", tick)
+		}
+		if g.nextPass != urlPathPass {
+			t.Fatalf("after tick %d the rotation is at pass %d, want the url-path pass (%d): every pass ran", tick, g.nextPass, urlPathPass)
+		}
+		ev := gcEvents(t, buf, "gc_tick_failed")
+		if len(ev) != tick {
+			t.Fatalf("after %d ticks, gc_tick_failed lines %v, want one a tick", tick, ev)
+		}
+		if msg, _ := ev[tick-1]["err"].(string); !strings.Contains(msg, "snapshot gc batch") {
+			t.Fatalf("tick %d: gc_tick_failed err %q, want the snapshot batch's failure", tick, msg)
+		}
 	}
 }
 
@@ -502,16 +514,28 @@ func TestPeriodicTick_AnEndedContextKeepsTheRotation(t *testing.T) {
 	}
 }
 
-// The startup pass's runTick moves the rotation past a failed pass too, and
-// still returns the failure (main logs it).
-func TestStartupPass_AFailingPassMovesTheRotation(t *testing.T) {
-	logger, _ := captureLogger()
-	g, _ := storeGC(t, &fakeStore{batchErrs: 1}, 2, logger)
-	if err := g.StartupPass(context.Background()); err == nil {
-		t.Fatal("StartupPass returned nil, want the snapshot pass's failure")
+// Ruling HD-15 (the hardening plan's final review, G-I1): the startup pass
+// goes on past a failed pass too — the blob pass after a failed snapshot
+// pass runs in the same start — and StartupPass still returns the failure
+// (main logs it). The first periodic tick retries the failed pass.
+func TestStartupPass_AFailingPassDoesNotStarveTheNext(t *testing.T) {
+	logger, buf := captureLogger()
+	f := &fakeStore{batchErrs: 1}
+	g, c := storeGC(t, f, 2, logger)
+	dead := seedReapableBlob(t, c, "a dead blob")
+	err := g.StartupPass(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "snapshot gc batch") {
+		t.Fatalf("StartupPass = %v, want the snapshot pass's failure", err)
 	}
-	if g.nextPass != blobPass {
-		t.Fatalf("the rotation is at pass %d, want the blob pass (%d)", g.nextPass, blobPass)
+	if blobRowExists(t, dbOf(t, c), dead) {
+		t.Fatal("the dead blob is still there: the startup pass's blob pass did not run after its failed snapshot pass")
+	}
+	g.periodicTick(context.Background())
+	if f.batches != 2 {
+		t.Fatalf("%d snapshot batches after the first periodic tick, want 2: the tick retries the pass that failed at the start", f.batches)
+	}
+	if ev := gcEvents(t, buf, "gc_tick_failed"); len(ev) != 0 {
+		t.Fatalf("gc_tick_failed lines %v, want none: the retried pass succeeded", ev)
 	}
 }
 
@@ -520,7 +544,8 @@ func TestStartupPass_AFailingPassMovesTheRotation(t *testing.T) {
 // GC's context lived moves the rotation past itself — url-path to
 // snapshot, snapshot to blob, blob back to url-path — and one stopped by
 // an ended context (a shutdown) leaves it as it is; either way passFailed
-// returns the pass's error, for runTick's caller to log or return.
+// returns the pass's error, which runTick returns, for its caller to log
+// or return, when no earlier pass of the tick failed (ruling HD-15).
 func TestPassFailed_MovesPastEachPassUnlessTheContextEnded(t *testing.T) {
 	ended, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -552,17 +577,28 @@ func TestPassFailed_MovesPastEachPassUnlessTheContextEnded(t *testing.T) {
 	}
 }
 
-// The H3 final review R3 #5, the url-path pass's return in runTick (the
-// rig of TestPeriodicTick_AFailingPassDoesNotStarveTheNext reaches only
-// the snapshot pass's): on a real cache whose url_path table is renamed
-// away, the way the handler tests break one table, the url-path pass
-// fails, and one tick moves the rotation to the snapshot pass.
+// The H3 final review R3 #5 and ruling HD-15, the url-path pass's return in
+// runTick (the rig of TestPeriodicTick_AFailingPassDoesNotStarveTheNext
+// reaches only the snapshot pass's): on a real cache whose url_path table
+// is renamed away, the way the handler tests break one table, the url-path
+// pass fails and moves the rotation to the snapshot pass, which runs in the
+// same tick: its sub-jobs B and C delete the displaced snapshot beyond
+// keep_displaced. The blob pass, whose reachability predicate reads
+// url_path too, then fails in turn and moves the rotation back to the
+// url-path pass; the tick logs one gc_tick_failed line, for its first
+// failure, the url-path pass's.
 func TestPeriodicTick_AFailingURLPathPassMovesToTheSnapshotPass(t *testing.T) {
 	logger, buf := captureLogger()
 	g, c := storeGC(t, nil, 2, logger)
 	g.store = c // the real cache behind the seam too, as New sets it
 	g.cfg.URLPathTTL = time.Hour
-	if _, err := dbOf(t, c).Exec(`ALTER TABLE url_path RENAME TO url_path_unreadable`); err != nil {
+	db := dbOf(t, c)
+	var ids []int64
+	for i := range 5 { // the current snapshot and four displaced: one beyond keep_displaced = 3
+		ids = append(ids, adoptSnapshot(t, c, "http", "h", "/r/dists/x",
+			putPoolBlob(t, c, fmt.Sprintf("anchor %d", i)), []string{putPoolBlob(t, c, fmt.Sprintf("member %d", i))}))
+	}
+	if _, err := db.Exec(`ALTER TABLE url_path RENAME TO url_path_unreadable`); err != nil {
 		t.Fatal(err)
 	}
 	g.periodicTick(context.Background())
@@ -573,8 +609,11 @@ func TestPeriodicTick_AFailingURLPathPassMovesToTheSnapshotPass(t *testing.T) {
 	if msg, _ := ev[0]["err"].(string); !strings.Contains(msg, "url_path gc batch") {
 		t.Fatalf("gc_tick_failed err %q, want the url-path batch's failure", msg)
 	}
-	if g.nextPass != snapshotPass {
-		t.Fatalf("after a failed url-path pass the rotation is at pass %d, want the snapshot pass (%d)", g.nextPass, snapshotPass)
+	if snapshotRowExists(t, db, ids[0]) {
+		t.Fatal("the displaced snapshot beyond keep_displaced is still there: the snapshot pass did not run after the failed url-path pass")
+	}
+	if g.nextPass != urlPathPass {
+		t.Fatalf("after the tick the rotation is at pass %d, want the url-path pass (%d): every pass ran", g.nextPass, urlPathPass)
 	}
 }
 
@@ -600,6 +639,133 @@ func TestPeriodicTick_AFailingBlobPassMovesToTheURLPathPass(t *testing.T) {
 	}
 	if g.nextPass != urlPathPass {
 		t.Fatalf("after a failed blob pass the rotation is at pass %d, want the url-path pass (%d)", g.nextPass, urlPathPass)
+	}
+}
+
+// Ruling HD-15: a tick whose passes all fail still runs each of them, and
+// logs one gc_tick_failed line, for its first failure. With url_path
+// unreadable the url-path pass fails, then the snapshot pass (failing behind
+// the seam), then the blob pass, whose reachability predicate reads url_path
+// too: the line is the url-path pass's.
+func TestPeriodicTick_LogsTheFirstFailedPass(t *testing.T) {
+	logger, buf := captureLogger()
+	f := &fakeStore{batchErrs: 1000}
+	g, c := storeGC(t, f, 2, logger)
+	g.cfg.URLPathTTL = time.Hour
+	if _, err := dbOf(t, c).Exec(`ALTER TABLE url_path RENAME TO url_path_unreadable`); err != nil {
+		t.Fatal(err)
+	}
+	g.periodicTick(context.Background())
+	if f.batches != 1 {
+		t.Fatalf("%d snapshot batches, want 1: the snapshot pass runs after the failed url-path pass", f.batches)
+	}
+	ev := gcEvents(t, buf, "gc_tick_failed")
+	if len(ev) != 1 {
+		t.Fatalf("gc_tick_failed lines %v, want one, for the tick's first failure", ev)
+	}
+	if msg, _ := ev[0]["err"].(string); !strings.Contains(msg, "url_path gc batch") {
+		t.Fatalf("gc_tick_failed err %q, want the tick's first failure, the url-path pass's", msg)
+	}
+	if g.nextPass != urlPathPass {
+		t.Fatalf("after the tick the rotation is at pass %d, want the url-path pass (%d): every pass ran", g.nextPass, urlPathPass)
+	}
+}
+
+// The hardening plan's final review, G-M2: sub-job C failing in a periodic
+// tick's snapshot pass is that pass's failure — one WARN gc_tick_failed
+// names it (retired snapshot gc chunk) — and, ruling HD-15, the blob pass
+// after it runs in the same tick.
+func TestPeriodicTick_AFailingSubJobCMovesToTheBlobPass(t *testing.T) {
+	logger, buf := captureLogger()
+	g, c := storeGC(t, &fakeStore{chunkErrs: true}, 2, logger)
+	dead := seedReapableBlob(t, c, "a dead blob")
+	g.periodicTick(context.Background())
+	ev := gcEvents(t, buf, "gc_tick_failed")
+	if len(ev) != 1 || ev[0]["level"] != "WARN" {
+		t.Fatalf("gc_tick_failed lines %v, want one at WARN, sub-job C's", ev)
+	}
+	if msg, _ := ev[0]["err"].(string); !strings.Contains(msg, "retired snapshot gc chunk") {
+		t.Fatalf("gc_tick_failed err %q, want sub-job C's failure", msg)
+	}
+	if blobRowExists(t, dbOf(t, c), dead) {
+		t.Fatal("the dead blob is still there: the blob pass did not run after sub-job C failed")
+	}
+}
+
+// freshStartGC is the GC a start builds over c (New: its rotation begins at
+// the url-path pass), with gc.url_path_ttl urlPathTTL (0: the pass is off).
+func freshStartGC(t *testing.T, c *cache.Cache, logger *slog.Logger, urlPathTTL time.Duration) *GC {
+	t.Helper()
+	g, err := New(Config{Cache: c, Logger: logger, Enabled: true, Interval: 24 * time.Hour, BatchSize: 100,
+		SnapshotBatchSize: 10, MaxTickDuration: time.Minute, BlobGrace: time.Minute, KeepDisplaced: 3,
+		PoolScanWorkers: 2, HeartbeatStaleGrace: 30 * time.Minute, URLPathTTL: urlPathTTL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return g
+}
+
+// Ruling HD-15 (the hardening plan's final review, G-I1): a daemon
+// restarted more often than gc.interval runs startup passes only, each
+// from a fresh rotation, so a pass that failed at every start used to keep
+// the passes after it from ever running there. With url_path unreadable
+// each start's url-path pass fails, and its snapshot pass still deletes
+// the displaced snapshots beyond keep_displaced, at the first start;
+// StartupPass returns the url-path pass's failure, the first (the blob
+// pass, whose reachability predicate reads url_path too, fails after it).
+func TestStartupPass_AFailingURLPathPassLeavesTheSnapshotPassToRun(t *testing.T) {
+	c := openTestCache(t)
+	db := dbOf(t, c)
+	var ids []int64
+	for i := range 6 { // the current snapshot and five displaced: two beyond keep_displaced = 3
+		ids = append(ids, adoptSnapshot(t, c, "http", "h", "/r/dists/x",
+			putPoolBlob(t, c, fmt.Sprintf("anchor %d", i)), []string{putPoolBlob(t, c, fmt.Sprintf("member %d", i))}))
+	}
+	if _, err := db.Exec(`ALTER TABLE url_path RENAME TO url_path_unreadable`); err != nil {
+		t.Fatal(err)
+	}
+	for start := 1; start <= 2; start++ {
+		logger, _ := captureLogger()
+		err := freshStartGC(t, c, logger, time.Hour).StartupPass(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "url_path gc batch") || strings.Contains(err.Error(), "blob gc batch") {
+			t.Fatalf("start %d: StartupPass = %v, want the url-path pass's failure, the first, alone", start, err)
+		}
+		for i, id := range ids {
+			if kept, beyond := snapshotRowExists(t, db, id), i < 2; kept == beyond {
+				t.Fatalf("after start %d, snapshot %d (beyond keep_displaced: %v) kept: %v; want those beyond it deleted at the first start",
+					start, id, beyond, kept)
+			}
+		}
+	}
+}
+
+// Ruling HD-15 (the hardening plan's final review, G-I1), the snapshot
+// pass: with snapshot_skipped_member unreadable each start's snapshot pass
+// fails (its sub-job B deletes the displaced snapshots beyond
+// keep_displaced, skipped members included), and its blob pass still reaps
+// a dead blob, at the first start; StartupPass returns the snapshot pass's
+// failure.
+func TestStartupPass_AFailingSnapshotPassLeavesTheBlobPassToRun(t *testing.T) {
+	c := openTestCache(t)
+	db := dbOf(t, c)
+	for i := range 6 { // the current snapshot and five displaced: two beyond keep_displaced = 3
+		adoptSnapshot(t, c, "http", "h", "/r/dists/x",
+			putPoolBlob(t, c, fmt.Sprintf("anchor %d", i)), []string{putPoolBlob(t, c, fmt.Sprintf("member %d", i))})
+	}
+	dead := putPoolBlob(t, c, "a dead blob nothing references")
+	fastForwardZeroedAt(t, db, dead)
+	if _, err := db.Exec(`ALTER TABLE snapshot_skipped_member RENAME TO snapshot_skipped_member_unreadable`); err != nil {
+		t.Fatal(err)
+	}
+	for start := 1; start <= 2; start++ {
+		logger, _ := captureLogger()
+		err := freshStartGC(t, c, logger, 0).StartupPass(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "snapshot gc batch") {
+			t.Fatalf("start %d: StartupPass = %v, want the snapshot pass's failure", start, err)
+		}
+		if row, file := blobRowExists(t, db, dead), fileExists(t, c.BlobPath(dead)); row || file {
+			t.Fatalf("after start %d the dead blob is still there (row %v, file %v): want it reaped at the first start", start, row, file)
+		}
 	}
 }
 

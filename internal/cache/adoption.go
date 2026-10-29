@@ -402,8 +402,9 @@ WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &form, &adopted
 			return ErrSnapshotAlreadyAdopted
 		}
 		// AIDEV-NOTE: a retired snapshot (quarantined by the legacy trust
-		// audit, spec §6.1, or reaped from phase F) must never become
-		// current again — its pins were released when it was retired.
+		// audit, spec §6.1, reaped from phase F, or retired by GC sub-job B
+		// beyond gc.keep_displaced: DN-7) must never become current again —
+		// its pins were released when it stopped being current.
 		if retiredAt.Valid {
 			return fmt.Errorf("%w: snapshot_id=%d", ErrSnapshotRetired, snapshotID)
 		}

@@ -532,8 +532,11 @@ func serveListeners(
 	if err := gcsvc.StartupPass(ctx); err != nil {
 		// A startup-pass failure (DB error, fs error reading pool/)
 		// is loud but not fatal — the daemon can still serve. Log
-		// and continue; the next periodic tick retries the GC pass,
-		// and the next process restart re-runs the pool scan.
+		// and continue. A failed pool scan ends the startup pass
+		// before its GC passes, and the next process restart re-runs
+		// it; a failed GC pass did not keep the passes after it from
+		// running (ruling HD-15). The periodic ticks run every pass
+		// again, the failed one included.
 		logger.Warn("gc startup pass failed", "err", err)
 	}
 

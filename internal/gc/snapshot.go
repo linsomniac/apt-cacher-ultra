@@ -72,11 +72,12 @@ type snapshotPassResult struct {
 // before its C has deleted what its B retired — at its deadline, at a
 // shutdown (ctx), or on a batch or chunk that failed or panicked — those
 // snapshots are no longer B-selectable at the next start (retired_at), so
-// they wait for a later periodic tick's snapshot pass (the next one; after
-// a failure or a panic, the one after it, since the rotation moves on) or
-// retiredRun, an hour after a start, as a reaped suite's do (R3 #2's
-// residual). Such a snapshot counts twice: in displaced_reaped when B
-// retires it, in retired_reaped when C deletes it.
+// they wait for a later periodic tick's snapshot pass (the next one, after
+// a failure too, since a failed pass no longer ends its tick: ruling HD-15;
+// after a panic, the one after it, since the rotation moves past the
+// snapshot pass) or retiredRun, an hour after a start, as a reaped suite's
+// do (R3 #2's residual). Such a snapshot counts twice: in displaced_reaped
+// when B retires it, in retired_reaped when C deletes it.
 //
 // Returns:
 //   - the cumulative counts (orphan, displaced, retired),
@@ -84,7 +85,8 @@ type snapshotPassResult struct {
 //     between batches with backlog remaining; runTick then returns
 //     without running the blob pass, and the next tick resumes this
 //     pass — A ∪ B, then C — before the blob pass),
-//   - error iff a DB-level failure occurred.
+//   - error iff a DB-level failure occurred (runTick then runs the blob
+//     pass all the same: ruling HD-15).
 func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase string) (snapshotPassResult, bool, error) {
 	staleGraceSeconds := int64(g.cfg.HeartbeatStaleGrace.Seconds())
 
