@@ -1457,8 +1457,8 @@ with this guarantee and its residuals.
 suite incarnation that was reaped, evicted at the global cap or forgotten,
 in the same transaction that removes the suite row (`deleteSuiteTx`). It
 also marks the displaced snapshots beyond `gc.keep_displaced` that a
-periodic GC run retired: snapshot-GC sub-job B retires them there, and
-sub-job C deletes them in chunks, while the startup pass's B still
+periodic GC run retired: snapshot-GC sub-job B retires them in that run,
+and sub-job C deletes them in chunks, while the startup pass's B still
 deletes them at once (the GC and upstream hardening plan of 2026-10-28,
 ruling HD-4). Retired snapshots are invisible to everything that
 reasons about a suite's history: the natural-key uniqueness (partial index

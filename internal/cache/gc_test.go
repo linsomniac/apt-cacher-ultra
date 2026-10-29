@@ -1266,18 +1266,25 @@ var wholeChildRows = [3]int{2, 1, 2}
 // DN-7: a periodic tick's sub-job B (retireDisplaced) only retires the
 // displaced snapshots beyond keep_displaced, in one short UPDATE —
 // retired_at is the batch's clock, and every child row stays — and leaves
-// the others as they were; the next batch selects nothing (B's selection
-// has retired_at IS NULL); and sub-job C then deletes the retired
-// snapshots' rows and headers, and nothing else.
+// the others as they were, while the same batch's sub-job A deletes an
+// abandoned candidate at once (each statement binds only its own class's
+// ids: the Task 2 review's minor 6); the next batch selects nothing (B's
+// selection has retired_at IS NULL); and sub-job C then deletes the
+// retired snapshots' rows and headers, and nothing else.
 func TestRunSnapshotGCBatch_RetiresTheDisplacedBeyondKeep(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	stubNow(t, evictNow)
 	ids, _ := displacedSuite(t, c, sk("h", "/r/dists/x"))
-	stubNow(t, evictNow+evictDay) // the batch's clock
+	orphan := orphanCandidate(t, c, "http", "h", "/r/dists/x", seedBlob(t, c, "an abandoned candidate's anchor"), evictNow)
+	stubNow(t, evictNow+evictDay) // the batch's clock: the candidate's heartbeat is a day old
 	res, err := c.RunSnapshotGCBatch(ctx, 10, 1800, 3, true)
-	if err != nil || res.DisplacedReaped != 2 || res.OrphanReaped != 0 {
-		t.Fatalf("RunSnapshotGCBatch = %+v, %v; want the 2 displaced snapshots beyond keep_displaced = 3 retired", res, err)
+	if err != nil || res.DisplacedReaped != 2 || res.OrphanReaped != 1 {
+		t.Fatalf("RunSnapshotGCBatch = %+v, %v; want the abandoned candidate deleted and the 2 displaced snapshots "+
+			"beyond keep_displaced = 3 retired", res, err)
+	}
+	if _, retired := snapshotRetiredAt(t, c, orphan); snapshotExists(t, c, orphan) {
+		t.Fatalf("the abandoned candidate %d is still there (retired %v); want it deleted by the batch", orphan, retired)
 	}
 	for i, id := range ids {
 		beyond := i < 2 // the two oldest of the five displaced

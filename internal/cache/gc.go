@@ -269,11 +269,13 @@ func (c *Cache) RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGrac
 	// 1 current + 4 displaced keeps only 2 displaced. The (adopted_at
 	// DESC, snapshot_id DESC) tie-breaker makes ranking deterministic
 	// when two displacements share the same unix-second adopted_at.
-	// Retired snapshots (those of a suite reaped, evicted at a cap or
-	// forgotten, and those the legacy trust audit quarantined) are ranked
-	// out the same way, before the window function (spec C9): they never
-	// take one of a suite's keep_displaced slots, and sub-job C
-	// (RunRetiredSnapshotGCChunk) deletes them.
+	// Retired snapshots — those of a suite reaped, evicted at a cap or
+	// forgotten, those the legacy trust audit quarantined, and the displaced
+	// snapshots a periodic tick's sub-job B retired (ruling HD-4) — are
+	// ranked out the same way, before the window function (spec C9): they
+	// never take one of a suite's keep_displaced slots, B never selects one
+	// again (so a batch never selects what an earlier one retired), and
+	// sub-job C (RunRetiredSnapshotGCChunk) deletes them.
 	//
 	// AIDEV-NOTE: ruling R-H1 (deferred minor F-24). A snapshot still
 	// queued in legacy_trust_audit — one the audit deferred after an I/O
@@ -436,7 +438,10 @@ func placeholders(n int) string {
 //
 // AIDEV-NOTE: measured (phase F design review, M-15): one 10,000-row
 // package_hash chunk held the writer about 80 ms over a 600,000-row table
-// with its four indexes. Re-measure before raising it.
+// with its four indexes. Measured again 2026-10-28, Task 2's probe of the
+// GC and upstream hardening plan: 120-240 ms a chunk, median 149-191 ms,
+// over ~700,000 package_hash rows, no -race, a loaded 12-thread laptop.
+// Re-measure before raising it.
 const retiredChunkRows = 10_000
 
 // effectiveChunkRows is the rows one sub-job C transaction deletes for a

@@ -68,9 +68,12 @@ type snapshotPassResult struct {
 // freshness scheduler and the listeners (main), so its long transactions
 // hold up no other writer and no request, and a daemon that never lives
 // until C runs (min(1 h, gc.interval)) still deletes them, their blobs in
-// this start's blob pass. Residual: when a periodic tick's C hits its
-// deadline, the snapshots its B retired are no longer B-selectable at the
-// next start (retired_at), so they wait for the next periodic tick or
+// this start's blob pass. Residual: when a periodic tick's pass stops
+// before its C has deleted what its B retired — at its deadline, at a
+// shutdown (ctx), or on a batch or chunk that failed or panicked — those
+// snapshots are no longer B-selectable at the next start (retired_at), so
+// they wait for a later periodic tick's snapshot pass (the next one; after
+// a failure or a panic, the one after it, since the rotation moves on) or
 // retiredRun, an hour after a start, as a reaped suite's do (R3 #2's
 // residual). Such a snapshot counts twice: in displaced_reaped when B
 // retires it, in retired_reaped when C deletes it.
@@ -194,8 +197,9 @@ const phaseRetired = "retired"
 // blob pass: the next start's or the next periodic tick's. C also deletes
 // the displaced snapshots a periodic tick's sub-job B retired (DN-7 of the
 // GC and upstream hardening plan): normally that tick's own C does, and
-// this run takes those a tick's C left at its deadline, which the startup
-// pass's B no longer selects.
+// this run takes those still retired when a tick's pass stopped before its
+// C had deleted them (its deadline, a shutdown, or a batch or chunk that
+// failed or panicked), which the startup pass's B no longer selects.
 func (g *GC) retiredRun(ctx context.Context) {
 	defer g.recoverPanic("retired")
 	start := time.Now()

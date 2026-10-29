@@ -416,8 +416,9 @@ func (s slowBatchStore) RunSnapshotGCBatch(ctx context.Context, n int, g int64, 
 // deadline before each chunk, the first included: when A ∪ B's last batch
 // already ran past the deadline, C deletes nothing this tick and reports
 // the deadline (the next tick resumes it). A check after each chunk would
-// always run one chunk past the deadline — 10,000 rows, seconds of the
-// writer, after max_tick_duration.
+// always run one chunk past the deadline — 10,000 rows, 120-240 ms of the
+// writer in the 2026-10-28 probe (retiredChunkRows' AIDEV-NOTE), after
+// max_tick_duration.
 func TestSnapshotPass_SubJobCChecksTheDeadlineBeforeItsFirstChunk(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		logger, _ := captureLogger()
