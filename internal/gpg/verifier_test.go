@@ -791,9 +791,13 @@ func TestVerifyInline_AnUnhashedIssuerContradictingTheHashedOneFailsS1(t *testin
 	if err != nil || !ok {
 		t.Fatalf("test premise: the packet parses as %T, %v", p, err)
 	}
-	if id, hashed := hashedIssuer(sig); !hashed || id != x.PrimaryKey.KeyId || sig.IssuerKeyId == nil || *sig.IssuerKeyId != sub.PublicKey.KeyId {
-		t.Fatalf("test premise: hashed issuer %016X (%v), go-crypto's %v; want X's primary key %016X and the subkey %016X",
-			id, hashed, sig.IssuerKeyId, x.PrimaryKey.KeyId, sub.PublicKey.KeyId)
+	var goCryptoID uint64
+	if sig.IssuerKeyId != nil {
+		goCryptoID = *sig.IssuerKeyId
+	}
+	if id, hashed := hashedIssuer(sig); !hashed || id != x.PrimaryKey.KeyId || goCryptoID != sub.PublicKey.KeyId {
+		t.Fatalf("test premise: hashed issuer %016X (%v), go-crypto's %016X; want X's primary key %016X and the subkey %016X",
+			id, hashed, goCryptoID, x.PrimaryKey.KeyId, sub.PublicKey.KeyId)
 	}
 	block, err := decodeClearsigned(body)
 	if err != nil || block == nil {
