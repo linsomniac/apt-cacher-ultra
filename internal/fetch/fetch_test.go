@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -1464,6 +1465,48 @@ func TestFetch_MaxBytesRefusesAResumeDeclaringMore(t *testing.T) {
 	}
 }
 
+// TestFetch_MaxBytesAcceptsAResumeOfExactlyIt: a chunked 200 cut after
+// 5,000 bytes whose 206 declares bytes 5000-9999/10000 ends at exactly
+// Target.MaxBytes, and passes: the 206's last is an index, so an object
+// of MaxBytes bytes ends at last MaxBytes-1, and its total is MaxBytes.
+func TestFetch_MaxBytesAcceptsAResumeOfExactlyIt(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch requests.Add(1) {
+		case 1:
+			cutChunked200(t, w, 5000)
+		case 2:
+			if got := r.Header.Get("Range"); got != "bytes=5000-" {
+				t.Errorf("resume Range = %q, want bytes=5000-", got)
+			}
+			w.Header().Set("Content-Range", "bytes 5000-9999/10000")
+			w.Header().Set("Content-Length", "5000")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(bytes.Repeat([]byte("r"), 5000))
+		default:
+			http.Error(w, "unexpected request", http.StatusServiceUnavailable)
+		}
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	dst := &bufDst{}
+	if _, err := client.Fetch(context.Background(), &Target{
+		CanonicalHost: "127.0.0.1",
+		URL:           srv.URL + "/resumed-exact",
+		MaxBytes:      10000,
+	}, dst); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	want := append(bytes.Repeat([]byte("c"), 5000), bytes.Repeat([]byte("r"), 5000)...)
+	if !bytes.Equal(dst.buf.Bytes(), want) {
+		t.Errorf("dst holds %d bytes, want the 5,000 cut bytes and the 5,000 resumed ones", dst.Written())
+	}
+	if got := requests.Load(); got != 2 {
+		t.Errorf("upstream saw %d requests, want 2 (the cut 200 and its resume)", got)
+	}
+}
+
 // TestFetch_MaxBytesStopsAResumedBodyThatRunsOver: the resume of a cut
 // chunked 200 whose 206 declares a range within Target.MaxBytes but whose
 // body runs past it fails with ErrBodyTooLarge as soon as it does, and is
@@ -1504,6 +1547,47 @@ func TestFetch_MaxBytesStopsAResumedBodyThatRunsOver(t *testing.T) {
 	}
 	if dst.Written() > 10001 {
 		t.Errorf("dst.Written() = %d, want at most 10001", dst.Written())
+	}
+}
+
+// TestFetch_MaxBytesAtMaxInt64ReadsTheWholeBody: Target.MaxBytes
+// math.MaxInt64 is a limit no body reaches. The one byte past it that
+// streamBody reads, to tell "runs over" from "ends there", must not wrap
+// the read limit negative, which would read nothing.
+func TestFetch_MaxBytesAtMaxInt64ReadsTheWholeBody(t *testing.T) {
+	for _, declared := range []bool{false, true} {
+		t.Run(fmt.Sprintf("Content-Length=%t", declared), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if declared {
+					w.Header().Set("Content-Length", "100000")
+					_, _ = w.Write(bytes.Repeat([]byte("x"), 100000))
+					return
+				}
+				writeFlushedBody(w, 100000)
+			}))
+			defer srv.Close()
+
+			client := newTestClient(t, []string{`^127\.0\.0\.1$`})
+			dst := &bufDst{}
+			res, err := client.Fetch(context.Background(), &Target{
+				CanonicalHost: "127.0.0.1",
+				URL:           srv.URL + "/unbounded",
+				MaxBytes:      math.MaxInt64,
+			}, dst)
+			if err != nil {
+				t.Fatalf("Fetch: %v", err)
+			}
+			if dst.Written() != 100000 {
+				t.Errorf("dst.Written() = %d, want 100000 (the whole body)", dst.Written())
+			}
+			wantLength := int64(-1)
+			if declared {
+				wantLength = 100000
+			}
+			if res.ContentLength != wantLength {
+				t.Errorf("ContentLength = %d, want %d (the response's declared length)", res.ContentLength, wantLength)
+			}
+		})
 	}
 }
 

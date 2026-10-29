@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -155,7 +156,8 @@ type Target struct {
 	// MaxBytes, when > 0, is the most body bytes the fetch accepts: a
 	// response whose declared length exceeds it fails before its body is
 	// read, and a body that runs past it fails as soon as it does, both
-	// with ErrBodyTooLarge, which is not retried. 0 is no limit.
+	// with ErrBodyTooLarge, which is not retried. 0 is no limit. Only
+	// Fetch honours it: Conditional ignores it and takes its own maxBody.
 	MaxBytes int64
 }
 
@@ -599,7 +601,15 @@ func streamBody(resp *http.Response, dst FetchDst, max int64) error {
 		if left < 0 {
 			left = 0
 		}
-		src = io.LimitReader(resp.Body, left+1) // one byte past max tells "runs over" from "ends there"
+		// AIDEV-NOTE: one byte past max tells "runs over" from "ends
+		// there", but at math.MaxInt64 that byte would wrap the limit
+		// negative and LimitReader would read nothing; no body runs past
+		// that max anyway (TestFetch_MaxBytesAtMaxInt64ReadsTheWholeBody).
+		n := left
+		if n < math.MaxInt64 {
+			n++
+		}
+		src = io.LimitReader(resp.Body, n)
 	}
 	if _, err := io.Copy(&writeErrTagger{w: dst}, src); err != nil {
 		return err
@@ -683,10 +693,13 @@ func parseContentRange(s string) (int64, int64, int64, error) {
 	return first, last, total, nil
 }
 
-// isRetryable reports whether err merits another attempt. Allowlist,
-// deny-range, ctx-cancel, 4xx, a cache write failure and a body over
-// Target.MaxBytes are not retryable. 5xx, header anomalies, size
-// mismatches, and generic IO/net errors are.
+// isRetryable reports whether err merits another attempt. Not retryable:
+// an allowlist or deny-range refusal, a cancelled or expired context, an
+// upstream status other than 5xx (a 4xx, or a blocked redirect's 3xx), a
+// 407 from the configured proxy, a blocked redirect, an invalid URL, a
+// failed cooldown probe (ErrHostUnreachable), a cache write failure and a
+// body over Target.MaxBytes. Retryable: 5xx, header anomalies, size
+// mismatches, and generic IO/net errors.
 func isRetryable(err error) bool {
 	if err == nil {
 		return false

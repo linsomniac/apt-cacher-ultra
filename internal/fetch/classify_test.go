@@ -71,7 +71,7 @@ func TestClassifyFetchOutcome_AllSentinels(t *testing.T) {
 // TestClassifyFetchOutcome_DialerCooldownPrecedence is the
 // load-bearing test from SPEC5 §12.1.6. The dialer's cooldown-probe
 // path wraps a single error with BOTH ErrUpstreamUnavailable AND
-// ErrHostUnreachable (`%w: %w: %v` at internal/fetch/dialer.go:163).
+// ErrHostUnreachable (`%w: %w: %v` in dialer.go's wrapDialWithTracker).
 // Inverting precedence here silently degrades operator visibility —
 // every cooldown event would surface as "unavailable" instead of
 // the more actionable "host_unreachable".

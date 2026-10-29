@@ -14,7 +14,7 @@ import (
 // Precedence (first match wins) is specific-cause-first. The exact
 // ordering is load-bearing because the dialer wraps a cooldown-probe
 // failure with BOTH ErrUpstreamUnavailable and ErrHostUnreachable
-// (`%w: %w: ...` at internal/fetch/dialer.go:163); checking
+// (`%w: %w: ...` in dialer.go's wrapDialWithTracker); checking
 // ErrUpstreamUnavailable first would mask the more diagnostic
 // `host_unreachable` label. SPEC5 §10.4.2 has the full precedence
 // table.
@@ -96,7 +96,7 @@ func classifyError(err error, conditional bool) string {
 
 	// Row 14: host_unreachable BEFORE row 21 (unavailable). The
 	// dialer wraps both sentinels on a cooldown-probe failure
-	// (`%w: %w: ...` at dialer.go:163); putting host_unreachable
+	// (`%w: %w: ...` in wrapDialWithTracker); putting host_unreachable
 	// first surfaces the diagnostic label. Inverting this order
 	// silently degrades operator visibility — pinned by the
 	// §12.1.6 precedence test.

@@ -3232,12 +3232,16 @@ func (d *countingDst) Write(p []byte) (int, error) {
 // declared length gives it away, and without end — has the download
 // stopped at the declared size (the 2026-09 security review's A-2, ruling
 // HD-5). The cache takes in exactly the declared size and the one byte
-// that shows the body runs over, the member fails as a fetch failure
-// naming fetch.ErrBodyTooLarge, nothing of it stays in pool/ or tmp/, and
-// the cache stops reading, which the upstream sees as a failed write. What
-// the upstream wrote is only logged: loopback socket buffers take in an
-// amount that varies by host and load (ruling HD-12). Without the cap the
-// cache reads on until countingFetcher's safety ceiling.
+// that shows the body runs over; the member fails as a fetch failure
+// naming fetch.ErrBodyTooLarge; nothing of it stays in pool/ or tmp/. And
+// the cache stops reading the upstream: adoptMember returns within 15 s
+// (a passing run takes about 0.25 s), where a cache that kept reading the
+// endless body past its dst — draining it to reuse the connection, say —
+// would read on until its 30 s context ended. The upstream then sees a
+// failed write once the cache has closed the connection. What the upstream
+// wrote is only logged: loopback socket buffers take in an amount that
+// varies by host and load (ruling HD-12). Without the cap the cache reads
+// on until countingFetcher's safety ceiling.
 func TestAdoptMember_AMemberLongerThanDeclaredStopsAtItsSize(t *testing.T) {
 	const declared = 1 << 20                                // the member's declared size
 	chunk := bytes.Repeat([]byte("Package: padded\n"), 256) // 4 KiB
@@ -3306,7 +3310,14 @@ func TestAdoptMember_AMemberLongerThanDeclaredStopsAtItsSize(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	start := time.Now()
 	_, err = ad.adoptMember(ctx, suite, m, false)
+	// A bound on time, not on the upstream's bytes (ruling HD-12): with a
+	// margin of some 50 times a passing run, it fails only a cache that
+	// keeps reading the endless body until its context ends.
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
+		t.Errorf("adoptMember took %s, want at most 15s: the cache kept reading the endless body past its limit", elapsed)
+	}
 	if got := counting.written.Load(); got != declared+1 {
 		t.Errorf("the cache took in %d bytes, want exactly %d (the declared size and the one byte that shows the body runs over)",
 			got, declared+1)
