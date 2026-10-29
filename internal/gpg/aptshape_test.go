@@ -19,12 +19,14 @@ import (
 // DN-6): the verifier, run on every shape of the committed corpus
 // (testdata/aptshapes, e2e/apt-oracle/README.md), refuses a shape when any
 // measured apt refuses it and accepts a shape every measured apt accepts,
-// but for the exceptions listed below, each with its reason.
+// but for the exceptions listed below, each with its reason, and for the
+// shapes pending the hybrid verifier (pendingHybrid, the plan's Task 9).
 //
-// AIDEV-NOTE: the corpus and verdicts.txt are one measurement (never edit a
-// fixture by hand; e2e/apt-oracle/README.md, "Adding a shape"). A row this
-// test fails is the cache disagreeing with apt: fix the verifier, or — only
-// with a ruling — list the shape below with its reason. Never force a row.
+// AIDEV-NOTE: the corpus, verdicts.txt and classes.txt are one measurement
+// (never edit a fixture by hand; e2e/apt-oracle/README.md, "Adding a
+// shape"). A row this test fails is the cache disagreeing with apt: fix the
+// verifier, or — only with a ruling — list the shape below with its reason.
+// Never force a row.
 
 // aptShapeColumns is the number of verdicts on each row of verdicts.txt, one
 // per client image in DN-2's order (debian:11, ubuntu:22.04, ubuntu:24.04,
@@ -72,6 +74,170 @@ var aptShapeKnownUnsafe = map[string]string{
 // S1 (requireKnownSignaturesVerify) and emptied it, so every row runs; a
 // shape goes back in it only with a ruling, like the exception maps above.
 var pendingS1 = map[string]bool{}
+
+// pendingHybrid holds the shapes of batches fx10 to fx13 (the final review's
+// and DN-11's, the hardening plan's Task 9a) that the verifier of Tasks 6
+// and 7 gets wrong: the table test skips each, naming it, until the hybrid
+// verifier (Task 9b) empties the map. Each value says what that verifier
+// does with the shape; TestAptShapeDeviations_NameShapesInTheTable checks it
+// against apt's verdicts.
+//
+// AIDEV-NOTE: the vc2_ shapes (the final review's V-C2) are pending though
+// today's verifier refuses them, as apt does: it does so only after
+// go-crypto has allocated 1 or 4 GiB for each, so running them would make
+// this package's tests allocate gibibytes. Task 9b refuses them before
+// go-crypto parses anything; its table test and allocation test run them.
+var pendingHybrid = map[string]string{
+	// Adopted, though some apt refuses them. (105)
+	"a_b64_lead_nbsp":               pendingAdopted,
+	"a_b64_lead_nel":                pendingAdopted,
+	"a_b64_lead_u3000":              pendingAdopted,
+	"a_b64_lead_vt":                 pendingAdopted,
+	"a_b64_nbsp_line":               pendingAdopted,
+	"a_b64_trail_nbsp":              pendingAdopted,
+	"a_b64_trail_vt":                pendingAdopted,
+	"a_b64_vt_line":                 pendingAdopted,
+	"a_crc_lead_nbsp":               pendingAdopted,
+	"a_crc_lead_vt":                 pendingAdopted,
+	"a_crc_trail_nbsp":              pendingAdopted,
+	"a_crc_trail_vt":                pendingAdopted,
+	"a_d_b64_lead_nbsp":             pendingAdopted,
+	"a_d_b64_lead_vt":               pendingAdopted,
+	"a_d_b64_trail_vt":              pendingAdopted,
+	"a_d_b64_vt_line":               pendingAdopted,
+	"a_d_begin_cr_sp":               pendingAdopted,
+	"a_d_begin_cr_tab":              pendingAdopted,
+	"a_d_begin_sp_cr_sp":            pendingAdopted,
+	"a_d_crc_lead_nbsp":             pendingAdopted,
+	"a_d_crc_lead_vt":               pendingAdopted,
+	"a_d_end_cr_sp":                 pendingAdopted,
+	"a_d_end_cr_sp_eof":             pendingAdopted,
+	"a_d_end_cr_tab":                pendingAdopted,
+	"a_d_end_sp_cr_sp":              pendingAdopted,
+	"a_d_hdr_colon_then_colonspace": pendingAdopted,
+	"a_d_hdr_nul_before_colon":      pendingAdopted,
+	"a_d_pad_split_100":             pendingAdopted,
+	"a_d_pad_split_200":             pendingAdopted,
+	"a_d_pad_split_437":             pendingAdopted,
+	"a_end_cr_sp":                   pendingAdopted,
+	"a_end_cr_sp_eof":               pendingAdopted,
+	"a_end_cr_tab":                  pendingAdopted,
+	"a_end_cr_tab_eof":              pendingAdopted,
+	"a_end_sp_cr_sp":                pendingAdopted,
+	"a_hdr_colon_then_colonspace":   pendingAdopted,
+	"a_hdr_nul_before_colon":        pendingAdopted,
+	"a_hdr_nul_key":                 pendingAdopted,
+	"a_hdr_tab_then_colonspace":     pendingAdopted,
+	"a_hdr_trailing_space":          pendingAdopted,
+	"a_hdrterm_cr_sp":               pendingAdopted,
+	"a_hdrterm_ff":                  pendingAdopted,
+	"a_hdrterm_nbsp":                pendingAdopted,
+	"a_hdrterm_nel":                 pendingAdopted,
+	"a_hdrterm_sp_cr_sp":            pendingAdopted,
+	"a_hdrterm_tab_cr_tab":          pendingAdopted,
+	"a_hdrterm_u2028":               pendingAdopted,
+	"a_hdrterm_u3000":               pendingAdopted,
+	"a_hdrterm_vt":                  pendingAdopted,
+	"a_lastline_dash_sp":            pendingAdopted,
+	"a_lastline_dash_sp_cr":         pendingAdopted,
+	"a_lastline_dash_sp_sp":         pendingAdopted,
+	"a_lastline_dash_sp_tab":        pendingAdopted,
+	"a_msgbegin_cr_sp":              pendingAdopted,
+	"a_msgbegin_cr_tab":             pendingAdopted,
+	"a_msgbegin_sp_cr_sp":           pendingAdopted,
+	"a_pad_split_100":               pendingAdopted,
+	"a_pad_split_200":               pendingAdopted,
+	"a_pad_split_437":               pendingAdopted,
+	"a_pad_unknown_then_good":       pendingAdopted,
+	"n_i_sha224":                    pendingAdopted,
+	"n_i_sha3_256":                  pendingAdopted,
+	"n_i_unknown00_first":           pendingAdopted,
+	"o_dash_unescaped":              pendingAdopted,
+	"o_empty2_both_dash":            pendingAdopted,
+	"o_empty2_first_dash":           pendingAdopted,
+	"p_badA_noissuer_plus_good":     pendingAdopted,
+	"p_d_good_mpi_bits_high":        pendingAdopted,
+	"p_d_good_mpi_bits_low":         pendingAdopted,
+	"p_d_good_unh_big_10001":        pendingAdopted,
+	"p_d_good_unh_crit_notation":    pendingAdopted,
+	"p_d_good_unh_crit_unknown100":  pendingAdopted,
+	"p_good_mpi_bits_high":          pendingAdopted,
+	"p_good_mpi_bits_low":           pendingAdopted,
+	"p_good_mpi_bits_minus1":        pendingAdopted,
+	"p_good_plus_dup_unh_crit":      pendingAdopted,
+	"p_good_unh_big_10001":          pendingAdopted,
+	"p_good_unh_big_30000":          pendingAdopted,
+	"p_good_unh_crit_ksflags":       pendingAdopted,
+	"p_good_unh_crit_notation":      pendingAdopted,
+	"p_good_unh_crit_signeruid":     pendingAdopted,
+	"p_good_unh_crit_sigtarget":     pendingAdopted,
+	"p_good_unh_crit_unknown100":    pendingAdopted,
+	"p_good_unh_empty":              pendingAdopted,
+	"q_bigunh_dup_plus_good":        pendingAdopted,
+	"q_d_b64_lead_nel":              pendingAdopted,
+	"q_d_good_unh_16B_16A":          pendingAdopted,
+	"q_d_good_unh_empty":            pendingAdopted,
+	"q_d_hdr_tab_then_colonspace":   pendingAdopted,
+	"q_good_plus_noissuer_bad":      pendingAdopted,
+	"q_good_unh_16B_16A":            pendingAdopted,
+	"q_good_unh_33A_only":           pendingAdopted,
+	"q_nohash_hdrterm_vt":           pendingAdopted,
+	"q_unknownB_bigunh_plus_good":   pendingAdopted,
+	"r_expiredE_critunh_plus_good":  pendingAdopted,
+	"r_subkey_good_critunh":         pendingAdopted,
+	"r_subkey_good_unh_empty":       pendingAdopted,
+	"s_hdr_colon_space_only":        pendingAdopted,
+	"sx_d_straddle_badA":            pendingAdopted,
+	"sx_d_straddle_v3garbageA":      pendingAdopted,
+	"sx_i_straddle_badA":            pendingAdopted,
+	"sx_i_straddle_unknownhashA":    pendingAdopted,
+	"sx_i_straddle_v3garbageA":      pendingAdopted,
+	"v6_d_v6unknown_plus_good":      pendingAdopted,
+	"v6_i_v6unknown_plus_good":      pendingAdopted,
+
+	// Refused, though every apt accepts them. (29)
+	"a_b64_irregular":            pendingRefused,
+	"a_b64_sp_mid":               pendingRefused,
+	"a_b64_tab_mid":              pendingRefused,
+	"a_b64_width_100":            pendingRefused,
+	"a_b64_width_200":            pendingRefused,
+	"a_b64_width_97":             pendingRefused,
+	"a_crc_on_last_line":         pendingRefused,
+	"a_d_b64_sp_mid":             pendingRefused,
+	"a_d_b64_tab_mid":            pendingRefused,
+	"a_d_b64_width_97":           pendingRefused,
+	"a_d_sighdrterm_ff":          pendingRefused,
+	"a_d_twoblocks_same":         pendingRefused,
+	"a_hash_lowercase_key":       pendingRefused,
+	"a_hdr_long_colon_late":      pendingRefused,
+	"a_lastline_crcr":            pendingRefused,
+	"a_pad_own_line":             pendingRefused,
+	"a_sighdrterm_ff":            pendingRefused,
+	"a_textline_cr_sp":           pendingRefused,
+	"a_textline_crcr":            pendingRefused,
+	"a_twoblocks_same":           pendingRefused,
+	"o2_binary_sig_in_clearsign": pendingRefused,
+	"q_b64_ff_mid":               pendingRefused,
+	"q_good_unh_16A_16B":         pendingRefused,
+	"q_good_unh_33B_16A":         pendingRefused,
+	"q_sighdrterm_vt":            pendingRefused,
+	"s_hash_hdr_trail_cr_sp":     pendingRefused,
+	"s_hash_hdr_trail_tab":       pendingRefused,
+	"vm3_d_end_marker_in_header": pendingRefused,
+	"vm3_i_end_marker_in_header": pendingRefused,
+
+	// Refused only after go-crypto allocates gibibytes (the AIDEV-NOTE above). (4)
+	"vc2_d_v4_embedded_v6_1g": pendingAllocates,
+	"vc2_d_v6_hashed_len_4g":  pendingAllocates,
+	"vc2_i_v4_embedded_v6_1g": pendingAllocates,
+	"vc2_i_v6_hashed_len_4g":  pendingAllocates,
+}
+
+const (
+	pendingAdopted   = "adopted, though some apt refuses it"
+	pendingRefused   = "refused, though every apt accepts it"
+	pendingAllocates = "refused, as apt does, but only after go-crypto allocates gibibytes (V-C2): not run"
+)
 
 const aptShapeDir = "testdata/aptshapes"
 
@@ -156,7 +322,7 @@ func loadAptShapes(t *testing.T) []aptShape {
 	for _, e := range entries {
 		file := e.Name()
 		switch {
-		case file == "Release" || file == "keys.gpg" || file == "verdicts.txt":
+		case file == "Release" || file == "keys.gpg" || file == "verdicts.txt" || file == "classes.txt":
 			continue
 		case e.IsDir():
 			t.Fatalf("%s: unexpected directory in the corpus", file)
@@ -221,11 +387,13 @@ func allReject(rejected []bool) bool {
 }
 
 // aptShapeVerifier is the verifier the table holds to apt: the host keyring
-// is keys.gpg alone (A, E and S: the clients' signed-by), with the defaults —
+// is keys.gpg alone (A, E, S and O: the clients' signed-by; O signs batch
+// fx13, e2e/apt-oracle/gen_shapes.py), with the defaults —
 // require_signature = true, no [[trusted_signer]] pin, allow_short_keyid =
-// true, no accept_any_signer. keys.gpg is loaded as an embedded source, not
-// with LoadKeyring on the corpus directory, which would also try every
-// <name>.Release.gpg as a keyring and warn for each.
+// true, no accept_any_signer: every key in it is trusted for every suite.
+// keys.gpg is loaded as an embedded source, not with LoadKeyring on the
+// corpus directory, which would also try every <name>.Release.gpg as a
+// keyring and warn for each.
 func aptShapeVerifier(t *testing.T) *Verifier {
 	t.Helper()
 	keys, err := os.ReadFile(filepath.Join(aptShapeDir, "keys.gpg"))
@@ -236,8 +404,8 @@ func aptShapeVerifier(t *testing.T) *Verifier {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if keyring.Size() != 3 {
-		t.Fatalf("keys.gpg holds %d keys, want 3 (A, E and S)", keyring.Size())
+	if keyring.Size() != 4 {
+		t.Fatalf("keys.gpg holds %d keys, want 4 (A, E, S and O)", keyring.Size())
 	}
 	v, err := NewVerifier(VerifierConfig{
 		Keyring:          keyring,
@@ -254,13 +422,17 @@ func aptShapeVerifier(t *testing.T) *Verifier {
 // TestVerifier_FollowsTheAptShapeTable holds the verifier to DN-3's rule over
 // the corpus: rejected iff any measured apt rejects, but for a strict
 // deviation (rejected, every apt accepts) and the known-unsafe shape
-// (accepted, every apt rejects); a shape pending S1 is skipped.
+// (accepted, every apt rejects); a shape pending S1 or the hybrid verifier
+// is skipped.
 func TestVerifier_FollowsTheAptShapeTable(t *testing.T) {
 	v := aptShapeVerifier(t)
 	for _, s := range loadAptShapes(t) {
 		t.Run(s.name, func(t *testing.T) {
 			if pendingS1[s.name] {
 				t.Skipf("%s: only S1 refuses it (the hardening plan's Task 7)", s.name)
+			}
+			if why, ok := pendingHybrid[s.name]; ok {
+				t.Skipf("%s: pending the hybrid verifier (the hardening plan's Task 9b): today %s", s.name, why)
 			}
 			wantRejected, why := anyRejects(s.rejected), "apt's verdicts"
 			if reason, ok := aptShapeDeviations[s.name]; ok {
@@ -294,8 +466,10 @@ func TestVerifier_FollowsTheAptShapeTable(t *testing.T) {
 }
 
 // TestAptShapeDeviations_NameShapesInTheTable: no stale entry — every shape
-// the exception maps and pendingS1 name has a row in verdicts.txt, no shape
-// is in two of them, and each listed reason is non-empty.
+// the exception maps, pendingS1 and pendingHybrid name has a row in
+// verdicts.txt, no shape is in two of them, each listed reason is non-empty,
+// and each pendingHybrid value agrees with apt's verdicts (adopted: some apt
+// refuses the shape; refused: every apt accepts it).
 func TestAptShapeDeviations_NameShapesInTheTable(t *testing.T) {
 	verdicts := loadAptShapeVerdicts(t)
 	seen := make(map[string]string)
@@ -325,6 +499,100 @@ func TestAptShapeDeviations_NameShapesInTheTable(t *testing.T) {
 		check("pendingS1", name, "S1")
 		if rejected, ok := verdicts[name]; ok && !anyRejects(rejected) {
 			t.Errorf("pendingS1: every apt accepts %s, so no rule should refuse it", name)
+		}
+	}
+	for name, why := range pendingHybrid {
+		check("pendingHybrid", name, why)
+		rejected, ok := verdicts[name]
+		if !ok {
+			continue
+		}
+		switch why {
+		case pendingAdopted:
+			if !anyRejects(rejected) {
+				t.Errorf("pendingHybrid: %s is listed as adopted though some apt refuses it, but every apt accepts it", name)
+			}
+		case pendingRefused:
+			if anyRejects(rejected) {
+				t.Errorf("pendingHybrid: %s is listed as refused though every apt accepts it, but apt refuses it: %v", name, rejected)
+			}
+		case pendingAllocates:
+			if !strings.HasPrefix(name, "vc2_") {
+				t.Errorf("pendingHybrid: %s is listed as allocating gibibytes, which only the vc2_ shapes do", name)
+			}
+		default:
+			t.Errorf("pendingHybrid: %s: %q is none of pendingAdopted, pendingRefused and pendingAllocates", name, why)
+		}
+	}
+}
+
+// The error classes of classes.txt (e2e/apt-oracle/README.md, "Error
+// classes"): "-" where apt accepted the shape; where it refused it, split
+// (apt's own checks of the file refused it before its verifier ran),
+// nodata, badsig or other (what the verifier, gpgv or sqv, said).
+var aptShapeClasses = map[string]bool{"split": true, "nodata": true, "badsig": true, "other": true}
+
+// loadAptShapeClasses parses classes.txt, whose rows and columns are
+// verdicts.txt's (its format: the AIDEV-NOTE in e2e/apt-oracle/run.sh):
+// "#" lines are comments, every other line a shape's name and
+// aptShapeColumns classes.
+func loadAptShapeClasses(t *testing.T) map[string][]string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(aptShapeDir, "classes.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make(map[string][]string)
+	for n, line := range strings.Split(strings.TrimSuffix(string(b), "\n"), "\n") {
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, " ")
+		if len(fields) != 1+aptShapeColumns {
+			t.Fatalf("classes.txt:%d: %q: want a name and %d classes", n+1, line, aptShapeColumns)
+		}
+		if _, dup := out[fields[0]]; dup {
+			t.Fatalf("classes.txt:%d: %s has two rows", n+1, fields[0])
+		}
+		out[fields[0]] = fields[1:]
+	}
+	return out
+}
+
+// TestAptShapeClasses_AgreeWithTheVerdicts: classes.txt names exactly
+// verdicts.txt's shapes; a cell is "-" exactly where apt accepted the shape,
+// else one of the classes; and a row is split in every column or in none —
+// apt's text layer (LineBuffer, SplitClearSignedFile,
+// VerifyDetachedSignatureFile) is the same in the six versions, so a split
+// refusal is every image's (the hardening plan's DN-11, layer T; Task 9b's
+// differential test holds the port of that layer to these rows).
+func TestAptShapeClasses_AgreeWithTheVerdicts(t *testing.T) {
+	verdicts := loadAptShapeVerdicts(t)
+	classes := loadAptShapeClasses(t)
+	for name := range verdicts {
+		if _, ok := classes[name]; !ok {
+			t.Errorf("%s: a row in verdicts.txt, none in classes.txt", name)
+		}
+	}
+	for name, row := range classes {
+		rejected, ok := verdicts[name]
+		if !ok {
+			t.Errorf("%s: a row in classes.txt, none in verdicts.txt", name)
+			continue
+		}
+		split := 0
+		for i, class := range row {
+			switch {
+			case !rejected[i] && class != "-":
+				t.Errorf("%s, column %d: apt accepted it, but its class is %q", name, i+1, class)
+			case rejected[i] && !aptShapeClasses[class]:
+				t.Errorf("%s, column %d: apt refused it, but its class %q is none of split, nodata, badsig and other", name, i+1, class)
+			case class == "split":
+				split++
+			}
+		}
+		if split != 0 && split != aptShapeColumns {
+			t.Errorf("%s: split in %d of %d columns (%v): apt's text layer is the same in every image", name, split, aptShapeColumns, row)
 		}
 	}
 }

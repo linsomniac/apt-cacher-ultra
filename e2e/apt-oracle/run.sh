@@ -3,10 +3,11 @@
 # of each client image on the apt-shape corpus, internal/gpg/testdata/aptshapes.
 # For each image it runs e2e/apt-oracle/in-container.sh in a container
 # without network (the images in parallel), prints apt's verdicts as one
-# table, shape by image, and compares them with the corpus's verdicts.txt:
-# any difference is "apt changed" (exit 1). Manual, never in CI: before a
-# release, after a go-crypto upgrade, after a change to internal/gpg's armor
-# or signature checks.
+# table, shape by image, and compares them, and the error class of each
+# refusal, with the corpus's verdicts.txt and classes.txt: any difference is
+# "apt changed" (exit 1). Manual, never in CI: before a release, after a
+# go-crypto upgrade, after a change to internal/gpg's armor or signature
+# checks.
 #
 #   E2E_APT_ORACLE_IMAGES  client images, whitespace-separated (default: the
 #                          six columns of verdicts.txt, in its order); any of
@@ -15,9 +16,11 @@
 #   make e2e-apt-oracle
 #   bash e2e/apt-oracle/run.sh            # measure and compare
 #   bash e2e/apt-oracle/run.sh --record   # measure and rewrite verdicts.txt
+#                                         # and classes.txt
 #
-# Exit status: 0 apt gives the recorded verdicts (or --record wrote them),
-# 1 apt changed or a container failed, 2 a usage or setup error.
+# Exit status: 0 apt gives the recorded verdicts and error classes (or
+# --record wrote them), 1 apt changed, a container failed or an error class
+# and apt's words disagree, 2 a usage or setup error.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -26,6 +29,7 @@ cd "$(dirname "$0")/../.."
 COLUMNS="debian:11 ubuntu:22.04 ubuntu:24.04 debian:12 debian:13 ubuntu:26.04"
 CORPUS=internal/gpg/testdata/aptshapes
 VERDICTS=$CORPUS/verdicts.txt
+CLASSES=$CORPUS/classes.txt
 
 record=0
 case "$#:${1-}" in
@@ -80,10 +84,12 @@ for f in "$CORPUS/keys.gpg" "$CORPUS/Release"; do
         exit 2
     fi
 done
-if ((!record)) && [[ ! -f $VERDICTS ]]; then
-    echo "[e2e-apt-oracle] $VERDICTS is missing: record it with --record"
-    exit 2
-fi
+for f in "$VERDICTS" "$CLASSES"; do
+    if ((!record)) && [[ ! -f $f ]]; then
+        echo "[e2e-apt-oracle] $f is missing: record it with --record"
+        exit 2
+    fi
+done
 for tool in docker timeout; do
     if ! command -v "$tool" > /dev/null; then
         echo "[e2e-apt-oracle] $tool is not installed"
@@ -157,11 +163,69 @@ if ((failed)); then
     exit 1
 fi
 
+# classify IMAGE OUT: "<shape> <class>" for every line of in-container.sh's
+# output OUT, unsorted; fails, naming each, when a class and apt's words
+# disagree.
+#
+# AIDEV-NOTE: the classes (e2e/apt-oracle/README.md, "Error classes"): "-"
+# accepted; split, apt's own checks of the file refused it before its
+# verifier ran (in-container.sh's <ran> "n"); with the verifier run ("y"),
+# nodata (NODATA), badsig (gpgv's BADSIG, sqv's "Message has been
+# manipulated") or other. Each class is checked against apt's wording, so
+# that a changed apt cannot shift one silently: a split refusal must print
+# one of apt's text-layer messages (gpgv.cc: SplitClearSignedFile's
+# "Splitting up", acquire's NOSPLIT, VerifyDetachedSignatureFile's dash,
+# binary, unclosed and stray-line messages, or its "got 'NODATA'" for a
+# Release.gpg without a BEGIN line), and a verifier's refusal none of them.
+# Task 9b's layer-T test holds the cache's port of apt's splitter to the
+# split rows of classes.txt.
+classify() {
+    awk -v img="$1" '
+    function textlayer(s) {
+        return s ~ /Splitting up .* into data and signature failed/ ||
+            s ~ /Clearsigned file isn.t valid, got .NOSPLIT./ ||
+            s ~ /does not start with a signed message block/ ||
+            s ~ /contains lines not belonging to a signature/ ||
+            s ~ /contains unexpected line starting with a dash/ ||
+            s ~ /is in unsupported binary format/ ||
+            s ~ /contains unclosed signatures/
+    }
+    function fail(why) {
+        printf "[e2e-apt-oracle] %s: %s: %s: %s\n", img, $1, why, line > "/dev/stderr"
+        bad = 1
+    }
+    /^#/ { next }
+    {
+        line = $0
+        sub(/^[^ ]+ [^ ]+ [^ ]+ ?/, "", line)
+        if ($2 == "0") {
+            if ($3 != "-") fail("accepted, yet asked whether apt ran its verifier")
+            print $1, "-"
+        } else if ($3 == "n") {
+            if (!textlayer(line) && line !~ /got .NODATA./)
+                fail("refused before apt ran its verifier, with no text-layer message")
+            print $1, "split"
+        } else if ($3 == "y") {
+            if (textlayer(line))
+                fail("refused with a text-layer message after apt ran its verifier")
+            if (line ~ /NODATA/) print $1, "nodata"
+            else if (line ~ /BADSIG/ || line ~ /Message has been manipulated/) print $1, "badsig"
+            else print $1, "other"
+        } else {
+            fail("refused, then not refused alike when run again (" $3 ")")
+            print $1, "?"
+        }
+    }
+    END { exit bad }
+    ' "$2"
+}
+
 # Per image: the version line, and the verdicts of every shape (ok: apt-get
-# update exited 0), checked to name exactly the corpus's shapes; apt's first
-# E:/W: line per shape goes to "said" ("<image index> <shape> <line>") for
-# the differences.
+# update exited 0), checked to name exactly the corpus's shapes; the error
+# class of each (classify); apt's first E:/W: line per shape goes to "said"
+# ("<image index> <shape> <line>") for the differences.
 columns_files=()
+class_files=()
 versions=()
 : > "$work/said"
 for i in "${!images[@]}"; do
@@ -174,7 +238,7 @@ for i in "${!images[@]}"; do
     versions+=("${version#\# }")
     if ! awk '
         /^#/ { next }
-        NF < 2 || $2 !~ /^[0-9]+$/ { bad = 1; next }
+        NF < 3 || $2 !~ /^[0-9]+$/ || $3 !~ /^[-yn?]$/ { bad = 1; next }
         { print $1, ($2 == "0" ? "ok" : "REJ") }
         END { exit bad }
     ' "$work/out.$i" | LC_ALL=C sort > "$work/verdicts.$i"; then
@@ -188,15 +252,25 @@ for i in "${!images[@]}"; do
         cut -d ' ' -f 1 "$work/verdicts.$i" | diff "$work/shapes" - | head -n 20 || true
         exit 1
     fi
+    if ! classify "${images[$i]}" "$work/out.$i" | LC_ALL=C sort > "$work/classes.$i"; then
+        echo "[e2e-apt-oracle] FAIL: ${images[$i]}: an error class that apt's" \
+            "words do not bear out (above); e2e/apt-oracle/README.md, \"Error" \
+            "classes\", says what to check"
+        exit 1
+    fi
     cut -d ' ' -f 2 "$work/verdicts.$i" > "$work/column.$i"
     columns_files+=("$work/column.$i")
+    cut -d ' ' -f 2 "$work/classes.$i" > "$work/class_column.$i"
+    class_files+=("$work/class_column.$i")
     awk -v k=$((i + 1)) '
         /^#/ { next }
-        { line = $0; sub(/^[^ ]+ [^ ]+ ?/, "", line); print k, $1, line }
+        { line = $0; sub(/^[^ ]+ [^ ]+ [^ ]+ ?/, "", line); print k, $1, line }
     ' "$work/out.$i" >> "$work/said"
 done
-# Rows: the shape's name, then one verdict per image, in images' order.
+# Rows: the shape's name, then one verdict (one class) per image, in images'
+# order.
 paste -d ' ' "$work/shapes" "${columns_files[@]}" > "$work/measured"
+paste -d ' ' "$work/shapes" "${class_files[@]}" > "$work/measured_classes"
 
 for i in "${!images[@]}"; do
     printf '[e2e-apt-oracle] %-13s %s\n' "${images[$i]}" "${versions[$i]}"
@@ -217,33 +291,53 @@ awk -v images="${images[*]}" '
 ' "$work/measured"
 echo
 
-# AIDEV-NOTE: verdicts.txt's format is an interface: the verifier's Go table
-# test (the hardening plan's Task 6) reads it too. Lines starting with "#"
-# are comments; every other line is "<name>" and one ok/REJ per COLUMNS
-# entry, in COLUMNS' order, single spaces between them.
+# AIDEV-NOTE: verdicts.txt's and classes.txt's formats are interfaces: the
+# verifier's Go table test (the hardening plan's Tasks 6 and 9) reads them
+# too. Lines starting with "#" are comments; every other line is "<name>"
+# and one field per COLUMNS entry, in COLUMNS' order, single spaces between
+# them: ok/REJ in verdicts.txt; in classes.txt, "-" where the verdict is ok,
+# else split, nodata, badsig or other.
 if ((record)); then
+    measured_at=$(date -u '+%Y-%m-%d %H:%M')
     {
         echo "# apt's verdicts on the shapes of internal/gpg/testdata/aptshapes, one"
         echo "# row per shape: ok (apt-get update succeeded) or REJ (it failed), in"
-        echo "# each client image. Measured $(date -u '+%Y-%m-%d %H:%M') UTC by"
+        echo "# each client image. Measured $measured_at UTC by"
         echo "# bash e2e/apt-oracle/run.sh --record (e2e/apt-oracle/README.md); the"
-        echo "# fixtures and this file are one measurement. The columns, after the"
-        echo "# shape's name:"
+        echo "# fixtures, this file and classes.txt are one measurement. The columns,"
+        echo "# after the shape's name:"
         for i in "${!images[@]}"; do
             printf '#   %-13s %s\n' "${images[$i]}" "${versions[$i]}"
         done
         cat "$work/measured"
     } > "$work/verdicts.txt"
+    {
+        echo "# apt's error class of each refusal in verdicts.txt, the same rows and"
+        echo "# columns: \"-\" where apt accepted the shape; where it refused it, split"
+        echo "# (apt's own checks of the file refused it before its verifier ran),"
+        echo "# nodata (the verifier found no signature data: gpgv's NODATA), badsig"
+        echo "# (a signature failed its check: gpgv's BADSIG, sqv's \"Message has been"
+        echo "# manipulated\") or other (anything else the verifier said). Measured"
+        echo "# $measured_at UTC with verdicts.txt; e2e/apt-oracle/README.md,"
+        echo "# \"Error classes\", says how each is derived."
+        cat "$work/measured_classes"
+    } > "$work/classes.txt"
     mv "$work/verdicts.txt" "$VERDICTS"
-    echo "[e2e-apt-oracle] RECORDED $VERDICTS ($nshapes shapes x ${#images[@]}" \
-        "images, $((SECONDS - start)) s): review its diff before committing it"
+    mv "$work/classes.txt" "$CLASSES"
+    echo "[e2e-apt-oracle] RECORDED $VERDICTS and $CLASSES ($nshapes shapes x" \
+        "${#images[@]} images, $((SECONDS - start)) s): review their diff before" \
+        "committing them"
     exit 0
 fi
 
-# Compare with verdicts.txt, image by image, and name every difference with
-# what apt said.
-if ! awk -v fields="${fields[*]}" -v images="${images[*]}" \
-    -v width=$((${#columns[@]} + 1)) -v said="$work/said" -v rec="$VERDICTS" '
+# compare RECORDED MEASURED KIND: names every difference between a recorded
+# file (verdicts.txt, or classes.txt for KIND class) and the measurement,
+# image by image, with what apt said; fails when there is one. A cell whose
+# verdict changed is reported once, as a verdict.
+compare() {
+    awk -v fields="${fields[*]}" -v images="${images[*]}" \
+        -v width=$((${#columns[@]} + 1)) -v said="$work/said" -v rec="$1" \
+        -v file="${1##*/}" -v kind="$3" '
     BEGIN { n = split(fields, field, " "); split(images, img, " ") }
     FILENAME == said {
         line = $0
@@ -254,7 +348,7 @@ if ! awk -v fields="${fields[*]}" -v images="${images[*]}" \
     FILENAME == rec {
         if (/^#/ || NF == 0) next
         if (NF != width) {
-            printf "[e2e-apt-oracle] verdicts.txt: not %d fields: %s\n", width, $0
+            printf "[e2e-apt-oracle] %s: not %d fields: %s\n", file, width, $0
             bad = 1
             next
         }
@@ -264,32 +358,41 @@ if ! awk -v fields="${fields[*]}" -v images="${images[*]}" \
     {
         seen[$1] = 1
         if (!($1 in recorded)) {
-            printf "[e2e-apt-oracle] %s: measured, but verdicts.txt has no row for it\n", $1
+            printf "[e2e-apt-oracle] %s: measured, but %s has no row for it\n", $1, file
             bad = 1
             next
         }
         split(recorded[$1], r, " ")
-        for (k = 1; k <= n; k++)
-            if (r[field[k]] != $(k + 1)) {
-                printf "[e2e-apt-oracle] apt changed: %s in %s: recorded %s, measured %s\n", $1, img[k], r[field[k]], $(k + 1)
-                line = what[k SUBSEP $1]
-                printf "    apt said: %s\n", (line == "" ? "(no E: or W: line)" : line)
-                bad = 1
-            }
+        for (k = 1; k <= n; k++) {
+            was = r[field[k]]
+            now = $(k + 1)
+            if (was == now || (kind == "class" && (was == "-" || now == "-")))
+                continue
+            printf "[e2e-apt-oracle] apt changed: %s in %s: recorded %s%s, measured %s\n", $1, img[k], (kind == "class" ? "class " : ""), was, now
+            line = what[k SUBSEP $1]
+            printf "    apt said: %s\n", (line == "" ? "(no E: or W: line)" : line)
+            bad = 1
+        }
     }
     END {
         for (s in recorded)
             if (!(s in seen)) {
-                printf "[e2e-apt-oracle] %s: in verdicts.txt, but the corpus has no such shape\n", s
+                printf "[e2e-apt-oracle] %s: in %s, but the corpus has no such shape\n", s, file
                 bad = 1
             }
         exit bad
     }
-' "$work/said" "$VERDICTS" "$work/measured"; then
-    echo "[e2e-apt-oracle] FAIL: apt changed, or verdicts.txt does not match the" \
-        "corpus ($((SECONDS - start)) s); e2e/apt-oracle/README.md, \"When apt" \
-        "changes\", says what to update"
+    ' "$work/said" "$1" "$2"
+}
+same=1
+compare "$VERDICTS" "$work/measured" verdict || same=0
+compare "$CLASSES" "$work/measured_classes" class || same=0
+if ((!same)); then
+    echo "[e2e-apt-oracle] FAIL: apt changed, or verdicts.txt or classes.txt does" \
+        "not match the corpus ($((SECONDS - start)) s); e2e/apt-oracle/README.md," \
+        "\"When apt changes\", says what to update"
     exit 1
 fi
 echo "[e2e-apt-oracle] PASS: $nshapes shapes x ${#images[@]} images, apt's" \
-    "verdicts as recorded in $VERDICTS ($((SECONDS - start)) s)"
+    "verdicts and error classes as recorded in $VERDICTS and $CLASSES" \
+    "($((SECONDS - start)) s)"
