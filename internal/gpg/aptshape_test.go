@@ -64,24 +64,12 @@ var aptShapeKnownUnsafe = map[string]string{
 	"x3i_sha1_only": "C-3, weak digests: out of scope, recorded Open (the hardening plan's Task 8 (f)); only the signer can make it",
 }
 
-// pendingS1 holds the shapes only S1 refuses (Appendix A's rule column marks
-// them REJ(S1)): a bad signature from a known key beside a good one. The
-// table test skips them until the hardening plan's Task 7 adds S1 and
-// empties this map — the one change its harness needs.
-var pendingS1 = map[string]bool{
-	"d_badsig_badfirst":             true,
-	"d_badsig_goodfirst":            true,
-	"i_badsig_badfirst":             true,
-	"i_badsig_goodfirst":            true,
-	"i_expired_bad_plus_good":       true,
-	"x3d_badsig_unhashed_fpr_added": true,
-	"x3i_badsig_unhashed_fpr_added": true,
-	"x3i_subkey_bad_plus_good":      true,
-	"xd_badsig_issuer_rewritten":    true,
-	"xi_badsig_issuer_removed":      true,
-	"xi_badsig_issuer_rewritten":    true,
-	"xi_crit_plus_good":             true,
-}
+// pendingS1 held the twelve shapes only S1 refuses (Appendix A's rule
+// column marks them REJ(S1): a bad signature from a known key beside a good
+// one) while the table test waited for S1. The hardening plan's Task 7 added
+// S1 (requireKnownSignaturesVerify) and emptied it, so every row runs; a
+// shape goes back in it only with a ruling, like the exception maps above.
+var pendingS1 = map[string]bool{}
 
 const aptShapeDir = "testdata/aptshapes"
 

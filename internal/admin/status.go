@@ -373,8 +373,8 @@ type adoptionEntry struct {
 	// success; for gpg_failed it carries the specific verifier
 	// sentinel (untrusted_signer, short_keyid, crypto_verify_failed,
 	// missing_signature, malformed_clearsign, malformed_signature,
-	// ambiguous_keyid, no_usable_signature); for other failures it
-	// mirrors Outcome.
+	// bad_signature, ambiguous_keyid, no_usable_signature); for other
+	// failures it mirrors Outcome.
 	// JSON-omitted when empty so the wire shape is unchanged for
 	// success rows.
 	Reason string `json:"reason,omitempty"`
@@ -1118,6 +1118,8 @@ func reasonTooltip(reason string) string {
 		return "InRelease starts like a clearsigned message but is not one in the shape apt accepts: its signature frame does not decode, or a line follows the signature, its armor checksum is forged, its armor is damaged, or it carries packets apt refuses."
 	case "malformed_signature":
 		return "The upstream Release.gpg is not one ASCII-armored signature block as apt requires — bytes around it, a binary signature, a damaged armor, or packets apt refuses."
+	case "bad_signature":
+		return "The upstream anchor carries a signature from a key the cache knows that fails verification — apt rejects it; often tampering on the path."
 	case "ambiguous_keyid":
 		return "Two or more keys in the trust set share the same 8-byte keyid; the short-keyid fallback refuses to guess."
 	case "crypto_verify_failed":

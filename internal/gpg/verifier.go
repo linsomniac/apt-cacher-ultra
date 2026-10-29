@@ -3,6 +3,7 @@ package gpg
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
+	pgperrors "github.com/ProtonMail/go-crypto/openpgp/errors"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
@@ -165,6 +167,8 @@ func ClassifyVerifyErr(err error) string {
 		return "ambiguous_keyid"
 	case errors.Is(err, ErrNoUsableSignature):
 		return "no_usable_signature"
+	case errors.Is(err, ErrBadSignature):
+		return "bad_signature"
 	}
 	return "crypto_verify_failed"
 }
@@ -220,6 +224,15 @@ var (
 	// legitimate but redundant operator-staged duplicate) silently
 	// substitute for the intended signer. Fail closed.
 	ErrAmbiguousKeyID = errors.New("ambiguous short issuer keyid in trust set")
+
+	// ErrBadSignature means a signature packet whose hashed issuer names a
+	// signing key in the host keyring failed its cryptographic check,
+	// carried a critical notation go-crypto does not know, or carried an
+	// unhashed issuer that contradicts the hashed one (S1,
+	// requireKnownSignaturesVerify): gpgv's BADSIG, which makes apt refuse
+	// the anchor even beside a good signature (the 2026-09 security
+	// review's VC-1).
+	ErrBadSignature = errors.New("a signature from a known key failed verification")
 )
 
 // errClearsignPanicked reports a clearsigned body that made the go-crypto
@@ -270,7 +283,11 @@ func decodeClearsigned(b []byte) (block *clearsign.Block, err error) {
 //     requireInlineSignatureShape), on the bypass path too: the END
 //     line's form, the armor checksum, the lines inside the armor,
 //     signature packets only. ErrMalformedClearsign.
-//  5. Iterate signature packets, attempting cryptographic verification
+//  5. Refuse a signature from a key in the host keyring that does not
+//     verify (S1, requireKnownSignaturesVerify), as apt's BADSIG makes
+//     it refuse the anchor even beside a good signature: ErrBadSignature.
+//     Not on the bypass path (the hardening plan's DN-8).
+//  6. Iterate signature packets, attempting cryptographic verification
 //     of each candidate (one with a trusted IssuerFingerprint)
 //     against the trust-set EntityList. Accept only on a packet that
 //     BOTH passes the long-form-fingerprint trust check AND verifies
@@ -323,6 +340,12 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 		// so per-source Signed-By rules on the fleet remain the
 		// authoritative trust anchor.
 		//
+		// AIDEV-NOTE: S1 (requireKnownSignaturesVerify) is deliberately
+		// not applied here, nor on VerifyDetached's bypass: the bypass
+		// verifies no signature, and S1 would be its only signature check
+		// (the hardening plan's DN-8, recorded Open). Do not add it here
+		// without that decision.
+		//
 		// clearsign.Decode proved a BEGIN/END PGP SIGNATURE frame is
 		// present, but armor.Decode (lazy, on Body read) and the
 		// armored body itself can still contain no parseable signature
@@ -367,7 +390,12 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 	if err := requireInlineSignatureShape(inRelease, sigBytes); err != nil {
 		return nil, err
 	}
-	// Step 5: per-packet verify-and-trust loop. A signature packet is
+	// Step 5: every signature from a key in the host keyring verifies (S1;
+	// F6 has left signature packets only).
+	if err := v.requireKnownSignaturesVerify(block.Bytes, sigBytes); err != nil {
+		return nil, err
+	}
+	// Step 6: per-packet verify-and-trust loop. A signature packet is
 	// accepted iff it carries a long-form IssuerFingerprint that is
 	// in trustFPs AND verifies cryptographically against trustSet.
 	if err := v.verifyAnyTrusted(suite, trustSet, trustFPs, block.Bytes, sigBytes); err != nil {
@@ -397,7 +425,10 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 //  2. Resolve per-suite trust set; if RequirePinned and no match, abort.
 //  3. De-armor sigBytes, refusing the shapes apt refuses (F1, F0, F2–F6:
 //     decodeMaybeArmoredSignature), on the bypass path too.
-//  4. Iterate signature packets, accepting on the first packet that
+//  4. Refuse a signature from a key in the host keyring that does not
+//     verify (S1, requireKnownSignaturesVerify: ErrBadSignature), as
+//     VerifyInline does; not on the bypass path (DN-8).
+//  5. Iterate signature packets, accepting on the first packet that
 //     BOTH passes the long-form-fingerprint trust check AND verifies
 //     cryptographically against trustSet — same per-packet coupling
 //     as VerifyInline (SPEC2 §7.6.3).
@@ -420,15 +451,15 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 // beginning the last line (F0), the END line's form (F2), the armor
 // checksum (F3), no "-" line inside the armor (F4), headers with ": "
 // (F5), signature packets only (F6). Besides that: both bodies
-// non-empty, the suite's trust set (pins first), and one signature
-// packet that passes the trust check and verifies — except under
-// accept_any_signer with no pin matched, where one parseable signature
-// packet is enough (SPEC2 §7.6.2's bypass, below). Still open: a second,
-// bad signature from a trusted key beside a good one (VC-1:
-// verifyAnyTrusted accepts on the first packet that verifies; the
-// hardening plan's Task 7), and weak digests or keys (C-3:
-// VerifyDetachedSignature runs with a nil config, no algorithm policy,
-// so SHA-1 and RSA-1024 pass).
+// non-empty, the suite's trust set (pins first), every signature from a
+// key in the host keyring verifying (S1: a bad one beside a good one, the
+// security review's VC-1, is refused as apt's BADSIG refuses it; enforced
+// since the hardening plan's Task 7, on the trusted path only: DN-8), and
+// one signature packet that passes the trust check and verifies — except
+// under accept_any_signer with no pin matched, where one parseable
+// signature packet is enough (SPEC2 §7.6.2's bypass, below). Still open:
+// weak digests or keys (C-3: VerifyDetachedSignature runs with a nil
+// config, no algorithm policy, so SHA-1 and RSA-1024 pass).
 func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef, releaseBytes, sigBytes []byte) ([]byte, error) {
 	_ = ctx
 
@@ -456,7 +487,8 @@ func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef,
 		// (F1, F0, F2–F6: structural, so in force on this path too),
 		// and requireParseableSignature adds that the armor holds at
 		// least one OpenPGP signature packet — F6 alone passes an armor
-		// with no packet at all.
+		// with no packet at all. S1 is not applied here (DN-8: the
+		// AIDEV-NOTE in VerifyInline's bypass).
 		binarySig, err := decodeMaybeArmoredSignature(sigBytes)
 		if err != nil {
 			return nil, fmt.Errorf("decode signature: %w", err)
@@ -480,6 +512,11 @@ func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef,
 		return nil, fmt.Errorf("decode signature: %w", err)
 	}
 
+	// Every signature from a key in the host keyring verifies (S1; F6, in
+	// decodeMaybeArmoredSignature, has left signature packets only).
+	if err := v.requireKnownSignaturesVerify(releaseBytes, binarySig); err != nil {
+		return nil, err
+	}
 	if err := v.verifyAnyTrusted(suite, trustSet, trustFPs, releaseBytes, binarySig); err != nil {
 		return nil, err
 	}
@@ -576,11 +613,13 @@ const clearsignBeginMarker = "-----BEGIN PGP SIGNED MESSAGE-----"
 // and packet shapes apt accepts (requireInlineSignatureShape: the END
 // line's form, no text after its marker, F2; the armor checksum F3; no "-"
 // line inside the armor F4; headers with ": " F5; signature packets only
-// F6); and one trusted signature packet that verifies (under
-// accept_any_signer with no pin matched, one parseable signature packet:
-// SPEC2 §7.6.2's bypass). Still open: VC-1 (a second, bad signature from a
-// trusted key beside a good one: the hardening plan's Task 7) and C-3 (no
-// algorithm policy: a SHA-1 digest or an RSA-1024 key verifies).
+// F6); every signature from a key in the host keyring verifying (S1,
+// requireKnownSignaturesVerify: VC-1, a bad signature beside a good one,
+// enforced since the plan's Task 7, on the trusted path only: DN-8); and
+// one trusted signature packet that verifies (under accept_any_signer with
+// no pin matched, one parseable signature packet: SPEC2 §7.6.2's bypass).
+// Still open: C-3 (no algorithm policy: a SHA-1 digest or an RSA-1024 key
+// verifies).
 //
 // A body without the marker returns nil: the decode step rejects it with
 // ErrMissingSignature. So does one without an END marker: the decoder
@@ -717,6 +756,155 @@ func readArmoredSignature(r io.Reader) ([]byte, error) {
 		return nil, fmt.Errorf("signature too large (>%d bytes)", max)
 	}
 	return out, nil
+}
+
+// requireKnownSignaturesVerify applies apt's rule that a bad signature from a
+// known key is fatal (VC-1; rulings HD-3, HD-8): every signature packet whose
+// hashed issuer names a signing key in the host keyring must pass its
+// cryptographic check against one of the keyring's entities holding that key
+// ID, and its unhashed issuer must not contradict the hashed one. A packet
+// whose check passes but whose key or signature is expired or revoked passes
+// (gpgv's EXPKEYSIG and REVKEYSIG, which apt ignores beside a good
+// signature); an unknown critical notation fails (gpgv's BADSIG); a packet
+// whose issuer the keyring lacks is ignored (gpgv's NO_PUBKEY).
+//
+// AIDEV-NOTE: go-crypto takes the issuer from the last issuer subpacket it
+// parses, unhashed after hashed, and looks keys up by that key ID only; gpgv
+// uses the hashed issuer. So "known" is read from sig.HashSuffix
+// (hashedIssuer), and a contradicting unhashed issuer is a failure — else an
+// on-path attacker rewrites a bad signature's unhashed issuer and it is
+// ignored here while every gpgv-based apt reports BADSIG
+// (xi_badsig_issuer_rewritten). openpgp.VerifyDetachedSignature returns a
+// non-nil signature exactly when the cryptographic check passed, then reports
+// expiry, revocation or an unknown critical notation as its error (go-crypto
+// v1.4.1 openpgp/read.go, verifyDetachedSignature and
+// checkMessageSignatureDetails). Each candidate entity is tried alone: the
+// library hashes once and tries every key with that one hash, which only the
+// first candidate can pass. The host keyring, not the suite's trust set: a
+// client that installed any of the cache's keys sees the BADSIG. Re-check all
+// of this when go-crypto is upgraded (the table test and this file's tests
+// pin it).
+func (v *Verifier) requireKnownSignaturesVerify(signed, sigBytes []byte) error {
+	keyring := v.keyring.EntityList()
+	reader := packet.NewReader(bytes.NewReader(sigBytes))
+	for {
+		pkt, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read signature packet: %w", err)
+		}
+		sig, ok := pkt.(*packet.Signature)
+		if !ok {
+			continue // unreachable: F6 has refused every other packet
+		}
+		id, hashed := hashedIssuer(sig)
+		if !hashed {
+			if sig.IssuerKeyId == nil {
+				continue
+			}
+			id = *sig.IssuerKeyId
+		}
+		keys := keyring.KeysByIdUsage(id, packet.KeyFlagSign)
+		if len(keys) == 0 {
+			continue
+		}
+		if sig.IssuerKeyId == nil || *sig.IssuerKeyId != id {
+			return fmt.Errorf("%w: issuer %016X: an unhashed issuer contradicts the hashed one", ErrBadSignature, id)
+		}
+		var one bytes.Buffer
+		if err := sig.Serialize(&one); err != nil {
+			return fmt.Errorf("re-serialize signature packet: %w", err)
+		}
+		passed := false
+		tried := make(map[*openpgp.Entity]bool, len(keys))
+		for _, k := range keys {
+			if tried[k.Entity] {
+				continue
+			}
+			tried[k.Entity] = true
+			got, _, verr := openpgp.VerifyDetachedSignature(openpgp.EntityList{k.Entity},
+				bytes.NewReader(signed), bytes.NewReader(one.Bytes()), nil)
+			if got != nil && !errors.As(verr, new(pgperrors.SignatureError)) {
+				passed = true
+				break
+			}
+		}
+		if !passed {
+			return fmt.Errorf("%w: issuer %016X", ErrBadSignature, id)
+		}
+	}
+}
+
+// hashedIssuer returns the key ID that sig's hashed subpacket area names: an
+// issuer fingerprint (subpacket 33) first — its key ID is bytes 12–19 of a
+// v4 fingerprint, 0–7 of a v6 one — else an issuer key ID (16); false when
+// the area names neither. The area is read from sig.HashSuffix, where
+// go-crypto keeps it verbatim (bytes [6:6+len] of a v4 signature's, [8:8+len]
+// of a v6's), because sig.IssuerKeyId is the last issuer subpacket go-crypto
+// parsed, the unhashed area's after the hashed one's (TestHashedIssuer).
+//
+// AIDEV-NOTE: the first matching subpacket counts, as in gpgv (whose
+// parse_sig_subpkt returns the first match): of two hashed issuer key IDs
+// the first names the issuer, so a forged packet that puts a known key's ID
+// before an unknown one is still known here, and then contradicts
+// sig.IssuerKeyId, the last. (The security review's prototype of this rule
+// kept the last 16 and the first 33; no real signer writes two.) A hashed
+// area that does not parse returns false; go-crypto's own parse, which F6
+// requires, has already refused it.
+func hashedIssuer(sig *packet.Signature) (uint64, bool) {
+	hs := sig.HashSuffix
+	var area []byte
+	switch {
+	case sig.Version == 4 && len(hs) >= 6:
+		if n := int(binary.BigEndian.Uint16(hs[4:6])); n <= len(hs)-6 {
+			area = hs[6 : 6+n]
+		}
+	case sig.Version == 6 && len(hs) >= 8:
+		if n := uint64(binary.BigEndian.Uint32(hs[4:8])); n <= uint64(len(hs)-8) {
+			area = hs[8 : 8+int(n)]
+		}
+	}
+	var keyID uint64
+	haveKeyID := false
+	for len(area) > 0 {
+		// A subpacket: its length in one, two or five octets (RFC 9580
+		// §5.2.3.7), then its type (the critical bit masked) and data.
+		var n, hl int
+		switch l0 := int(area[0]); {
+		case l0 < 192:
+			n, hl = l0, 1
+		case l0 < 255:
+			if len(area) < 2 {
+				return 0, false
+			}
+			n, hl = (l0-192)<<8+int(area[1])+192, 2
+		default:
+			if len(area) < 5 {
+				return 0, false
+			}
+			l := uint64(binary.BigEndian.Uint32(area[1:5]))
+			if l > uint64(len(area)) {
+				return 0, false
+			}
+			n, hl = int(l), 5
+		}
+		if n == 0 || n > len(area)-hl {
+			return 0, false
+		}
+		typ, data := area[hl]&0x7f, area[hl+1:hl+n]
+		switch {
+		case typ == 33 && len(data) == 21 && data[0] == 4:
+			return binary.BigEndian.Uint64(data[13:21]), true
+		case typ == 33 && len(data) == 33 && data[0] == 6:
+			return binary.BigEndian.Uint64(data[1:9]), true
+		case typ == 16 && len(data) == 8 && !haveKeyID:
+			keyID, haveKeyID = binary.BigEndian.Uint64(data), true
+		}
+		area = area[hl+n:]
+	}
+	return keyID, haveKeyID
 }
 
 // verifyAnyTrusted enumerates every signature packet in sigBytes and

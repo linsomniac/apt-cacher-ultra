@@ -78,3 +78,5 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   packets apt refuses, a `Release.gpg` with bytes around its armor, or a
   binary one (apt 2.2 to 3.2 reject each; the cache adopted them and its
   clients' `apt update` then failed). A second armor block is refused too.
+- Adoption refuses a signed anchor that carries a bad signature from a key
+  the cache knows beside a good one, as apt does.

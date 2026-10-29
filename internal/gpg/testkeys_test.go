@@ -143,6 +143,22 @@ func detachSignWith(t *testing.T, e *openpgp.Entity, message []byte, armored boo
 	return buf.Bytes()
 }
 
+// detachSignAt is detachSignWith's binary form with the signature made at
+// when, not now (clearsignAt's reason; openpgp.DetachSign moreover refuses
+// a key that has expired at the signing time).
+func detachSignAt(t *testing.T, e *openpgp.Entity, message []byte, when time.Time) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	cfg := &packet.Config{
+		DefaultHash: crypto.SHA256,
+		Time:        func() time.Time { return when },
+	}
+	if err := openpgp.DetachSign(&buf, e, bytes.NewReader(message), cfg); err != nil {
+		t.Fatalf("detach sign at %v: %v", when, err)
+	}
+	return buf.Bytes()
+}
+
 // armorSignature wraps binary signature packets in one ASCII armor
 // block, as `gpg --detach-sign --armor` writes a Release.gpg: the BEGIN
 // line, a blank line, the base64 lines, the CRC line of exactly these
@@ -171,11 +187,32 @@ func armorSignature(t *testing.T, packets []byte) []byte {
 // over the canonicalized cleartext.
 func clearsignWith(t *testing.T, e *openpgp.Entity, plaintext []byte) []byte {
 	t.Helper()
-	var buf bytes.Buffer
-	w, err := clearsign.Encode(&buf, e.PrivateKey, &packet.Config{
+	return clearsignWithConfig(t, e, plaintext, &packet.Config{
 		DefaultHash: crypto.SHA256,
 		Time:        time.Now,
 	})
+}
+
+// clearsignAt is clearsignWith with the signature made at when, not now.
+// A key that has expired since can so have signed while it was valid, as
+// the corpus' E did (gpgv's EXPKEYSIG, which apt ignores beside a good
+// signature): newExpiredEntity's key is valid for the one second after its
+// creation, so a signature made at e.PrimaryKey.CreationTime is one, where
+// clearsignWith's, made now, would postdate the expiry.
+func clearsignAt(t *testing.T, e *openpgp.Entity, plaintext []byte, when time.Time) []byte {
+	t.Helper()
+	return clearsignWithConfig(t, e, plaintext, &packet.Config{
+		DefaultHash: crypto.SHA256,
+		Time:        func() time.Time { return when },
+	})
+}
+
+// clearsignWithConfig is clearsignWith with the signing config given: its
+// time, hash and notations.
+func clearsignWithConfig(t *testing.T, e *openpgp.Entity, plaintext []byte, cfg *packet.Config) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w, err := clearsign.Encode(&buf, e.PrivateKey, cfg)
 	if err != nil {
 		t.Fatalf("clearsign.Encode: %v", err)
 	}
@@ -247,6 +284,39 @@ func substituteSignatures(base, from []byte) ([]byte, error) {
 		return nil, fmt.Errorf("decode from armor: %w", err)
 	}
 	return assembleClearsignedBlock(b.Plaintext, fromSig)
+}
+
+// signaturePacketsOf returns the binary signature packets of a clearsigned
+// message, to be joined with others' (assembleClearsignedBlock) in the
+// order a test needs.
+func signaturePacketsOf(t *testing.T, clearsigned []byte) []byte {
+	t.Helper()
+	b, _ := clearsign.Decode(clearsigned)
+	if b == nil {
+		t.Fatal(errInvalidFixture)
+	}
+	packets, err := readArmoredBlockBody(b)
+	if err != nil {
+		t.Fatalf("decode armor: %v", err)
+	}
+	return packets
+}
+
+// joined concatenates byte strings in the order given: signature packets
+// (binary, as signaturePacketsOf or detachSignWith return them), or a
+// signature's subpackets.
+func joined(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
+
+// inlineWithSignatures returns an InRelease of fakeReleasePlaintext whose
+// one armor block holds packets, joined in the order given: the signature
+// packets of several signers, some of them over another text.
+func inlineWithSignatures(t *testing.T, packets ...[]byte) []byte {
+	t.Helper()
+	body, err := assembleClearsignedBlock([]byte(fakeReleasePlaintext), joined(packets...))
+	if err != nil {
+		t.Fatalf("assembleClearsignedBlock: %v", err)
+	}
+	return body
 }
 
 // readArmoredBlockBody pulls the binary signature bytes out of a
