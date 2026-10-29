@@ -2,3 +2,6 @@
 # only in CRs): no end-of-line conversion on any checkout or commit,
 # whatever core.autocrlf says (e2e/apt-oracle/README.md).
 internal/gpg/testdata/aptshapes/** -text
+# So are the real vendors' anchors the verifier's vendor test reads (nginx's
+# InRelease has CRLF line ends): internal/gpg/vendors_test.go.
+internal/gpg/testdata/vendors/** -text
