@@ -64,3 +64,9 @@ prompt
 # stage does `COPY e2e/cache.toml`, and .dockerignore filtering applies
 # to the build-context tarball itself — excluding e2e/ here would make
 # that COPY fail.
+
+# Published repository artifacts and generated MITM CA storage.
+site/
+debs/
+**/ca/
+**/apt-cacher-ultra-ca.crt

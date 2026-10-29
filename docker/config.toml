@@ -1,0 +1,28 @@
+# Container defaults: HTTP cache; HTTPS clients must use DIRECT or HTTPS///.
+[cache]
+dir = "/var/cache/apt-cacher-ultra"
+listen = "0.0.0.0:3142"
+advertise_host = "localhost:3142"
+
+[upstream]
+allowed_host_regex = ['^.*$']
+
+[adoption]
+# Enable after adding trusted keys for any third-party repositories.
+enabled = false
+
+[admin]
+# Compose publishes this port only on the Docker host's loopback address.
+listen = "0.0.0.0:6789"
+
+[log]
+format = "json"
+
+[tls_mitm]
+# To cache HTTPS, change enabled to true and uncomment both policy lines below.
+# Adapt the literal-host list before first startup; clients must trust the CA.
+enabled = false
+# allowed_host_regex = '^(deb\.debian\.org|security\.debian\.org|archive\.ubuntu\.com|security\.ubuntu\.com|download\.docker\.com)$'
+# allow_unconstrained_ca = false
+# CA certificate/key are generated in /var/cache/apt-cacher-ultra/ca/ and
+# persist in the apt-cache volume. No separate certificate mount is needed.

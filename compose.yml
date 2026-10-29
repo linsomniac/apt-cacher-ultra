@@ -1,0 +1,20 @@
+services:
+  apt-cacher-ultra:
+    image: ${APT_CACHER_ULTRA_IMAGE:-ghcr.io/linsomniac/apt-cacher-ultra:edge}
+    build:
+      context: .
+      args:
+        VERSION: ${APT_CACHER_ULTRA_VERSION:-dev}
+    restart: unless-stopped
+    ports:
+      - "${APT_CACHER_ULTRA_BIND:-127.0.0.1}:3142:3142"
+      - "127.0.0.1:6789:6789"
+    volumes:
+      - apt-cache:/var/cache/apt-cacher-ultra
+      - ./docker/config.toml:/etc/apt-cacher-ultra/config.toml:ro
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 60s
+
+volumes:
+  apt-cache:
