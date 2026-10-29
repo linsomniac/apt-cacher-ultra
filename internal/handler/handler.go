@@ -2073,14 +2073,15 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 	//
 	// prefetchUnread: this check could not read the vouching hashes, so
 	// strict mode decides on the read after the download (final review
-	// R4 #2).
-	prefetchUnread := false
+	// R4 #2). prefetchVouched: it found the path vouched, so strict mode
+	// decides on that read too when it finds no row (ruling HD-6).
+	prefetchUnread, prefetchVouched := false, false
 	if !req.IsMetadata {
-		res, end, unread := h.prefetchCheck(ctx, req)
+		res, end, unread, vouched := h.prefetchCheck(ctx, req)
 		if end {
 			return res
 		}
-		prefetchUnread = unread
+		prefetchUnread, prefetchVouched = unread, vouched
 	}
 
 	bw, err := h.cache.NewTempBlob()
@@ -2147,9 +2148,13 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 					"canonical_host", req.CanonicalHost,
 					"path", req.Path,
 				)
-				// Final review R4 #2: strict mode's decision, which the
-				// check before the download could not make, is made here.
-				if prefetchUnread && isDebPath(req.Path) {
+				// Final review R4 #2 and ruling HD-6: strict mode's decision is
+				// made here when the check before the download could not read
+				// the vouching hashes, or when it found the path vouched and the
+				// vouching is gone now (its snapshot retired, or displaced by one
+				// that does not list it, during the download) — a .deb that was
+				// vouched is never served unchecked on a strict host.
+				if (prefetchUnread || prefetchVouched) && isDebPath(req.Path) {
 					if res, end := h.strictAfterDownload(ctx, req); end {
 						res.status = fres.Status
 						return res
@@ -2343,10 +2348,14 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 // errUnvouchedRetryable while a signed adoption is in flight on the host,
 // for serveCacheMiss to wait for outside singleflight (spec C10), or, with
 // none in flight, takes a second look at once (prefetchRecheck, final
-// review R1 #2). unread: the vouching hashes could not be read (logged
-// WARN), so runFetch's read after the download makes strict mode's
-// decision (strictAfterDownload).
-func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request) (res sfResult, end, unread bool) {
+// review R1 #2). runFetch's read after the download makes strict mode's
+// decision for a .deb (strictAfterDownload) in two cases: unread, the
+// vouching hashes could not be read (logged WARN; final review R4 #2); and
+// vouched, this read or prefetchRecheck's second look found the path
+// vouched (one declared hash), when the read after the download finds no
+// row — the vouching snapshot was retired, or displaced by one that does
+// not list the path, during the download (ruling HD-6).
+func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request) (res sfResult, end, unread, vouched bool) {
 	rows, derr := h.cache.DeclaredHashesForPath(ctx,
 		req.CanonicalScheme, req.CanonicalHost, req.Path)
 	if derr != nil {
@@ -2360,7 +2369,7 @@ func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request) (res sf
 			"canonical_host", req.CanonicalHost,
 			"path", req.Path,
 		)
-		return sfResult{}, false, true
+		return sfResult{}, false, true, false
 	}
 	distinct := distinctDeclared(rows)
 	if len(distinct) >= 2 {
@@ -2370,13 +2379,13 @@ func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request) (res sf
 			"fetched", false,
 			"declared", declaredAttrs(rows),
 		)
-		return sfResult{err: ErrPackageHashConflict}, true, false
+		return sfResult{err: ErrPackageHashConflict}, true, false, false
 	}
 	// SPEC3 §6.1 strict mode fires only on .deb paths; the predicate must
 	// not refuse source tarballs, udebs, etc. that legitimately have no
 	// package_hash row.
 	if len(distinct) != 0 || !isDebPath(req.Path) {
-		return sfResult{}, false, false
+		return sfResult{}, false, false, len(distinct) == 1
 	}
 	switch sm, snapID, count := h.classifyStrictMode(ctx,
 		req.CanonicalScheme, req.CanonicalHost); sm {
@@ -2386,30 +2395,33 @@ func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request) (res sf
 			// this attempt (releasing the host slot) and let serveCacheMiss
 			// wait outside singleflight.
 			if h.adoptions.AdoptionsInFlight(req.CanonicalHost) {
-				return sfResult{err: errUnvouchedRetryable, snapshotCount: count}, true, false
+				return sfResult{err: errUnvouchedRetryable, snapshotCount: count}, true, false, false
 			}
 			// Final review R1 #2: an adoption that committed the rows
 			// vouching for this .deb may have ended since the lookup above
 			// (its count ends after its commit): look once more, at once.
-			res, end = h.prefetchRecheck(ctx, req, count)
-			return res, end, false
+			// Rows it finds vouch the path as the first look's would
+			// (ruling HD-6).
+			res, end, vouched = h.prefetchRecheck(ctx, req, count)
+			return res, end, false, vouched
 		}
 		h.logUnvouchedRefused(req, count)
-		return sfResult{err: ErrUnvouchedDebRefused}, true, false
+		return sfResult{err: ErrUnvouchedDebRefused}, true, false, false
 	case strictPassthrough:
 		h.logUnvouchedPassthrough(req.CanonicalHost, req.Path, snapID)
 	}
-	return sfResult{}, false, false
+	return sfResult{}, false, false, false
 }
 
 // prefetchRecheck is the miss path's second look before a strict-mode
 // refusal with no signed adoption in flight on the host, recheckRefusal's
 // twin (final review R1 #2): one more package_hash read, at once. Rows that
-// agree let the download go ahead (end false): the read after it validates
-// the bytes. Rows that disagree are refused here, before the download, as
-// prefetchCheck refuses them. Anything else keeps the refusal already
-// decided — count is its current_snapshot_count — and nothing is
-// downloaded; the host's coverage is not read again.
+// agree let the download go ahead (end false, vouched): the read after it
+// validates the bytes, or makes strict mode's decision if no row vouches
+// the path by then (ruling HD-6). Rows that disagree are refused here,
+// before the download, as prefetchCheck refuses them. Anything else keeps
+// the refusal already decided — count is its current_snapshot_count — and
+// nothing is downloaded; the host's coverage is not read again.
 //
 // AIDEV-NOTE: a read fault here keeps the refusal, logged WARN. Re-running
 // the whole check (as R1 #2's fix first did) failed open on a coverage-read
@@ -2418,7 +2430,7 @@ func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request) (res sf
 // conflict is refused here for the same reason: left to the read after
 // the download, a fault of that read served the file unchecked (the D4/D5
 // re-review).
-func (h *Handler) prefetchRecheck(ctx context.Context, req *proxy.Request, count int) (res sfResult, end bool) {
+func (h *Handler) prefetchRecheck(ctx context.Context, req *proxy.Request, count int) (res sfResult, end, vouched bool) {
 	rows, err := h.cache.DeclaredHashesForPath(ctx,
 		req.CanonicalScheme, req.CanonicalHost, req.Path)
 	switch {
@@ -2435,27 +2447,35 @@ func (h *Handler) prefetchRecheck(ctx context.Context, req *proxy.Request, count
 			"fetched", false,
 			"declared", declaredAttrs(rows),
 		)
-		return sfResult{err: ErrPackageHashConflict}, true
+		return sfResult{err: ErrPackageHashConflict}, true, false
 	case len(rows) > 0:
-		return sfResult{}, false
+		return sfResult{}, false, true
 	}
 	h.logUnvouchedRefused(req, count)
-	return sfResult{err: ErrUnvouchedDebRefused}, true
+	return sfResult{err: ErrUnvouchedDebRefused}, true, false
 }
 
 // strictAfterDownload is strict mode's decision for a downloaded .deb no
-// current snapshot vouches for, after prefetchCheck could not read the
-// vouching hashes (final review R4 #2): the decision prefetchCheck makes,
-// on runFetch's read after the download — the attempt ends (end, with res)
-// refused, or errUnvouchedRetryable while a signed adoption is in flight on
-// the host (serveCacheMiss waits and retries the miss once; the retry
-// checks before its download again).
+// current snapshot vouches for, in two cases: prefetchCheck could not read
+// the vouching hashes (final review R4 #2), or it found the .deb vouched
+// and the vouching is gone after the download — the snapshot retired, or
+// displaced by one that does not list the .deb, while it downloaded
+// (ruling HD-6). It is the decision prefetchCheck makes, on runFetch's read
+// after the download — the attempt ends (end, with res) refused, or
+// errUnvouchedRetryable while a signed adoption is in flight on the host
+// (serveCacheMiss waits and retries the miss once; the retry checks before
+// its download again). Where strict mode would not refuse an unvouched
+// .deb, the downloaded one is served unchecked, as before.
 //
 // AIDEV-NOTE: no second look here (prefetchRecheck, R1 #2): the
 // race it closes — an adoption committing and ending between the lookup
 // and the in-flight check — would need the read before the download to
-// have failed too; its cost is one refusal, Retry-After 60. A failure of
-// both reads fails open: the post-download read's WARN path serves.
+// have failed too, or (HD-6) the vouching it found to have ended during
+// the download; its cost is one refusal, Retry-After 60. A failure of
+// both reads fails open: the post-download read's WARN path serves. So
+// does a failed post-download read after one before it that found the
+// .deb vouched: HD-6 decides a read after the download that finds no
+// row, not one that fails.
 func (h *Handler) strictAfterDownload(ctx context.Context, req *proxy.Request) (res sfResult, end bool) {
 	switch sm, snapID, count := h.classifyStrictMode(ctx,
 		req.CanonicalScheme, req.CanonicalHost); sm {

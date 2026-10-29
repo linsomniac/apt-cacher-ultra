@@ -67,3 +67,6 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 - Upstream downloads are no longer decompressed in transit (a gzip-encoded
   body skipped the size check, and a resumed one could be corrupted), and
   adoption stops a member's download at the size its `Release` declares.
+- With `integrity.refuse_unvouched_debs`, a `.deb` whose vouching snapshot
+  is retired or replaced while it downloads is refused like any unvouched
+  `.deb`, instead of being served unchecked.
