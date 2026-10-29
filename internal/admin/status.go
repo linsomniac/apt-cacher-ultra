@@ -372,8 +372,9 @@ type adoptionEntry struct {
 	// Reason is the SPEC5 §10.5 additive sub-classification. Empty on
 	// success; for gpg_failed it carries the specific verifier
 	// sentinel (untrusted_signer, short_keyid, crypto_verify_failed,
-	// missing_signature, malformed_clearsign, ambiguous_keyid,
-	// no_usable_signature); for other failures it mirrors Outcome.
+	// missing_signature, malformed_clearsign, malformed_signature,
+	// ambiguous_keyid, no_usable_signature); for other failures it
+	// mirrors Outcome.
 	// JSON-omitted when empty so the wire shape is unchanged for
 	// success rows.
 	Reason string `json:"reason,omitempty"`
@@ -1114,7 +1115,9 @@ func reasonTooltip(reason string) string {
 	case "missing_signature":
 		return "InRelease body is not clearsigned. Plain-text InRelease files are never adopted as signed metadata, whatever adoption.require_signature says."
 	case "malformed_clearsign":
-		return "InRelease starts like a clearsigned message but its signature frame does not decode."
+		return "InRelease starts like a clearsigned message but is not one in the shape apt accepts: its signature frame does not decode, or a line follows the signature, its armor checksum is forged, its armor is damaged, or it carries packets apt refuses."
+	case "malformed_signature":
+		return "The upstream Release.gpg is not one ASCII-armored signature block as apt requires — bytes around it, a binary signature, or a damaged armor."
 	case "ambiguous_keyid":
 		return "Two or more keys in the trust set share the same 8-byte keyid; the short-keyid fallback refuses to guess."
 	case "crypto_verify_failed":

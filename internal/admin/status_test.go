@@ -634,7 +634,7 @@ func TestOutcomeBadgeClass(t *testing.T) {
 // reason (spec C5 rev 4) must each return a specific, non-passthrough
 // explanation; unknown tags pass through verbatim.
 func TestReasonTooltip(t *testing.T) {
-	for _, tag := range []string{"member_fetch_failed", "db_failed", "malformed_clearsign"} {
+	for _, tag := range []string{"member_fetch_failed", "db_failed", "malformed_clearsign", "malformed_signature"} {
 		got := reasonTooltip(tag)
 		if got == "" || got == tag {
 			t.Errorf("reasonTooltip(%q) = %q; want a specific explanation, not passthrough", tag, got)

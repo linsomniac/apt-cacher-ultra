@@ -153,6 +153,8 @@ func ClassifyVerifyErr(err error) string {
 		return "unpinned_suite"
 	case errors.Is(err, ErrMalformedClearsign):
 		return "malformed_clearsign"
+	case errors.Is(err, ErrMalformedSignature):
+		return "malformed_signature"
 	case errors.Is(err, ErrMissingSignature):
 		return "missing_signature"
 	case errors.Is(err, ErrShortKeyID):
@@ -182,8 +184,20 @@ var (
 
 	// ErrMalformedClearsign means the body carries the clearsign marker
 	// but is not a decodable clearsigned message (no END line, no
-	// signature frame, zero signed lines). It is never treated as text.
+	// signature frame, zero signed lines), or not one in the shape apt
+	// accepts (F0–F6, armor_shape.go and packet_shape.go: a line after
+	// the END line, a forged armor checksum, a damaged armor, packets apt
+	// refuses). It is never treated as text.
 	ErrMalformedClearsign = errors.New("InRelease clearsign envelope is malformed")
+
+	// ErrMalformedSignature means a Release.gpg is not one ASCII-armored
+	// signature block in the shape apt accepts (F0–F6, both forms' rules:
+	// bytes before its BEGIN line — a binary signature included — or after
+	// its END line, a damaged armor, a forged armor checksum, packets apt
+	// refuses). The detached twin of ErrMalformedClearsign. Its text starts
+	// with the file's name, capital R and all (the hardening plan's DN-4),
+	// hence the ST1005 exemption.
+	ErrMalformedSignature = errors.New("Release.gpg is not one ASCII-armored signature block apt accepts") //nolint:staticcheck // ST1005: starts with the file name Release.gpg
 
 	// ErrShortKeyID means the signature lacks the long-form
 	// IssuerFingerprint subpacket. SPEC2 §7.6.3 rejects short-keyid-
@@ -242,17 +256,21 @@ func decodeClearsigned(b []byte) (block *clearsign.Block, err error) {
 //     clearsign.Decode silently discards prefix data, so we enforce
 //     "exactly one clearsigned message: its first line is the BEGIN
 //     marker (apt's rule, ruling R-D2 — no leading byte, whitespace
-//     included), and at most whitespace follows the END marker" before
-//     invoking the decoder (requireBareClearsigned). Without this, an
-//     adversary could prepend forged content to a real InRelease;
-//     the verifier would happily verify the embedded message while
-//     §7.5 step 2 stored the original (prefix-bearing) bytes as the
+//     included), and the first END marker begins its last line" before
+//     invoking the decoder (requireBareClearsigned: F1 and F0). Without
+//     this, an adversary could prepend forged content to a real
+//     InRelease; the verifier would happily verify the embedded message
+//     while §7.5 step 2 stored the original (prefix-bearing) bytes as the
 //     pool blob — a cache-pollution path.
 //  2. Resolve per-suite trust set; if RequirePinned and no match, abort.
 //  3. Decode the clearsigned block; a body without the marker is
 //     ErrMissingSignature, one that does not decode is
 //     ErrMalformedClearsign, in every mode.
-//  4. Iterate signature packets, attempting cryptographic verification
+//  4. Refuse the armor and packet shapes apt refuses (F2–F6,
+//     requireInlineSignatureShape), on the bypass path too: the END
+//     line's form, the armor checksum, the lines inside the armor,
+//     signature packets only. ErrMalformedClearsign.
+//  5. Iterate signature packets, attempting cryptographic verification
 //     of each candidate (one with a trusted IssuerFingerprint)
 //     against the trust-set EntityList. Accept only on a packet that
 //     BOTH passes the long-form-fingerprint trust check AND verifies
@@ -266,8 +284,8 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 	_ = ctx
 
 	// Step 1: structural input guard — no prefix or suffix data
-	// around the clearsigned block. requireBareClearsigned returns
-	// nil when no BEGIN marker is present, so plain-text bodies
+	// around the clearsigned block (F1, F0). requireBareClearsigned
+	// returns nil when no BEGIN marker is present, so plain-text bodies
 	// reach Step 3, which rejects them with ErrMissingSignature.
 	if err := requireBareClearsigned(inRelease); err != nil {
 		return nil, err
@@ -315,6 +333,11 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 		if err != nil {
 			return nil, fmt.Errorf("read signature: %w", err)
 		}
+		// Step 4 on the bypass path: F2–F6 are structural, so the
+		// relaxation of trust leaves them in force (DN-3).
+		if err := requireInlineSignatureShape(inRelease, sigBytes); err != nil {
+			return nil, err
+		}
 		if err := requireParseableSignature(bytes.NewReader(sigBytes)); err != nil {
 			return nil, fmt.Errorf("clearsigned signature body: %w", err)
 		}
@@ -334,13 +357,17 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 		return nil, fmt.Errorf("%w: pin matched but no key in host keyring satisfies it", ErrNoUsableSignature)
 	}
 
-	// Step 4: per-packet verify-and-trust loop. A signature packet is
-	// accepted iff it carries a long-form IssuerFingerprint that is
-	// in trustFPs AND verifies cryptographically against trustSet.
 	sigBytes, err := readArmoredSignature(block.ArmoredSignature.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read signature: %w", err)
 	}
+	// Step 4: the armor and packet shapes apt refuses (F2–F6).
+	if err := requireInlineSignatureShape(inRelease, sigBytes); err != nil {
+		return nil, err
+	}
+	// Step 5: per-packet verify-and-trust loop. A signature packet is
+	// accepted iff it carries a long-form IssuerFingerprint that is
+	// in trustFPs AND verifies cryptographically against trustSet.
 	if err := v.verifyAnyTrusted(suite, trustSet, trustFPs, block.Bytes, sigBytes); err != nil {
 		return nil, err
 	}
@@ -353,17 +380,21 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 // success — there is no "extracted plaintext" the way clearsign has;
 // the Release file IS the verified plaintext.
 //
-// sigBytes may be either binary or ASCII-armored. apt-ftparchive's
-// recommended workflow emits ASCII-armored Release.gpg
-// (`gpg --detach-sign --armor`), but binary Release.gpg also exists in
-// the wild; both forms are accepted.
+// sigBytes must be one ASCII-armored signature block, as apt-ftparchive's
+// recommended workflow emits it (`gpg --detach-sign --armor`), in the
+// shape apt accepts: its first line is the BEGIN line, nothing follows
+// its END line, and its armor and packets pass F0–F6 (armor_shape.go,
+// packet_shape.go). A binary Release.gpg is refused, as apt 2.2 to 3.2
+// refuse it ("unsupported binary format"). Each refusal is
+// ErrMalformedSignature.
 //
 // Order of checks (each fails closed):
 //  1. Empty inputs are a programming error in the caller (the
 //     freshness checker only routes here when both Release and
 //     Release.gpg fetched non-empty bodies).
 //  2. Resolve per-suite trust set; if RequirePinned and no match, abort.
-//  3. De-armor sigBytes if it looks armored; otherwise treat as binary.
+//  3. De-armor sigBytes, refusing the shapes apt refuses (F1, F0, F2–F6:
+//     decodeMaybeArmoredSignature), on the bypass path too.
 //  4. Iterate signature packets, accepting on the first packet that
 //     BOTH passes the long-form-fingerprint trust check AND verifies
 //     cryptographically against trustSet — same per-packet coupling
@@ -374,25 +405,28 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 // function (the freshness checker only switches to detached mode
 // after fetching both bodies).
 //
-// AIDEV-NOTE: we deliberately do NOT enforce a "bare armor" guard
-// equivalent to requireBareClearsigned. clearsign.Decode silently
-// strips prefix bytes around its envelope, which can alias verified-
-// bytes vs stored-bytes when the InRelease blob lands in the pool.
-// armor.Decode also strips, but for Release.gpg the stored bytes
-// (whatever they are) are served verbatim to apt clients on every
-// subsequent fetch, which re-verify against the same key. What this
-// enforces: both bodies non-empty, the suite's trust set (pins first),
-// and one signature packet that passes the trust check and verifies —
-// except under accept_any_signer with no pin matched, where one parseable
-// signature packet is enough (SPEC2 §7.6.2's bypass, below).
-// It does NOT accept only what apt accepts: the 2026-09 security review
-// found apt 3.3.2 rejecting shapes this accepts, all still open — bytes
-// or lines around the armor, two concatenated armor blocks and a binary
-// Release.gpg (VC-2; the binary form is documented), a forged `=CRC`
-// line (C-4), a second, bad signature from the same trusted key beside
-// a good one (VC-1: verifyAnyTrusted accepts on the first packet that
-// verifies), and weak digests or keys (C-3: VerifyDetachedSignature
-// runs with a nil config, no algorithm policy, so SHA-1 and RSA-1024 pass).
+// AIDEV-NOTE: the detached form's "bare armor" guard, the twin of
+// requireBareClearsigned's. Until the 2026-10-28 hardening plan this
+// deliberately enforced none — armor.Decode strips bytes around the
+// armor, and the stored bytes are what apt clients re-verify — and so
+// adopted what apt refuses (the 2026-09 security review's VC-2: bytes or
+// lines around the armor, two concatenated armor blocks, a binary
+// Release.gpg; C-4: a forged `=CRC` line), and every client of the suite
+// then failed `apt update`. Enforced now (the plan's DN-3), by
+// decodeMaybeArmoredSignature on the bypass path too: the BEGIN line at
+// byte 0 (F1: a binary signature fails it), the first END marker
+// beginning the last line (F0), the END line's form (F2), the armor
+// checksum (F3), no "-" line inside the armor (F4), headers with ": "
+// (F5), signature packets only (F6). Besides that: both bodies
+// non-empty, the suite's trust set (pins first), and one signature
+// packet that passes the trust check and verifies — except under
+// accept_any_signer with no pin matched, where one parseable signature
+// packet is enough (SPEC2 §7.6.2's bypass, below). Still open: a second,
+// bad signature from a trusted key beside a good one (VC-1:
+// verifyAnyTrusted accepts on the first packet that verifies; the
+// hardening plan's Task 7), and weak digests or keys (C-3:
+// VerifyDetachedSignature runs with a nil config, no algorithm policy,
+// so SHA-1 and RSA-1024 pass).
 func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef, releaseBytes, sigBytes []byte) ([]byte, error) {
 	_ = ctx
 
@@ -416,12 +450,11 @@ func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef,
 		// returned verbatim, matching the verified-bytes-equal-stored-
 		// bytes invariant.
 		//
-		// decodeMaybeArmoredSignature only structurally validates the
-		// ASCII-armor frame when present; for non-armored input it
-		// merely size-caps the bytes. requireParseableSignature is the
-		// invariant that "the body actually decodes as at least one
-		// OpenPGP signature packet" — without it, raw non-armored
-		// garbage under 64 KiB would propagate untouched into the pool.
+		// decodeMaybeArmoredSignature refuses the shapes apt refuses
+		// (F1, F0, F2–F6: structural, so in force on this path too),
+		// and requireParseableSignature adds that the armor holds at
+		// least one OpenPGP signature packet — F6 alone passes an armor
+		// with no packet at all.
 		binarySig, err := decodeMaybeArmoredSignature(sigBytes)
 		if err != nil {
 			return nil, fmt.Errorf("decode signature: %w", err)
@@ -452,50 +485,65 @@ func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef,
 }
 
 // decodeMaybeArmoredSignature returns the binary signature packet
-// bytes for a Release.gpg blob. If the input begins with an armor
-// frame ("-----BEGIN PGP SIGNATURE-----" after optional whitespace),
-// it is de-armored; otherwise the bytes are returned as-is.
+// bytes of a Release.gpg that is one ASCII-armored signature block in
+// the shape apt accepts, and refuses anything else with
+// ErrMalformedSignature: a first line that is not the BEGIN line (F1 —
+// bytes before the armor, or a binary signature), an armor go-crypto
+// cannot decode or of another type, and the F0, F2–F5 and F6 failures.
+// (The name is older than the refusal of binary signatures, which it
+// used to return as they were.)
 //
 // Caps the binary output at 64 KiB — real Release.gpg signatures are
 // well under 1 KiB; the cap bounds memory if a hostile upstream feeds
-// a giant fake signature.
+// a giant fake signature. A body that does not de-armor (illegal
+// base64) or runs past the cap keeps its plain error, as an InRelease's
+// does in readArmoredSignature.
 func decodeMaybeArmoredSignature(b []byte) ([]byte, error) {
 	const maxBinary = 64 << 10
-	if isArmoredSignature(b) {
-		block, err := armor.Decode(bytes.NewReader(b))
-		if err != nil {
-			return nil, fmt.Errorf("armor decode: %w", err)
-		}
-		if block.Type != "PGP SIGNATURE" {
-			return nil, fmt.Errorf("unexpected armor type %q (want \"PGP SIGNATURE\")", block.Type)
-		}
-		out, err := io.ReadAll(io.LimitReader(block.Body, int64(maxBinary)+1))
-		if err != nil {
-			return nil, err
-		}
-		if len(out) > maxBinary {
-			return nil, fmt.Errorf("signature too large (>%d bytes after de-armor)", maxBinary)
-		}
-		return out, nil
+	if !isArmoredSignature(b) {
+		return nil, fmt.Errorf("%w: its first line is not %q followed only by blanks (bytes before the armor, or a binary signature, which apt refuses)", ErrMalformedSignature, sigArmorBegin)
 	}
-	if len(b) > maxBinary {
-		return nil, fmt.Errorf("signature too large (>%d bytes)", maxBinary)
+	block, err := armor.Decode(bytes.NewReader(b))
+	if err != nil {
+		return nil, fmt.Errorf("%w: armor decode: %v", ErrMalformedSignature, err)
 	}
-	return b, nil
+	if block.Type != "PGP SIGNATURE" {
+		return nil, fmt.Errorf("%w: unexpected armor type %q (want \"PGP SIGNATURE\")", ErrMalformedSignature, block.Type)
+	}
+	out, err := io.ReadAll(io.LimitReader(block.Body, int64(maxBinary)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > maxBinary {
+		return nil, fmt.Errorf("signature too large (>%d bytes after de-armor)", maxBinary)
+	}
+	// F0 and F2–F5 on the raw bytes beside the decode, then F6 on what
+	// it decoded (armor_shape.go's AIDEV-NOTE: go-crypto's armor reader
+	// skips what apt refuses). The armor's BEGIN line is line 0 (F1).
+	lines := splitLines(b)
+	if err := requireEndMarkerBeginsLastLine(b, lines); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrMalformedSignature, err)
+	}
+	if err := checkSignatureArmor(b, lines, 0, out); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrMalformedSignature, err)
+	}
+	if err := requireSignaturePacketsOnly(out); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrMalformedSignature, err)
+	}
+	return out, nil
 }
 
-// isArmoredSignature returns true iff b (after skipping leading
-// whitespace) begins with the standard "PGP SIGNATURE" armor header.
+// isArmoredSignature is F1 for the detached form: b's first line is the
+// armor's BEGIN line, "-----BEGIN PGP SIGNATURE-----" followed only by
+// spaces, tabs and CRs, with nothing before it — no leading whitespace or
+// blank line (d_lead_ws, d_lead_nl), no BOM (x3d_bom), and so no binary
+// signature, which apt 2.2 to 3.2 refuse (d_binary).
 func isArmoredSignature(b []byte) bool {
-	for len(b) > 0 {
-		c := b[0]
-		if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
-			b = b[1:]
-			continue
-		}
-		break
+	first := b
+	if i := bytes.IndexByte(b, '\n'); i >= 0 {
+		first = b[:i]
 	}
-	return bytes.HasPrefix(b, []byte("-----BEGIN PGP SIGNATURE-----"))
+	return isMarkerLine(first, sigArmorBegin)
 }
 
 // clearsignBeginMarker opens a clearsigned message (deferred minor A-50:
@@ -505,59 +553,90 @@ const clearsignBeginMarker = "-----BEGIN PGP SIGNED MESSAGE-----"
 // requireBareClearsigned enforces apt's shape on a body that carries the
 // clearsign marker: its FIRST line is exactly the marker (trailing CR,
 // space and tab ignored — aptpath.SniffInRelease, apt's
-// StartsWithGPGClearTextSignature), and only whitespace follows the END
-// line. clearsign.Decode silently strips bytes around the message; we
-// reject them to keep "verified bytes == stored bytes (modulo trailing
-// newlines)" — SPEC2 §7.5 step 2. Both failures are
-// ErrMalformedClearsign (deferred minor A-51).
+// StartsWithGPGClearTextSignature: F1), and the first END marker in the
+// body begins its last line (F0: after the END line nothing, or one LF).
+// clearsign.Decode silently strips bytes around the message; we reject
+// them to keep "verified bytes == stored bytes" — SPEC2 §7.5 step 2. Both
+// failures are ErrMalformedClearsign (deferred minor A-51).
 //
 // AIDEV-NOTE: ruling R-D2 (phase D). A snapshot anchor is served to apt
 // clients, which reject an InRelease whose first line is not the marker
 // (leading whitespace or a blank line included), so adoption refuses that
 // too — the first-line rule the handler's sniff applies before a body
-// earns a suite row or a signed-seen marker. Enforced for the inline form:
-// that first line, nothing but whitespace after END, a decodable envelope,
-// and one trusted signature packet that verifies (under accept_any_signer
-// with no pin matched, one parseable signature packet: SPEC2 §7.6.2's
-// bypass). That is still not exactly what apt accepts: the 2026-09
-// security review's VC-2 (apt 3.3.2 rejects any line after END, an empty
-// one included), C-4 (a forged `=CRC` line before END), VC-1 (a second,
-// bad signature from the same trusted key beside a good one) and C-3 (no
-// algorithm policy: a SHA-1 digest or an RSA-1024 key verifies) are
-// accepted here and open.
+// earns a suite row or a signed-seen marker (F1). The 2026-09 security
+// review found shapes apt rejects that this adopted: VC-2, any line after
+// the END line, an empty one included (this guard let whitespace through
+// there until the 2026-10-28 hardening plan), and C-4, a forged `=CRC`
+// line. Enforced for the inline form now (the plan's DN-3, F0–F6, on the
+// bypass path too): that first line (F1); the first END marker beginning
+// the last line (F0, here: no line after the END line, no dash-escaped END
+// in the signed text); a decodable envelope; after the decode, the armor
+// and packet shapes apt accepts (requireInlineSignatureShape: the END
+// line's form, no text after its marker, F2; the armor checksum F3; no "-"
+// line inside the armor F4; headers with ": " F5; signature packets only
+// F6); and one trusted signature packet that verifies (under
+// accept_any_signer with no pin matched, one parseable signature packet:
+// SPEC2 §7.6.2's bypass). Still open: VC-1 (a second, bad signature from a
+// trusted key beside a good one: the hardening plan's Task 7) and C-3 (no
+// algorithm policy: a SHA-1 digest or an RSA-1024 key verifies).
 //
 // A body without the marker returns nil: the decode step rejects it with
-// ErrMissingSignature.
+// ErrMissingSignature. So does one without an END marker: the decoder
+// then reports it.
 func requireBareClearsigned(b []byte) error {
-	const endSig = "-----END PGP SIGNATURE-----"
 	if !bytes.Contains(b, []byte(clearsignBeginMarker)) {
 		return nil
 	}
 	if !aptpath.SniffInRelease(b) {
 		return fmt.Errorf("%w: the first line is not the BEGIN marker (apt rejects it)", ErrMalformedClearsign)
 	}
-	endIdx := bytes.Index(b, []byte(endSig))
-	if endIdx < 0 {
+	if !bytes.Contains(b, []byte(sigArmorEnd)) {
 		// Missing END marker — let clearsign.Decode produce the real
 		// error. Don't fabricate one here.
 		return nil
 	}
-	if !isWhitespaceOnly(b[endIdx+len(endSig):]) {
-		return fmt.Errorf("%w: extraneous bytes after the END marker", ErrMalformedClearsign)
+	if err := requireEndMarkerBeginsLastLine(b, splitLines(b)); err != nil {
+		return fmt.Errorf("%w: %v", ErrMalformedClearsign, err)
 	}
 	return nil
 }
 
-func isWhitespaceOnly(b []byte) bool {
-	for _, c := range b {
-		switch c {
-		case ' ', '\t', '\r', '\n':
-			continue
-		default:
-			return false
+// requireInlineSignatureShape applies F2–F6 to an InRelease whose envelope
+// decoded (requireBareClearsigned applied F1 and F0 before the decode):
+// F2–F5 to the armor that follows the signed text, F6 to sigBytes, the
+// signature packets the decoder read from it. A failure is
+// ErrMalformedClearsign.
+//
+// The armor's BEGIN line is the first line from line 1 on that is
+// "-----BEGIN PGP SIGNATURE-----" followed only by spaces, tabs and CRs,
+// as apt reads it. go-crypto ends the signed text at the first line that
+// is exactly the marker (one CR stripped) and takes a line with trailing
+// blanks as text, since dash-escaping is optional to it; such an
+// unescaped line in the signed text is found here first, and F4 then
+// refuses the real BEGIN line inside the armor it opens.
+// aptpath.DecodableClearsign rewrites only line 0, so these line indexes
+// on inRelease are the decoder's too.
+func requireInlineSignatureShape(inRelease, sigBytes []byte) error {
+	lines := splitLines(inRelease)
+	begin := -1
+	for i := 1; i < len(lines); i++ {
+		if isMarkerLine(lineAt(inRelease, lines, i), sigArmorBegin) {
+			begin = i
+			break
 		}
 	}
-	return true
+	if begin < 0 {
+		// The decoder found an armor, at a line this search accepts too:
+		// unreachable, but never assumed.
+		return fmt.Errorf("%w: no signature BEGIN line", ErrMalformedClearsign)
+	}
+	if err := checkSignatureArmor(inRelease, lines, begin, sigBytes); err != nil {
+		return fmt.Errorf("%w: %v", ErrMalformedClearsign, err)
+	}
+	if err := requireSignaturePacketsOnly(sigBytes); err != nil {
+		return fmt.Errorf("%w: %v", ErrMalformedClearsign, err)
+	}
+	return nil
 }
 
 // resolveTrustSet implements SPEC2 §7.6.2. Returns:
@@ -912,9 +991,10 @@ func (v *Verifier) logUnverifiedSignerOnce(suite freshness.SuiteRef, sigSource i
 // This is the structural-integrity guard for the accept_any_signer
 // bypass branches (SPEC2 §7.6.3): the trust + cryptographic check is
 // skipped, but a clearsign envelope or Release.gpg blob that doesn't
-// contain a parseable PGP signature packet must still be rejected —
-// otherwise raw non-armored garbage (which decodeMaybeArmoredSignature
-// only size-caps) would silently pass through to the pool.
+// contain a parseable PGP signature packet must still be rejected.
+// F6 (requireSignaturePacketsOnly), which runs before it on both
+// branches, refuses every packet that is not a parseable signature;
+// this adds that there is at least one.
 func requireParseableSignature(r io.Reader) error {
 	reader := packet.NewReader(r)
 	for {

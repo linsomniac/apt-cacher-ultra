@@ -708,12 +708,13 @@ optional file that lists only a SHA512 hash and fails its integrity check
 is not retried by automatic repair; the reconcile on unchanged checks
 still heals the index files apt requests.
 
-A `Release.gpg` in binary form (not ASCII-armored) is accepted: the cache
-adopts a repository that publishes `Release` with such a signature. apt
-2.2 to 3.2 refuse it, through the cache or directly ("Detached signature
-file … is in unsupported binary format"), so such a repository is
-unusable unless it also publishes an `InRelease`, which apt then uses
-instead (Jitsi's repository does).
+A `Release.gpg` in binary form (not ASCII-armored) is refused, as apt 2.2
+to 3.2 refuse it, through the cache or directly ("Detached signature
+file … is in unsupported binary format"): the cache does not adopt a
+`Release` with such a signature (reason `malformed_signature`, as for a
+`Release.gpg` with bytes around its armor). Such a repository is usable
+only if it also publishes an `InRelease`, which apt and the cache then
+use instead (Jitsi's repository does).
 
 ### Architecture and member availability
 

@@ -143,6 +143,29 @@ func detachSignWith(t *testing.T, e *openpgp.Entity, message []byte, armored boo
 	return buf.Bytes()
 }
 
+// armorSignature wraps binary signature packets in one ASCII armor
+// block, as `gpg --detach-sign --armor` writes a Release.gpg: the BEGIN
+// line, a blank line, the base64 lines, the CRC line of exactly these
+// bytes and the END line. A test that tampers with packets, or joins
+// several, armors the result with it so that the structural checks
+// (F0–F6) pass and the test reaches the check it is about.
+func armorSignature(t *testing.T, packets []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w, err := armor.Encode(&buf, "PGP SIGNATURE", nil)
+	if err != nil {
+		t.Fatalf("armor.Encode: %v", err)
+	}
+	if _, err := w.Write(packets); err != nil {
+		t.Fatalf("armor write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("armor close: %v", err)
+	}
+	buf.WriteByte('\n')
+	return buf.Bytes()
+}
+
 // clearsignWith produces a clearsigned message body equivalent to what
 // apt's repo-signing tooling emits for InRelease. The signature is
 // over the canonicalized cleartext.

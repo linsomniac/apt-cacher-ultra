@@ -441,10 +441,14 @@ func TestVerifier_RejectsSuffixGarbage(t *testing.T) {
 	}
 }
 
-func TestVerifier_AcceptsTrailingNewlines(t *testing.T) {
-	// Whitespace-only trailing bytes are conventional (apt's own
-	// InRelease frequently ends with a final newline after the END
-	// marker). The strict guard must allow this.
+// TestVerifier_AcceptsOneFinalNewlineRefusesALineAfterEND (formerly
+// TestVerifier_AcceptsTrailingNewlines, which accepted "\n\n  \r\n" after
+// the END marker): an InRelease conventionally ends with one newline after
+// its END line, LF or CRLF, and that is accepted; but every apt 2.2–3.2
+// refuses any line after the END line, an empty or blank one included (the
+// corpus' i_trail_lf, i_trail_ws, x3i_after_end_cr_line), so the verifier
+// refuses it too (F0, the 2026-09 security review's VC-2).
+func TestVerifier_AcceptsOneFinalNewlineRefusesALineAfterEND(t *testing.T) {
 	signer := newTestEntity(t, "Signer", "signer@example.com")
 	keyring := newKeyring(t, signer)
 	v, _ := NewVerifier(VerifierConfig{
@@ -453,9 +457,19 @@ func TestVerifier_AcceptsTrailingNewlines(t *testing.T) {
 		Logger:           silentLogger(),
 	})
 	body := clearsignWith(t, signer, []byte(fakeReleasePlaintext))
-	withWS := append(append([]byte{}, body...), []byte("\n\n  \r\n")...)
-	if _, err := v.VerifyInline(context.Background(), newSuite(), withWS); err != nil {
-		t.Fatalf("trailing whitespace should be accepted: %v", err)
+	if !bytes.HasSuffix(body, []byte("-----END PGP SIGNATURE-----")) {
+		t.Fatalf("test premise: the clearsigned body does not end with the END marker: %q", body[len(body)-40:])
+	}
+	for _, tail := range []string{"", "\n", "\r\n"} {
+		if _, err := v.VerifyInline(context.Background(), newSuite(), append(append([]byte{}, body...), tail...)); err != nil {
+			t.Errorf("END line, then %q: %v; want accepted", tail, err)
+		}
+	}
+	for _, tail := range []string{"\n\n", "\n\n  \r\n", "\n\r", "\n \n"} {
+		_, err := v.VerifyInline(context.Background(), newSuite(), append(append([]byte{}, body...), tail...))
+		if !errors.Is(err, ErrMalformedClearsign) || !strings.Contains(err.Error(), "after the END marker") {
+			t.Errorf("END line, then %q: err = %v; want ErrMalformedClearsign, extraneous bytes after the END marker", tail, err)
+		}
 	}
 }
 
@@ -684,6 +698,12 @@ func TestClassifyVerifyErr(t *testing.T) {
 		{"missing_signature", ErrMissingSignature, "missing_signature"},
 		{"malformed_clearsign", ErrMalformedClearsign, "malformed_clearsign"},
 		{"malformed_clearsign_decoder_panic", fmt.Errorf("x: %w", errClearsignPanicked), "malformed_clearsign"},
+		{"malformed_signature", ErrMalformedSignature, "malformed_signature"},
+		{
+			"malformed_signature_as_verify_detached_wraps_it",
+			fmt.Errorf("decode signature: %w", fmt.Errorf("%w: %v", ErrMalformedSignature, errors.New("no END line"))),
+			"malformed_signature",
+		},
 		{"short_keyid", ErrShortKeyID, "short_keyid"},
 		{"untrusted_signer", ErrUntrustedSigner, "untrusted_signer"},
 		{"ambiguous_keyid", ErrAmbiguousKeyID, "ambiguous_keyid"},
@@ -997,12 +1017,14 @@ func TestVerifier_AcceptAnySigner_LogsOncePerSuite(t *testing.T) {
 }
 
 // TestVerifier_AcceptAnySigner_MalformedSignatureBody_StillRejected
-// asserts the requireParseableSignature guard for the inline bypass.
+// asserts the inline bypass refuses an armored body that is no packet.
 // clearsign.Decode validates the BEGIN/END envelope, and armor.Decode
 // validates base64 framing, but neither proves the armored body
-// contains a parseable OpenPGP signature packet. Without the strict
+// contains a parseable OpenPGP signature packet. Without a strict
 // guard, a clearsigned envelope whose armored body is garbage would
-// silently adopt under the bypass.
+// silently adopt under the bypass. The guard was requireParseableSignature;
+// F6 (requireSignaturePacketsOnly, structural, so on the bypass too) now
+// refuses it first, as ErrMalformedClearsign.
 func TestVerifier_AcceptAnySigner_MalformedSignatureBody_StillRejected(t *testing.T) {
 	other := newTestEntity(t, "Other", "other@example.com")
 	keyring := newKeyring(t, other)
@@ -1027,8 +1049,8 @@ func TestVerifier_AcceptAnySigner_MalformedSignatureBody_StillRejected(t *testin
 	}
 
 	_, err = v.VerifyInline(context.Background(), newSuite(), body)
-	if err == nil {
-		t.Fatal("expected error on clearsigned envelope with malformed signature body under accept_any_signer")
+	if !errors.Is(err, ErrMalformedClearsign) {
+		t.Fatalf("err = %v; want ErrMalformedClearsign on clearsigned envelope with malformed signature body under accept_any_signer", err)
 	}
 }
 
