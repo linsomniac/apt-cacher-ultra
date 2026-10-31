@@ -178,7 +178,7 @@ type adoptionTestEnv struct {
 func newAdoptionTestEnv(t *testing.T) *adoptionTestEnv {
 	t.Helper()
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger()) // no migration noise (final review, tests Minor 2)
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -190,11 +190,12 @@ func newAdoptionTestEnv(t *testing.T) *adoptionTestEnv {
 		Fetcher:     ff,
 		Verifier:    passThroughVerifier{},
 		HostLimiter: hostsem.New(8),
+		Logger:      discardLogger(), // silent (final fix wave FW-6: it logged adoption_success & co. to stderr)
 	})
 	if err != nil {
 		t.Fatalf("NewAdopter: %v", err)
 	}
-	return &adoptionTestEnv{
+	env := &adoptionTestEnv{
 		t:        t,
 		cache:    c,
 		adopter:  ad,
@@ -205,6 +206,20 @@ func newAdoptionTestEnv(t *testing.T) *adoptionTestEnv {
 			CanonicalHost:   "archive.ubuntu.com",
 			SuitePath:       "/ubuntu/dists/noble",
 		},
+	}
+	// Spec C3: CommitAdoption is UPDATE-only, so an adopted suite needs a
+	// row — in production the handler created it before any check ran.
+	trackSuite(t, c, env.suite)
+	return env
+}
+
+// trackSuite gives suite a suite_freshness row: spec C3 lets only the
+// handler create rows, and CommitAdoption (UPDATE-only) and the checker
+// (I-4) need one.
+func trackSuite(t testing.TB, c *cache.Cache, suite SuiteRef) {
+	t.Helper()
+	if err := c.EnsureSuiteForTest(context.Background(), suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath); err != nil {
+		t.Fatalf("EnsureSuiteForTest: %v", err)
 	}
 }
 
@@ -399,8 +414,8 @@ func TestAdopter_DetachedHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSuiteSnapshot: %v", err)
 	}
-	if snap.InReleaseHash != nil {
-		t.Errorf("detached snapshot has unexpected inrelease_hash=%s", *snap.InReleaseHash)
+	if snap.SingleAnchorHash != nil {
+		t.Errorf("detached snapshot has unexpected inrelease_hash=%s", *snap.SingleAnchorHash)
 	}
 	if snap.ReleaseHash == nil || *snap.ReleaseHash != shaOf(releaseText) {
 		t.Errorf("release_hash = %v, want %s", snap.ReleaseHash, shaOf(releaseText))
@@ -468,7 +483,7 @@ func TestAdopter_FormDriftWARN_OnFormTransition(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -513,6 +528,7 @@ func TestAdopter_FormDriftWARN_OnFormTransition(t *testing.T) {
 
 	// First adoption: inline. With no prior current snapshot,
 	// adoption_form_drift must NOT fire — first adoption is not drift.
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, inlineRelease, "etag-1", ""); err != nil {
 		t.Fatalf("Run inline: %v", err)
 	}
@@ -798,12 +814,12 @@ func TestIsIndexTarget(t *testing.T) {
 		"InRelease",
 	}
 	for _, p := range indexTargets {
-		if !isIndexTarget(p) {
+		if !isIndexTarget(testDistsSuite, p) {
 			t.Errorf("isIndexTarget(%q) = false, want true", p)
 		}
 	}
 	for _, p := range optional {
-		if isIndexTarget(p) {
+		if isIndexTarget(testDistsSuite, p) {
 			t.Errorf("isIndexTarget(%q) = true, want false", p)
 		}
 	}
@@ -820,6 +836,7 @@ func newTolerantAdopter(t *testing.T, env *adoptionTestEnv) *Adopter {
 		Verifier:                       passThroughVerifier{},
 		HostLimiter:                    hostsem.New(8),
 		TolerateOptionalMemberFailures: true,
+		Logger:                         discardLogger(),
 	})
 	if err != nil {
 		t.Fatalf("NewAdopter: %v", err)
@@ -1166,13 +1183,14 @@ func TestAdopter_RejectsUnsetDependencies(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			c, _ := cache.Open(context.Background(), dir, nil)
+			c, _ := cache.Open(context.Background(), dir, discardLogger())
 			t.Cleanup(func() { _ = c.Close() })
 			cfg := AdoptionConfig{
 				Cache:       c,
 				Fetcher:     newFakeFetcher(),
 				Verifier:    passThroughVerifier{},
 				HostLimiter: hostsem.New(1),
+				Logger:      discardLogger(),
 			}
 			tc.mutate(&cfg)
 			if _, err := NewAdopter(cfg); err == nil {
@@ -1227,87 +1245,6 @@ func (b *blockingFetcher) Fetch(ctx context.Context, target *fetch.Target, dst f
 		return nil, err
 	}
 	return &fetch.FetchResult{Status: 200, ContentLength: int64(len(body))}, nil
-}
-
-func TestAdopter_ConcurrencyCap(t *testing.T) {
-	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = c.Close() })
-
-	pending := make(chan blockReq, 8)
-	bf := &blockingFetcher{pending: pending}
-
-	ad, err := NewAdopter(AdoptionConfig{
-		Cache:         c,
-		Fetcher:       bf,
-		Verifier:      passThroughVerifier{},
-		HostLimiter:   hostsem.New(8),
-		MaxConcurrent: 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	suiteA := SuiteRef{CanonicalScheme: "http", CanonicalHost: "x.example", SuitePath: "/p1"}
-	suiteB := SuiteRef{CanonicalScheme: "http", CanonicalHost: "x.example", SuitePath: "/p2"}
-	body := []byte("body")
-	// Use Sources not Packages — step 8 would otherwise try to parse
-	// the test body. Concurrency-cap behavior is independent of which
-	// member type is being fetched.
-	releaseA, _ := makeRelease(map[string][]byte{"main/Sources": body})
-	releaseB, _ := makeRelease(map[string][]byte{"main/Sources": []byte("other body")})
-	bf.put("http://x.example/p1/main/Sources", body)
-	bf.put("http://x.example/p2/main/Sources", []byte("other body"))
-
-	// A starts; will block on member fetch.
-	doneA := make(chan error, 1)
-	go func() { doneA <- ad.Run(context.Background(), suiteA, releaseA, "", "") }()
-
-	var aReq blockReq
-	select {
-	case aReq = <-pending:
-	case <-time.After(2 * time.Second):
-		t.Fatal("goroutine A never reached fetch")
-	}
-
-	// B starts while A holds the cap. Must NOT enter Fetch.
-	doneB := make(chan error, 1)
-	go func() { doneB <- ad.Run(context.Background(), suiteB, releaseB, "", "") }()
-	select {
-	case <-pending:
-		t.Fatal("goroutine B reached fetch while concurrency cap was held")
-	case <-time.After(150 * time.Millisecond):
-		// expected
-	}
-
-	// Release A; A finishes, B can then take the slot.
-	close(aReq.release)
-	select {
-	case err := <-doneA:
-		if err != nil {
-			t.Fatalf("A: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("A never finished after release")
-	}
-	var bReq blockReq
-	select {
-	case bReq = <-pending:
-	case <-time.After(2 * time.Second):
-		t.Fatal("B never reached fetch after A released slot")
-	}
-	close(bReq.release)
-	select {
-	case err := <-doneB:
-		if err != nil {
-			t.Fatalf("B: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("B never finished")
-	}
 }
 
 // blobsInPool counts files under pool/. Tests use it to verify that
@@ -1400,6 +1337,7 @@ func TestAdopter_PackageHash_NonStandardSuiteSkips(t *testing.T) {
 	})
 	env.fetcher.put("http://weird.example/some/non-standard/path/main/binary-amd64/Packages", stanzas)
 
+	trackSuite(t, env.cache, env.suite)
 	if err := env.adopter.Run(context.Background(), env.suite, releaseText, "", ""); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -1679,7 +1617,7 @@ func TestBlobHeartbeatTracker_ConcurrentAddSnapshot(t *testing.T) {
 
 func TestRunHeartbeatTicker_AdvancesHeartbeatAt(t *testing.T) {
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1692,7 +1630,7 @@ func TestRunHeartbeatTicker_AdvancesHeartbeatAt(t *testing.T) {
 	if err := c.PutBlob(ctx, hash, 1); err != nil {
 		t.Fatal(err)
 	}
-	id, _, err := c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "tick.example",
 		SuitePath:       "/p",
@@ -1759,7 +1697,7 @@ func TestRunHeartbeatTicker_AdvancesHeartbeatAt(t *testing.T) {
 
 func TestRunHeartbeatTicker_DisabledWhenIntervalZero(t *testing.T) {
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1787,7 +1725,7 @@ func TestRunHeartbeatTicker_DisabledWhenIntervalZero(t *testing.T) {
 
 func TestRunHeartbeatTicker_ExitsOnCancelWithoutTickingMoreThanOnce(t *testing.T) {
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1846,7 +1784,7 @@ func TestAdopter_MemberSkipped_404SkipsMidList(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -1886,6 +1824,7 @@ func TestAdopter_MemberSkipped_404SkipsMidList(t *testing.T) {
 	ff.fail404(base + "main/Contents-amd64")
 	ff.put(base+"main/source/Sources", src)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("Run: %v (expected nil — 4xx members should skip, not abort)", err)
 	}
@@ -1996,8 +1935,8 @@ func TestAdopter_MemberSkipped_AllMembers404Fails(t *testing.T) {
 	env.fetcher.fail404(base + "main/source/Sources")
 
 	err := env.adopter.Run(context.Background(), env.suite, releaseText, "", "")
-	if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
-		t.Fatalf("Run err = %v, want wrapped ErrAdoptionMemberFetchFailed (all-skipped guard)", err)
+	if !errors.Is(err, ErrAdoptionGuardFailed) {
+		t.Fatalf("Run err = %v, want ErrAdoptionGuardFailed (all-skipped guard)", err)
 	}
 	if !strings.Contains(err.Error(), "all 2 declared members returned 4xx") {
 		t.Errorf("Run err = %q, want 'all 2 declared members returned 4xx' substring", err.Error())
@@ -2167,7 +2106,7 @@ func TestArchFromFilteredPath(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			gotArch, gotFiltered := archFromFilteredPath(tc.path)
+			gotArch, gotFiltered := archFromFilteredPath(testDistsSuite, tc.path)
 			if gotArch != tc.wantArch || gotFiltered != tc.wantFiltered {
 				t.Errorf("archFromFilteredPath(%q) = (%q, %v), want (%q, %v)",
 					tc.path, gotArch, gotFiltered, tc.wantArch, tc.wantFiltered)
@@ -2187,7 +2126,7 @@ func TestAdopter_MultiArch_NoFilter_AllArchsAdopted(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -2233,6 +2172,7 @@ func TestAdopter_MultiArch_NoFilter_AllArchsAdopted(t *testing.T) {
 	ff.put(base+"main/binary-arm64/Packages", pkgsArm64)
 	ff.put(base+"main/binary-i386/Packages", pkgsI386)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -2387,7 +2327,7 @@ func TestMissingRequestableIndexGroups(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := missingRequestableIndexGroups(tc.declared, tc.fetched, tc.allowlist)
+			got := missingRequestableIndexGroups(testDistsSuite, tc.declared, tc.fetched, tc.allowlist)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("missingRequestableIndexGroups() = %v, want %v", got, tc.want)
 			}
@@ -2400,7 +2340,7 @@ func TestAdopter_MultiArch_AllowlistFiltersOutOtherArchs(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -2441,6 +2381,7 @@ func TestAdopter_MultiArch_AllowlistFiltersOutOtherArchs(t *testing.T) {
 	// Deliberately seed arm64 too — the filter must skip without fetching.
 	ff.put(base+"main/binary-arm64/Packages", pkgsArm64)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -2505,7 +2446,7 @@ func TestAdopter_Allowlist_KeepsBinaryAllIndexTarget(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -2546,6 +2487,7 @@ func TestAdopter_Allowlist_KeepsBinaryAllIndexTarget(t *testing.T) {
 	ff.put(base+"main/binary-amd64/Packages", pkgsAmd64)
 	ff.put(base+"main/binary-all/Packages", pkgsAll)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -2606,7 +2548,7 @@ func TestAdopter_Allowlist_BlocksPublishWhenBinaryAllUnavailable(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -2647,8 +2589,8 @@ func TestAdopter_Allowlist_BlocksPublishWhenBinaryAllUnavailable(t *testing.T) {
 	ff.fail404(base + "main/binary-all/Packages")
 
 	err = ad.Run(context.Background(), suite, releaseText, "etag-1", "")
-	if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
-		t.Fatalf("want ErrAdoptionMemberFetchFailed (deferred), got %v", err)
+	if !errors.Is(err, ErrAdoptionGuardFailed) {
+		t.Fatalf("want ErrAdoptionGuardFailed (deferred), got %v", err)
 	}
 
 	// No degraded snapshot adopted — the (here: nonexistent) prior keeps serving.
@@ -2701,7 +2643,7 @@ func TestAdopter_Sources_HappyPath(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -2745,6 +2687,7 @@ func TestAdopter_Sources_HappyPath(t *testing.T) {
 	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
 	ff.put(base+"main/source/Sources", srcBody)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -2801,7 +2744,7 @@ func TestAdopter_Sources_CrossVariantDisagreement(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -2858,6 +2801,7 @@ func TestAdopter_Sources_CrossVariantDisagreement(t *testing.T) {
 	ff.put(base+"main/source/Sources", srcPlain)
 	ff.put(base+"main/source/Sources.gz", srcGz)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("cross-declaration Sources disagreement must be tolerated, got %v", err)
 	}
@@ -2897,7 +2841,7 @@ func TestAdopter_Sources_IntraFileOrigTarballConflict(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -2931,6 +2875,7 @@ func TestAdopter_Sources_IntraFileOrigTarballConflict(t *testing.T) {
 	ff.put(base+"main/binary-amd64/Packages", pkgs)
 	ff.put(base+"main/source/Sources", src)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("intra-file orig conflict must be tolerated, got %v", err)
 	}
@@ -2975,7 +2920,7 @@ func TestAdopter_PdiffIndex_HappyPath(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -3011,6 +2956,7 @@ func TestAdopter_PdiffIndex_HappyPath(t *testing.T) {
 	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
 	ff.put(base+"main/binary-amd64/Packages.diff/Index", indexBody)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -3062,7 +3008,7 @@ func TestAdopter_PdiffIndex_MalformedEntriesSkipped(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -3098,6 +3044,7 @@ func TestAdopter_PdiffIndex_MalformedEntriesSkipped(t *testing.T) {
 	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
 	ff.put(base+"main/binary-amd64/Packages.diff/Index", indexBody)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("Run: %v (malformed entry should be skipped, not abort)", err)
 	}
@@ -3132,7 +3079,7 @@ func TestAdopter_MultiArch_AllowlistKeepsSourcePseudoArch(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -3174,6 +3121,7 @@ func TestAdopter_MultiArch_AllowlistKeepsSourcePseudoArch(t *testing.T) {
 	ff.put(base+"main/binary-arm64/Packages", pkgsArm64)
 	ff.put(base+"main/source/Sources", srcBody)
 
+	trackSuite(t, c, suite)
 	if err := ad.Run(context.Background(), suite, releaseText, "etag-1", ""); err != nil {
 		t.Fatalf("Run: %v", err)
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"regexp"
@@ -241,21 +242,21 @@ func TestVerifier_MissingSignature_RequireTrue(t *testing.T) {
 	}
 }
 
-func TestVerifier_MissingSignature_RequireFalse(t *testing.T) {
+func TestVerifier_MissingSignature_RequireFalseStillRejected(t *testing.T) {
 	signer := newTestEntity(t, "Signer", "signer@example.com")
 	keyring := newKeyring(t, signer)
 	v, _ := NewVerifier(VerifierConfig{
 		Keyring:          keyring,
-		RequireSignature: false, // operator opted into unsigned mode
+		RequireSignature: false, // no longer relaxes inline verification (spec C5 rev 4)
 		Logger:           silentLogger(),
 	})
 
 	plain, err := v.VerifyInline(context.Background(), newSuite(), []byte(fakeReleasePlaintext))
-	if err != nil {
-		t.Fatalf("VerifyInline: %v", err)
+	if !errors.Is(err, ErrMissingSignature) {
+		t.Fatalf("err = %v, want ErrMissingSignature", err)
 	}
-	if !bytes.Equal(plain, []byte(fakeReleasePlaintext)) {
-		t.Fatalf("expected verbatim body return, got %q", plain)
+	if plain != nil {
+		t.Fatalf("expected nil result on rejection, got %q", plain)
 	}
 }
 
@@ -412,6 +413,9 @@ func TestVerifier_RejectsPrefixGarbage(t *testing.T) {
 	if !bytes.Contains([]byte(err.Error()), []byte("BEGIN marker")) {
 		t.Fatalf("error doesn't mention BEGIN marker: %v", err)
 	}
+	if ClassifyVerifyErr(err) != "malformed_clearsign" { // deferred minor A-51
+		t.Fatalf("reason = %q, want malformed_clearsign", ClassifyVerifyErr(err))
+	}
 }
 
 func TestVerifier_RejectsSuffixGarbage(t *testing.T) {
@@ -431,6 +435,9 @@ func TestVerifier_RejectsSuffixGarbage(t *testing.T) {
 	}
 	if !bytes.Contains([]byte(err.Error()), []byte("END marker")) {
 		t.Fatalf("error doesn't mention END marker: %v", err)
+	}
+	if ClassifyVerifyErr(err) != "malformed_clearsign" { // deferred minor A-51
+		t.Fatalf("reason = %q, want malformed_clearsign", ClassifyVerifyErr(err))
 	}
 }
 
@@ -452,11 +459,11 @@ func TestVerifier_AcceptsTrailingNewlines(t *testing.T) {
 	}
 }
 
-func TestVerifier_AllowsUnsignedBodyWithMarkerlessJunk(t *testing.T) {
-	// require_signature=false + body without any clearsign marker:
-	// return the body verbatim. The structural guard must not
-	// inadvertently reject plaintext bodies just because they
-	// happen to contain non-whitespace bytes.
+func TestVerifier_MarkerlessBodyRejectedWhenSignatureOptional(t *testing.T) {
+	// require_signature = false no longer passes plain bodies through;
+	// spec C5 rev 4. A body without any clearsign marker is
+	// ErrMissingSignature in every mode: the structural guard lets it
+	// through to the decode step, which rejects it.
 	signer := newTestEntity(t, "Signer", "signer@example.com")
 	keyring := newKeyring(t, signer)
 	v, _ := NewVerifier(VerifierConfig{
@@ -466,11 +473,11 @@ func TestVerifier_AllowsUnsignedBodyWithMarkerlessJunk(t *testing.T) {
 	})
 	plain := []byte("Origin: Plain\nSuite: noble\nSHA256:\n abc 12 main/Sources\n")
 	got, err := v.VerifyInline(context.Background(), newSuite(), plain)
-	if err != nil {
-		t.Fatalf("expected verbatim return for plain body: %v", err)
+	if !errors.Is(err, ErrMissingSignature) {
+		t.Fatalf("err = %v, want ErrMissingSignature", err)
 	}
-	if !bytes.Equal(got, plain) {
-		t.Fatalf("verbatim mismatch")
+	if got != nil {
+		t.Fatalf("expected nil result on rejection, got %q", got)
 	}
 }
 
@@ -675,6 +682,8 @@ func TestClassifyVerifyErr(t *testing.T) {
 		{"nil_returns_empty", nil, ""},
 		{"unpinned_suite", ErrUnpinnedSuite, "unpinned_suite"},
 		{"missing_signature", ErrMissingSignature, "missing_signature"},
+		{"malformed_clearsign", ErrMalformedClearsign, "malformed_clearsign"},
+		{"malformed_clearsign_decoder_panic", fmt.Errorf("x: %w", errClearsignPanicked), "malformed_clearsign"},
 		{"short_keyid", ErrShortKeyID, "short_keyid"},
 		{"untrusted_signer", ErrUntrustedSigner, "untrusted_signer"},
 		{"ambiguous_keyid", ErrAmbiguousKeyID, "ambiguous_keyid"},
@@ -875,11 +884,12 @@ func TestVerifier_AcceptAnySigner_MissingClearsign_RequireSig_StillRejected(t *t
 	}
 }
 
-// TestVerifier_AcceptAnySigner_NotClearsigned_RequireSigFalse asserts
-// the existing "unsigned-OK" passthrough is preserved: a body without
-// a clearsign envelope is returned verbatim when require_signature is
-// false, regardless of accept_any_signer.
-func TestVerifier_AcceptAnySigner_NotClearsigned_RequireSigFalse(t *testing.T) {
+// TestVerifier_AcceptAnySigner_NotClearsigned_RequireSigFalseRejected
+// asserts that a body without a clearsign envelope is rejected with
+// ErrMissingSignature even with require_signature = false and
+// accept_any_signer = true (spec C5 rev 4): accept_any_signer relaxes
+// trust, never the presence of a clearsigned envelope.
+func TestVerifier_AcceptAnySigner_NotClearsigned_RequireSigFalseRejected(t *testing.T) {
 	other := newTestEntity(t, "Other", "other@example.com")
 	keyring := newKeyring(t, other)
 
@@ -895,11 +905,11 @@ func TestVerifier_AcceptAnySigner_NotClearsigned_RequireSigFalse(t *testing.T) {
 
 	body := []byte(fakeReleasePlaintext)
 	plain, err := v.VerifyInline(context.Background(), newSuite(), body)
-	if err != nil {
-		t.Fatalf("VerifyInline: %v", err)
+	if !errors.Is(err, ErrMissingSignature) {
+		t.Fatalf("err = %v, want ErrMissingSignature", err)
 	}
-	if !bytes.Equal(plain, body) {
-		t.Fatalf("plaintext mismatch under require_signature=false passthrough")
+	if plain != nil {
+		t.Fatalf("expected nil result on rejection, got %q", plain)
 	}
 }
 

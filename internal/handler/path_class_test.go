@@ -114,10 +114,56 @@ func TestIsIndexTargetPath(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isIndexTargetPath(tc.path); got != tc.want {
+			if got := isIndexTargetPath("/ubuntu/dists/noble", tc.path); got != tc.want {
 				t.Errorf("isIndexTargetPath(%q) = %v, want %v", tc.path, got, tc.want)
 			}
 		})
+	}
+}
+
+// PR #8 parity item 2, the handler's isIndexTargetPath (the
+// snapshot_index_target_404 alert): a flat suite's suite-relative root
+// Packages, Packages.gz and Sources.xz are IndexTargets; its InRelease, a
+// .deb under it and its pdiff Index are not. Under a dists suite none of
+// the root paths is (spec C5's layout rule, as on the adoption side).
+func TestIsIndexTargetPath_LayoutAware(t *testing.T) {
+	targets := []string{"Packages", "Packages.gz", "Sources.xz"}
+	never := []string{"InRelease", "amd64/kubelet_1.34.1-1.1_amd64.deb", "Packages.diff/Index", "main/Packages.gz"}
+	for _, l := range []struct {
+		suite string
+		flat  bool
+	}{{"/core:/stable:/v1.34/deb", true}, {"/core:/stable:/v1.34/deb/.", true}, {"/ubuntu/dists/noble", false}} {
+		for _, p := range targets {
+			if got := isIndexTargetPath(l.suite, p); got != l.flat {
+				t.Errorf("isIndexTargetPath(%q, %q) = %v, want %v", l.suite, p, got, l.flat)
+			}
+		}
+		for _, p := range never {
+			if isIndexTargetPath(l.suite, p) {
+				t.Errorf("isIndexTargetPath(%q, %q) = true, want false", l.suite, p)
+			}
+		}
+	}
+}
+
+// The flat arch labels of plan design note 4 on the handler side: a flat
+// suite's root Packages* is "all" and its root Sources* "source"; under a
+// dists suite the label is archFromPath's.
+func TestIndexTargetArch(t *testing.T) {
+	for _, tc := range []struct {
+		suite, path, want string
+	}{
+		{"/flat", "Packages", "all"},
+		{"/flat", "Packages.zst", "all"},
+		{"/flat/.", "Packages.gz", "all"},
+		{"/flat", "Sources.xz", "source"},
+		{"/ubuntu/dists/noble", "main/binary-arm64/Packages.gz", "arm64"},
+		{"/ubuntu/dists/noble", "main/source/Sources.gz", "source"},
+		{"/ubuntu/dists/noble", "Packages.gz", ""},
+	} {
+		if got := indexTargetArch(tc.suite, tc.path); got != tc.want {
+			t.Errorf("indexTargetArch(%q, %q) = %q, want %q", tc.suite, tc.path, got, tc.want)
+		}
 	}
 }
 

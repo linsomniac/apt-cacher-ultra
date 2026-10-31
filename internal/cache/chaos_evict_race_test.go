@@ -66,7 +66,7 @@ func TestChaos_BlobGC_EvictRace_OneZeroNegOne(t *testing.T) {
 
 			// Step 1: adopt S1 with B as a member. Rule 2 bumps B's
 			// refcount to 1 and clears refcount_zeroed_at.
-			s1, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+			s1, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 				CanonicalScheme: "http",
 				CanonicalHost:   "ev.example",
 				SuitePath:       "/p",
@@ -93,7 +93,7 @@ func TestChaos_BlobGC_EvictRace_OneZeroNegOne(t *testing.T) {
 			// CommitAdoption Step 8 walks S1's snapshot_member rows
 			// and decrements refcount; B goes 1 → 0; Rule 3 sets
 			// zeroed_at = t1 (now via stubNow).
-			s2, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+			s2, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 				CanonicalScheme: "http",
 				CanonicalHost:   "ev.example",
 				SuitePath:       "/p",

@@ -79,7 +79,7 @@ func commitSnapshot(
 ) int64 {
 	t.Helper()
 	ctx := context.Background()
-	id, _, err := c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{
 		CanonicalScheme: scheme,
 		CanonicalHost:   host,
 		SuitePath:       suitePath,
@@ -131,11 +131,11 @@ func TestScanOnce_TwoSnapshots_OneCorrupted(t *testing.T) {
 			},
 		},
 	)
-	if err := c.PutSuiteFreshness(ctx, cache.SuiteFreshness{
+	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{
 		CanonicalScheme: "http", CanonicalHost: "archive.ubuntu.com",
 		SuitePath: "/ubuntu/dists/noble", CurrentSnapshotID: &idA,
 	}); err != nil {
-		t.Fatalf("PutSuiteFreshness A: %v", err)
+		t.Fatalf("SeedSuiteForTest A: %v", err)
 	}
 
 	// Snapshot B: bookworm/InRelease + a Packages member.
@@ -149,11 +149,11 @@ func TestScanOnce_TwoSnapshots_OneCorrupted(t *testing.T) {
 		},
 		nil,
 	)
-	if err := c.PutSuiteFreshness(ctx, cache.SuiteFreshness{
+	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{
 		CanonicalScheme: "http", CanonicalHost: "deb.debian.org",
 		SuitePath: "/debian/dists/bookworm", CurrentSnapshotID: &idB,
 	}); err != nil {
-		t.Fatalf("PutSuiteFreshness B: %v", err)
+		t.Fatalf("SeedSuiteForTest B: %v", err)
 	}
 
 	// Corrupt the Packages blob of snapshot A.
@@ -216,11 +216,11 @@ func TestScanOnce_NoCorruption_ScanIsClean(t *testing.T) {
 		},
 		nil,
 	)
-	if err := c.PutSuiteFreshness(ctx, cache.SuiteFreshness{
+	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{
 		CanonicalScheme: "http", CanonicalHost: "archive.ubuntu.com",
 		SuitePath: "/ubuntu/dists/noble", CurrentSnapshotID: &id,
 	}); err != nil {
-		t.Fatalf("PutSuiteFreshness: %v", err)
+		t.Fatalf("SeedSuiteForTest: %v", err)
 	}
 
 	var buf safeBuf
@@ -269,17 +269,17 @@ func TestScanOnce_DisplacedSnapshotNotScanned(t *testing.T) {
 		},
 		nil,
 	)
-	if err := c.PutSuiteFreshness(ctx, cache.SuiteFreshness{
+	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{
 		CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suite,
 		CurrentSnapshotID: &idOld,
 	}); err != nil {
-		t.Fatalf("PutSuiteFreshness old: %v", err)
+		t.Fatalf("SeedSuiteForTest old: %v", err)
 	}
 
 	// Adopt a new snapshot (CommitAdoption flips current_snapshot_id).
 	relNew := seedBlob(t, c, []byte("noble InRelease v2"))
 	pkgNew := seedBlob(t, c, []byte("noble Packages v2"))
-	idNew, _, err := c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{
+	idNew, _, err := c.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{
 		CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suite,
 		InReleaseHash: &relNew,
 	})
@@ -337,11 +337,11 @@ func TestScanOnce_MissingFile_NotReportedAsCorruption(t *testing.T) {
 		},
 		nil,
 	)
-	if err := c.PutSuiteFreshness(ctx, cache.SuiteFreshness{
+	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{
 		CanonicalScheme: "http", CanonicalHost: "archive.ubuntu.com",
 		SuitePath: "/ubuntu/dists/noble", CurrentSnapshotID: &id,
 	}); err != nil {
-		t.Fatalf("PutSuiteFreshness: %v", err)
+		t.Fatalf("SeedSuiteForTest: %v", err)
 	}
 
 	// Delete the file (simulating an out-of-band rm or filesystem fault).
@@ -457,11 +457,11 @@ func TestListIntegrityCandidates_DedupsAcrossTables(t *testing.T) {
 			},
 		},
 	)
-	if err := c.PutSuiteFreshness(ctx, cache.SuiteFreshness{
+	if err := c.SeedSuiteForTest(ctx, cache.SuiteFreshness{
 		CanonicalScheme: "http", CanonicalHost: "archive.ubuntu.com",
 		SuitePath: "/ubuntu/dists/noble", CurrentSnapshotID: &id,
 	}); err != nil {
-		t.Fatalf("PutSuiteFreshness: %v", err)
+		t.Fatalf("SeedSuiteForTest: %v", err)
 	}
 	got, err := c.ListIntegrityCandidates(ctx)
 	if err != nil {

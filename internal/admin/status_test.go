@@ -240,6 +240,7 @@ func TestVitalState(t *testing.T) {
 				Cache:   cacheInfo{BytesUsed: 1024},
 				GC:      &gcInfo{LastRunUnixTime: ptrI64(1_000_003_500)},
 			},
+			AdoptionEnabled:   true, // the SUITES vital is stale without it (§9.1)
 			GCIntervalSeconds: 60,
 		}
 	}
@@ -259,10 +260,9 @@ func TestVitalState(t *testing.T) {
 		{
 			"suites_healthy_no_lag",
 			func(m *htmlRenderModel) {
-				m.Suites = []suiteEntry{{
-					LastSuccessUnixTime:           ptrI64(1_000_000_000),
-					InReleaseChangeSeenAtUnixTime: ptrI64(1_000_000_000),
-				}}
+				// No change pending (deferred minor B-60: a change stamp
+				// here meant one seen and not yet adopted, not "no lag").
+				m.Suites = []suiteEntry{{LastSuccessUnixTime: ptrI64(1_000_000_000)}}
 			},
 			"suites", "ok",
 		},
@@ -271,7 +271,10 @@ func TestVitalState(t *testing.T) {
 			func(m *htmlRenderModel) {
 				m.Suites = []suiteEntry{{
 					LastSuccessUnixTime:           ptrI64(1_000_000_000),
-					InReleaseChangeSeenAtUnixTime: ptrI64(1_000_000_000 + 3600),
+					InReleaseChangeSeenAtUnixTime: ptrI64(1_000_000_000 - 2*3600),
+					Lagging:                       "(lagging 2h 0m)",
+					LagSeconds:                    2 * 3600,
+					LagWarn:                       true,
 				}}
 			},
 			"suites", "warn",
@@ -281,10 +284,41 @@ func TestVitalState(t *testing.T) {
 			func(m *htmlRenderModel) {
 				m.Suites = []suiteEntry{{
 					LastSuccessUnixTime:           ptrI64(1_000_000_000),
-					InReleaseChangeSeenAtUnixTime: ptrI64(1_000_000_000 + 24*3600 + 1),
+					InReleaseChangeSeenAtUnixTime: ptrI64(1_000_000_000 - (24*3600 + 1)),
+					Lagging:                       "(lagging 1d 0h)",
+					LagSeconds:                    24*3600 + 1,
+					LagWarn:                       true,
 				}}
 			},
 			"suites", "crit",
+		},
+		// Spec C7: a failing adoption marks the Suites vital warn even
+		// with no lag at all — the row's problem is the adoption, not
+		// staleness.
+		{
+			"suites_warn_adoption_failing",
+			func(m *htmlRenderModel) {
+				m.Suites = []suiteEntry{{AdoptionFailing: true, AdoptionStatus: "adoption failing 1h 0m · gpg_failed · retry in 30m"}}
+			},
+			"suites", "warn",
+		},
+		// Ruling A5: a refusal older than a day warns, never crits.
+		{
+			"suites_warn_refused_long",
+			func(m *htmlRenderModel) {
+				m.Suites = []suiteEntry{{AdoptionRefused: true, RefusedLong: true}}
+			},
+			"suites", "warn",
+		},
+		// Ruling A4: with adoption disabled (the shipped default) the lag
+		// is expected, so the vital is stale, not crit.
+		{
+			"suites_stale_adoption_disabled",
+			func(m *htmlRenderModel) {
+				m.AdoptionEnabled = false
+				m.Suites = []suiteEntry{{LagSeconds: 2 * 86400, LagWarn: true}}
+			},
+			"suites", "stale",
 		},
 
 		{
@@ -321,6 +355,23 @@ func TestVitalState(t *testing.T) {
 				}
 			},
 			"adoptions", "crit",
+		},
+		// Spec C7: a refusal is a state, not a failure. The same 5/10
+		// split that pushes the ratio to "crit" for gpg_failed must stay
+		// "ok" when every non-success row is "refused" instead.
+		{
+			"adoptions_ok_refused_not_counted_as_failure",
+			func(m *htmlRenderModel) {
+				m.RecentAdoptions = make([]adoptionEntry, 10)
+				for i := range m.RecentAdoptions {
+					if i < 5 {
+						m.RecentAdoptions[i].Outcome = "refused"
+					} else {
+						m.RecentAdoptions[i].Outcome = "success"
+					}
+				}
+			},
+			"adoptions", "ok",
 		},
 
 		{
@@ -579,10 +630,11 @@ func TestOutcomeBadgeClass(t *testing.T) {
 
 // TestReasonTooltip pins the human-readable hover text for the adoption
 // reason chips. The two outcomes broken out of run_failed
-// (member_fetch_failed, db_failed) must each return a specific,
-// non-passthrough explanation; unknown tags pass through verbatim.
+// (member_fetch_failed, db_failed) and the malformed_clearsign gpg
+// reason (spec C5 rev 4) must each return a specific, non-passthrough
+// explanation; unknown tags pass through verbatim.
 func TestReasonTooltip(t *testing.T) {
-	for _, tag := range []string{"member_fetch_failed", "db_failed"} {
+	for _, tag := range []string{"member_fetch_failed", "db_failed", "malformed_clearsign"} {
 		got := reasonTooltip(tag)
 		if got == "" || got == tag {
 			t.Errorf("reasonTooltip(%q) = %q; want a specific explanation, not passthrough", tag, got)

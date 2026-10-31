@@ -70,10 +70,10 @@ func TestGetCacheSummaryByHostArch_MultiArchAndHost(t *testing.T) {
 	for _, s := range seeds {
 		key := s.host + "|" + s.suite
 		if !suitesSeen[key] {
-			if err := c.PutSuiteFreshness(ctx, SuiteFreshness{
+			if err := c.SeedSuiteForTest(ctx, SuiteFreshness{
 				CanonicalScheme: s.scheme, CanonicalHost: s.host, SuitePath: s.suite,
 			}); err != nil {
-				t.Fatalf("PutSuiteFreshness[%s]: %v", key, err)
+				t.Fatalf("SeedSuiteForTest[%s]: %v", key, err)
 			}
 			suitesSeen[key] = true
 		}
@@ -84,7 +84,7 @@ func TestGetCacheSummaryByHostArch_MultiArchAndHost(t *testing.T) {
 		parts := strings.SplitN(key, "|", 2)
 		host, suite := parts[0], parts[1]
 		releaseHash := blobIDs["amd64-foo"] // arbitrary; FK target
-		id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+		id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 			CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite,
 			InReleaseHash: &releaseHash,
 		})
@@ -193,14 +193,14 @@ func TestGetCacheSummaryByHostArch_NoBlobForUrlPath(t *testing.T) {
 		t.Fatalf("PutBlob: %v", err)
 	}
 
-	if err := c.PutSuiteFreshness(ctx, SuiteFreshness{
+	if err := c.SeedSuiteForTest(ctx, SuiteFreshness{
 		CanonicalScheme: "http",
 		CanonicalHost:   "deb.debian.org",
 		SuitePath:       "/debian/dists/bookworm",
 	}); err != nil {
-		t.Fatalf("PutSuiteFreshness: %v", err)
+		t.Fatalf("SeedSuiteForTest: %v", err)
 	}
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http",
 		CanonicalHost:   "deb.debian.org",
 		SuitePath:       "/debian/dists/bookworm",
@@ -266,12 +266,12 @@ func TestGetCacheSummaryByHostArch_SharedBlobDedup(t *testing.T) {
 	}
 
 	const host, suite = "archive.ubuntu.com", "/ubuntu/dists/noble"
-	if err := c.PutSuiteFreshness(ctx, SuiteFreshness{
+	if err := c.SeedSuiteForTest(ctx, SuiteFreshness{
 		CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite,
 	}); err != nil {
-		t.Fatalf("PutSuiteFreshness: %v", err)
+		t.Fatalf("SeedSuiteForTest: %v", err)
 	}
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite, InReleaseHash: &h,
 	})
 	if err != nil {
@@ -344,12 +344,12 @@ func TestGetCacheSummaryByHostArch_ExcludesEmptyArchRows(t *testing.T) {
 		t.Fatalf("PutBlob: %v", err)
 	}
 
-	if err := c.PutSuiteFreshness(ctx, SuiteFreshness{
+	if err := c.SeedSuiteForTest(ctx, SuiteFreshness{
 		CanonicalScheme: "http", CanonicalHost: "legacy.example", SuitePath: "/legacy/dists/old",
 	}); err != nil {
-		t.Fatalf("PutSuiteFreshness: %v", err)
+		t.Fatalf("SeedSuiteForTest: %v", err)
 	}
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "legacy.example", SuitePath: "/legacy/dists/old",
 		InReleaseHash: &releaseHash,
 	})

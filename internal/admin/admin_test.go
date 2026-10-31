@@ -22,6 +22,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
+	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -31,8 +32,47 @@ import (
 // + a base URL ("http://127.0.0.1:<port>") + a cleanup func.
 func startAdminServer(t *testing.T, opts ...adminOpt) (*Server, string, func()) {
 	t.Helper()
+	s, ln, c := newAdminServer(t, opts...)
+	return s, "http://" + ln.Addr().String(), serveAdminServer(t, s, ln, c)
+}
+
+// serveAdminServer serves a server newAdminServer built and returns
+// startAdminServer's cleanup, for a test that changes the server before it
+// serves.
+func serveAdminServer(t *testing.T, s *Server, ln net.Listener, c *cache.Cache) func() {
+	t.Helper()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		_ = s.Serve(ln)
+	}()
+	cleanup := func() {
+		// Deferred minor F-23: the cache closes only once the server is
+		// done — Shutdown, its refresher included, and Serve, whose first
+		// refresh runs before it listens — or the TempDir cleanup can meet
+		// a WAL file still open (directory not empty). Thirty seconds, and
+		// a slow shutdown is reported, not ignored.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := s.Shutdown(ctx); err != nil {
+			t.Errorf("admin Shutdown: %v", err)
+		}
+		select {
+		case <-served:
+		case <-ctx.Done():
+			t.Errorf("admin Serve still running 30s after Shutdown")
+		}
+		_ = c.Close()
+	}
+	return cleanup
+}
+
+// newAdminServer constructs an admin Server over a real cache and gc.GC,
+// with an ephemeral listener it does not serve.
+func newAdminServer(t *testing.T, opts ...adminOpt) (*Server, net.Listener, *cache.Cache) {
+	t.Helper()
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -89,16 +129,7 @@ func startAdminServer(t *testing.T, opts ...adminOpt) (*Server, string, func()) 
 		_ = ln.Close()
 		t.Fatalf("admin.New: %v", err)
 	}
-
-	go func() { _ = s.Serve(ln) }()
-
-	cleanup := func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = s.Shutdown(ctx)
-		_ = c.Close()
-	}
-	return s, "http://" + cfg.AdminAddr, cleanup
+	return s, ln, c
 }
 
 type adminOpt func(*Config)
@@ -650,21 +681,18 @@ func TestParseHtpasswd_RejectsEmptyFile(t *testing.T) {
 }
 
 // TestStatusHTML_SuiteTable pins the suite-table column header
-// rename (Lagging → InRelease changed) AND the SPEC5 §12.2.4
-// lagging annotation rendering. Seeds a suite with
-// inrelease_change_seen_at well past last_success_at so the
-// "(lagging …)" muted suffix renders in the InRelease-changed cell.
+// rename (Lagging → InRelease changed) AND the spec C7 lagging
+// annotation rendering. Seeds a suite whose InRelease change was
+// first seen 1h 30m ago so the "(lagging …)" muted suffix renders
+// in the InRelease-changed cell.
 func TestStatusHTML_SuiteTable(t *testing.T) {
 	s, base, cleanup := startAdminServer(t)
 	defer cleanup()
 
-	// Seed a lagging suite: last successful re-adoption was 2 hours
-	// ago, but upstream's InRelease has been seen changing 30 minutes
-	// ago — gap = 1h 30m.
 	now := time.Now().Unix()
 	lastSuccess := now - 2*3600
-	seenAt := now - 30*60
-	if err := s.cfg.Cache.PutSuiteFreshness(context.Background(),
+	seenAt := wallclock.Now().Unix() - 5400
+	if err := s.cfg.Cache.SeedSuiteForTest(context.Background(),
 		cache.SuiteFreshness{
 			CanonicalScheme:       "http",
 			CanonicalHost:         "archive.ubuntu.com",
@@ -672,7 +700,7 @@ func TestStatusHTML_SuiteTable(t *testing.T) {
 			LastSuccessAt:         &lastSuccess,
 			InReleaseChangeSeenAt: &seenAt,
 		}); err != nil {
-		t.Fatalf("PutSuiteFreshness: %v", err)
+		t.Fatalf("SeedSuiteForTest: %v", err)
 	}
 
 	resp := mustGet(t, base+"/")
@@ -691,35 +719,7 @@ func TestStatusHTML_SuiteTable(t *testing.T) {
 	}
 }
 
-// TestLaggingAnnotation pins SPEC5 §12.2.4 lagging-render rules:
-// nil inputs and seenAt<=successAt produce empty; the gap is
-// formatted as "Xh Ym" or just "Xm" when zero hours.
-func TestLaggingAnnotation(t *testing.T) {
-	mk := func(unix int64) *int64 { return &unix }
-	cases := []struct {
-		name    string
-		seen    *int64
-		success *int64
-		want    string
-	}{
-		{"both_nil", nil, nil, ""},
-		{"seen_nil", nil, mk(100), ""},
-		{"success_nil", mk(100), nil, ""},
-		{"in_sync", mk(100), mk(100), ""},
-		{"adopted_after_seen", mk(100), mk(200), ""},
-		{"lag_30m", mk(2000), mk(200), "(lagging 30m)"},
-		{"lag_1h_5m", mk(3900), mk(0), "(lagging 1h 5m)"},
-		{"lag_25h", mk(90000), mk(0), "(lagging 25h 0m)"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := laggingAnnotation(tc.seen, tc.success); got != tc.want {
-				t.Errorf("laggingAnnotation(%v, %v) = %q, want %q",
-					tc.seen, tc.success, got, tc.want)
-			}
-		})
-	}
-}
+// Lag rendering is covered by TestLaggingAnnotation_FromFirstSighting in suites_status_test.go.
 
 // TestAdminRequest_AuthUserAndScrapeID pins the SPEC5 §10.1
 // admin_request log fields:
@@ -1432,13 +1432,11 @@ func (s *stubReconciler) Reconcile(_ context.Context, scheme, host, suitePath st
 func withReconciler(r Reconciler) adminOpt { return func(cfg *Config) { cfg.Reconciler = r } }
 
 func TestEndpoint_Reconcile(t *testing.T) {
-	const form = "application/x-www-form-urlencoded"
 	t.Run("triggered 202 + params", func(t *testing.T) {
 		stub := &stubReconciler{result: true}
 		_, base, cleanup := startAdminServer(t, withReconciler(stub))
 		defer cleanup()
-		resp, err := http.Post(base+"/reconcile", form,
-			strings.NewReader("scheme=https&host=packages.microsoft.com&suite=/ubuntu/24.04/prod/dists/noble"))
+		resp, err := postReconcile(base, "scheme=https&host=packages.microsoft.com&suite=/ubuntu/24.04/prod/dists/noble")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1454,7 +1452,7 @@ func TestEndpoint_Reconcile(t *testing.T) {
 		stub := &stubReconciler{result: false}
 		_, base, cleanup := startAdminServer(t, withReconciler(stub))
 		defer cleanup()
-		resp, _ := http.Post(base+"/reconcile", form, strings.NewReader("host=h&suite=/s"))
+		resp, _ := postReconcile(base, "host=h&suite=/s")
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusConflict {
 			t.Errorf("status=%d want 409", resp.StatusCode)
@@ -1464,7 +1462,7 @@ func TestEndpoint_Reconcile(t *testing.T) {
 		stub := &stubReconciler{result: true}
 		_, base, cleanup := startAdminServer(t, withReconciler(stub))
 		defer cleanup()
-		resp, _ := http.Post(base+"/reconcile", form, strings.NewReader("host=h"))
+		resp, _ := postReconcile(base, "host=h")
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("status=%d want 400", resp.StatusCode)
@@ -1476,7 +1474,7 @@ func TestEndpoint_Reconcile(t *testing.T) {
 	t.Run("no reconciler 501", func(t *testing.T) {
 		_, base, cleanup := startAdminServer(t)
 		defer cleanup()
-		resp, _ := http.Post(base+"/reconcile", form, strings.NewReader("host=h&suite=/s"))
+		resp, _ := postReconcile(base, "host=h&suite=/s")
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusNotImplemented {
 			t.Errorf("status=%d want 501", resp.StatusCode)

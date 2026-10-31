@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 // newTestLogger returns a logger that drops everything to /dev/null. The
@@ -85,7 +86,10 @@ func loadAutoCAPool(t *testing.T, cacheDir string) *x509.CertPool {
 // is reachable) and an empty deny-CIDR list (so the default 127.0.0.0/8
 // deny does not block the test fetcher). cfg.Cache.Listen is intentionally
 // left empty — the test path goes through serveListeners with a bound :0
-// listener, not through serve.
+// listener, not through serve. Unlike the production defaults,
+// adoption.adopt_unsigned is false here (the struct literal leaves it
+// unset): a cmd test that expects the default sets it (deferred minor
+// E-74).
 func minimalCfg(cacheDir string, mirrors []config.MirrorRule) *config.Config {
 	cfg := &config.Config{
 		Cache: config.CacheConfig{
@@ -115,7 +119,7 @@ func minimalCfg(cacheDir string, mirrors []config.MirrorRule) *config.Config {
 func TestServe_EndToEnd_MirrorFetchAndCache(t *testing.T) {
 	t.Parallel()
 
-	const wantBody = "Package: hello\nVersion: 1.0\n"
+	wantBody := string(simtest.ClearsignedFixture("Package: hello\nVersion: 1.0\n")) // an upstream InRelease
 	var upstreamHits atomic.Int32
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -214,7 +218,7 @@ func TestServe_GracefulShutdown_DrainsInflight(t *testing.T) {
 	entered := make(chan struct{})
 	released := make(chan struct{})
 	var once sync.Once
-	const wantBody = "slow body"
+	wantBody := string(simtest.ClearsignedFixture("slow body")) // an upstream InRelease
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		once.Do(func() { close(entered) })
@@ -236,13 +240,9 @@ func TestServe_GracefulShutdown_DrainsInflight(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	var serveErr error
-	go func() {
-		defer wg.Done()
-		serveErr = serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
-	}()
+	serveDone := serveUntilCleanup(t, ctx, cancel, func(ctx context.Context) error {
+		return serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
+	})
 
 	// Kick off the slow request from another goroutine.
 	respCh := make(chan struct {
@@ -294,9 +294,8 @@ func TestServe_GracefulShutdown_DrainsInflight(t *testing.T) {
 		t.Fatalf("client never got response during graceful drain")
 	}
 
-	wg.Wait()
-	if serveErr != nil {
-		t.Fatalf("serveListeners: %v", serveErr)
+	if err := <-serveDone; err != nil {
+		t.Fatalf("serveListeners: %v", err)
 	}
 }
 
@@ -384,10 +383,9 @@ func TestServe_ReturnsListenError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	done := make(chan error, 1)
-	go func() {
-		done <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
-	}()
+	done := serveUntilCleanup(t, ctx, cancel, func(ctx context.Context) error {
+		return serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
+	})
 
 	// Give the goroutine a moment to enter Serve(), then close the listener
 	// out from under it. Serve() will return a "use of closed network
@@ -485,10 +483,9 @@ func TestServe_GracefulShutdown_KillsHungFetchAfterDrainBudget(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	serveDone := make(chan error, 1)
-	go func() {
-		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
-	}()
+	serveDone := serveUntilCleanup(t, ctx, cancel, func(ctx context.Context) error {
+		return serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
+	})
 
 	// Kick off the request. We do not care about its body — only that
 	// it reaches the upstream so we know the fetch is in flight.
@@ -575,10 +572,9 @@ func TestServe_GracefulShutdown_KillsSlowClientAfterDrainBudget(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	serveDone := make(chan error, 1)
-	go func() {
-		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
-	}()
+	serveDone := serveUntilCleanup(t, ctx, cancel, func(ctx context.Context) error {
+		return serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
+	})
 
 	// Warm the cache so the slow-client request below is a cache HIT,
 	// exercising the ServeContent path codex called out specifically.

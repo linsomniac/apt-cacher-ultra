@@ -35,7 +35,7 @@ func captureLogger() (*slog.Logger, *bytes.Buffer) {
 func openTestCache(t *testing.T) *cache.Cache {
 	t.Helper()
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -642,8 +642,8 @@ func TestRunBlobGCBatch_ExcludesUnreachableBlobs(t *testing.T) {
 	res, err := dbHandle.Exec(`
 INSERT INTO suite_snapshot
   (canonical_scheme, canonical_host, suite_path,
-   inrelease_hash, created_at, adopted_at, package_coverage_complete, heartbeat_at)
-VALUES ('http', 'race.example', '/p', ?, 1, 1, 0, 1)`, relBlob)
+   inrelease_hash, anchor_form, created_at, adopted_at, package_coverage_complete, heartbeat_at)
+VALUES ('http', 'race.example', '/p', ?, 'inline', 1, 1, 0, 1)`, relBlob)
 	if err != nil {
 		t.Fatal(err)
 	}

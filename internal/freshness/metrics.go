@@ -1,8 +1,10 @@
 package freshness
 
 import (
+	"context"
 	"errors"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 )
 
@@ -18,6 +20,32 @@ import (
 // adoption attempts, so a missing classification would silently
 // under-count a category. Adding a new ErrAdoption* sentinel means
 // classifying it AND extending the SPEC5 §10.4.3 outcome enum.
+// Outcome inventory: success, refused (spec C5 refusal states; the
+// reason says which), release_date_in_future, timed_out
+// (adoption.max_duration), unpinned_suite, gpg_failed, parse_failed,
+// member_mismatch, member_fetch_failed, db_failed, run_failed, and
+// panicked (Checker.recoverAdoption).
+//
+// AIDEV-NOTE: metrics added by the flat-repository work, outside the
+// SPEC5 §10.4.3 inventory: acu_clock_steps_detected_total (spec C4) and
+// acu_legacy_snapshots_quarantined_total (spec §6.1, startup legacy
+// trust audit), both unlabelled counters; acu_adoption_failing_suites
+// (spec C7, unlabelled gauge); acu_freshness_waiting_for_slot (spec C4,
+// unlabelled gauge); acu_freshness_unlogged_panics_total (deferred minor
+// B-44, unlabelled counter); acu_repair_deferred_total (deferred minor
+// B-31, counter by host); acu_strict_adoption_waits_total (spec C10,
+// counter by host); acu_suites_reaped_total (spec C9, design review M-16,
+// counter by reason: idle, non_canonical, junk);
+// acu_anchorless_sniff_rejected_total (spec C4 Dispatch 4, counter by
+// host); acu_suite_reaper_last_run_unixtime (spec C9, deferred minor
+// F-13, unlabelled gauge). The flip barrier's
+// acu_flip_hold_skipped_total, acu_flip_hold_expired_total,
+// acu_flip_quiet_cut_short_total, acu_flip_waiters_over_cap_total,
+// acu_flip_slow_anchor_reads_total and
+// acu_flip_gate_panics_total (spec C8, unlabelled counters) and
+// acu_flip_barrier_active (unlabelled gauge) are declared in
+// internal/flipgate. An adoption ended by shutdown is not an adoption
+// outcome: it logs adoption_abandoned_at_shutdown and counts nowhere.
 var (
 	freshnessCheckTotal = metrics.NewCounterWithCap(
 		"acu_freshness_check_total",
@@ -39,6 +67,48 @@ var (
 		"host",
 	)
 
+	// strictWaitsTotal counts requests that waited for a host's signed
+	// adoptions in flight before strict mode decided (spec C10).
+	strictWaitsTotal = metrics.NewCounterWithCap(
+		"acu_strict_adoption_waits_total",
+		"Unvouched .deb requests that waited for the host's adoptions in flight before strict mode decided, by host (spec C10).",
+		metrics.DefaultMaxSeries,
+		"host",
+	)
+
+	// repairDeferredTotal counts repairs and reconciles of an unchanged
+	// suite that found no free admission slot and wait for its next
+	// unchanged check (deferred minor B-31: the DEBUG line alone was
+	// invisible).
+	repairDeferredTotal = metrics.NewCounterWithCap(
+		"acu_repair_deferred_total",
+		"Repairs and reconciles deferred because no adoption slot was free, by host (spec C4).",
+		metrics.DefaultMaxSeries,
+		"host",
+	)
+
+	// suitesReapedTotal counts the suites the suite reaper deleted, by
+	// reason (spec C9, design review M-16): a closed three-value enum —
+	// idle, non_canonical, junk — so dashboards see reaping without
+	// parsing suite_reaped lines.
+	suitesReapedTotal = metrics.NewCounterWithCap(
+		"acu_suites_reaped_total",
+		"Suites the suite reaper deleted, by reason: idle, non_canonical or junk (spec C9).",
+		metrics.DefaultMaxSeries,
+		"reason",
+	)
+
+	// anchorlessSniffRejectedTotal counts the anchorless refresh's 200
+	// answers whose body failed the flat index sniff (spec C4 Dispatch 4,
+	// "counter anchorless_sniff_rejected"): the cached row stays. By host,
+	// so an upstream that answers HTML shows where it is.
+	anchorlessSniffRejectedTotal = metrics.NewCounterWithCap(
+		"acu_anchorless_sniff_rejected_total",
+		"Anchorless refresh 200 answers whose body failed the flat index sniff; the cached row stays (spec C4).",
+		metrics.DefaultMaxSeries,
+		"host",
+	)
+
 	// freshnessStaleSuites is the per-tick gauge of suites whose
 	// last_success_at has aged past staleSuiteFactor*refresh (SPEC §7.4
 	// observability). Labeled adopted=true|false so a frozen ADOPTED
@@ -49,6 +119,64 @@ var (
 		"Suites whose last_success_at is older than staleSuiteFactor*refresh, by adopted state (SPEC §7.4).",
 		metrics.DefaultMaxSeries,
 		"adopted",
+	)
+
+	// clockStepsTotal counts detected wall-clock steps: a past-event stamp
+	// found in the future (backward, spec C4) and the reaper's forward step
+	// (deferred minor F-17).
+	clockStepsTotal = metrics.NewCounter(
+		"acu_clock_steps_detected_total",
+		"Wall-clock steps detected: a past-event timestamp found in the future (a backward step), "+
+			"or the wall clock run ahead of the monotonic clock between reaper runs (a forward step).",
+	)
+
+	// reaperLastRunUnixtime is when the suite reaper last completed a run
+	// (deferred minor F-13): an alert on its age catches a reaper that
+	// stopped, as acu_gc_last_run_unixtime does for GC.
+	reaperLastRunUnixtime = metrics.NewGauge(
+		"acu_suite_reaper_last_run_unixtime",
+		"Unix-seconds timestamp of the suite reaper's last completed run (spec C9).",
+	)
+
+	// legacyQuarantinedTotal counts pre-v7 snapshots the startup trust
+	// audit quarantined (spec §6.1); the reason is in the WARN line.
+	legacyQuarantinedTotal = metrics.NewCounter(
+		"acu_legacy_snapshots_quarantined_total",
+		"Pre-v7 snapshots quarantined by the startup legacy trust audit.",
+	)
+
+	// adoptionFailingSuites is the number of suites whose latest adoption
+	// attempt failed (refusal states excluded, spec C7), refreshed every
+	// scheduler tick. 0 when no adopter is wired: records left by an
+	// earlier run with adoption enabled are inert.
+	adoptionFailingSuites = metrics.NewGauge(
+		"acu_adoption_failing_suites",
+		"Suites whose latest adoption attempt failed, refusal states excluded; refreshed every scheduler tick (spec C7).",
+	)
+
+	// freshnessWaitingForSlot is the number of suites waiting for an
+	// adoption slot; the scheduler re-checks each as soon as capacity it
+	// can use is released (spec C4).
+	freshnessWaitingForSlot = metrics.NewGauge(
+		"acu_freshness_waiting_for_slot",
+		"Suites waiting for an adoption slot; each is re-checked as soon as one it can use is released (spec C4).",
+	)
+
+	// freshnessUnloggedPanics counts recovered panics — of a freshness
+	// check (scheduled or client-triggered), a scheduler tick, the
+	// start-time retry spread, an adoption, its counters and admin ring
+	// event, its failure record, the adoption heartbeat, a repair or
+	// reconcile, a suite reaper run or POST /forget — that could not be
+	// logged because reporting them panicked too, or that struck the
+	// counting itself (an adoption's counters and ring event), and POST
+	// /reconcile's snapshot read failure line when logging it panicked
+	// while the suite was held (the H1 final review's prod minor 1): a
+	// bug, please report it. Every boundary counts through unloggedPanic
+	// (deferred minors B-18, B-44, E-42, E-45; review M-2 of the H1 plan,
+	// and of Task 9 for checkLockedSafe's report).
+	freshnessUnloggedPanics = metrics.NewCounter(
+		"acu_freshness_unlogged_panics_total",
+		"Recovered panics — of a freshness check (scheduled or client-triggered), scheduler tick, retry spread, adoption and its counters, failure record, adoption heartbeat, repair, reconcile, reaper run or POST /forget — that could not be logged because reporting them panicked too, or that struck the counting itself; also a POST /reconcile log line that panicked while it held the suite (a bug).",
 	)
 
 	adoptionTotal = metrics.NewCounterWithCap(
@@ -188,6 +316,21 @@ func classifyAdoptionOutcome(err error) string {
 		return "success"
 	}
 	switch {
+	case errors.Is(err, ErrAdoptionUpstreamOlder), errors.Is(err, ErrAdoptionRollbackRefused),
+		errors.Is(err, ErrAdoptionUnsignedDowngradeRefused), errors.Is(err, ErrAdoptionUnsignedTooLarge):
+		return "refused"
+	case errors.Is(err, ErrAdoptionReleaseDateInFuture):
+		return "release_date_in_future"
+	case errors.Is(err, ErrAdoptionPanicked):
+		return "panicked"
+	// timed_out stays ahead of the member and DB sentinels: a deadline that
+	// surfaces through a %w chain is timed_out — including a commit that
+	// hit commitTimeout. Member-fetch errors flatten their cause with %v,
+	// so they never match here; spawnAdoption reclassifies as timed_out an
+	// attempt whose adoption.max_duration passed in the member pipeline,
+	// never one whose deadline passed in the flip barrier (ruling R-C2).
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timed_out"
 	// unpinned_suite is checked BEFORE gpg_failed: the verifier wraps
 	// its return with both ErrAdoptionGPGFailed (the runShared
 	// category sentinel) and ErrAdoptionUnpinnedSuite (the specific
@@ -236,6 +379,28 @@ func classifyAdoptionOutcome(err error) string {
 func classifyAdoptionReason(err error, outcome string, gpgClassifier func(error) string) string {
 	if err == nil {
 		return ""
+	}
+	switch outcome {
+	case "refused":
+		// AIDEV-NOTE: one case per refusal sentinel (overview, B
+		// carry-forward). A refusal recorded under another reason would be
+		// misread — rollback_refused is in admin's refusalKeepsCurrent, which
+		// hides the lag of a suite that is in fact behind — so an
+		// unrecognised refusal falls back to the outcome, which the admin
+		// page shows as a failure.
+		switch {
+		case errors.Is(err, ErrAdoptionUpstreamOlder):
+			return cache.ReasonUpstreamOlder
+		case errors.Is(err, ErrAdoptionRollbackRefused):
+			return cache.ReasonRollbackRefused
+		case errors.Is(err, ErrAdoptionUnsignedDowngradeRefused):
+			return cache.ReasonUnsignedDowngradeRefused
+		case errors.Is(err, ErrAdoptionUnsignedTooLarge):
+			return cache.ReasonUnsignedTooLarge
+		}
+		return outcome
+	case "panicked":
+		return cache.ReasonPanic
 	}
 	if outcome == "gpg_failed" && gpgClassifier != nil {
 		if r := gpgClassifier(err); r != "" {

@@ -462,21 +462,54 @@ func TestSuitePath(t *testing.T) {
 		want string
 	}{
 		{"/ubuntu/dists/noble/InRelease", "/ubuntu/dists/noble"},
-		{"/ubuntu/dists/noble", "/ubuntu/dists/noble"},
+		{"/ubuntu/dists/noble", ""}, // spec C2: a suite needs a member
 		{"/ubuntu/dists/noble/main/binary-amd64/Packages.gz", "/ubuntu/dists/noble"},
 		{"/dists/stable/Release", "/dists/stable"},  // no repo prefix
-		{"/dists/stable", "/dists/stable"},          // bare suite path
+		{"/dists/stable", ""},                       // spec C2: a suite needs a member
 		{"/ubuntu/pool/main/h/hello/hello.deb", ""}, // not under /dists/
 		{"/", ""}, // root
 		{"", ""},  // empty
 		{"/debian/dists/bookworm-updates/InRelease", "/debian/dists/bookworm-updates"},
 		// nested repo paths
 		{"/some/deep/repo/dists/sid/InRelease", "/some/deep/repo/dists/sid"},
+		// flat repositories (spec C2; aptpath.TestSuitePath_Flat owns the table)
+		{"/core:/stable:/v1.34/deb/InRelease", "/core:/stable:/v1.34/deb"},
+		{"/core:/stable:/v1.34/deb/./Packages.gz", "/core:/stable:/v1.34/deb/."},
+		{"/core:/stable:/v1.34/deb/amd64/kubelet_1.34.1-1.1_amd64.deb", ""},
+		{"/InRelease", ""},
 	}
 	for _, c := range cases {
 		got := SuitePath(c.path)
 		if got != c.want {
 			t.Errorf("SuitePath(%q) = %q, want %q", c.path, got, c.want)
+		}
+	}
+}
+
+// Spec C2 and §7: Parse decodes the request URI before the grammar runs,
+// so "%2E" and "." land on the same suite (the `deb <uri> ./` twin), and
+// the pkgs.k8s.io shape maps to its literal directory (PR #8's evidence).
+// A flat .deb and a host-root anchor get no suite.
+func TestParse_FlatSuites(t *testing.T) {
+	p := newTestParser(t)
+	for _, c := range []struct {
+		uri, path, suite string
+	}{
+		{"https://pkgs.k8s.io/core:/stable:/v1.34/deb/InRelease", "/core:/stable:/v1.34/deb/InRelease", "/core:/stable:/v1.34/deb"},
+		{"http://h.example/repo/InRelease", "/repo/InRelease", "/repo"},
+		{"http://h.example/repo/./InRelease", "/repo/./InRelease", "/repo/."},
+		{"http://h.example/repo/%2E/InRelease", "/repo/./InRelease", "/repo/."},
+		{"http://h.example/repo/%2e/Packages.gz", "/repo/./Packages.gz", "/repo/."},
+		{"http://h.example/repo/amd64/x_1_amd64.deb", "/repo/amd64/x_1_amd64.deb", ""},
+		{"http://h.example/InRelease", "/InRelease", ""},
+		{"http://h.example/repo/%252E/InRelease", "/repo/%2E/InRelease", ""}, // a decoded '%': no suite
+	} {
+		r, err := p.Parse(c.uri, "")
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.uri, err)
+		}
+		if r.Path != c.path || r.SuitePath != c.suite {
+			t.Errorf("Parse(%q) = path %q, suite %q; want %q, %q", c.uri, r.Path, r.SuitePath, c.path, c.suite)
 		}
 	}
 }
@@ -779,5 +812,113 @@ func TestCanonicalHosts_DuplicatesCollapsed(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("expected shared.example.com exactly once, got %d times in %v", count, hosts)
+	}
+}
+
+func TestParse_ControlBytesRejected(t *testing.T) {
+	p, err := New(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, uri := range []string{
+		"http://archive.ubuntu.com/ubuntu/dists/noble/In%00Release",
+		"http://archive.ubuntu.com/ubuntu/dists/noble/In%0aRelease",
+		"http://archive.ubuntu.com/ubuntu/dists/noble/In%7fRelease",
+	} {
+		if _, err := p.Parse(uri, ""); !errors.Is(err, ErrInvalidPath) {
+			t.Errorf("Parse(%q) err = %v, want ErrInvalidPath", uri, err)
+		}
+	}
+}
+
+// Spec C1 / S-3: a decoded '#' must not truncate the upstream URL nor
+// mint a suite.
+func TestParse_EncodedHashKeepsKeyAndURLInSync(t *testing.T) {
+	p, err := New(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := p.Parse("http://archive.ubuntu.com/ubuntu%23x/dists/noble/InRelease", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Path != "/ubuntu#x/dists/noble/InRelease" {
+		t.Fatalf("Path = %q", req.Path)
+	}
+	if req.SuitePath != "" {
+		t.Errorf("SuitePath = %q, want none", req.SuitePath)
+	}
+	if want := "http://archive.ubuntu.com/ubuntu%23x/dists/noble/InRelease"; req.UpstreamURL != want {
+		t.Errorf("UpstreamURL = %q, want %q", req.UpstreamURL, want)
+	}
+}
+
+func TestParse_UpstreamURLUsesAptEncoding(t *testing.T) {
+	p, err := New(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := p.Parse("http://archive.ubuntu.com/ubuntu/pool/main/g/gcc/libstdc%2b%2b6_14.2.0-4ubuntu2~24.04_amd64.deb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "http://archive.ubuntu.com/ubuntu/pool/main/g/gcc/libstdc%2b%2b6_14.2.0-4ubuntu2%7e24.04_amd64.deb"
+	if req.UpstreamURL != want {
+		t.Errorf("UpstreamURL = %q, want %q", req.UpstreamURL, want)
+	}
+}
+
+// Mirror mode (abs_path request line) goes through the same checks.
+func TestParse_MirrorModeControlBytesAndEncoding(t *testing.T) {
+	p, err := New(nil, []config.MirrorRule{
+		{Prefix: "/ubuntu", Upstream: "http://archive.ubuntu.com/ubuntu/"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Parse("/ubuntu/dists/noble/In%00Release", "cache.example.com:3142"); !errors.Is(err, ErrInvalidPath) {
+		t.Errorf("mirror control byte: err = %v, want ErrInvalidPath", err)
+	}
+	req, err := p.Parse("/ubuntu/pool/main/g/gcc/libstdc%2b%2b6_14.2.0-4ubuntu2~24.04_amd64.deb", "cache.example.com:3142")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "http://archive.ubuntu.com/ubuntu/pool/main/g/gcc/libstdc%2b%2b6_14.2.0-4ubuntu2%7e24.04_amd64.deb"; req.UpstreamURL != want {
+		t.Errorf("mirror UpstreamURL = %q, want %q", req.UpstreamURL, want)
+	}
+}
+
+// Ruling PG-2: a Debian pool artifact's basename is never metadata,
+// whatever prefix it starts with — a package named icons-foo, a flat
+// repository's Packages_1.0_all.deb — in a dists/ pool or a flat directory.
+func TestIsMetadata_PoolArtifactsAreNeverMetadata(t *testing.T) {
+	for _, base := range []string{"icons-foo_1.0_all.deb", "Packages_1.0_all.deb", "Sources-x_1.0_amd64.udeb",
+		"Contents-y_1.0_amd64.ddeb", "icons-theme_2.0.dsc", "icons-theme_2.0.orig.tar.xz", "icons-theme_2.0-1.debian.tar.xz",
+		"icons-theme_2.0-1.diff.gz", "Translation-z_1.0_amd64.buildinfo", "Components-w_1.0_amd64.changes"} {
+		for _, dir := range []string{"/ubuntu/pool/main/i/icons-theme/", "/repo/flat/"} {
+			if IsMetadata(dir + base) {
+				t.Errorf("IsMetadata(%q) = true, want false (a pool artifact)", dir+base)
+			}
+		}
+	}
+}
+
+// Ruling PG-2's other side: every real metadata basename stays metadata,
+// and by-hash and .diff/Index keep their rules.
+func TestIsMetadata_RealMetadataNamesStayMetadata(t *testing.T) {
+	for _, base := range []string{"Packages", "Packages.xz", "Sources.gz", "Contents-amd64.gz", "Contents-udeb-amd64.gz",
+		"Contents-source.gz", "Translation-en.bz2", "Translation-pt_BR.xz", "Components-amd64.yml.gz", "icons-48x48.tar.gz",
+		"icons-64x64@2.tar.gz", "InRelease", "Release", "Release.gpg"} {
+		for _, dir := range []string{"/ubuntu/dists/noble/main/", "/repo/flat/"} {
+			if !IsMetadata(dir + base) {
+				t.Errorf("IsMetadata(%q) = false, want true", dir+base)
+			}
+		}
+	}
+	for _, p := range []string{"/ubuntu/dists/noble/main/binary-amd64/by-hash/SHA256/icons-foo_1.0_all.deb",
+		"/repo/flat/Packages.diff/Index"} {
+		if !IsMetadata(p) {
+			t.Errorf("IsMetadata(%q) = false, want true", p)
+		}
 	}
 }

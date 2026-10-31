@@ -23,6 +23,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
+	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
 	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
 	"github.com/linsomniac/apt-cacher-ultra/internal/gc"
 	"github.com/linsomniac/apt-cacher-ultra/internal/gpg"
@@ -77,6 +78,13 @@ var (
 	// immediately on any pending Read/Write — tunnels unwind in
 	// tens of microseconds typically. 1s is a generous ceiling.
 	tunnelDrainGrace = time.Second
+
+	// runReaper runs the suite reaper (spec C9); serveListeners starts it
+	// through this seam, in freshWG beside the checker, whatever gc.enabled
+	// and periodic_refresh say. Tests swap it to see that it is started and
+	// joined (TestServeListeners_StartsTheReaperWhateverGCSays; the Task 11
+	// review's Important 1) without waiting out its uptime floor.
+	runReaper = (*freshness.Reaper).Run
 
 	// caLockTimeoutForTest, when > 0, overrides the §4.2.2 flock
 	// acquire timeout passed to tlsmitm.LoadOrGenerate. Production
@@ -357,12 +365,15 @@ func serveListeners(
 		"freshness_cooldown", cfg.Freshness.Cooldown.Duration,
 		"freshness_periodic_refresh", cfg.Freshness.PeriodicRefresh.Duration,
 		"freshness_max_concurrent_adoptions", cfg.Freshness.MaxConcurrentAdoptions,
+		"freshness_max_suites", cfg.Freshness.MaxSuites,
 		"adoption_enabled", cfg.Adoption.Enabled,
 		"adoption_require_signature", cfg.Adoption.RequireSignature,
 		"adoption_require_pinned_signer", cfg.Adoption.RequirePinnedSigner,
 		"adoption_accept_any_signer", cfg.Adoption.AcceptAnySigner,
+		"adoption_adopt_unsigned", cfg.Adoption.AdoptUnsigned,
 		"adoption_tolerate_optional_member_failures", cfg.Adoption.TolerateOptionalMemberFailures,
 		"adoption_hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,
+		"adoption_flip_quiet_period", cfg.Adoption.FlipQuietPeriod.Duration,
 		"hot_packages_window", cfg.HotPackages.Window.Duration,
 		"hold_packages_window", cfg.HoldPackages.Window.Duration,
 		"retention_max_versions_per_package", cfg.Retention.MaxVersionsPerPackage,
@@ -380,6 +391,7 @@ func serveListeners(
 		"gc_heartbeat_interval", cfg.GC.HeartbeatInterval.Duration,
 		"gc_heartbeat_stale_grace_effective", cfg.HeartbeatStaleGraceEffective(),
 		"gc_url_path_ttl", cfg.GC.URLPathTTL.Duration,
+		"gc_suite_idle_ttl", cfg.GC.SuiteIdleTTL.Duration,
 		"admin_enabled", cfg.Admin.Enabled,
 		"admin_listen", cfg.Admin.Listen,
 		"admin_htpasswd_file", cfg.Admin.HtpasswdFile,
@@ -397,9 +409,11 @@ func serveListeners(
 
 	// SPEC2 §5.1 documents require_signature = false as a loud
 	// configuration: emit at WARN so the operator's choice is visible
-	// in the journal even before adoption is actually wired.
+	// in the journal even before adoption is actually wired. The
+	// setting no longer affects verification (spec C5 rev 4): it only
+	// admits an empty keyring at startup (see buildAdopter).
 	if !cfg.Adoption.RequireSignature {
-		logger.Warn("adoption.require_signature = false: unsigned upstream metadata would be adopted (auditable per SPEC2 §5.1)")
+		logger.Warn("adoption_require_signature_disabled")
 	}
 
 	// SPEC2 §5.1: accept_any_signer = true is a loud relaxation —
@@ -424,10 +438,10 @@ func serveListeners(
 
 	// SPEC4 §10.2: gc_disabled Warn names the operator's choice when
 	// the master switch is off. The cache still works, but disk usage
-	// will grow unbounded as adoptions roll.
+	// will grow unbounded as adoptions roll. Suite reaping runs whatever
+	// gc.enabled says (spec C9), and the line says so (gcDisabledDetail).
 	if !cfg.GC.Enabled {
-		logger.Warn("gc_disabled",
-			"detail", "gc.enabled = false: orphan blobs and displaced snapshots will not be reaped; pool/ size grows unboundedly with rolling adoptions")
+		logger.Warn("gc_disabled", "detail", gcDisabledDetail(cfg.GC.SuiteIdleTTL.Duration))
 	}
 
 	// SPEC5 §5.2 / §10.2: admin-listener startup events.
@@ -467,11 +481,35 @@ func serveListeners(
 		logger.Warn("startup tmp sweep failed", "err", err)
 	}
 
+	// Spec §6.1: remove trust from pre-v7 snapshots that cannot be proved
+	// signed and clean, and record signed-seen history from cached signed
+	// anchors, BEFORE anything collects garbage, checks, adopts or serves.
+	// AIDEV-NOTE: a returned error is a database failure or a missing /
+	// unmounted pool; refusing to start is deliberate — nothing in the
+	// failed batch was applied and the audit resumes on the next start. A
+	// single unreadable anchor, or a panic auditing one snapshot, is
+	// deferred inside the audit, not returned.
+	if _, err := freshness.RunLegacyTrustAudit(ctx, c, logger); err != nil {
+		return err // already prefixed "legacy trust audit:"
+	}
+
+	// Rulings PD-8, PD-12: a suite table above the global cap, or with a
+	// host at its per-host cap, refuses new suites until cap eviction or
+	// the suite reaper makes room; say so. At exactly the global cap a new
+	// suite evicts an idle one, so a full table logs nothing.
+	warnSuiteCaps(ctx, c, cfg.Freshness.MaxSuites, logger)
+
 	// SPEC4 §4.2 steps 5 + 6: pool/ orphan scan + one-shot GC pass.
 	// Both are blocking — the cache does not begin answering requests
 	// until they complete (we have not yet called Serve on any
 	// listener). When gc.enabled = false, gcsvc.StartupPass returns
 	// immediately and the periodic goroutine below is never started.
+	// The one-shot pass runs no snapshot-GC sub-job C (ruling PF-15):
+	// retired snapshots never serve, so a backlog of them after a burst
+	// of reaps must not keep the listeners closed; the periodic ticks
+	// delete them, normally the first (a later one when an earlier pass,
+	// the startup pass's blob pass say, hit its deadline: the passes
+	// resume in rotation).
 	gcsvc, err := gc.New(gc.Config{
 		Cache:                 c,
 		Logger:                logger,
@@ -555,33 +593,18 @@ func serveListeners(
 	// even for failures, which leave no DB row.
 	adoptionRing := observability.NewRing(50)
 
-	freshChecker, err := freshness.New(freshness.Config{
-		Cache:               c,
-		Fetcher:             fetchClient,
-		HostLimiter:         hostLimiter,
-		Cooldown:            cfg.Freshness.Cooldown.Duration,
-		Refresh:             cfg.Freshness.PeriodicRefresh.Duration,
-		Adopter:             adopter,
-		LifetimeCtx:         freshCtx,
-		Logger:              logger,
-		AdoptionRing:        adoptionRing,
-		GPGReasonClassifier: gpg.ClassifyVerifyErr,
-	})
+	freshChecker, err := freshness.New(checkerConfig(freshCtx, cfg, c, fetchClient, hostLimiter, logger, adopter, adoptionRing))
 	if err != nil {
 		return fmt.Errorf("build freshness checker: %w", err)
 	}
+	// Spec C9: the suite reaper runs beside the checker, under its
+	// lifetime, whatever gc.enabled says, and serves POST /forget.
+	reaper, err := freshness.NewReaper(reaperConfig(cfg, c, freshChecker, logger))
+	if err != nil {
+		return fmt.Errorf("build suite reaper: %w", err)
+	}
 
-	h, err := handler.New(handler.Config{
-		Parser:              parser,
-		Cache:               c,
-		Fetch:               fetchClient,
-		HostLimiter:         hostLimiter,
-		Logger:              logger,
-		Freshness:           freshChecker,
-		Serve:               cfg.Serve,
-		RefuseUnvouchedDebs: cfg.Integrity.RefuseUnvouchedDebs,
-		AdoptionEnabled:     cfg.Adoption.Enabled,
-	})
+	h, err := handler.New(handlerConfig(cfg, parser, c, fetchClient, hostLimiter, logger, freshChecker, adopter))
 	if err != nil {
 		return fmt.Errorf("build handler: %w", err)
 	}
@@ -610,6 +633,11 @@ func serveListeners(
 	go func() {
 		defer freshWG.Done()
 		freshChecker.Run(freshCtx)
+	}()
+	freshWG.Add(1)
+	go func() {
+		defer freshWG.Done()
+		runReaper(reaper, freshCtx)
 	}()
 
 	// SPEC2 §6.5 at-rest integrity scanner. Shares the freshCtx so the
@@ -702,6 +730,8 @@ func serveListeners(
 			AdoptionAcceptAnySigner: cfg.Adoption.AcceptAnySigner,
 			Keyring:                 &keyringProvider{k: keyring},
 			Reconciler:              freshChecker,
+			Forgetter:               reaper,
+			CheckBackoff:            freshness.CheckBackoff,
 		})
 		if err != nil {
 			return fmt.Errorf("build admin: %w", err)
@@ -781,6 +811,19 @@ func serveListeners(
 			logger.Error("listener exited unexpectedly", "err", err)
 		}
 	}
+
+	// Spec C8 (phase C plan, design note 18): close the flip barrier
+	// before anything drains. An adoption waiting in it abandons its commit
+	// at once (and records nothing), held InRelease/Release requests are
+	// answered, and no commit starts late in the stop window. A commit
+	// already running is waited for below (waitAdoptionDrain).
+	//
+	// AIDEV-NOTE: the order is load-bearing (deferred minor C-28): before
+	// the listeners shut down, so held requests are answered while they
+	// still can be, and before the drain, so the drain never waits on a
+	// barrier. TestServeListeners_ShutsDownWithTheBarrierOn is a smoke test
+	// only: no daemon test reaches a flip in the barrier.
+	adopter.FlipGate().Close()
 
 	// SPEC §9.5 step 2: stop accepting (Shutdown closes the listener
 	// before draining), then wait up to shutdownTimeout for in-flight
@@ -906,10 +949,17 @@ func serveListeners(
 
 	// SPEC2 §9.5 step 5: drain in-flight adoption goroutines spawned
 	// by the freshness Checker. freshCancel above already cancelled
-	// the LifetimeCtx those goroutines run under, so they should be
-	// returning shortly; this Wait makes the shutdown deterministic
-	// before the cache is closed by the deferred c.Close().
-	freshChecker.WaitForAdoptions()
+	// the LifetimeCtx those goroutines run under, so they abandon
+	// their upstream work, and an adoption that has not reached its
+	// commit skips it; a commit already running is not cancelled (spec C4)
+	// and can hold this Wait for up to the 5-minute commit timeout
+	// (the packaged unit's TimeoutStopSec=35 may SIGKILL first; SQLite
+	// rolls the transaction back). This Wait makes the shutdown
+	// deterministic before the cache is closed by the deferred
+	// c.Close(); past adoptionDrainNotice it is explained in the journal.
+	// No adoption is in the flip barrier any more: the gate was closed at
+	// the signal.
+	waitAdoptionDrain(freshChecker.WaitForAdoptions, adoptionDrainNotice, logger)
 
 	wg.Wait()
 	logger.Info("apt-cacher-ultra stopped")
@@ -924,9 +974,11 @@ func serveListeners(
 // require_signature = true (no key would satisfy any verification —
 // the cache would never adopt and the operator would never see why
 // without this gate). With require_signature = false the empty
-// keyring is allowed; signature checks fall through to "trust the
-// body verbatim" mode for InRelease bodies that lack a clearsign
-// block, and any clearsign-bearing body would simply fail to verify.
+// keyring is allowed, and that is all the setting does (spec C5
+// rev 4): InRelease bodies without a decodable clearsign block are
+// still rejected, and signed bodies fail with no_usable_signature
+// (naming the empty keyring for an unpinned suite), except unpinned
+// suites under accept_any_signer, which skip the keyring.
 func buildAdopter(
 	cfg *config.Config,
 	c *cache.Cache,
@@ -973,12 +1025,21 @@ func buildAdopter(
 		return nil, nil, fmt.Errorf("build verifier: %w", err)
 	}
 
+	// Spec C8: the flip barrier. The handler registers anchor serves with
+	// the same gate (Adopter.FlipGate); 0s disables it.
+	flipGate, err := flipgate.New(flipgate.Config{Quiet: cfg.Adoption.FlipQuietPeriod.Duration})
+	if err != nil {
+		return nil, nil, fmt.Errorf("build flip barrier: %w", err)
+	}
+
 	adopter, err := freshness.NewAdopter(freshness.AdoptionConfig{
 		Cache:                          c,
 		Fetcher:                        fetchClient,
 		Verifier:                       verifier,
 		HostLimiter:                    hostLimiter,
 		MaxConcurrent:                  cfg.Freshness.MaxConcurrentAdoptions,
+		MaxDuration:                    cfg.Adoption.MaxDuration.Duration,
+		FlipGate:                       flipGate,
 		HotPackagesWindow:              cfg.HotPackages.Window.Duration,
 		HotPrefetchBudget:              cfg.Adoption.HotPrefetchBudget.Duration,
 		MaxVersionsPerPackage:          cfg.Retention.MaxVersionsPerPackage,
@@ -989,16 +1050,21 @@ func buildAdopter(
 		MemberRetryDelay:               cfg.Adoption.MemberRetryDelay.Duration,
 		RepairSkippedMembers:           cfg.Adoption.RepairSkippedMembers,
 		RequiredArchitectures:          cfg.Adoption.RequiredArchitectures,
+		AdoptUnsigned:                  cfg.Adoption.AdoptUnsigned,
 		Logger:                         logger,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("new adopter: %w", err)
+	}
+	if err := applyE2EHooks(adopter, logger); err != nil {
+		return nil, nil, fmt.Errorf("e2e hooks: %w", err)
 	}
 
 	logger.Info("phase2 adoption enabled",
 		"keyring_keys", keyring.Size(),
 		"trusted_signer_blocks", len(pins),
 		"require_pinned_signer", cfg.Adoption.RequirePinnedSigner,
+		"adopt_unsigned", adopter.AdoptsUnsigned(),
 		"allow_short_keyid", cfg.Adoption.AllowShortKeyID,
 		"accept_any_signer", cfg.Adoption.AcceptAnySigner,
 		"tolerate_optional_member_failures", cfg.Adoption.TolerateOptionalMemberFailures,
@@ -1007,10 +1073,191 @@ func buildAdopter(
 		"repair_skipped_members", cfg.Adoption.RepairSkippedMembers,
 		"required_architectures", cfg.Adoption.RequiredArchitectures,
 		"max_concurrent_adoptions", cfg.Freshness.MaxConcurrentAdoptions,
+		"max_duration", cfg.Adoption.MaxDuration.Duration,
+		"flip_quiet_period", cfg.Adoption.FlipQuietPeriod.Duration,
 		"hot_packages_window", cfg.HotPackages.Window.Duration,
 		"hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,
 	)
 	return adopter, keyring, nil
+}
+
+// gcDisabledDetail is the gc_disabled WARN's detail: what gc.enabled =
+// false stops, and whether suite reaping still runs — it does whatever
+// gc.enabled says, unless gc.suite_idle_ttl is "0s" (spec C9) — and, when
+// it does not, what still deletes.
+//
+// AIDEV-NOTE: final review spec m7. For an operator who set gc.enabled =
+// false to keep everything, this is the one in-product line at the first
+// 1.1.0 start, an hour before the reaper's first run; it must not imply
+// that nothing is deleted. With "0s" too (the final fix wave's re-review,
+// logging minor 2) two deleters remain: cap eviction, at the global cap
+// only (createSuiteTx: a suite with no current snapshot, not requested
+// for suiteEvictIdle; the per-host cap only refuses), and the reaper's
+// daily orphan-marker sweep, which runOnce runs whatever the TTL (only
+// reaping is gated on it). Any other TTL keeps the line's "suite reaping
+// still runs"; "0s" there says "turns it off", not "keeps idle suites",
+// since cap eviction still takes idle suites.
+func gcDisabledDetail(suiteIdleTTL time.Duration) string {
+	const detail = "gc.enabled = false: orphan blobs and displaced snapshots will not be reaped; " +
+		"pool/ size grows unboundedly with rolling adoptions"
+	if suiteIdleTTL == 0 {
+		return detail + `; suite reaping is off too (gc.suite_idle_ttl = "0s"), but still deleted are suites ` +
+			`evicted at the freshness.max_suites total cap (no current snapshot, not requested for 24h) and, ` +
+			`daily, signed-seen records of untracked paths last seen over a year ago`
+	}
+	return detail + fmt.Sprintf(`; suite reaping still runs: gc.suite_idle_ttl = %s reaps the suites no client asked for in that long ("0s" turns it off)`,
+		suiteIdleTTL)
+}
+
+// warnSuiteCaps logs WARN suite_caps_exceeded at startup when new suites
+// are refused: the suite table holds more than freshness.max_suites rows
+// (a lowered cap, or an upgraded v6 table), or a canonical host holds at
+// least a tenth of it (ruling PD-12, narrowing PD-8). Above the global cap
+// every creation attempt is refused but still evicts one suite idle for
+// 24 h, so the table converges; a host at its cap never evicts and waits
+// for the suite reaper (gc.suite_idle_ttl, 30 days by default; spec C9). A
+// read error is logged and otherwise ignored: the caps hold either way.
+//
+// AIDEV-NOTE: a table at exactly the global cap logs nothing. That is
+// normal operation for a full cache — a new suite evicts an idle one and
+// is refused only when none qualifies (suite_seed_rejected says so at
+// runtime) — and warning on every restart would steer operators to raise
+// max_suites needlessly (PD-12).
+func warnSuiteCaps(ctx context.Context, c *cache.Cache, maxSuites int, logger *slog.Logger) {
+	// Validate keeps max_suites >= 10; an unvalidated configuration (the
+	// tests' minimalCfg) has 0, which means no cap here, not "exceeded"
+	// (deferred minor D-45).
+	if maxSuites <= 0 {
+		return
+	}
+	perHost := maxSuites / 10
+	u, err := c.SuiteCapUsage(ctx, perHost)
+	if err != nil {
+		logger.Warn("suite_cap_usage_read_failed", "err", err)
+		return
+	}
+	if u.Total <= maxSuites && u.HostsAtCap == 0 {
+		return
+	}
+	logger.Warn("suite_caps_exceeded",
+		"suites", u.Total,
+		"max_suites", maxSuites,
+		"hosts_at_cap", u.HostsAtCap,
+		"per_host_cap", perHost,
+		"fullest_host", u.FullestHost,
+		"fullest_host_suites", u.FullestHostRows,
+	)
+}
+
+// reaperConfig is the suite reaper's configuration (spec C9, C11:
+// gc.suite_idle_ttl). Factored out, like checkerConfig, for the wiring
+// tests.
+func reaperConfig(cfg *config.Config, c *cache.Cache, checker *freshness.Checker, logger *slog.Logger) freshness.ReaperConfig {
+	return freshness.ReaperConfig{Cache: c, Checker: checker, IdleTTL: cfg.GC.SuiteIdleTTL.Duration, Logger: logger}
+}
+
+// checkerConfig is the freshness checker's configuration (spec C4, C11:
+// freshness.max_suites bounds the scheduler's queues). Factored out, like
+// handlerConfig, for the wiring tests.
+func checkerConfig(lifetimeCtx context.Context, cfg *config.Config, c *cache.Cache, fetchClient *fetch.Client,
+	hostLimiter *hostsem.Sem, logger *slog.Logger, adopter *freshness.Adopter, ring *observability.Ring) freshness.Config {
+	return freshness.Config{
+		Cache:               c,
+		Fetcher:             fetchClient,
+		HostLimiter:         hostLimiter,
+		Cooldown:            cfg.Freshness.Cooldown.Duration,
+		Refresh:             cfg.Freshness.PeriodicRefresh.Duration,
+		MaxSuites:           cfg.Freshness.MaxSuites,
+		Adopter:             adopter,
+		LifetimeCtx:         lifetimeCtx,
+		Logger:              logger,
+		AdoptionRing:        ring,
+		GPGReasonClassifier: gpg.ClassifyVerifyErr,
+	}
+}
+
+// handlerConfig assembles the request handler's configuration. The flip
+// barrier is the adopter's — nil with adoption disabled — so anchor serves
+// and commits meet at one gate (spec C8); retained by-hash searches the
+// displaced snapshots GC keeps (gc.keep_displaced).
+func handlerConfig(
+	cfg *config.Config,
+	parser *proxy.Parser,
+	c *cache.Cache,
+	fetchClient *fetch.Client,
+	hostLimiter *hostsem.Sem,
+	logger *slog.Logger,
+	freshChecker *freshness.Checker,
+	adopter *freshness.Adopter,
+) handler.Config {
+	// Spec C3: the checker holds an evicted suite's mutex. A nil checker
+	// must stay a nil interface (a typed nil would be called).
+	var guard cache.SuiteGuard
+	if freshChecker != nil {
+		guard = freshChecker
+	}
+	// Spec C10: strict mode waits for the checker's adoptions in flight;
+	// with adoption disabled there are none (nil: no wait).
+	var adoptions handler.AdoptionWaiter
+	if freshChecker != nil && adopter != nil {
+		adoptions = freshChecker
+	}
+	return handler.Config{
+		Parser:              parser,
+		Cache:               c,
+		Fetch:               fetchClient,
+		HostLimiter:         hostLimiter,
+		Logger:              logger,
+		Freshness:           freshChecker,
+		Serve:               cfg.Serve,
+		RefuseUnvouchedDebs: cfg.Integrity.RefuseUnvouchedDebs,
+		AdoptionEnabled:     cfg.Adoption.Enabled,
+		FlipGate:            adopter.FlipGate(),
+		KeepDisplaced:       cfg.GC.KeepDisplaced,
+		MaxSuites:           cfg.Freshness.MaxSuites,
+		SuiteGuard:          guard,
+		Adoptions:           adoptions,
+	}
+}
+
+// adoptionDrainNotice is how long the shutdown waits on in-flight
+// adoptions before it explains the wait (deferred minor B-64).
+const adoptionDrainNotice = 2 * time.Second
+
+// waitAdoptionDrain runs wait (the adoption drain) and, once it has run
+// for notice, logs shutdown_waiting_for_adoptions at INFO (once), so a
+// slow stop is explained in the journal: the drain waits for adoption,
+// repair and reconcile goroutines, and a commit already running is never
+// cancelled and may take up to the 5-minute commit timeout. It returns
+// when wait does; a panicking wait is logged with its stack (deferred
+// minor C-30) and the shutdown carries on.
+//
+// AIDEV-NOTE: the 5-minute figure here, in the notice's detail, in the
+// drain comment above and in docs/log-fields.md and docs/configuration.md
+// is freshness's unexported commitTimeout (internal/freshness/adoption.go):
+// change them together (deferred minor C-33).
+func waitAdoptionDrain(wait func(), notice time.Duration, logger *slog.Logger) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("shutdown_wait_panicked", "panic", r, "stack", string(debug.Stack()))
+			}
+		}()
+		wait()
+	}()
+	timer := time.NewTimer(notice)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return
+	case <-timer.C:
+		logger.Info("shutdown_waiting_for_adoptions",
+			"waited", notice,
+			"detail", "an adoption, repair or reconcile is still finishing: a commit already running is never cancelled (spec C4) and takes at most the 5-minute commit timeout; other work stops at its next cancellation point")
+	}
+	<-done
 }
 
 // keyringProvider adapts a *gpg.Keyring to admin.KeyringProvider so

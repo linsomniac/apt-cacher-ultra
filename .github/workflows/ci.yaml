@@ -22,13 +22,28 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.25'
+          go-version: '1.27'
           cache: true
       - run: go vet ./...
       - run: go test -race -timeout 10m ./...
+      # e2e/flat's test binary seam (cmd/apt-cacher-ultra/e2ehooks.go),
+      # compiled only with this tag.
+      - name: e2ehooks seam
+        run: |
+          go vet -tags e2ehooks ./cmd/apt-cacher-ultra/
+          go test -tags e2ehooks -count=1 ./cmd/apt-cacher-ultra/
       - name: Verify portable Linux binary
         run: |
           CGO_ENABLED=1 make build
+          if grep -q ACU_E2E_ build/apt-cacher-ultra; then
+            echo "Release binary contains the e2e test seam (ACU_E2E_)" >&2
+            exit 1
+          fi
+          buildinfo="$(go version -m build/apt-cacher-ultra)"
+          if [[ "$buildinfo" == *-tags=*e2ehooks* ]]; then
+            echo "Release binary was built with -tags e2ehooks" >&2
+            exit 1
+          fi
           program_headers="$(readelf --program-headers --wide build/apt-cacher-ultra)"
           if [[ "$program_headers" == *INTERP* ]]; then
             echo "Binary requires an external ELF interpreter" >&2
@@ -47,14 +62,36 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.25'
+          go-version: '1.27'
           cache: true
       - uses: golangci/golangci-lint-action@v8
         with:
           # Pin so CI is reproducible; bump deliberately rather than letting
           # `latest` drift behind your back. v2.x is required for Go 1.25
-          # targets (v1.x was built with go1.23/1.24).
-          version: v2.12.2
+          # targets (v1.x was built with go1.23/1.24), and v2.14 or later
+          # for the Go 1.27 toolchain: v2.12.2 cannot read Go 1.27's export
+          # data ("export data version 5 is greater than maximum supported
+          # version 4").
+          version: v2.14.0
+      # e2e/flat's test binary seam (cmd/apt-cacher-ultra/e2ehooks.go and
+      # its test) compiles only with this tag, so the run above skips it.
+      - name: golangci-lint (e2ehooks)
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.14.0
+          args: --build-tags e2ehooks ./cmd/...
+      # The e2e harnesses and the package's maintainer scripts, among them
+      # e2e/live/smoke.sh, which runs only by hand (the Makefile's
+      # shellcheck target, which `make lint` runs too). It runs ShellCheck
+      # from the pinned koalaman/shellcheck:v0.11.0 image, not the runner's:
+      # ShellCheck versions differ in what they flag (0.9.0, the one
+      # ubuntu-latest ships, flagged an SC2015 at e2e/flat/test.sh that the
+      # local 0.11.0 did not), so CI and every checkout run the one version. -x follows each `source`
+      # (e2e/flat/lib.sh, for both harnesses); without it ShellCheck reports
+      # SC1091. It does not report an upper-case setting or a function a
+      # sourced file stops defining.
+      - name: shellcheck
+        run: make shellcheck
 
   # SPEC §12.4 docker-compose end-to-end test. Slower lane (~2 min for
   # the docker build + apt-get update inside ubuntu:noble), but it's
@@ -84,6 +121,49 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: bash e2e/deb/run.sh
+
+  # Spec §7 real-apt end-to-end test of flat repositories
+  # (e2e/flat/README.md): nginx, the daemon and apt clients in one
+  # container, one job per client image so every apt version (2.2 to 3.2)
+  # runs on every change. The rows with `unsigned: true` (the oldest and
+  # newest images) also wait for the unsigned confirmation, 5 to 15
+  # minutes after first contact; the others take about 2.5 minutes plus
+  # the image build. Both the unsigned image list and the timeout derive
+  # from that one boolean, so bumping a row's image cannot drop its
+  # unsigned scenario. No retry: a flaky scenario must show. A failure
+  # that names a distribution mirror is re-run alone.
+  e2e-flat:
+    name: e2e-flat (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: 'debian:11', unsigned: true }
+          - { image: 'ubuntu:22.04', unsigned: false }
+          - { image: 'ubuntu:24.04', unsigned: false }
+          - { image: 'debian:12', unsigned: false }
+          - { image: 'debian:13', unsigned: false }
+          - { image: 'ubuntu:26.04', unsigned: true }
+    timeout-minutes: ${{ matrix.unsigned && 30 || 15 }}
+    steps:
+      - uses: actions/checkout@v5
+      # A job timeout signals the step's shell alone, which does not pass
+      # it into the container, so the test's own failure output (the
+      # scenario and both log tails) would be lost. timeout(1) instead
+      # sends INT to the whole step's process group 3 minutes before the
+      # job's limit (27 of 30, 12 of 15): docker run passes it into the
+      # container, and test.sh's INT trap prints the tails once the command
+      # it is running returns, since bash runs a trap only between commands:
+      # normally within seconds, but a command stuck for good still loses
+      # them (docker run relayed them in 6 of 7 local trials). -k 60 kills
+      # what is left a minute later. The last 2 minutes cover the checkout
+      # before this step and the runner's own overhead.
+      - run: timeout -s INT -k 60 "${E2E_STEP_MINUTES}m" bash e2e/flat/run.sh
+        env:
+          E2E_FLAT_IMAGES: ${{ matrix.image }}
+          E2E_FLAT_UNSIGNED_IMAGES: ${{ matrix.unsigned && matrix.image || '' }}
+          E2E_STEP_MINUTES: ${{ matrix.unsigned && 27 || 12 }}
 
   # Fast unit tests for the apt-repo publishing scripts
   # (scripts/select-stable-tags.sh, scripts/build-apt-repo.sh). Docker-free

@@ -17,6 +17,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 // chaosPaths is the set of apt-shaped requests each chaos client issues:
@@ -37,6 +38,11 @@ var chaosPaths = []string{
 // surfaces as a clear comparison failure rather than a uniform-bytes
 // false-positive.
 func chaosBodyFor(path string) []byte {
+	if path == "/ubuntu/dists/noble/InRelease" {
+		// Clearsigned, so the priming miss creates the suite's row and
+		// later hits fire freshness checks.
+		return simtest.ClearsignedFixture("chaos-body|" + path)
+	}
 	return []byte("chaos-body|" + path)
 }
 

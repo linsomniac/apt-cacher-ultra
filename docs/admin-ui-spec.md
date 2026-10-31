@@ -78,7 +78,7 @@ If any item above must change, this spec is amended before code lands.
    cells. The verdict is reinforced by row-level state stripes throughout
    the page.
 2. **Buried failures surfaced.** When ≥10% of the recent-adoptions ring
-   buffer shares a non-success outcome, an aggregate-notice strip renders
+   buffer shares a failing outcome (neither success nor refused), an aggregate-notice strip renders
    above the table naming the outcome, count, most-recent example, and a
    remediation hint. For the `gpg_failed` case the hint deep-links to the
    Keyring section as the natural next diagnostic.
@@ -138,7 +138,7 @@ If any item above must change, this spec is amended before code lands.
   both the TLS MITM CA fingerprint and the keyring primary/subkey
   fingerprints.
 - **Aggregate-notice threshold.** Resolved: 10% of the recent-adoptions
-  ring buffer with the dominant non-success outcome. Threshold lives
+  ring buffer with the dominant failing outcome (refusals excluded). Threshold lives
   in one place in the inline JS and is trivially tunable (see §8.2).
 - **Source taxonomy.** Resolved: three-way split based on `source_path`
   prefix —
@@ -337,6 +337,130 @@ and detail panels become `<details>` (default-closed except non-healthy).
 With JS enabled, an `IntersectionObserver` highlights the rail entry
 corresponding to the section currently in view.
 
+### 4.5 Suites row fields (phase B)
+
+The flat-repository work (spec C7) adds fields to each `suites[]` JSON
+entry. This spec carries no other per-field prose for that array (§0.1's
+locked-contract list only calls out the additive `keyring[]` fields from
+commit e5b6024 by name), so the new fields' one-line meanings live here,
+next to the Suites table contract in §5.3:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `scheme` | string | The suite's canonical scheme, `http` or `https` (phase F, ruling PF-7): a repository can be tracked under both, as two rows with the same `host` and `suite_path`, and `POST /forget` (`docs/configuration.md`, *Forgetting a suite*) takes it, defaulting to `https`. The Suites table's Host column shows it as `scheme://host`. |
+| `flat` | boolean | `true` for a flat repository's suite — a canonical suite path with no `dists` segment, its `./` twin included (spec C2) — and `false` for a `dists/` suite (phase G). The Suites table's Suite path cell shows a neutral `flat` badge after the path. The tag is not selectable (`user-select: none`), so copying the Suite path cell — as `/forget`'s 409 asks — copies the path alone. |
+| `anchor_form` | string | The current snapshot's anchor form — `inline`, `detached` or `unsigned` (a `Release` no signature covers: it vouches no `.deb`); empty when the suite has no current snapshot. |
+| `anchorless` | boolean | `true` for a flat repository without a snapshot whose last answered check refreshed its cached index files without a `Release` (spec C4 Dispatch 4; phase H1) — with adoption enabled, no current snapshot, a last success, no failure or refusal record and no pending change: marks no other answered check of such a suite leaves (a first adoption leaves a pending change, a failure or refusal a record, a commit a snapshot); `false` otherwise, and always while adoption is disabled. One exception: a flat suite whose row was created while adoption was disabled has a last success already, so it reads `true` from the moment adoption is enabled until its first check, which for a suite no client has asked for in 7 days comes only once one asks again. It tells such a repository from a dormant, never-adopted suite, which also has no snapshot and no record. The Adoption cell reads `refreshed without a Release`. |
+| `last_requested_unixtime` | int64 or `null` | When a client last showed interest in the suite (spec C3): written when the suite's row is created, then by coalesced touches — at most one write per suite per hour — from serves of its anchors (`InRelease`, `Release`, `Release.gpg`; status below 400, 304 and HEAD included), of its flat indexes, and of `.deb`s its current snapshot vouched for. A `dists/` suite's index requests (`main/binary-amd64/Packages.gz`) never move it. It decides cap eviction: at the `freshness.max_suites` cap, a suite with no current snapshot whose stamp is 24 hours old or more can be evicted for a new one (`suite_evicted`), and reaping: a suite whose stamp is older than `gc.suite_idle_ttl` is reaped (`suite_reaped`; `0s` disables reaping). The Suites table's *Last requested* column shows it (phase H1). |
+| `check_fail_count` | int64 | Consecutive failed checks since the last answered check: ended unknown (transport error, deadline, unexpected status), or found nothing they may adopt (a suite without a snapshot whose upstream has neither `InRelease` nor `Release`, which also records `anchor_absent`; a signature the check found but could not record as seen), or — a flat repository without a `Release` (phase G) — refreshed its cached index files with no content answer (an HTML page for each, 401, 403). An unsigned `Release` while `adoption.adopt_unsigned` is off is the refusal `unsigned_disabled`, not a failed check, and so is a flat repository without a `Release` while the knob is off. Drives the scheduler's healthy → never-checked → failing ordering and its 2 min → 1 h backoff. Resets to 0 on every answered check, an absent current anchor (`anchor_absent`) included. While above 0 the Adoption cell says so (below). |
+| `adoption_fail_reason` | string or `null` | The current failure or refusal reason; `null` when no record exists. |
+| `adoption_fail_count` | int64 | Consecutive adoption attempts in the current failure/refusal streak; `0` when no record exists. |
+| `adoption_fail_first_unixtime` | int64 or `null` | When the current streak started; for `unsigned_unconfirmed` and `anchor_absent`, when the current bytes (or absence) were first observed — it restarts on new content while `adoption_fail_count` keeps growing. |
+| `adoption_next_retry_unixtime` | int64 or `null` | When the same content is retried next; new content is tried at once regardless of this stamp. |
+| `adoption_refused` | boolean | `true` when the record above is a refusal state (`upstream_older`, `rollback_refused`, `unsigned_downgrade_refused`, `unsigned_unconfirmed`, `unsigned_too_large`, `anchor_absent`, `unsigned_disabled`), not a failure. |
+
+These are additive to the locked JSON contract (§0.1), the same way
+`keyring[]` was: no existing key changes shape or meaning (`scheme` too:
+the HTML Host cell gains the `scheme://` prefix, the JSON `host` is
+unchanged; `flat` too: the HTML Suite path cell gains its badge, the JSON
+`suite_path` is unchanged; `anchorless` too).
+
+**Adoption column.** The Suites table's "Adoption" column renders the
+record above as one line, via the server-side `adoptionStatus` helper:
+`"adoption failing 3d 2h · untrusted_signer · retry in 41m"` for a failure,
+`"refused: upstream_older · retry due"` for a refusal, and
+`"refused: upstream_older · since 1d 1h · retry due"` for a refusal whose
+streak began more than 24 h ago. Empty when the suite has no failure or
+refusal record — or `"refreshed without a Release"` for an `anchorless`
+suite (phase H1). While adoption is disabled, the text gains the suffix
+` (adoption disabled)`: the record was stored while adoption was enabled
+and is inert now. A suite whose checks keep failing (`check_fail_count`
+above 0) adds `"checks failing ×3 · backoff ends in 12m"` — after the
+record's text and ` · ` when there is one: the count, and when the
+scheduler's backoff (2 min doubling to 1 h, from `last_check_unixtime`)
+ends, or `"backoff over"` once it has (phase H1). That is the earliest
+the scheduler may check the suite: a client's request may trigger a
+check sooner, after the `cooldown`, and a suite whose last success is
+recent is checked later. A suite the scheduler does not queue on its
+backoff shows the count alone: with adoption enabled, a never-adopted
+suite no client asked for within 7 days (dormant), and an adopted suite
+its `anchor_absent` or `unsigned_disabled` record paces (the record's
+own text shows its retry). A suite waiting for an adoption slot is not
+shown as such (that queue is the scheduler's, in memory). The JSON carries the parts as
+they are (`check_fail_count`, `last_check_unixtime`), not this text.
+
+**Unsigned and absent-anchor refusals (phase E).** `unsigned_unconfirmed`
+is an unsigned repository waiting for its second observation — at least
+`max(cooldown, 5 min)` after the first, an hour when the confirming check
+sees a 401/403 on a signature file; the confirming check is the record's
+first retry that late (2 minutes, doubling, each ±25 %), so with the
+default `cooldown` and `periodic_refresh` the repository adopts
+usually 5 to 15 minutes after its first observation — and clears itself
+when it adopts;
+`unsigned_downgrade_refused` (the suite was seen signed) lasts until
+upstream serves a signature the cache adopts, or the suite is forgotten
+(`POST /forget`, an admin endpoint outside this page: see
+`docs/configuration.md`, *Forgetting a suite*) while no other suite of
+its repository path — under either scheme, or as its `/.` twin — has a
+row (otherwise the forgotten suite is refused again);
+`unsigned_too_large` (more than 1,000 declared files) lasts until
+upstream's `Release` declares fewer; `anchor_absent` means the current
+snapshot's anchor is gone upstream (or a detached suite's changed
+`Release` has no `Release.gpg`) while the snapshot keeps serving, or, for
+a suite without a snapshot, that upstream serves neither `InRelease` nor
+`Release`; `unsigned_disabled` means `adoption.adopt_unsigned` is off:
+an unsigned `Release` is not adopted, and an unsigned suite already
+adopted keeps serving its last snapshot without updates until the knob is
+turned back on, the suite is forgotten, or it is reaped after
+`gc.suite_idle_ttl` without a client — forgotten or reaped with the knob
+still off, it is then a suite not yet adopted, served as the cache first
+stored its files. None of them hides lag (only `upstream_older` and
+`rollback_refused` do, §9.1), and all five follow the `REFUSED 24H+` rule
+below. A suite without a snapshot shows lag from the first check that
+found its anchor, so a first adoption refused for good
+(`unsigned_downgrade_refused`, `unsigned_disabled`, or an
+`unsigned_unconfirmed` that never confirms) shows a lag that keeps
+growing: the suite has in fact never been adopted.
+
+**FAILING count.** The Suites panel's eyebrow and the SUITES vital cell's
+sub-line count suites with a genuine failure record (`adoption_refused ==
+false` and a record exists) as FAILING; a refusal is a state, not a
+failure (spec C7), and is excluded — matching the ADOPTIONS vital's ratio
+(§9.1).
+
+**Old refusals (`REFUSED 24H+`).** A refusal whose streak began (for
+`unsigned_unconfirmed`, whose current bytes were first observed) more than
+24 h ago (`adoption_fail_first_unixtime`; a stamp in the future counts as
+now, so its age is 0) is still a state, not a failure, but it may be a
+silent freeze — a vendor that stops emitting `Date` is refused
+`upstream_older` forever, and that reason's lag is suppressed. Such a row
+warns (`data-state="warn"`), the SUITES vital warns (never crit), and the
+eyebrow and the vital's sub-line add `{n} REFUSED 24H+` (only when > 0).
+Below 24 h nothing changes. The checker also logs WARN
+`adoption_refused_persistently`, but only at a streak milestone (the 3rd,
+6th, 12th, 24th, 48th … attempt) reached once the streak is 24 h old:
+with hourly retries the first comes at the 48th attempt, about 43 h in —
+about a day after the row starts warning.
+
+**Adoption disabled.** With adoption disabled (the shipped default) a
+stored record marks no warn and is not counted as FAILING or REFUSED 24H+,
+and a lag keeps its "(lagging …)" text but does not warn: Phase 1 never
+refreshes metadata, so the lag is truthful but expected. The SUITES vital
+is `stale` (§9.1). The JSON keeps every field as stored.
+
+### 4.6 GC and Recent Adoptions fields (phase H1)
+
+Two more fields, additive to the locked JSON contract as §4.5's are:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `gc.retired_reaped` | int | Retired snapshots the last GC run deleted — those of reaped, forgotten and evicted suites, and those the upgrade's trust audit quarantined (spec C9, sub-job C) — beside `displaced_reaped`; the GC panel shows it as *Retired reaped*. Always 0 after the startup run, which leaves them to a run an hour after the start (when `gc.interval` is longer than an hour) and to the periodic runs; that run's count (INFO `gc_retired_run_complete`) is not a last-run figure and does not reach this field. |
+| `recent_adoptions[].scheme` | string | The adopted suite's canonical scheme, `http` or `https`; the Recent Adoptions table's Host cell shows `scheme://host`, as the Suites table does. Empty for an event recorded without one. |
+
+A Recent Adoptions row's duration is the attempt's wall-clock time,
+and includes the flip barrier's wait (spec C8: at most 140 s) for an
+adoption that commits behind it, as `acu_adoption_duration_seconds` does.
+
 ---
 
 ## 5. Component contracts
@@ -436,10 +560,28 @@ The five cells (left → right):
 | Cell | Eyebrow         | Value source                                | Sub source                          | Hint source                                  |
 |------|-----------------|---------------------------------------------|-------------------------------------|----------------------------------------------|
 | 1    | CACHE           | `formatBytes .Cache.BytesUsed`              | `.Cache.BlobCount` + " blobs"       | `.Cache.ZeroRefcountBacklog` (when > 0)      |
-| 2    | SUITES          | `len .Suites`                               | lagging count (suites with `.Lagging != ""`) | stale count (lagging > 24h)         |
-| 3    | ADOPTIONS       | success-count / `len .RecentAdoptions`      | avg `.DurationSeconds`              | most-recent non-success `.Outcome`           |
+| 2    | SUITES          | `len .Suites`                               | one line: `N LAGGING` (suites with `.LagWarn`) · `M FAILING` (suites with `.AdoptionFailing`), plus `K REFUSED 24H+` (suites with `.RefusedLong`) when K > 0; `ADOPTION DISABLED — METADATA NOT REFRESHED` instead while adoption is disabled | — (both counts render in the sub line) |
+| 3    | ADOPTIONS       | success-count / `len .RecentAdoptions`      | `N FAILED` and `M REFUSED` counts (`RING CLEAN` when both are 0) | `{n} EVENTS IN RING` (always shown) |
 | 4    | GC              | `formatShortDuration .GC.LastRunDurationSeconds` | `durationOf` since `.GC.LastRunUnixTime` | `formatBytes .GC.LastRunBytesReclaimed` |
 | 5    | ACTIVE          | `len .ActiveHosts`                          | "idle" / "busy"                     | max `.SlotCapacity`                          |
+
+**Lag rule (phase B; replaces the two-stamp comparison this row originally
+described).** Lag runs from the first time the cache saw upstream's new
+metadata to now. A row, and the suites vital, warn when the lag exceeds 1 h,
+an adoption is failing, or a refusal is older than 24 h (§4.5); the vital
+is critical when the lag exceeds 24 h. The "(lagging …)" text shows any
+lag. With adoption disabled none of this warns and the vital is `stale`
+(§9.1).
+
+**ADOPTIONS counts (phase B).** The sub-line splits non-success outcomes
+into `N FAILED` and `M REFUSED` (each shown only when > 0) rather than one
+combined count — a refusal is a state, not a failure (spec C7). `RING
+CLEAN` renders only when both counts are 0, i.e. every event in the ring
+is a success; `RING EMPTY` renders instead when the ring has no events at
+all. The Recent Adoptions panel's own eyebrow (§5.8) states the same
+breakdown in full: `{n} IN RING · {failed} FAILED · {refused} REFUSED ·
+{success} SUCCESS`; `{n} IN RING` is always shown, each other clause only
+when its count is > 0.
 
 Each cell's `data-state` is computed server-side at template render time
 using helper `vitalState(...)` (§6.2) — the per-cell threshold logic
@@ -537,16 +679,21 @@ outside-click and on `Escape` (§8.4).
 
 Used in:
 - Recent-adoptions outcome column (one of: `success`, `gpg_failed`,
-  `fetch_failed`, `parse_failed`, etc.)
+  `fetch_failed`, `parse_failed`, `refused`, `release_date_in_future`,
+  `timed_out`, `panicked`, etc. — phase B adds `refused`,
+  `release_date_in_future` and `timed_out` (spec C5/C7); `panicked` has
+  been in the ring since Task 6)
 - Lagging annotation on suites
 - GC deadline-reached cell
 - TLS MITM enabled/disabled state
 - Keyring source attribution (§5.6)
 
 The badge for an outcome maps via helper `outcomeBadgeClass(s)` (§6.2):
-`success` → `.b--ok`, others → `.b--crit` (or `.b--warn` for the few
-soft-failure modes the operator has classified that way; implementer
-chooses based on the existing outcome enum and notes the mapping inline).
+`success` → `.b--ok`; `refused` → `.b--warn` (phase B: a refusal is a state,
+not a failure — the current snapshot keeps serving, spec C7); every other
+non-success outcome → `.b--crit`, including unknown future outcomes. The
+Recent Adoptions row carries the same split: `data-state="warn"` for
+`refused`, `data-state="crit"` for every other non-success outcome.
 
 ### 5.6 Keyring section
 
@@ -652,7 +799,11 @@ of 12px so subkey lists read as a hierarchy below the primary.
 ### 5.7 Aggregate-failure notice
 
 Rendered above the Recent Adoptions table when JS detects that ≥10% of
-the table's `<tr data-outcome="...">` rows share a non-success outcome.
+the table's `<tr data-outcome="...">` rows share a failing outcome:
+neither `success` nor `refused` (a refusal is a state, not a failure, spec
+C7 — the ADOPTIONS vital and the panel counters exclude it too). Refused
+rows still count in the total, so a ring of refusals and successes raises
+no notice.
 The notice is created by JS into a placeholder `<div id="adoptions-notice"
 class="notice-mount"></div>` server-rendered between the section
 eyebrow and the table:
@@ -707,19 +858,20 @@ A two-line block in the panel body, height 96px, centered:
 ```html
 <div class="empty empty--{stale|crit}" role="status">
   <span class="empty__eyebrow">NO SUITES TRACKED YET</span>
-  <p class="empty__body">Adoption begins when a client requests an
-  InRelease through the proxy.</p>
+  <p class="empty__body">A suite is tracked once a client requests its
+  InRelease through the proxy (…).</p>
 </div>
 ```
 
 `.empty` carries the 4px left stripe when state is non-stale (the
 keyring critical-empty case is the principal example).
 
-Per-section copy:
+Per-section copy (the page renders these words; its Suites body was a
+different sentence until phase H1):
 
 | Section          | Eyebrow                  | Body                                                                                                  |
 |------------------|--------------------------|-------------------------------------------------------------------------------------------------------|
-| Suites           | NO SUITES TRACKED YET    | Adoption begins when a client requests an InRelease through the proxy.                                |
+| Suites           | NO SUITES TRACKED YET    | A suite is tracked once a client requests its InRelease through the proxy (with adoption enabled, also its Release, or, for a flat repository, its root `Packages` or `Sources`). |
 | Adoptions        | RING BUFFER EMPTY        | Process started {uptime} ago.                                                                         |
 | Keyring (disabled) | ADOPTION DISABLED      | Keyring is not loaded because `[adoption].enabled = false`. Enable adoption to bundle default keys.   |
 | Keyring (crit)   | NO GPG KEYS LOADED       | Adoption is enabled but no keyring entries are present. Every adoption will fail with `gpg_failed`.   |
@@ -823,9 +975,20 @@ attributes, not from a stale roll-up).
 
 Applied to `<tr>` rows in the Recent Adoptions table. Value is the
 outcome enum string (`success`, `gpg_failed`, `fetch_failed`,
-`parse_failed`, etc.) — the JS uses this to compute the dominant
-non-success outcome for the aggregate notice (§8.2). The value is the
-canonical enum string from the JSON payload, not a localized label.
+`parse_failed`, `refused`, `release_date_in_future`, `timed_out`,
+`panicked`, etc.) — the JS uses this to compute the dominant failing (neither success nor refused)
+outcome for the aggregate notice (§8.2). The value is the canonical enum
+string from the JSON payload, not a localized label.
+
+A sibling `data-reason` attribute (it predates phase B) is emitted
+whenever the row's `reason` is non-empty — including when it equals the
+outcome, as in `timed_out`/`timed_out` — e.g. outcome `refused` with reason
+`upstream_older` or `rollback_refused`, or outcome `gpg_failed` with one of
+the verifier sentinels. Both the outcome badge and, when present, the
+reason badge carry a `title=` tooltip from the server-side `reasonTooltip`
+helper — the aggregate-notice JS's own `hints` dispatch (§8.2) is a
+separate, shorter table; an outcome missing from it falls back to a
+generic hint, not to `reasonTooltip`.
 
 ### 7.3 `data-label` (all `<td>` in `.data` tables)
 
@@ -905,9 +1068,12 @@ worst state(s):
 ### 8.2 Aggregate-failure notice
 
 Reads `tr[data-outcome]` rows from the Recent Adoptions table. Computes
-the top non-success outcome and its count. If `count / total >= 0.10`,
-renders the notice into `#adoptions-notice`. Otherwise leaves the mount
-empty.
+the top failing outcome and its count, skipping `success` and `refused`
+rows (a refusal is a state, not a failure; the skip is
+`if(o==='success'||o==='refused'||!o)return;`, pinned by a string-level
+template test). `total` is every row, refusals included. If
+`count / total >= 0.10`, renders the notice into `#adoptions-notice`.
+Otherwise leaves the mount empty.
 
 Tunable constant at top of the module:
 
@@ -928,6 +1094,12 @@ const HINTS = {
   // …extend as outcomes are added
 };
 ```
+
+The shipped table (`status_template.go`) also covers `member_mismatch`,
+`member_fetch_failed`, `db_failed` (retried on the backoff schedule),
+`unpinned_suite`, `run_failed` and, from phase B, `release_date_in_future`,
+`timed_out` and `panicked`. `refused` has no hint because it never raises
+the notice.
 
 No HINT may reference a CLI invocation that does not exist in
 `cmd/apt-cacher-ultra/`. If the operator-facing remediation requires a
@@ -984,10 +1156,37 @@ rules; both reference this section.
 | Cell      | `crit`                                                       | `warn`                                                           | `stale`                                |
 |-----------|--------------------------------------------------------------|------------------------------------------------------------------|----------------------------------------|
 | CACHE     | `.GC.PoolUnlinkErrors > 0`                                   | `.Cache.ZeroRefcountBacklog > 1000`                              | `.Cache.BytesUsed == 0`                |
-| SUITES    | any suite lagging > 24h                                      | any suite lagging at all                                         | `len .Suites == 0`                     |
+| SUITES    | any suite's lag exceeds 24h                                  | any suite's lag exceeds 1h, an adoption is failing, or a refusal is older than 24h | `len .Suites == 0`, or adoption disabled |
 | ADOPTIONS | non-success rate ≥ 50%                                       | non-success rate ≥ 10%                                           | ring buffer empty (uptime <5m)         |
 | GC        | `.GC.LastRunDeadlineReached` true on the last run            | last run older than `2 × .GCIntervalSeconds` (wrapper)           | `.GC.LastRunUnixTime == nil`           |
 | ACTIVE    | (no crit threshold defined; reserved)                        | (no warn threshold; reserved)                                    | no active hosts and uptime <5m         |
+
+**SUITES (phase B; replaces the two-stamp comparison this row originally
+described).** Lag runs from the first time the cache saw upstream's new
+metadata to now. A row, and the suites vital, warn when the lag exceeds 1 h
+or an adoption is failing; the vital is critical when the lag exceeds 24 h.
+The "(lagging …)" text shows any lag. A suite refused `upstream_older` or
+`rollback_refused` shows no lag at all (the cache already serves content at
+least as new as upstream); every other refusal reason keeps lag. A refusal
+of any reason whose streak began more than 24 h ago warns the row and the
+vital, never crits (§4.5 `REFUSED 24H+`): a missing `Date` says nothing
+about the content's age, so a long refusal must not freeze a suite silently.
+
+**SUITES with adoption disabled (phase B).** Adoption is disabled by default,
+and Phase 1 never refreshes metadata, so every tracked upstream eventually
+lags by more than a day — truthfully, but by design. Following the keyring
+panel's `ADOPTION DISABLED` precedent, the SUITES vital is then `stale` (not
+`warn`/`crit` from lag) and its sub-line reads `ADOPTION DISABLED — METADATA
+NOT REFRESHED`; rows keep their "(lagging …)" text but do not warn, and a
+stored failure or refusal record is inert (§4.5). The page therefore stays
+HEALTHY rather than DEGRADED forever.
+
+**ADOPTIONS (phase B).** The non-success ratio excludes `refused` rows from
+the numerator (a refusal is a state, not a failure, spec C7) but keeps them
+in the denominator, same as `success`; a window of only refusals and
+successes stays `ok`. This is the same FAILED/REFUSED split the vital's
+sub-line and the Recent Adoptions panel eyebrow render (§5.2), and the
+aggregate-failure notice (§5.7, §8.2) excludes refusals the same way.
 
 The CACHE `crit` threshold reads pool-unlink errors from the GC block
 (that's where `PoolUnlinkErrors` lives) rather than from `cacheInfo`.
@@ -1241,7 +1440,7 @@ fixtures:
 |----------------------------------|-------------------------------------------------------------------------------|
 | `golden_healthy.html`            | All `.vital[data-state]` values are `ok`; `tr[data-state]` rows have no crit/warn; `.notice-mount` is empty; `.keys-chip[data-keyring-count]` is `>0`; verdict pill renders as `STATUS` (the no-JS fallback) |
 | `golden_warming_up.html`         | `body[data-uptime-seconds] < 300`; `.GC.LastRunUnixTime == nil` branch produces "NO GC RUN YET" empty state |
-| `golden_watching_lagging.html`   | 3 suite rows carry `data-state="warn"`; suites vital cell carries `data-state="warn"` |
+| `golden_watching_lagging.html`   | 3 suite rows carry `data-state="warn"` (lag runs from the first time the cache saw upstream's new metadata to now; a row and the suites vital warn when the lag exceeds 1 h or an adoption is failing, and are critical past 24 h — phase B); suites vital cell carries `data-state="warn"` |
 | `golden_degraded_gpg.html`       | Recent-adoptions rows carry `data-outcome="gpg_failed"` at the expected ratio; the `notice-mount` placeholder is present (JS fills at runtime — markup only checked) |
 | `golden_keyring_empty_disabled.html` | Wrapper renders `.AdoptionEnabled=false`; `.empty--stale` block visible; "ADOPTION DISABLED" eyebrow present |
 | `golden_keyring_empty_enabled.html`  | Wrapper renders `.AdoptionEnabled=true`; `.empty--crit` block visible; "NO GPG KEYS LOADED" eyebrow present |

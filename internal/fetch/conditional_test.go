@@ -93,6 +93,44 @@ func TestConditional_BodyTooLarge(t *testing.T) {
 	}
 }
 
+// Ruling PG-29: a 200 whose Content-Length already exceeds maxBody fails
+// with ErrConditionalBodyTooLarge before any of its body is read. The
+// server sends its headers and then nothing, so a client that read the
+// body would wait out its context instead. A Content-Length of exactly
+// maxBody is read.
+func TestConditional_DeclaredOverCapFailsWithoutReadingTheBody(t *testing.T) {
+	block := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/at-the-cap" {
+			w.Header().Set("Content-Length", "1024")
+			_, _ = w.Write(make([]byte, 1024))
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", 64<<20))
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-block:
+		case <-r.Context().Done():
+		}
+	}))
+	// Order matters: release the handler before httptest's Close.
+	defer srv.Close()
+	defer close(block)
+
+	c := newTestClient(t, []string{`^127\.0\.0\.1$`})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := c.Conditional(ctx, &Target{CanonicalHost: "127.0.0.1", URL: srv.URL + "/Packages"}, `"e1"`, "", 1024)
+	if !errors.Is(err, ErrConditionalBodyTooLarge) {
+		t.Fatalf("err = %v, want ErrConditionalBodyTooLarge without reading the body", err)
+	}
+	res, err := c.Conditional(ctx, &Target{CanonicalHost: "127.0.0.1", URL: srv.URL + "/at-the-cap"}, "", "", 1024)
+	if err != nil || res.Status != http.StatusOK || len(res.Body) != 1024 {
+		t.Fatalf("at the cap: res %+v, err %v; want its 1024 bytes", res, err)
+	}
+}
+
 func TestConditional_ServerError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)

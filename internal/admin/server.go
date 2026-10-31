@@ -98,12 +98,25 @@ type Config struct {
 	// New does NOT reject a nil Reconciler.
 	Reconciler Reconciler
 
+	// Forgetter is OPTIONAL. When non-nil, POST /forget is enabled and
+	// delegates to Forgetter.Forget (spec C9, D9). When nil, the endpoint
+	// returns 501 Not Implemented. cmd wires the freshness Reaper; New
+	// does NOT reject a nil Forgetter.
+	Forgetter Forgetter
+
 	// Keyring supplies the loaded GPG keyring inventory for the
 	// status page's `keyring` section. nil is treated as "adoption
 	// disabled or keyring not yet wired" — the section renders as
 	// an empty list. Defined as an interface so admin does not
 	// import internal/gpg.
 	Keyring KeyringProvider
+
+	// CheckBackoff is OPTIONAL: the scheduler's backoff after a streak
+	// of failed checks (freshness.CheckBackoff, which cmd wires), for the
+	// suites table's "checks failing ×k · backoff ends in …" (deferred
+	// minor B-63). nil: the text is the count alone. A
+	// function, not an import: admin does not import internal/freshness.
+	CheckBackoff func(failCount int64) time.Duration
 }
 
 // Reconciler forces an in-place reconcile of one suite's current snapshot
@@ -114,6 +127,18 @@ type Config struct {
 // reconcile holds the suite lock (caller sees 409 Conflict).
 type Reconciler interface {
 	Reconcile(ctx context.Context, scheme, host, suitePath string) bool
+}
+
+// Forgetter deletes one suite as the reaper would, regardless of
+// idleness, for POST /forget (spec C9, D9). nil → POST /forget returns
+// 501. cmd wires the freshness Reaper; the interface keeps admin from
+// importing internal/freshness. Forget's result has Deleted when the
+// suite was forgotten, with the base's markers deleted and the rows that
+// kept them (KeptBy, ruling PF-7); Deleted is false with a nil error when
+// the suite is busy or unknown (the endpoint answers 409 for both: no
+// existence oracle); an error is a database failure (500).
+type Forgetter interface {
+	Forget(ctx context.Context, scheme, host, suitePath string) (cache.ForgetResult, error)
 }
 
 // KeyringProvider returns the inventory of trusted-key entities loaded
@@ -184,6 +209,12 @@ type Server struct {
 	profilingCtx    context.Context
 	profilingCancel context.CancelFunc
 
+	// stopping ends when Shutdown begins (stop): a POST /forget in flight
+	// then ends at its next step instead of holding the listener's drain
+	// (handleForget). Set once in New().
+	stopping context.Context
+	stop     context.CancelFunc
+
 	// refresher coordinates the §9.7.6 refresher goroutine. Closed
 	// on Shutdown. refresherCancel cancels the context that
 	// in-flight queries inside runRefreshOnce inherit, so a slow
@@ -252,6 +283,9 @@ type Server struct {
 	// Shutdown's walkWg.Wait: refreshPoolDiskBytes must observe
 	// shutdownStarted under mu before calling Add(1), so Add(1) on
 	// a zero counter is properly ordered before any concurrent Wait.
+	// shutdownStarted also stops startRefresher from starting a
+	// refresher after Shutdown, which nothing would stop (deferred
+	// minor F-23).
 	mu              sync.Mutex
 	shutdownStarted bool
 }
@@ -289,6 +323,7 @@ func New(cfg Config) (*Server, error) {
 		cfg:    cfg,
 		logger: logger,
 	}
+	s.stopping, s.stop = context.WithCancel(context.Background())
 	s.gauges = newRefresherGauges(cfg.Registry, cfg.Admin.MetricSeriesCap)
 	s.startup = newStartupGauges(cfg.Registry, cfg.Admin.MetricSeriesCap,
 		cfg.BuildInfo, cfg.StartTime)
@@ -306,11 +341,24 @@ func New(cfg Config) (*Server, error) {
 		s.profilingCtx, s.profilingCancel = context.WithCancel(context.Background())
 	}
 
+	// AIDEV-NOTE: ErrorLog routes net/http's own lines — above all "http:
+	// panic serving …" when a handler panics (a POST /forget whose
+	// Forgetter re-panics after logging freshness_check_panicked
+	// where=forget) — through this server's slog handler at ERROR, as the
+	// proxy listeners route theirs at WARN (newHTTPServer) (final review
+	// spec m1). Without it net/http falls back to the standard log
+	// package, which main's slog.SetDefault already sends through the same
+	// handler, but at INFO (so log.level "warn" or "error" drops the line),
+	// and only in a process that called SetDefault (the admin tests do
+	// not). So what this changes is the level, and the server's dependence
+	// on that process-wide setting; in the daemon the line was already a
+	// structured record (the final fix wave's re-review, logging minor 1).
 	s.server = &http.Server{
 		Addr:              cfg.AdminAddr,
 		Handler:           s.buildHandler(),
 		ReadHeaderTimeout: cfg.Admin.ReadTimeout.Duration,
 		IdleTimeout:       cfg.Admin.IdleTimeout.Duration,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 	return s, nil
 }
@@ -348,6 +396,10 @@ func (s *Server) buildHandler() http.Handler {
 		if r.Method == http.MethodOptions {
 			if _, profile := profiles[r.URL.Path]; profile {
 				w.Header().Set("Allow", "GET, OPTIONS")
+			} else if r.URL.Path == "/forget" || r.URL.Path == "/reconcile" {
+				// The mutating endpoints (deferred minor F-6: /reconcile
+				// answered the read-only set).
+				w.Header().Set("Allow", "POST, OPTIONS")
 			} else {
 				w.Header().Set("Allow", allowMethods)
 			}
@@ -373,6 +425,16 @@ func (s *Server) buildHandler() http.Handler {
 				return
 			}
 			s.handleReconcile(w, r)
+			return
+		}
+		// POST /forget, likewise (spec C9, D9).
+		if r.URL.Path == "/forget" {
+			if r.Method != http.MethodPost {
+				w.Header().Set("Allow", "POST, OPTIONS")
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			s.handleForget(w, r)
 			return
 		}
 		h, known := routes[r.URL.Path]
@@ -429,6 +491,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.profilingCancel != nil {
 		s.profilingCancel()
 	}
+	s.stop() // a POST /forget in flight ends at its next step (handleForget)
 
 	s.mu.Lock()
 	s.shutdownStarted = true

@@ -57,7 +57,25 @@ WHERE canonical_scheme = ? AND canonical_host = ? AND path = ?`
 // upstream_etag, and upstream_lastmod are all carried through — pass nil
 // pointers for fields that should remain SQL NULL.
 func (c *Cache) PutURLPath(ctx context.Context, u URLPath) error {
-	const q = `
+	isMD := int64(0)
+	if u.IsMetadata {
+		isMD = 1
+	}
+	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, putURLPathSQL,
+			u.CanonicalScheme, u.CanonicalHost, u.Path, u.BlobHash, u.UpstreamURL,
+			isMD, u.LastRequestedAt, u.RequestCount, u.LastFetchedAt,
+			u.UpstreamETag, u.UpstreamLastMod)
+		if err != nil {
+			return fmt.Errorf("PutURLPath: %w", err)
+		}
+		return nil
+	})
+}
+
+// putURLPathSQL is PutURLPath's upsert, shared with StoreFetched (one
+// statement, so the miss path's url_path row matches PutURLPath's).
+const putURLPathSQL = `
 INSERT INTO url_path
   (canonical_scheme, canonical_host, path, blob_hash, upstream_url,
    is_metadata, last_requested_at, request_count, last_fetched_at,
@@ -75,21 +93,6 @@ ON CONFLICT(canonical_scheme, canonical_host, path) DO UPDATE SET
   -- A fresh fetch/serve re-establishes the row; clear any hold-grace stamp
   -- so a re-fetched path isn't reaped at a stale drop deadline.
   dropped_at        = NULL`
-	isMD := int64(0)
-	if u.IsMetadata {
-		isMD = 1
-	}
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
-		_, err := conn.ExecContext(ctx, q,
-			u.CanonicalScheme, u.CanonicalHost, u.Path, u.BlobHash, u.UpstreamURL,
-			isMD, u.LastRequestedAt, u.RequestCount, u.LastFetchedAt,
-			u.UpstreamETag, u.UpstreamLastMod)
-		if err != nil {
-			return fmt.Errorf("PutURLPath: %w", err)
-		}
-		return nil
-	})
-}
 
 // TouchURLPath records that a request was just served from cache for this
 // (scheme, host, path). Increments request_count and updates
@@ -201,23 +204,58 @@ ON CONFLICT(hash) DO UPDATE
 	})
 }
 
-// GetSuiteFreshness returns the suite_freshness row for the suite, or
-// ErrNotFound when no check has ever been recorded.
-func (c *Cache) GetSuiteFreshness(ctx context.Context, scheme, host, suitePath string) (*SuiteFreshness, error) {
-	const q = `
-SELECT canonical_scheme, canonical_host, suite_path,
-       last_check_at, last_success_at,
-       inrelease_etag, inrelease_lastmod, inrelease_change_seen_at,
-       current_snapshot_id
-FROM suite_freshness
-WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`
-	var s SuiteFreshness
-	err := c.db.QueryRowContext(ctx, q, scheme, host, suitePath).Scan(
+// suiteFreshnessColumns is the column list every suite_freshness reader
+// scans, in (*SuiteFreshness).scanDest order.
+//
+// AIDEV-NOTE: keep in lockstep with scanDest, position by position. A
+// column added to one list only fails Scan loudly (the counts differ); the
+// silent hazard is a reorder or a same-position edit in one list, which
+// scans a column into another field of a compatible type (deferred minor
+// B-1).
+var suiteFreshnessColumns = []string{
+	"canonical_scheme", "canonical_host", "suite_path",
+	"last_check_at", "last_success_at",
+	"inrelease_etag", "inrelease_lastmod", "inrelease_change_seen_at",
+	"current_snapshot_id", "last_requested_at", "check_fail_count",
+	"adoption_fail_hash", "adoption_fail_reason", "adoption_fail_count",
+	"adoption_fail_first_at", "adoption_fail_last_at", "adoption_next_retry_at",
+	"adoption_fail_etag", "adoption_fail_lastmod",
+}
+
+// suiteFreshnessSelect renders suiteFreshnessColumns for a SELECT list,
+// qualified by alias when it is not empty.
+func suiteFreshnessSelect(alias string) string {
+	cols := make([]string, len(suiteFreshnessColumns))
+	for i, c := range suiteFreshnessColumns {
+		if alias != "" {
+			c = alias + "." + c
+		}
+		cols[i] = c
+	}
+	return strings.Join(cols, ", ")
+}
+
+// scanDest returns Scan destinations matching suiteFreshnessColumns.
+func (s *SuiteFreshness) scanDest() []any {
+	return []any{
 		&s.CanonicalScheme, &s.CanonicalHost, &s.SuitePath,
 		&s.LastCheckAt, &s.LastSuccessAt,
 		&s.InReleaseETag, &s.InReleaseLastMod, &s.InReleaseChangeSeenAt,
-		&s.CurrentSnapshotID,
-	)
+		&s.CurrentSnapshotID, &s.LastRequestedAt, &s.CheckFailCount,
+		&s.AdoptionFailHash, &s.AdoptionFailReason, &s.AdoptionFailCount,
+		&s.AdoptionFailFirstAt, &s.AdoptionFailLastAt, &s.AdoptionNextRetryAt,
+		&s.AdoptionFailETag, &s.AdoptionFailLastMod,
+	}
+}
+
+// GetSuiteFreshness returns the suite_freshness row for the suite, or
+// ErrNotFound when no check has ever been recorded.
+func (c *Cache) GetSuiteFreshness(ctx context.Context, scheme, host, suitePath string) (*SuiteFreshness, error) {
+	q := `SELECT ` + suiteFreshnessSelect("") + `
+FROM suite_freshness
+WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`
+	var s SuiteFreshness
+	err := c.db.QueryRowContext(ctx, q, scheme, host, suitePath).Scan(s.scanDest()...)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, ErrNotFound
@@ -233,11 +271,20 @@ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`
 // to show "this suite was last adopted at <timestamp>" without an
 // N+1 GetSuiteSnapshot lookup.
 //
-// AIDEV-NOTE: SPEC5 §9.7.8 — exists alongside ListSuites (which is
-// untouched and continues to back the periodic freshness scheduler);
-// the two helpers have different return shapes. Use ListSuites when
-// you only need freshness columns; use ListSuitesWithAdoption when
-// you need the snapshot's adopted_at too.
+// AIDEV-NOTE: SPEC5 §9.7.8 — exists alongside ListSuites; the two
+// helpers have different return shapes. Since phase E this is also the
+// periodic freshness scheduler's per-tick read (freshness.Cache; the
+// tick uses CurrentAnchorForm to refresh its waiters' signed flag), and
+// ListSuites has no production caller (tests only).
+// AIDEV-NOTE: this is a full-table scan (a LEFT JOIN) with no LIMIT, run
+// at every scheduler tick (periodic_refresh / 4) and every status-page
+// render. Deployments are expected to track tens to low thousands of
+// suites (freshness.max_suites, 5,000 by default, caps the table), so the
+// scan is cheap. If a future phase pushes the table much further, or an
+// operator raises the cap far beyond it, the tick should switch
+// to a chunked scan keyed on (canonical_scheme, canonical_host,
+// suite_path). (Moved here from ListSuites, which the tick no longer
+// runs.)
 //
 // CurrentAdoptedAt is nil when:
 //   - suite_freshness.current_snapshot_id IS NULL (suite never
@@ -251,11 +298,7 @@ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`
 //     "current" snapshot, but the LEFT JOIN doesn't filter on
 //     adopted_at to keep the query simple).
 func (c *Cache) ListSuitesWithAdoption(ctx context.Context) ([]SuiteWithAdoption, error) {
-	const q = `
-SELECT sf.canonical_scheme, sf.canonical_host, sf.suite_path,
-       sf.last_check_at, sf.last_success_at,
-       sf.inrelease_etag, sf.inrelease_lastmod, sf.inrelease_change_seen_at,
-       sf.current_snapshot_id, ss.adopted_at
+	q := `SELECT ` + suiteFreshnessSelect("sf") + `, ss.adopted_at, ss.anchor_form
 FROM suite_freshness sf
 LEFT JOIN suite_snapshot ss
        ON ss.snapshot_id = sf.current_snapshot_id`
@@ -267,14 +310,12 @@ LEFT JOIN suite_snapshot ss
 	var out []SuiteWithAdoption
 	for rows.Next() {
 		var s SuiteWithAdoption
-		if err := rows.Scan(
-			&s.CanonicalScheme, &s.CanonicalHost, &s.SuitePath,
-			&s.LastCheckAt, &s.LastSuccessAt,
-			&s.InReleaseETag, &s.InReleaseLastMod, &s.InReleaseChangeSeenAt,
-			&s.CurrentSnapshotID, &s.CurrentAdoptedAt,
-		); err != nil {
+		var form sql.NullString
+		dest := append(s.scanDest(), &s.CurrentAdoptedAt, &form)
+		if err := rows.Scan(dest...); err != nil {
 			return nil, fmt.Errorf("ListSuitesWithAdoption scan: %w", err)
 		}
+		s.CurrentAnchorForm = form.String
 		out = append(out, s)
 	}
 	if err := rows.Err(); err != nil {
@@ -703,21 +744,15 @@ SELECT canonical_host, path, is_metadata, request_count, last_requested_at
 }
 
 // ListSuites returns every suite_freshness row, in no guaranteed order.
-// Used by the periodic freshness scheduler (SPEC §7.4) to pick suites
-// whose last_success_at is older than periodic_refresh.
+// It has no production caller since phase E: the periodic freshness
+// scheduler (SPEC §7.4) reads ListSuitesWithAdoption at every tick. Kept
+// for tests and diagnostics.
 //
-// AIDEV-NOTE: this is a full-table scan with no LIMIT. Phase 1 deployments
-// are expected to track tens — at worst low hundreds — of suites
-// (canonical_host × suite_codename), so the scan is cheap. If a future
-// phase pushes this number into the thousands, the caller should switch
-// to a chunked scan keyed on (canonical_scheme, canonical_host, suite_path).
+// AIDEV-NOTE: a full-table scan with no LIMIT. The scaling caveat for the
+// scheduler's per-tick scan now lives on ListSuitesWithAdoption, the query
+// the tick runs.
 func (c *Cache) ListSuites(ctx context.Context) ([]SuiteFreshness, error) {
-	const q = `
-SELECT canonical_scheme, canonical_host, suite_path,
-       last_check_at, last_success_at,
-       inrelease_etag, inrelease_lastmod, inrelease_change_seen_at,
-       current_snapshot_id
-FROM suite_freshness`
+	q := `SELECT ` + suiteFreshnessSelect("") + ` FROM suite_freshness`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("ListSuites: %w", err)
@@ -726,12 +761,7 @@ FROM suite_freshness`
 	var out []SuiteFreshness
 	for rows.Next() {
 		var s SuiteFreshness
-		if err := rows.Scan(
-			&s.CanonicalScheme, &s.CanonicalHost, &s.SuitePath,
-			&s.LastCheckAt, &s.LastSuccessAt,
-			&s.InReleaseETag, &s.InReleaseLastMod, &s.InReleaseChangeSeenAt,
-			&s.CurrentSnapshotID,
-		); err != nil {
+		if err := rows.Scan(s.scanDest()...); err != nil {
 			return nil, fmt.Errorf("ListSuites scan: %w", err)
 		}
 		out = append(out, s)
@@ -982,6 +1012,12 @@ func keepNewestNVersionSet(versions []string, n int) map[string]struct{} {
 // NULL). The strict-mode predicate treats that case as "no snapshot
 // is the contract on this host" — falls through to trust-upstream.
 func (c *Cache) HostCurrentSnapshotsCoverage(ctx context.Context, scheme, host string) ([]SnapshotCoverage, error) {
+	// AIDEV-NOTE: spec C5/C10 — unsigned snapshots never count for strict
+	// mode (they vouch nothing), so they are not "snapshots in force" here.
+	// Flat snapshots (and /. twins) count like dists/ ones: C10's rule is
+	// host-wide, and C6's vouching replaces PR #8's per-directory scoping;
+	// an anchorless suite has no snapshot (TestServeHTTP_FlatStrictMatrix,
+	// TestServeHTTP_CurrentSnapshotCountCountsFlatSnapshots).
 	const q = `
 SELECT ss.snapshot_id, ss.package_coverage_complete
   FROM suite_snapshot ss
@@ -991,7 +1027,8 @@ SELECT ss.snapshot_id, ss.package_coverage_complete
    AND sf.suite_path         = ss.suite_path
    AND sf.current_snapshot_id = ss.snapshot_id
  WHERE ss.canonical_scheme = ?
-   AND ss.canonical_host   = ?`
+   AND ss.canonical_host   = ?
+   AND ss.anchor_form     <> 'unsigned'`
 	rows, err := c.db.QueryContext(ctx, q, scheme, host)
 	if err != nil {
 		return nil, fmt.Errorf("HostCurrentSnapshotsCoverage: %w", err)
@@ -1013,32 +1050,6 @@ SELECT ss.snapshot_id, ss.package_coverage_complete
 		return nil, fmt.Errorf("HostCurrentSnapshotsCoverage iter: %w", err)
 	}
 	return out, nil
-}
-
-// PutSuiteFreshness upserts the per-suite freshness state.
-func (c *Cache) PutSuiteFreshness(ctx context.Context, s SuiteFreshness) error {
-	const q = `
-INSERT INTO suite_freshness
-  (canonical_scheme, canonical_host, suite_path,
-   last_check_at, last_success_at,
-   inrelease_etag, inrelease_lastmod, inrelease_change_seen_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(canonical_scheme, canonical_host, suite_path) DO UPDATE SET
-  last_check_at            = excluded.last_check_at,
-  last_success_at          = excluded.last_success_at,
-  inrelease_etag           = excluded.inrelease_etag,
-  inrelease_lastmod        = excluded.inrelease_lastmod,
-  inrelease_change_seen_at = excluded.inrelease_change_seen_at`
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
-		_, err := conn.ExecContext(ctx, q,
-			s.CanonicalScheme, s.CanonicalHost, s.SuitePath,
-			s.LastCheckAt, s.LastSuccessAt,
-			s.InReleaseETag, s.InReleaseLastMod, s.InReleaseChangeSeenAt)
-		if err != nil {
-			return fmt.Errorf("PutSuiteFreshness: %w", err)
-		}
-		return nil
-	})
 }
 
 // ListCachedDebs returns every cached .deb whose filename basename

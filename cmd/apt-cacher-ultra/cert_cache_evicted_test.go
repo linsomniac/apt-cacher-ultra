@@ -90,10 +90,9 @@ func TestServe_LeafCacheEviction_EmitsMITMCertCacheEvictedLog(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	serveDone := make(chan error, 1)
-	go func() {
-		serveDone <- serveListeners(ctx, cfg, logger, cacheLn, nil, nil, nil)
-	}()
+	serveDone := serveUntilCleanup(t, ctx, cancel, func(ctx context.Context) error {
+		return serveListeners(ctx, cfg, logger, cacheLn, nil, nil, nil)
+	})
 
 	if err := waitForDaemonReady(t, cacheAddr, 10*time.Second); err != nil {
 		t.Fatalf("daemon never became ready: %v", err)

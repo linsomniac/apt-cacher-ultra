@@ -8,13 +8,18 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/gc"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
+	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
 // statusModel is the SPEC5 §10.5 status-page JSON shape, also used
@@ -237,22 +242,73 @@ type listenerInfo struct {
 }
 
 type suiteEntry struct {
-	Host                             string `json:"host"`
-	SuitePath                        string `json:"suite_path"`
+	// Scheme is the suite's canonical scheme, http or https: a suite of
+	// either scheme may share host and path, and POST /forget takes it
+	// (ruling PF-7; additive to the locked JSON contract).
+	Scheme    string `json:"scheme"`
+	Host      string `json:"host"`
+	SuitePath string `json:"suite_path"`
+	// Flat marks a flat repository's suite (aptpath.IsFlatSuitePath: spec
+	// C2's flat grammar, a ./ twin included; spec C7, C11): additive to
+	// the locked JSON contract, like scheme. The HTML shows it as a tag
+	// beside the suite path.
+	Flat bool `json:"flat"`
+	// Anchorless marks a flat suite the cache refreshes without a Release
+	// (spec C4 Dispatch 4, phase G ruling PG-14): derived, see
+	// annotateSuiteEntries. Additive to the locked JSON contract; the HTML
+	// Adoption cell reads "refreshed without a Release".
+	Anchorless                       bool   `json:"anchorless"`
 	LastCheckUnixTime                *int64 `json:"last_check_unixtime"`
 	LastSuccessUnixTime              *int64 `json:"last_success_unixtime"`
 	CurrentSnapshotID                *int64 `json:"current_snapshot_id"`
 	CurrentSnapshotAdoptedAtUnixTime *int64 `json:"current_snapshot_adopted_at_unixtime"`
 	InReleaseChangeSeenAtUnixTime    *int64 `json:"inrelease_change_seen_at_unixtime"`
 
-	// Lagging is the SPEC5 §12.2.4 HTML annotation rendered next
-	// to InReleaseChangeSeenAtUnixTime when the upstream advertised
-	// a newer InRelease that we haven't successfully refetched yet.
-	// Empty otherwise. Excluded from JSON — consumers compute the
-	// signal themselves from the two timestamps. Format: "(lagging
-	// Xh Ym)" / "(lagging Xm)" matching the operator-facing
-	// duration helper.
+	// Lagging renders "(lagging Xh Ym)" / "(lagging Xm)" while an
+	// upstream InRelease change first seen at
+	// InReleaseChangeSeenAtUnixTime has not been adopted — the lag runs
+	// from that first sighting to now (spec C7), not the retired
+	// two-stamp comparison against last_success_at (which every check
+	// bumps, so it could never fire). Empty when there is nothing to
+	// show: no sighting yet, a future stamp (clock step), or a refusal
+	// reason where the cache already serves content at least as new as
+	// upstream (see refusalKeepsCurrent) — there the "refused: …" text
+	// in AdoptionStatus is the signal, not a lag. Excluded from JSON —
+	// consumers compute the signal themselves from the record.
 	Lagging string `json:"-"`
+
+	// Spec C7 "Visibility" (phase B). AnchorForm is "" for a suite with no
+	// current snapshot. The adoption_fail_* fields mirror the failure
+	// record; adoption_refused marks a refusal state (not a failure).
+	AnchorForm                string  `json:"anchor_form"`
+	LastRequestedUnixTime     *int64  `json:"last_requested_unixtime"`
+	CheckFailCount            int64   `json:"check_fail_count"`
+	AdoptionFailReason        *string `json:"adoption_fail_reason"`
+	AdoptionFailCount         int64   `json:"adoption_fail_count"`
+	AdoptionFailFirstUnixTime *int64  `json:"adoption_fail_first_unixtime"`
+	AdoptionNextRetryUnixTime *int64  `json:"adoption_next_retry_unixtime"`
+	AdoptionRefused           bool    `json:"adoption_refused"`
+
+	// HTML-only: AdoptionFailing marks a failing (not refused) record;
+	// AdoptionStatus is its one-line summary; LagSeconds feeds the panel
+	// state. JSON consumers compute these from the fields above.
+	AdoptionFailing bool   `json:"-"`
+	AdoptionStatus  string `json:"-"`
+	// CheckStatus is "checks failing ×k · backoff ends in …" for a suite
+	// whose checks keep ending unknown (deferred minor B-63);
+	// annotateSuiteEntries sets it, and the Adoption cell shows it after
+	// AdoptionStatus.
+	CheckStatus string `json:"-"`
+	LagSeconds  int64  `json:"-"`
+	// LagWarn marks a lag beyond 1 h: an adoption normally completes in
+	// minutes, so a longer lag means at least one attempt failed. Rows and
+	// the LAGGING count use it; the "(lagging …)" text shows any lag.
+	LagWarn bool `json:"-"`
+	// RefusedLong marks a refusal whose streak began more than
+	// refusalEscalateAge ago: still a state, not a failure, but one that
+	// may be a silent freeze, so its row and the SUITES vital warn (never
+	// crit) and the REFUSED 24H+ count shows it.
+	RefusedLong bool `json:"-"`
 }
 
 // gcInfo carries the SPEC5 §10.5 gc.* block. The pointer-typed
@@ -277,6 +333,7 @@ type gcInfo struct {
 	LastRunDurationSeconds  float64 `json:"last_run_duration_seconds"`
 	OrphanCandidatesReaped  int     `json:"orphan_candidates_reaped"`
 	DisplacedReaped         int     `json:"displaced_reaped"`
+	RetiredReaped           int     `json:"retired_reaped"` // snapshot-GC sub-job C (spec C9); additive
 	URLPathRowsReaped       int     `json:"url_path_rows_reaped"`
 	PoolOrphansRepaired     int     `json:"pool_orphans_repaired"`
 	PoolOrphanBytesRepaired int64   `json:"pool_orphan_bytes_repaired"`
@@ -304,15 +361,21 @@ type hotURLEntry struct {
 }
 
 type adoptionEntry struct {
+	// Scheme is the suite's canonical scheme, http or https (deferred
+	// minor F-19): the HTML Host cell shows scheme://host, as the suites
+	// table does, so a host copied from it into POST /forget carries its
+	// scheme. Additive to the locked JSON contract.
+	Scheme    string `json:"scheme"`
 	Host      string `json:"host"`
 	SuitePath string `json:"suite_path"`
 	Outcome   string `json:"outcome"`
 	// Reason is the SPEC5 §10.5 additive sub-classification. Empty on
 	// success; for gpg_failed it carries the specific verifier
 	// sentinel (untrusted_signer, short_keyid, crypto_verify_failed,
-	// missing_signature, ambiguous_keyid, no_usable_signature); for
-	// other failures it mirrors Outcome. JSON-omitted when empty so
-	// the wire shape is unchanged for success rows.
+	// missing_signature, malformed_clearsign, ambiguous_keyid,
+	// no_usable_signature); for other failures it mirrors Outcome.
+	// JSON-omitted when empty so the wire shape is unchanged for
+	// success rows.
 	Reason string `json:"reason,omitempty"`
 	// MemberPath is the SPEC5 §10.5 additive field naming the declared
 	// Release member that failed (member_fetch_failed / member_mismatch),
@@ -406,12 +469,13 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 		RepoCoverage:    buildRepoCoverageInfo(repo, s.cfg.AdoptionArchitectures),
 		Listeners:       buildListenerInfo(s.cfg),
 		TLSMITM:         buildTLSMITMInfo(s.cfg.TLSMITM),
-		Suites:          buildSuiteEntries(suitesRaw.([]cache.SuiteWithAdoption)),
+		Suites:          buildSuiteEntries(suitesRaw.([]cache.SuiteWithAdoption), wallclock.Now().Unix()),
 		HotURLPaths:     buildHotURLEntries(hotPaths.([]cache.HotURLPath)),
 		RecentAdoptions: buildAdoptionEntries(s.cfg.Ring.Snapshot()),
 		ActiveHosts:     buildActiveHostEntries(s.cfg.HostLimiter.Snapshot()),
 		Keyring:         buildKeyringEntries(s.cfg.Keyring),
 	}
+	annotateSuiteEntries(model.Suites, s.adoptionEnabled(), s.cfg.CheckBackoff, wallclock.Now().Unix())
 
 	// SPEC5 §10.5: gc is always present at the top level. When no GC
 	// run has completed, gcInfo.MarshalJSON emits the abbreviated
@@ -419,23 +483,38 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 	// LastRunUnixTime != nil to choose the populated-vs-empty branch.
 	gci := &gcInfo{}
 	if summary, ok := s.cfg.GC.LastRunSummary(); ok {
-		ts := summary.AtUnixTime
-		gci.LastRunUnixTime = &ts
-		gci.LastRunPhase = summary.Phase
-		gci.LastRunBlobsReaped = summary.BlobsReaped
-		gci.LastRunBytesReclaimed = summary.BytesReclaimed
-		gci.LastRunDeadlineReached = summary.DeadlineReached
-		gci.LastRunDurationSeconds = summary.DurationSeconds
-		gci.OrphanCandidatesReaped = summary.OrphanCandidatesReaped
-		gci.DisplacedReaped = summary.DisplacedReaped
-		gci.URLPathRowsReaped = summary.URLPathRowsReaped
-		gci.PoolOrphansRepaired = summary.PoolOrphansRepaired
-		gci.PoolOrphanBytesRepaired = summary.PoolOrphanBytesRepaired
-		gci.PoolUnlinkErrors = summary.PoolUnlinkErrors
+		gci = gcInfoFromSummary(summary)
 	}
 	model.GC = gci
 
 	return model, "", nil
+}
+
+// gcInfoFromSummary copies the last GC run's summary into the status
+// page's gc block, field by field.
+//
+// AIDEV-NOTE: a field gc.LastRunSummary gains is not shown until it is
+// copied here (retired_reaped waited from phase F to H1: the F
+// carry-forward); TestGCInfoFromSummary_CopiesEveryShownField pins the
+// copy of each field the block has (its reflection pass fails on a gcInfo
+// field a fully set summary leaves zero).
+func gcInfoFromSummary(summary gc.LastRunSummary) *gcInfo {
+	ts := summary.AtUnixTime
+	return &gcInfo{
+		LastRunUnixTime:         &ts,
+		LastRunPhase:            summary.Phase,
+		LastRunBlobsReaped:      summary.BlobsReaped,
+		LastRunBytesReclaimed:   summary.BytesReclaimed,
+		LastRunDeadlineReached:  summary.DeadlineReached,
+		LastRunDurationSeconds:  summary.DurationSeconds,
+		OrphanCandidatesReaped:  summary.OrphanCandidatesReaped,
+		DisplacedReaped:         summary.DisplacedReaped,
+		RetiredReaped:           summary.RetiredReaped,
+		URLPathRowsReaped:       summary.URLPathRowsReaped,
+		PoolOrphansRepaired:     summary.PoolOrphansRepaired,
+		PoolOrphanBytesRepaired: summary.PoolOrphanBytesRepaired,
+		PoolUnlinkErrors:        summary.PoolUnlinkErrors,
+	}
 }
 
 // runDBQuery wraps a DB call in its own 5s context.WithTimeout
@@ -548,42 +627,267 @@ func buildListenerInfo(cfg Config) []listenerInfo {
 	return out
 }
 
-func buildSuiteEntries(rows []cache.SuiteWithAdoption) []suiteEntry {
+func buildSuiteEntries(rows []cache.SuiteWithAdoption, now int64) []suiteEntry {
 	out := make([]suiteEntry, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, suiteEntry{
+		e := suiteEntry{
+			Scheme:                           r.CanonicalScheme,
 			Host:                             r.CanonicalHost,
 			SuitePath:                        r.SuitePath,
+			Flat:                             aptpath.IsFlatSuitePath(r.SuitePath),
 			LastCheckUnixTime:                r.LastCheckAt,
 			LastSuccessUnixTime:              r.LastSuccessAt,
 			CurrentSnapshotID:                r.CurrentSnapshotID,
 			CurrentSnapshotAdoptedAtUnixTime: r.CurrentAdoptedAt,
 			InReleaseChangeSeenAtUnixTime:    r.InReleaseChangeSeenAt,
-			Lagging:                          laggingAnnotation(r.InReleaseChangeSeenAt, r.LastSuccessAt),
-		})
+			AnchorForm:                       r.CurrentAnchorForm,
+			LastRequestedUnixTime:            r.LastRequestedAt,
+			CheckFailCount:                   r.CheckFailCount,
+			AdoptionFailReason:               r.AdoptionFailReason,
+			AdoptionFailCount:                r.AdoptionFailCount,
+			AdoptionFailFirstUnixTime:        r.AdoptionFailFirstAt,
+			AdoptionNextRetryUnixTime:        r.AdoptionNextRetryAt,
+		}
+		if r.AdoptionFailCount > 0 && r.AdoptionFailReason != nil {
+			e.AdoptionRefused = cache.IsRefusalReason(*r.AdoptionFailReason)
+			e.AdoptionFailing = !e.AdoptionRefused
+			e.RefusedLong = e.AdoptionRefused && streakAge(r.SuiteFreshness, now) > refusalEscalateAge
+			e.AdoptionStatus = adoptionStatus(r.SuiteFreshness, e.AdoptionRefused, e.RefusedLong, now)
+		}
+		// A refusal whose reason means the cache already serves content
+		// at least as new as upstream (refusalKeepsCurrent) keeps its
+		// first-sighting inrelease_change_seen_at forever — RecordAdoptionFailure
+		// never clears it, and deferred checks keep the first sighting.
+		// Showing that as growing lag would eventually push the Suites
+		// vital to warn/crit for a suite that isn't actually behind (spec
+		// C7: a refusal is a state, not a failure). Suppress the lag for
+		// those rows; the "refused: …" text in AdoptionStatus is the
+		// signal, and RefusedLong escalates one older than a day.
+		if !e.AdoptionRefused || !refusalKeepsCurrent(*r.AdoptionFailReason) {
+			e.Lagging, e.LagSeconds = laggingAnnotation(r.InReleaseChangeSeenAt, now)
+			e.LagWarn = e.LagSeconds > 3600
+		}
+		out = append(out, e)
 	}
 	return out
 }
 
-// laggingAnnotation renders the SPEC5 §12.2.4 "(lagging Xh Ym)"
-// suffix when the upstream's InRelease changed after our last
-// successful re-adoption (= the cache is serving older metadata
-// than upstream advertises). Both inputs may be nil — in which
-// case we cannot determine lag and return "".
-func laggingAnnotation(seenAt, successAt *int64) string {
-	if seenAt == nil || successAt == nil {
+// annotateSuiteEntries derives what the suites table shows beyond the
+// rows' own fields: Anchorless (JSON and HTML: "refreshed without a
+// Release" in the Adoption cell) and CheckStatus (HTML: "checks failing
+// ×k · backoff ends in d", or "… backoff over" once it has: the earliest
+// the scheduler may check the suite — a client's T1 may come sooner, a
+// not-yet-stale suite later; the count alone for a suite the scheduler
+// does not queue on its backoff (unscheduled), without a backoff
+// function, or for a last check further in the future than
+// statusClockStepTolerance: suiteDue reads that stamp as infinitely old,
+// so no backoff holds the suite, and as laggingAnnotation shows no lag
+// for a future stamp, the cell shows no backoff). adoptionEnabled is the
+// status page's own signal (Server.adoptionEnabled).
+//
+// AIDEV-NOTE: phase G ruling PG-14 (design note 5 of the H1 plan).
+// Anchorless is derived, not stored: adoption enabled, a flat suite, no
+// current snapshot, a successful check, no adoption record and no pending
+// change. Only an answered anchorless check ends in that state
+// (anchorlessRefresh clears the pending change and the record together):
+// a first adoption, queued or running, leaves inrelease_change_seen_at
+// set (checkFirst), a refusal or failure writes a record, a commit sets
+// the current snapshot. With adoption disabled no anchorless check runs,
+// and the Phase-1 check bumps last_success_at for an InRelease too, so
+// the field is false there. One exception: a flat suite whose row an
+// adoption-disabled InRelease miss created has last_success_at set
+// (suiteSeed stamps it), so after adoption is enabled the field reads true
+// until the suite's first check (review M-11 of the H1 plan), which for a
+// suite no client asked for in 7 days (dormant: suiteDue never queues it)
+// comes only once one asks again (the H1 final review's ops M-3). If the
+// freshness side changes any of these, change the derivation
+// (TestSuiteEntries_Anchorless).
+func annotateSuiteEntries(es []suiteEntry, adoptionEnabled bool, checkBackoff func(int64) time.Duration, now int64) {
+	for i := range es {
+		e := &es[i]
+		e.Anchorless = adoptionEnabled && e.Flat && e.CurrentSnapshotID == nil && e.LastSuccessUnixTime != nil &&
+			e.AdoptionFailCount == 0 && e.InReleaseChangeSeenAtUnixTime == nil
+		if e.Anchorless {
+			e.AdoptionStatus = "refreshed without a Release"
+		}
+		if e.CheckFailCount <= 0 {
+			continue
+		}
+		e.CheckStatus = "checks failing ×" + strconv.FormatInt(e.CheckFailCount, 10)
+		if checkBackoff == nil || e.LastCheckUnixTime == nil || *e.LastCheckUnixTime > now+statusClockStepTolerance ||
+			unscheduled(e, adoptionEnabled, now) {
+			continue
+		}
+		next := *e.LastCheckUnixTime + int64(checkBackoff(e.CheckFailCount)/time.Second)
+		if next > now {
+			e.CheckStatus += " · backoff ends in " + durationOf(next-now)
+		} else {
+			e.CheckStatus += " · backoff over"
+		}
+	}
+}
+
+// statusInterestWindow mirrors freshness's interestWindow (spec C4
+// Dispatch 3), and statusClockStepTolerance (seconds) its
+// clockStepTolerance; admin does not import freshness.
+//
+// AIDEV-NOTE: unscheduled and annotateSuiteEntries' future-stamp test
+// mirror the scheduler's suiteDue (review M-5 of the H1 plan; Task 4
+// review M-2): its dormancy (a never-adopted suite without client
+// interest), its record pacing (an adopted suite's anchor_absent or
+// unsigned_disabled record) and its clock-step rule (a last_check_at
+// beyond the tolerance is infinitely old, so no backoff holds the suite).
+// Known gaps: unscheduled ignores adoption_next_retry_at, so a pacing
+// record whose retry has come, which suiteDue queues once the backoff
+// ends, still shows the count alone (less informative, never a false
+// promise); and it cannot see the checker's in-memory pacing of a suite
+// whose last answered check ended anchor_absent (ruling PE-10,
+// pacedAbsentAnswer), so there the cell may say the backoff is over while
+// the scheduler waits for the record's retry, which the record's own text
+// shows. Change both sides together.
+const (
+	statusInterestWindow     = 7 * 24 * time.Hour
+	statusClockStepTolerance = 2
+)
+
+// unscheduled reports a suite the scheduler does not queue on its failing
+// checks' backoff: with adoption enabled, a never-adopted suite no client
+// asked for within the interest window (dormant), and an adopted suite
+// its anchor_absent or unsigned_disabled record paces (rulings PE-2,
+// PE-12; the record's own text shows its retry). The Adoption cell then
+// shows the failing count alone: "backoff over" would promise a check that
+// never comes.
+func unscheduled(e *suiteEntry, adoptionEnabled bool, now int64) bool {
+	if !adoptionEnabled {
+		return false
+	}
+	if e.CurrentSnapshotID == nil {
+		if e.LastRequestedUnixTime == nil {
+			return true
+		}
+		d := now - *e.LastRequestedUnixTime
+		if d < 0 {
+			d = -d // a stamp in the future counts as interest within the window, as interested reads it
+		}
+		return d >= int64(statusInterestWindow/time.Second)
+	}
+	return e.AdoptionFailCount > 0 && e.AdoptionFailReason != nil &&
+		(*e.AdoptionFailReason == cache.ReasonAnchorAbsent || *e.AdoptionFailReason == cache.ReasonUnsignedDisabled)
+}
+
+// adoptionEnabled is the status page's signal that adoption is on: a
+// keyring provider wired whose snapshot is non-nil (see
+// buildHTMLRenderModel's AIDEV-NOTE).
+func (s *Server) adoptionEnabled() bool {
+	return s.cfg.Keyring != nil && s.cfg.Keyring.KeyringSnapshot() != nil
+}
+
+// laggingAnnotation renders "(lagging …)" while an upstream change first
+// seen at seenAt has not been adopted, and returns the lag in seconds.
+// The lag runs from the first sighting to now (spec C7): the old rule
+// compared it with last_success_at, which every check bumps, so it could
+// never fire. A stamp in the future (clock step) shows no lag.
+func laggingAnnotation(seenAt *int64, now int64) (string, int64) {
+	if seenAt == nil || *seenAt > now {
+		return "", 0
+	}
+	lag := now - *seenAt
+	return "(lagging " + durationOf(lag) + ")", lag
+}
+
+// refusalEscalateAge (seconds) is how old a refusal streak gets before
+// the page escalates it (RefusedLong). It matches the 24 h after which
+// the checker logs WARN adoption_refused_persistently
+// (freshness.refusalEscalateAge).
+const refusalEscalateAge = 24 * 3600
+
+// streakAge is how long the record's streak has lasted, in seconds. A
+// streak start in the future (clock step) counts as now: age 0.
+func streakAge(s cache.SuiteFreshness, now int64) int64 {
+	if s.AdoptionFailFirstAt == nil || *s.AdoptionFailFirstAt >= now {
+		return 0
+	}
+	return now - *s.AdoptionFailFirstAt
+}
+
+// adoptionStatus summarises the spec C7 record for the suites table:
+// "adoption failing 3d 2h · untrusted_signer · retry in 41m",
+// "refused: upstream_older · retry due", or, for a refusal older than
+// refusalEscalateAge, "refused: upstream_older · since 1d 1h · retry due".
+// A row without a reason has no record to summarise: "" (deferred minor
+// B-61; buildSuiteEntries calls it only with one, but it must not rely on
+// that).
+func adoptionStatus(s cache.SuiteFreshness, refused, long bool, now int64) string {
+	if s.AdoptionFailReason == nil {
 		return ""
 	}
-	if *seenAt <= *successAt {
-		return ""
+	retry := "retry due"
+	if s.AdoptionNextRetryAt != nil && *s.AdoptionNextRetryAt > now {
+		retry = "retry in " + durationOf(*s.AdoptionNextRetryAt-now)
 	}
-	gap := time.Duration(*seenAt-*successAt) * time.Second
-	h := int(gap.Hours())
-	m := int(gap.Minutes()) % 60
-	if h == 0 {
-		return fmt.Sprintf("(lagging %dm)", m)
+	if refused {
+		if long {
+			return "refused: " + *s.AdoptionFailReason + " · since " + durationOf(streakAge(s, now)) + " · " + retry
+		}
+		return "refused: " + *s.AdoptionFailReason + " · " + retry
 	}
-	return fmt.Sprintf("(lagging %dh %dm)", h, m)
+	return "adoption failing " + durationOf(streakAge(s, now)) + " · " + *s.AdoptionFailReason + " · " + retry
+}
+
+// suitesForHTML adapts the suite rows to the HTML page. With adoption
+// disabled nothing is attempted or adopted, so a record stored while it
+// was enabled is inert: its text gains " (adoption disabled)" and it marks
+// no warn (final review S I3). A lag is truthful but expected — Phase 1
+// never refreshes metadata — so rows keep their lag text without warning,
+// and vitalState shows the SUITES vital stale with "ADOPTION DISABLED —
+// METADATA NOT REFRESHED" (ruling A4). The JSON keeps the raw fields.
+func suitesForHTML(suites []suiteEntry, adoptionEnabled bool) []suiteEntry {
+	if adoptionEnabled {
+		return suites
+	}
+	out := slices.Clone(suites)
+	for i := range out {
+		e := &out[i]
+		if e.AdoptionStatus != "" {
+			e.AdoptionStatus += " (adoption disabled)"
+		}
+		e.AdoptionFailing, e.RefusedLong, e.LagWarn = false, false, false
+	}
+	return out
+}
+
+// refusalKeepsCurrent reports whether an adoption refusal for the given
+// reason leaves the cache already serving content at least as new as
+// upstream, so there is nothing to catch up on and buildSuiteEntries
+// must not render it as lag (spec C7: a refusal is a state, not a
+// failure; RecordAdoptionFailure never clears inrelease_change_seen_at
+// and deferred checks keep the first sighting, so an unsuppressed row
+// would accrue lag forever and eventually push the Suites vital to warn
+// and then crit for a suite that isn't actually behind).
+//
+//   - ReasonUpstreamOlder: upstream's Release Date is older than (or
+//     missing after) the current snapshot's — the cache is ahead or tied.
+//     A missing Date says nothing about the content's age, which is why
+//     a refusal older than refusalEscalateAge warns anyway (RefusedLong):
+//     a vendor that stops emitting Date must not freeze silently.
+//   - ReasonRollbackRefused: upstream is serving content identical to an
+//     older snapshot the cache already replaced (a flapping mirror) —
+//     not a step backward for the cache.
+//
+// Every other refusal reason — the phase E reasons
+// (unsigned_downgrade_refused, unsigned_unconfirmed, unsigned_too_large,
+// anchor_absent, unsigned_disabled) — means the cache really is behind
+// (e.g. a vendor that stopped signing, or adopt_unsigned turned off), so
+// those keep the ordinary lag behaviour; the operator must act (the
+// spec's POST /forget escape hatch, or the knob). Extend the
+// case list here, not at the call site, when phase E adds reasons that
+// also leave the cache current.
+func refusalKeepsCurrent(reason string) bool {
+	switch reason {
+	case cache.ReasonUpstreamOlder, cache.ReasonRollbackRefused:
+		return true
+	}
+	return false
 }
 
 func buildHotURLEntries(rows []cache.HotURLPath) []hotURLEntry {
@@ -604,6 +908,7 @@ func buildAdoptionEntries(events []observability.AdoptionEvent) []adoptionEntry 
 	out := make([]adoptionEntry, 0, len(events))
 	for _, e := range events {
 		out = append(out, adoptionEntry{
+			Scheme:            e.Scheme,
 			Host:              e.Host,
 			SuitePath:         e.SuitePath,
 			Outcome:           e.Outcome,
@@ -719,23 +1024,27 @@ func writeStatusJSON(w io.Writer, m statusModel) error {
 // buildHTMLRenderModel composes the docs/admin-ui-spec.md §0.7 wrapper
 // from the wire-shaped statusModel plus the bits of server config the
 // HTML template needs but the JSON contract intentionally does not
-// expose. JSON path never calls this.
+// expose. The JSON path does not call this wrapper, but it reads the
+// same adoption signal (Server.adoptionEnabled) for suites[].anchorless.
 //
 // AIDEV-NOTE: AdoptionEnabled — the spec hint at §0.7 says
 // `cfg.Keyring != nil at server build time`, but in production the cmd
 // entry point always passes a non-nil KeyringProvider whose snapshot is
 // nil when adoption is disabled (see cmd/apt-cacher-ultra/main.go
-// keyringProvider adapter). §2.3 forbids editing cmd and admin/server.go
-// to add an explicit AdoptionEnabled field, so the wrapper uses the
-// snapshot-nil convention as the operator-facing signal: a nil snapshot
+// keyringProvider adapter). The signal is therefore the snapshot-nil
+// convention, which lives in Server.adoptionEnabled: a nil snapshot
 // means "no keyring wired at all" → adoption disabled, while a non-nil
 // (possibly empty) slice means "adoption enabled, keys may not be loaded
-// yet". See .phase-loop-notes.md "Spec issues" for the followup.
+// yet". It is not HTML-only: buildStatusModel passes it to
+// annotateSuiteEntries, so it also derives the JSON's
+// suites[].anchorless, and changing the convention changes the JSON
+// contract (TestStatus_AnchorlessFlatSuiteThroughTheServer). Making the
+// signal explicit (an AdoptionEnabled field in admin.Config) would need
+// cmd and server changes; until then the snapshot-nil convention is the
+// signal.
 func (s *Server) buildHTMLRenderModel(m statusModel) htmlRenderModel {
-	w := htmlRenderModel{statusModel: m}
-	if s.cfg.Keyring != nil && s.cfg.Keyring.KeyringSnapshot() != nil {
-		w.AdoptionEnabled = true
-	}
+	w := htmlRenderModel{statusModel: m, AdoptionEnabled: s.adoptionEnabled()}
+	w.Suites = suitesForHTML(m.Suites, w.AdoptionEnabled)
 	if s.cfg.GC != nil {
 		w.GCIntervalSeconds = s.cfg.GC.Interval().Seconds()
 	}
@@ -803,7 +1112,9 @@ func reasonTooltip(reason string) string {
 	case "no_usable_signature":
 		return "No signature packet in the clearsigned block carried a trusted IssuerFingerprint."
 	case "missing_signature":
-		return "InRelease body is not clearsigned and adoption.require_signature is true."
+		return "InRelease body is not clearsigned. Plain-text InRelease files are never adopted as signed metadata, whatever adoption.require_signature says."
+	case "malformed_clearsign":
+		return "InRelease starts like a clearsigned message but its signature frame does not decode."
 	case "ambiguous_keyid":
 		return "Two or more keys in the trust set share the same 8-byte keyid; the short-keyid fallback refuses to guess."
 	case "crypto_verify_failed":
@@ -817,9 +1128,21 @@ func reasonTooltip(reason string) string {
 	case "member_fetch_failed":
 		return "A Release-listed member could not be fetched intact — size/content-length mismatch (often an index republished mid-fetch, or a non-essential member the upstream serves with the wrong body), a transport error, or a 5xx. The failing member and detail are shown in the row."
 	case "db_failed":
-		return "Adoption hit a local cache/DB error (blob write, rehash, or snapshot insert), not an upstream problem. It is retried on the next freshness tick."
+		return "Adoption hit a local cache/DB error (blob write, rehash, or snapshot insert), not an upstream problem. It is retried on the backoff schedule."
 	case "run_failed":
 		return "Adoption failed for a reason not otherwise categorized; consult the adoption_run_failed log line."
+	case "refused":
+		return "Not a failure: the adoption was refused by a rule (see the reason). The current snapshot keeps serving; the same content is not retried until its retry time, new content is tried at once."
+	case "upstream_older":
+		return "The upstream Release's Date is older than the current snapshot's, or missing after a dated one: apt would refuse it too. Refused, not failed."
+	case "rollback_refused":
+		return "Upstream serves content identical to an older snapshot the cache already replaced (a flapping mirror). Refused, not failed."
+	case "release_date_in_future":
+		return "The Release's Date is more than 10 s ahead of the cache's clock (apt's Acquire::Max-FutureTime). Check the cache host's clock."
+	case "timed_out":
+		return "The adoption exceeded adoption.max_duration and was abandoned; it is retried on the backoff schedule."
+	case "panic", "panicked":
+		return "The adoption goroutine panicked; it was recovered and recorded. See the adoption_panicked log line."
 	}
 	return reason
 }
@@ -1091,24 +1414,25 @@ func vitalState(kind string, m htmlRenderModel) string {
 		if len(m.Suites) == 0 {
 			return "stale"
 		}
-		worstLagSeconds := int64(0)
-		anyLag := false
+		if !m.AdoptionEnabled {
+			// ADOPTION DISABLED — METADATA NOT REFRESHED (§9.1, the
+			// keyring panel's precedent): the lag is expected, not a
+			// fault, so it must not hold the page at DEGRADED.
+			return "stale"
+		}
+		var worstLag int64
+		anyWarn := false
 		for _, s := range m.Suites {
-			if s.LastSuccessUnixTime == nil || s.InReleaseChangeSeenAtUnixTime == nil {
-				continue
-			}
-			if *s.InReleaseChangeSeenAtUnixTime > *s.LastSuccessUnixTime {
-				anyLag = true
-				lag := *s.InReleaseChangeSeenAtUnixTime - *s.LastSuccessUnixTime
-				if lag > worstLagSeconds {
-					worstLagSeconds = lag
-				}
-			}
+			worstLag = max(worstLag, s.LagSeconds)
+			anyWarn = anyWarn || s.AdoptionFailing || s.RefusedLong
 		}
-		if worstLagSeconds > 24*3600 {
+		switch {
+		case worstLag > 24*3600:
 			return "crit"
-		}
-		if anyLag {
+		case worstLag > 3600 || anyWarn:
+			// An adoption normally completes within minutes; a lag beyond
+			// the 1 h retry cap means at least one attempt failed. A
+			// refusal older than a day warns, never crits (ruling A5).
 			return "warn"
 		}
 		return "ok"
@@ -1120,9 +1444,14 @@ func vitalState(kind string, m htmlRenderModel) string {
 			}
 			return "ok"
 		}
+		// A "refused" outcome is a state, not a failure (spec C7): it is
+		// excluded from the failure side of the ratio, same as "success".
+		// The denominator stays the full window (refusals are real events,
+		// just not failing ones), so a window of only refusals + successes
+		// keeps this cell "ok".
 		fail := 0
 		for _, a := range m.RecentAdoptions {
-			if a.Outcome != "success" {
+			if a.Outcome != "success" && a.Outcome != "refused" {
 				fail++
 			}
 		}
@@ -1220,20 +1549,24 @@ func verdictExplanation(m htmlRenderModel) string {
 // produced by internal/freshness/metrics.go's classifier:
 //
 //	"success", "gpg_failed", "parse_failed", "member_mismatch",
-//	"unpinned_suite", "run_failed".
+//	"member_fetch_failed", "db_failed", "unpinned_suite", "run_failed",
+//	"refused", "release_date_in_future", "timed_out", "panicked".
 //
-// All non-success outcomes are critical for the operator (the row's
-// adoption did not land); they map to b--crit. Unknown outcomes — e.g.
-// a future enum value the classifier adds before this helper is updated
-// — map to b--crit too rather than the previous b--stale, since
-// "future failure mode we don't recognise" is closer to crit than to
-// stale. Existing soft-state values ("lagging", "warn") keep their
-// b--warn mapping for non-adoption use sites.
+// "refused" is a state, not a failure (spec C7): the adoption was
+// refused by a rule (upstream_older, rollback_refused, …), the current
+// snapshot keeps serving, and the row maps to b--warn like the soft-state
+// values below. Every other non-success outcome is critical for the
+// operator (the row's adoption did not land); they map to b--crit.
+// Unknown outcomes — e.g. a future enum value the classifier adds before
+// this helper is updated — map to b--crit too rather than the previous
+// b--stale, since "future failure mode we don't recognise" is closer to
+// crit than to stale. Existing soft-state values ("lagging", "warn")
+// keep their b--warn mapping for non-adoption use sites.
 func outcomeBadgeClass(outcome string) string {
 	switch outcome {
 	case "success":
 		return "b--ok"
-	case "lagging", "warn":
+	case "lagging", "warn", "refused":
 		return "b--warn"
 	case "":
 		return "b--stale"

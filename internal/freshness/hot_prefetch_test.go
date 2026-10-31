@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -45,7 +44,7 @@ type hotPrefetchFixture struct {
 func newHotPrefetchFixture(t *testing.T, budget time.Duration) *hotPrefetchFixture {
 	t.Helper()
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
@@ -59,6 +58,7 @@ func newHotPrefetchFixture(t *testing.T, budget time.Duration) *hotPrefetchFixtu
 		HostLimiter:       hostsem.New(8),
 		HotPackagesWindow: 24 * time.Hour,
 		HotPrefetchBudget: budget,
+		Logger:            discardLogger(),
 	})
 	if err != nil {
 		t.Fatalf("NewAdopter: %v", err)
@@ -75,7 +75,7 @@ func newHotPrefetchFixture(t *testing.T, budget time.Duration) *hotPrefetchFixtu
 	priorBlobBytes := []byte("old deb bytes")
 	priorBlob := writeFixtureBlob(t, c, priorBlobBytes)
 	priorRelease := writeFixtureBlob(t, c, []byte("InRelease v1"))
-	priorID, _, err := c.InsertCandidateSnapshot(context.Background(), cache.SnapshotCandidate{
+	priorID, _, err := c.InsertTrackedCandidateForTest(context.Background(), cache.SnapshotCandidate{
 		CanonicalScheme: suite.CanonicalScheme,
 		CanonicalHost:   suite.CanonicalHost,
 		SuitePath:       suite.SuitePath,
@@ -85,12 +85,12 @@ func newHotPrefetchFixture(t *testing.T, budget time.Duration) *hotPrefetchFixtu
 		t.Fatalf("InsertCandidateSnapshot prior: %v", err)
 	}
 	const debP = "/pool/main/h/hello/hello.deb"
-	if err := c.PutSuiteFreshness(context.Background(), cache.SuiteFreshness{
+	if err := c.SeedSuiteForTest(context.Background(), cache.SuiteFreshness{
 		CanonicalScheme: suite.CanonicalScheme,
 		CanonicalHost:   suite.CanonicalHost,
 		SuitePath:       suite.SuitePath,
 	}); err != nil {
-		t.Fatalf("PutSuiteFreshness: %v", err)
+		t.Fatalf("SeedSuiteForTest: %v", err)
 	}
 	if err := c.CommitAdoption(context.Background(), priorID,
 		[]cache.SnapshotMember{{SnapshotID: priorID, Path: "InRelease", BlobHash: priorRelease, DeclaredSHA256: priorRelease}}, nil,
@@ -125,7 +125,7 @@ func newHotPrefetchFixture(t *testing.T, budget time.Duration) *hotPrefetchFixtu
 	// to warm; we use the same path here for simplicity (a Phase 3
 	// upgrade-in-place where the filename was stable).
 	candidateRelease := writeFixtureBlob(t, c, []byte("InRelease v2"))
-	candidateID, _, err := c.InsertCandidateSnapshot(context.Background(), cache.SnapshotCandidate{
+	candidateID, _, err := c.InsertTrackedCandidateForTest(context.Background(), cache.SnapshotCandidate{
 		CanonicalScheme: suite.CanonicalScheme,
 		CanonicalHost:   suite.CanonicalHost,
 		SuitePath:       suite.SuitePath,
@@ -337,13 +337,13 @@ func TestRunHotPrefetch_EmptyHotSet(t *testing.T) {
 // (if unusual) Release files.
 func TestBuildPackageHashes_AllowsDuplicatePackageArch(t *testing.T) {
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
 	defer func() { _ = c.Close() }()
 
-	logger := slog.Default()
+	logger := discardLogger()
 	a := &Adopter{cache: c, logger: logger}
 
 	debHashA := strings.Repeat("a", 64)
@@ -366,7 +366,7 @@ func TestBuildPackageHashes_AllowsDuplicatePackageArch(t *testing.T) {
 	members := []ReleaseMember{
 		{Path: "main/binary-amd64/Packages", SHA256: pkgsBlob, Size: int64(len(pkgs))},
 	}
-	res, err := a.buildPackageHashes(suiteRef, 1, members, members)
+	res, err := a.buildPackageHashes(suiteRef, 1, cache.FormInline, members, members)
 	if err != nil {
 		t.Fatalf("buildPackageHashes: unexpected error: %v", err)
 	}
@@ -400,12 +400,12 @@ func TestBuildPackageHashes_AllowsDuplicatePackageArch(t *testing.T) {
 // anyway). User decision (round-5); reverses the round-1 ride-along.
 func TestBuildPackageHashes_VersionlessBinaryStanzaSkippedCoverageIntact(t *testing.T) {
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
 	defer func() { _ = c.Close() }()
-	a := &Adopter{cache: c, logger: slog.Default()}
+	a := &Adopter{cache: c, logger: discardLogger()}
 
 	withVer := strings.Repeat("a", 64)
 	noVer := strings.Repeat("b", 64)
@@ -421,7 +421,7 @@ func TestBuildPackageHashes_VersionlessBinaryStanzaSkippedCoverageIntact(t *test
 	suiteRef := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.example", SuitePath: "/dists/noble"}
 	members := []ReleaseMember{{Path: "main/binary-amd64/Packages", SHA256: pkgsBlob, Size: int64(len(pkgs))}}
 
-	res, err := a.buildPackageHashes(suiteRef, 1, members, members)
+	res, err := a.buildPackageHashes(suiteRef, 1, cache.FormInline, members, members)
 	if err != nil {
 		t.Fatalf("buildPackageHashes: %v", err)
 	}
@@ -451,12 +451,12 @@ func TestBuildPackageHashes_VersionlessBinaryStanzaSkippedCoverageIntact(t *test
 // round-5 non-punitive decision.
 func TestBuildPackageHashes_AllVersionlessBinaryFlipsCoverage(t *testing.T) {
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
 	defer func() { _ = c.Close() }()
-	a := &Adopter{cache: c, logger: slog.Default()}
+	a := &Adopter{cache: c, logger: discardLogger()}
 
 	a1 := strings.Repeat("a", 64)
 	b1 := strings.Repeat("b", 64)
@@ -472,7 +472,7 @@ func TestBuildPackageHashes_AllVersionlessBinaryFlipsCoverage(t *testing.T) {
 	suiteRef := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.example", SuitePath: "/dists/noble"}
 	members := []ReleaseMember{{Path: "main/binary-amd64/Packages", SHA256: pkgsBlob, Size: int64(len(pkgs))}}
 
-	res, err := a.buildPackageHashes(suiteRef, 1, members, members)
+	res, err := a.buildPackageHashes(suiteRef, 1, cache.FormInline, members, members)
 	if err != nil {
 		t.Fatalf("buildPackageHashes: %v", err)
 	}
@@ -493,12 +493,12 @@ func TestBuildPackageHashes_AllVersionlessBinaryFlipsCoverage(t *testing.T) {
 // FULL incomplete-identity condition, not just version=='' (round-9 finding).
 func TestBuildPackageHashes_IncompleteIdentityBinarySkipped(t *testing.T) {
 	dir := t.TempDir()
-	c, err := cache.Open(context.Background(), dir, nil)
+	c, err := cache.Open(context.Background(), dir, discardLogger())
 	if err != nil {
 		t.Fatalf("cache.Open: %v", err)
 	}
 	defer func() { _ = c.Close() }()
-	a := &Adopter{cache: c, logger: slog.Default()}
+	a := &Adopter{cache: c, logger: discardLogger()}
 
 	good := strings.Repeat("a", 64)
 	noArch := strings.Repeat("b", 64)
@@ -518,7 +518,7 @@ func TestBuildPackageHashes_IncompleteIdentityBinarySkipped(t *testing.T) {
 	suiteRef := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.example", SuitePath: "/dists/noble"}
 	members := []ReleaseMember{{Path: "main/binary-amd64/Packages", SHA256: pkgsBlob, Size: int64(len(pkgs))}}
 
-	res, err := a.buildPackageHashes(suiteRef, 1, members, members)
+	res, err := a.buildPackageHashes(suiteRef, 1, cache.FormInline, members, members)
 	if err != nil {
 		t.Fatalf("buildPackageHashes: %v", err)
 	}

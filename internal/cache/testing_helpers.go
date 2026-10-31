@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -62,4 +63,96 @@ func (c *Cache) DeletePackageHashForTest(ctx context.Context, scheme, host, debP
 		}
 		return nil
 	})
+}
+
+// ClearSignedSeenForTest deletes every marker. Tests that build a
+// "pre-v7" state with v7 code use it to undo CommitAdoption's marks.
+func (c *Cache) ClearSignedSeenForTest(ctx context.Context) error {
+	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx, `DELETE FROM suite_signed_seen`)
+		return err
+	})
+}
+
+// SetCommittedHookForTest sets committedHook (cache.go): fn runs on the
+// writer goroutine right after a creation attempt's, ReapIdleSuite's or
+// ForgetSuite's transaction commits, before its result is handed back.
+// Set it before the operation it targets; tests outside the package use
+// it to fail a submit whose delete committed (the reaper's settled reap,
+// TestReaper_ASettledReapIsAReap).
+func (c *Cache) SetCommittedHookForTest(fn func()) {
+	c.committedHook = fn
+}
+
+// SeedSuiteForTest stores s's suite row the way fixtures relied on before
+// spec C3 made every writer but CreateSuite UPDATE-only: it creates the
+// row if absent (createSuiteTx, uncapped, interest stamp now) and writes
+// s's six check columns with UpdateSuiteFreshness's statement, and its
+// LastRequestedAt (the client-interest stamp) when set, in one writer
+// transaction. Fixtures use it to build a tracked suite in a given
+// state. This file is not a _test.go file, so the helper is compiled into
+// the production binary; never call it from non-test code
+// (TestOnlyTheHandlerCreatesSuiteRows fails on such a call). TEST-ONLY.
+func (c *Cache) SeedSuiteForTest(ctx context.Context, s SuiteFreshness) error {
+	key := SuiteKey{CanonicalScheme: s.CanonicalScheme, CanonicalHost: s.CanonicalHost, SuitePath: s.SuitePath}
+	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("SeedSuiteForTest: begin: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		if _, err := createSuiteTx(ctx, tx, SuiteSeed{SuiteKey: key, RequestedAt: nowUnix()}, SuiteCaps{}, nil, nowUnix()); err != nil {
+			return fmt.Errorf("SeedSuiteForTest: %w", err)
+		}
+		if err := updateSuiteFreshness(ctx, tx, s); err != nil {
+			return fmt.Errorf("SeedSuiteForTest: update: %w", err)
+		}
+		if s.LastRequestedAt != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE suite_freshness SET last_requested_at = ?
+ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,
+				*s.LastRequestedAt, s.CanonicalScheme, s.CanonicalHost, s.SuitePath); err != nil {
+				return fmt.Errorf("SeedSuiteForTest: interest: %w", err)
+			}
+		}
+		return tx.Commit()
+	})
+}
+
+// EnsureSuiteForTest gives a suite an empty row (uncapped, interest stamp
+// now) unless it has one: spec C3 lets only the handler create rows, and
+// CommitAdoption (UPDATE-only) and the checker (I-4) need one. TEST-ONLY.
+func (c *Cache) EnsureSuiteForTest(ctx context.Context, scheme, host, suitePath string) error {
+	_, err := c.CreateSuite(ctx, SuiteSeed{
+		SuiteKey:    SuiteKey{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath},
+		RequestedAt: nowUnix(),
+	}, SuiteCaps{}, nil)
+	return err
+}
+
+// InsertTrackedCandidateForTest is InsertCandidateSnapshot for a suite
+// that EnsureSuiteForTest first gives a row, so the candidate can be
+// committed (CommitAdoption Step 6 is UPDATE-only). TEST-ONLY.
+func (c *Cache) InsertTrackedCandidateForTest(ctx context.Context, sc SnapshotCandidate) (int64, bool, error) {
+	if err := c.EnsureSuiteForTest(ctx, sc.CanonicalScheme, sc.CanonicalHost, sc.SuitePath); err != nil {
+		return 0, false, err
+	}
+	return c.InsertCandidateSnapshot(ctx, sc)
+}
+
+// MigrateToVersionForTest creates dir/cache.db at schema version (the
+// migrations before it applied, no Go step after it), for upgrade
+// fixtures a test then fills with an older binary's rows and opens with
+// Open. TEST-ONLY.
+func MigrateToVersionForTest(ctx context.Context, dir string, version int) error {
+	db, err := openDB(filepath.Join(dir, "cache.db"))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	for v := 0; v < version; v++ {
+		if err := applyMigration(ctx, db, v); err != nil {
+			return fmt.Errorf("MigrateToVersionForTest: migration %d: %w", v, err)
+		}
+	}
+	return nil
 }

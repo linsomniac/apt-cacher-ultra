@@ -58,7 +58,7 @@ func putPoolBlob(t *testing.T, c *cache.Cache, content string) string {
 func adoptSnapshot(t *testing.T, c *cache.Cache, scheme, host, suite, inreleaseHash string, blobHashes []string) int64 {
 	t.Helper()
 	ctx := context.Background()
-	id, _, err := c.InsertCandidateSnapshot(ctx, cache.SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{
 		CanonicalScheme:         scheme,
 		CanonicalHost:           host,
 		SuitePath:               suite,
@@ -471,7 +471,7 @@ func TestRunTick_ResumesPendingBlobBeforeStartingAnotherSnapshotPass(t *testing.
 	logger, _ := captureLogger()
 	orphanBlob := seedReapableBlob(t, c, "orphan awaiting blob pass")
 	anchor := putPoolBlob(t, c, "orphan candidate anchor")
-	id, _, err := c.InsertCandidateSnapshot(context.Background(), cache.SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(context.Background(), cache.SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: "example.test", SuitePath: "/dists/stable", InReleaseHash: &anchor,
 	})
 	if err != nil {
@@ -601,9 +601,9 @@ func TestStartupPass_PoolOrphans_ReapedAndCounted(t *testing.T) {
 // 1 current plus the 3 most-recently-displaced, ordered by
 // (adopted_at DESC, snapshot_id DESC) per §9.6.3 sub-job B.
 //
-// Adoptions all happen within the same wall-clock second on a fast
-// host, so adopted_at ties are resolved by snapshot_id descending —
-// which is monotonically increasing, i.e. ordering by adoption order.
+// CommitAdoption keeps adopted_at strictly increasing per suite (spec
+// C8), so the (adopted_at DESC, snapshot_id DESC) ranking is adoption
+// order even when all five commits land in one wall-clock second.
 // The expectation is therefore: keep S5 (current), and S4, S3, S2 as
 // the displaced 3-most-recent. S1 is reaped.
 func TestForensicRetention_KeepDisplacedThree(t *testing.T) {

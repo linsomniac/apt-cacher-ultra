@@ -19,10 +19,13 @@ import (
 
 	"github.com/ulikunitz/xz"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
+	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
+	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
 // maxDecompressedPackagesBytes caps how much we'll inflate a single
@@ -32,6 +35,13 @@ import (
 // adoption (the bytes were signed and hash-verified, but a hostile
 // upstream could still ship pathological content).
 const maxDecompressedPackagesBytes = 256 << 20
+
+// commitTimeout bounds CommitAdoption, which runs detached from the
+// adoption's context (spec C4).
+const commitTimeout = 5 * time.Minute
+
+// defaultMaxAdoptionDuration is adoption.max_duration's default.
+const defaultMaxAdoptionDuration = 30 * time.Minute
 
 // SuiteRef identifies a suite for adoption — the canonical scheme/host
 // (post-Remap) plus the suite path. The freshness checker passes this
@@ -81,6 +91,12 @@ var (
 	ErrAdoptionMemberMismatch    = errors.New("adoption_member_mismatch")
 	ErrAdoptionDBFailed          = errors.New("adoption_db_failed")
 
+	// AIDEV-NOTE: ErrAdoptionGuardFailed marks a pre-commit guard refusal
+	// (required architecture group missing, every member 4xx, serve-contract
+	// target absent). It wraps ErrAdoptionMemberFetchFailed so the outcome
+	// label stays member_fetch_failed; retry logic can tell guards apart.
+	ErrAdoptionGuardFailed = fmt.Errorf("adoption_guard_failed: %w", ErrAdoptionMemberFetchFailed)
+
 	// ErrAdoptionUnpinnedSuite is the freshness-level sentinel for
 	// the SPEC5 §10.4.3 `unpinned_suite` outcome — emitted by the
 	// gpg verifier when integrity.require_pinned_signer is set and
@@ -92,6 +108,21 @@ var (
 	// already imports freshness, so a freshness->gpg edge would
 	// cycle).
 	ErrAdoptionUnpinnedSuite = errors.New("adoption_unpinned_suite")
+
+	// ErrAdoptionUpstreamOlder is the spec C5 refusal for a candidate
+	// whose verified Release Date is older than the current snapshot's
+	// (apt ignores such a Release). A refusal state, not a failure (C7).
+	ErrAdoptionUpstreamOlder = errors.New("adoption_upstream_older")
+
+	// ErrAdoptionRollbackRefused is the spec C5 refusal for content equal
+	// to an adopted snapshot of the suite that is no longer current: a
+	// flapping mirror must not flip the cache backwards.
+	ErrAdoptionRollbackRefused = errors.New("adoption_rollback_refused")
+
+	// ErrAdoptionReleaseDateInFuture fails a candidate dated more than
+	// maxReleaseDateSkew ahead of the cache's clock (apt: "not valid
+	// yet"). A failure: the normal retry schedule applies.
+	ErrAdoptionReleaseDateInFuture = errors.New("adoption_release_date_in_future")
 )
 
 // AdoptionMemberError carries the failing Release member's suite-
@@ -152,6 +183,12 @@ var archFilterBinaryRE = regexp.MustCompile(`(?:^|/)binary-([a-z][a-z0-9]*)/(?:P
 // pseudo-arch "source".
 var archFilterSourceRE = regexp.MustCompile(`(?:^|/)source/(?:Sources(?:\.(?:gz|xz|bz2))?|Sources\.diff/Index)$`)
 
+// flatArchFilterSourceRE matches a flat suite's root Sources index and its
+// pdiff Index (spec C5 flat IndexTargets): the filter scopes them to the
+// pseudo-arch "source" as it does a component's source/Sources. A flat
+// suite's root Packages carries every architecture and is never filtered.
+var flatArchFilterSourceRE = regexp.MustCompile(`^(?:Sources(?:\.(?:gz|xz|bz2))?|Sources\.diff/Index)$`)
+
 // archFilterOptionalRES are the SPEC6_7 §7 filter extension: per-arch
 // OPTIONAL member shapes — Contents (plain and udeb flavor, component
 // or suite-root level), cnf Commands, and dep11 Components. Capture 1
@@ -179,7 +216,17 @@ var archFilterOptionalRES = []*regexp.Regexp{
 // (e.g. Debian's Contents-all) serves clients of EVERY architecture,
 // so no allowlist may filter it — it reports ("", false) like an
 // unfiltered path.
-func archFromFilteredPath(p string) (arch string, filtered bool) {
+//
+// suitePath makes it layout-aware (spec C5 flat IndexTargets; the flat
+// pdiff arch labels of plan design note 4): a flat suite's root Sources,
+// Sources.* and Sources.diff/Index are "source", and its root Packages*
+// and Packages.diff/Index — every architecture in one file, the
+// pseudo-arch "all" — are never filtered. Under a dists suite a root
+// Sources is no shape the filter knows.
+func archFromFilteredPath(suitePath, p string) (arch string, filtered bool) {
+	if aptpath.IsFlatSuitePath(suitePath) && flatArchFilterSourceRE.MatchString(p) {
+		return "source", true
+	}
 	if m := archFilterBinaryRE.FindStringSubmatch(p); m != nil {
 		// The pseudo-arch "all" is the arch-independent IndexTarget
 		// (binary-all/Packages): apt fetches it on EVERY host alongside
@@ -224,6 +271,12 @@ func archFromFilteredPath(p string) (arch string, filtered bool) {
 var indexTargetRE = regexp.MustCompile(
 	`(?:^|/)(?:binary-[a-z][a-z0-9]*/Packages|source/Sources)(?:\.diff/Index|\.[a-z0-9]+)?$`)
 
+// flatIndexTargetRE is indexTargetRE for a flat suite (spec C5): its root
+// Packages* / Sources* (any codec) and their pdiff Index, which a flat
+// Release declares at the suite root — the files apt requests for a
+// `deb <uri>/ /` or `deb <uri> ./` source.
+var flatIndexTargetRE = regexp.MustCompile(`^(?:Packages|Sources)(?:\.diff/Index|\.[a-z0-9]+)?$`)
+
 // isIndexTarget reports whether a Release member's suite-relative path
 // is an apt IndexTarget — a per-arch Packages* / per-component Sources*
 // (any codec) or their pdiff Index, i.e. the files apt actually fetches
@@ -235,7 +288,15 @@ var indexTargetRE = regexp.MustCompile(
 // is set, an integrity/availability failure on a non-IndexTarget member
 // is skipped instead of aborting the whole suite; IndexTargets stay
 // fatal regardless.
-func isIndexTarget(p string) bool {
+//
+// It is layout-aware (spec C5): a flat suite's IndexTargets are its root
+// shapes (flatIndexTargetRE) and nothing else — apt never requests a
+// nested binary-<arch>/Packages for a flat source — and a dists suite's
+// are indexTargetRE's, so a root Packages under a dists suite is none.
+func isIndexTarget(suitePath, p string) bool {
+	if aptpath.IsFlatSuitePath(suitePath) {
+		return flatIndexTargetRE.MatchString(p)
+	}
 	return indexTargetRE.MatchString(p)
 }
 
@@ -246,6 +307,18 @@ func isIndexTarget(p string) bool {
 // "source/Sources"); capture 2 is the arch (empty for source).
 var indexTargetGroupRE = regexp.MustCompile(
 	`(?:^|/)(binary-([a-z][a-z0-9]*)/Packages|source/Sources)(?:\.[a-z0-9]+)?$`)
+
+// flatIndexTargetGroupRE is indexTargetGroupRE for a flat suite: a root
+// Packages or Sources with any (or no) codec; capture 1 is the group key.
+//
+// AIDEV-NOTE: indexTargetRE, flatIndexTargetRE, indexTargetGroupRE, this
+// one and internal/handler's indexTargetPathRE / flatIndexTargetPathRE
+// describe ONE surface — the files apt installs from — in two layouts
+// (spec C5: the root shapes count only for a flat suite). They live in
+// two packages on purpose (no import edge); widen or narrow them
+// together, and keep the layout rule (aptpath.IsFlatSuitePath) the same
+// on both sides.
+var flatIndexTargetGroupRE = regexp.MustCompile(`^(Packages|Sources)(?:\.[a-z0-9]+)?$`)
 
 // indexTargetGroup classifies a Release member path into its SPEC6_7
 // §6 index-target GROUP: all compression variants of one logical index
@@ -259,7 +332,22 @@ var indexTargetGroupRE = regexp.MustCompile(
 // Returns (group key, arch, true) for base IndexTarget shapes — arch
 // is the pseudo-arch "source" for Sources groups — and ("", "", false)
 // for everything else.
-func indexTargetGroup(p string) (group, arch string, ok bool) {
+//
+// It is layout-aware (spec C5): a flat suite's root Packages holds every
+// architecture in one file, so it groups under the pseudo-arch "all",
+// which missingRequestableIndexGroups always requires, and its root
+// Sources under "source"; a dists suite's groups are today's.
+func indexTargetGroup(suitePath, p string) (group, arch string, ok bool) {
+	if aptpath.IsFlatSuitePath(suitePath) {
+		fm := flatIndexTargetGroupRE.FindStringSubmatch(p)
+		switch {
+		case fm == nil:
+			return "", "", false
+		case fm[1] == "Sources":
+			return fm[1], "source", true
+		}
+		return fm[1], "all", true
+	}
 	m := indexTargetGroupRE.FindStringSubmatchIndex(p)
 	if m == nil {
 		return "", "", false
@@ -297,11 +385,14 @@ func indexTargetGroup(p string) (group, arch string, ok bool) {
 // declared-but-unserved foreign-arch IndexTargets (e.g. Ubuntu's
 // binary-armhf, which 404s on the main archive) are legitimately tolerated
 // as 4xx_index_target skips, so they are NOT required here.
-func missingRequestableIndexGroups(declared, fetched []ReleaseMember, allowlist map[string]struct{}) []string {
+//
+// suitePath makes the groups layout-aware (indexTargetGroup): a flat
+// suite's root Packages is its "all" group, required like binary-all.
+func missingRequestableIndexGroups(suitePath string, declared, fetched []ReleaseMember, allowlist map[string]struct{}) []string {
 	// Declared IndexTarget groups whose arch a configured client requests.
 	required := make(map[string]struct{})
 	for _, m := range declared {
-		group, arch, ok := indexTargetGroup(m.Path)
+		group, arch, ok := indexTargetGroup(suitePath, m.Path)
 		if !ok {
 			continue
 		}
@@ -321,7 +412,7 @@ func missingRequestableIndexGroups(declared, fetched []ReleaseMember, allowlist 
 	// A group is served iff at least one of its compression variants was
 	// fetched, so drop every required group the snapshot actually has.
 	for _, m := range fetched {
-		if group, _, ok := indexTargetGroup(m.Path); ok {
+		if group, _, ok := indexTargetGroup(suitePath, m.Path); ok {
 			delete(required, group)
 		}
 	}
@@ -357,17 +448,35 @@ var errAdoptionMemberSkipped = errors.New("adoption_member_skipped")
 
 // AdoptionConfig bundles Adopter dependencies. Required: Cache, Fetcher,
 // Verifier, HostLimiter. Optional: MaxConcurrent (0 = unlimited),
-// MemberFetchTimeout (per-member upstream budget — adopters can run
-// long; we want each member call bounded), Logger.
+// MaxDuration (0 = 30m, bounds the whole run; each member fetch is
+// bounded by the Fetcher's own upstream timeouts), Logger, and the knobs
+// documented on the fields below.
 type AdoptionConfig struct {
 	Cache       *cache.Cache
 	Fetcher     AdoptionFetcher
 	Verifier    Verifier
 	HostLimiter *hostsem.Sem
 
-	// MaxConcurrent caps how many adoption goroutines may run at once
-	// across the whole cache (SPEC2 §9.3.1). Zero means unlimited.
+	// MaxConcurrent is max_concurrent_adoptions: the Checker's global
+	// admission slots for adoption, repair and reconcile (spec C4). Zero
+	// means unlimited.
 	MaxConcurrent int
+
+	// MaxDuration bounds every adoption, repair and reconcile run
+	// (adoption.max_duration, spec C4). Zero means 30m.
+	MaxDuration time.Duration
+
+	// FlipGate is the spec C8 flip barrier the commit waits behind
+	// (adoption.flip_quiet_period). nil, or a gate with a zero quiet
+	// period, commits at once (the pre-C8 behaviour). The handler must
+	// register anchor serves with the same gate (Adopter.FlipGate).
+	FlipGate *flipgate.Gate
+
+	// AdoptUnsigned is adoption.adopt_unsigned (spec C5 safeguard 1, D6):
+	// whether a Release-only upstream is adopted in the unsigned form
+	// (never vouching a .deb, never a downgrade from signed). The zero
+	// value is off; config defaults it on.
+	AdoptUnsigned bool
 
 	// HotPackagesWindow is the SPEC3 §5.2 hot_packages.window. 0
 	// disables hot-package proactive refresh entirely.
@@ -460,7 +569,11 @@ type AdoptionConfig struct {
 
 	Logger *slog.Logger
 
-	// now is a test seam; production uses time.Now.
+	// now is a test seam; production uses wallclock.Now.
+	//
+	// AIDEV-NOTE: wall clock, for persisted stamps and comparisons with
+	// them only. Never measure a duration or a deadline with it (it has no
+	// monotonic reading and tests step it); use time.Now / time.Since.
 	now func() time.Time
 }
 
@@ -474,10 +587,37 @@ type Adopter struct {
 	verifier Verifier
 	hostSem  *hostsem.Sem
 
-	// concurrencySem bounds the total in-flight adoptions across all
-	// suites. nil channel means "no cap" (MaxConcurrent = 0). Acquired
-	// once at the top of Run, released after success or error.
-	concurrencySem chan struct{}
+	// maxConcurrent and maxDuration configure the Checker's admission and
+	// run deadline (spec C4); the Adopter itself never waits for a slot.
+	maxConcurrent int
+	maxDuration   time.Duration
+
+	// flipGate is the spec C8 barrier the commit waits behind (nil: none).
+	flipGate *flipgate.Gate
+
+	// adoptUnsigned is adoption.adopt_unsigned (spec C5 safeguard 1).
+	adoptUnsigned bool
+
+	// beforeCommit, when set (tests only), runs inside the commit — after
+	// the flip barrier, before CommitAdoption: the window spec C5's
+	// in-transaction never-downgrade recheck closes.
+	beforeCommit func()
+
+	// heartbeatHook, when set (tests only), runs at each heartbeat tick.
+	heartbeatHook func()
+
+	// reparseHook, when set (tests only), runs at each parse of a
+	// snapshot's pinned Release (reparseSnapshotRelease).
+	reparseHook func()
+
+	// reconcilePendingHook, when set, runs at the start of
+	// reconcilePending. Test seam: a panic in the repair decision must not
+	// wedge the suite mutex.
+	reconcilePendingHook func()
+
+	// commitDelay is a test seam (zero in production): every commit waits
+	// this long before it runs (SetCommitDelayForTest).
+	commitDelay time.Duration
 
 	// hotPackagesWindow + hotPrefetchBudget are the SPEC3 §5.2 keys
 	// the hot-prefetch loop reads. Stored on the Adopter so each
@@ -539,9 +679,9 @@ type Adopter struct {
 	// reparseSnapshotRelease (GPG-verified Release re-parse) and found zero
 	// missing requestable members. Clearing this map forces a full re-check,
 	// which is the right behavior for the on-demand /reconcile endpoint.
-	// Entries are never reaped; growth is bounded by distinct AUTOINCREMENT
-	// snapshot IDs over the process lifetime — the same long-tail profile the
-	// per-suite `locks` map (freshness.go) already accepts.
+	// Each reaper run drops the entries of snapshots that are no suite's
+	// current one (sweepReconcileMemo, spec C9), so the memo stays bounded
+	// by the suite table rather than by every snapshot id the process saw.
 	reconciledSnapshots sync.Map // map[int64]struct{}
 
 	logger *slog.Logger
@@ -566,6 +706,9 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 	if cfg.MaxConcurrent < 0 {
 		return nil, fmt.Errorf("freshness: max_concurrent_adoptions must be >= 0, got %d", cfg.MaxConcurrent)
 	}
+	if cfg.MaxDuration < 0 {
+		return nil, fmt.Errorf("freshness: adoption.max_duration must be >= 0, got %s", cfg.MaxDuration)
+	}
 	if cfg.HotPackagesWindow < 0 {
 		return nil, fmt.Errorf("freshness: hot_packages.window must be >= 0, got %s", cfg.HotPackagesWindow)
 	}
@@ -587,11 +730,11 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 	}
 	now := cfg.now
 	if now == nil {
-		now = time.Now
+		now = wallclock.Now
 	}
-	var sem chan struct{}
-	if cfg.MaxConcurrent > 0 {
-		sem = make(chan struct{}, cfg.MaxConcurrent)
+	maxDur := cfg.MaxDuration
+	if maxDur == 0 {
+		maxDur = defaultMaxAdoptionDuration
 	}
 	maxVersions := cfg.MaxVersionsPerPackage
 	if maxVersions < 1 {
@@ -619,7 +762,10 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		fetcher:                 cfg.Fetcher,
 		verifier:                cfg.Verifier,
 		hostSem:                 cfg.HostLimiter,
-		concurrencySem:          sem,
+		maxConcurrent:           cfg.MaxConcurrent,
+		maxDuration:             maxDur,
+		flipGate:                cfg.FlipGate,
+		adoptUnsigned:           cfg.AdoptUnsigned,
 		hotPackagesWindow:       cfg.HotPackagesWindow,
 		hotPrefetchBudget:       cfg.HotPrefetchBudget,
 		maxVersionsPerPackage:   maxVersions,
@@ -636,6 +782,19 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		now:                     now,
 	}, nil
 }
+
+// SetCommitDelayForTest makes every adoption commit wait d before it runs,
+// inside the flip barrier, as a slow transaction does: the snapshot
+// switches when the commit returns. TEST-ONLY — call it before any
+// adoption runs; zero (the default) is no delay.
+//
+// AIDEV-NOTE: exported for internal/handler's flip simulations, which
+// model a real commit's latency (a zero-time commit hides how a hold's end
+// orders against it; final review, concurrency Important 1), and called by
+// cmd/apt-cacher-ultra/e2ehooks.go, compiled only with -tags e2ehooks
+// (e2e/flat's test binary): a release build never calls it. Named
+// *ForTest by convention; never call it from any other non-test code.
+func (a *Adopter) SetCommitDelayForTest(d time.Duration) { a.commitDelay = d }
 
 // ctxSleep waits d, returning early with ctx.Err() on cancellation.
 // The production retrySleep — shutdown must never block on a member
@@ -783,23 +942,27 @@ func (a *Adopter) runHeartbeatTicker(ctx context.Context, host string, snapshotI
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			if a.heartbeatHook != nil {
+				a.heartbeatHook()
+			}
 			a.heartbeat(ctx, host, snapshotID, tracker)
 		}
 	}
 }
 
-// adoptionForm distinguishes the two SPEC2 §7.6.3 signature forms.
+// adoptionForm distinguishes the anchor forms (SPEC2 §7.6.3, spec C5).
 type adoptionForm int
 
 const (
 	adoptionFormInline   adoptionForm = iota // clearsigned InRelease
 	adoptionFormDetached                     // Release + Release.gpg
+	adoptionFormUnsigned                     // Release alone, unverified (spec C5, phase E)
 )
 
 // adoptionPayload carries the form-specific inputs to runShared.
-// Exactly one of (inlineBytes) or (releaseBytes + sigBytes) is set on
-// entry; runShared populates the *Hash fields once step 2 has stored
-// the verified blobs in pool/.
+// Exactly one of (inlineBytes), (releaseBytes + sigBytes) or — for the
+// unsigned form — (releaseBytes) is set on entry; runShared populates the
+// *Hash fields once step 2 has stored the blobs in pool/.
 type adoptionPayload struct {
 	form adoptionForm
 
@@ -807,11 +970,21 @@ type adoptionPayload struct {
 	inlineBytes []byte // clearsigned InRelease
 	inlineHash  string // sha256 of inlineBytes (set in step 2)
 
-	// Detached mode (form == adoptionFormDetached).
+	// Detached mode (form == adoptionFormDetached); the unsigned form uses
+	// releaseBytes and releaseHash alone.
 	releaseBytes   []byte
 	sigBytes       []byte
 	releaseHash    string // sha256 of releaseBytes (set in step 2)
 	releaseGPGHash string // sha256 of sigBytes (set in step 2)
+
+	// membersDone, when set, runs once the member pipeline (members,
+	// by-hash, hot prefetch) is over and before the flip barrier: the
+	// Checker frees the host slot there (spec C4).
+	membersDone func()
+
+	// stop is the shutdown signal: the Checker's lifetime context (nil for
+	// Run/RunDetached, which have none). See stopErr and barrierCtx.
+	stop context.Context
 }
 
 // Run executes the §7.5 adoption flow for an inline (clearsigned
@@ -822,8 +995,8 @@ type adoptionPayload struct {
 //
 // Run is synchronous: callers (typically the freshness Checker)
 // invoke it from a goroutine. The per-suite mutex held by the caller
-// serializes overlapping adoptions on the same suite; the global
-// concurrency cap held inside Run bounds total parallel adoptions.
+// serializes overlapping adoptions on the same suite; admission (global
+// and per-host slots) is the Checker's job.
 func (a *Adopter) Run(ctx context.Context, suite SuiteRef, inRelease []byte, etag, lastmod string) error {
 	return a.runShared(ctx, suite, &adoptionPayload{
 		form:        adoptionFormInline,
@@ -848,30 +1021,64 @@ func (a *Adopter) RunDetached(ctx context.Context, suite SuiteRef, releaseBytes,
 	}, etag, lastmod)
 }
 
-// runShared is the SPEC2 §7.5 adoption pipeline shared across both
-// signature forms. Form-specific dispatch happens at three points:
-//   - Step 1: VerifyInline vs VerifyDetached.
-//   - Step 2: persist 1 blob (InRelease) vs 2 blobs (Release, Release.gpg).
-//   - Step 6: metadata-self rows — 1 (InRelease) vs 2 (Release, Release.gpg).
-//
-// Steps 3–5 and 7–10 are identical: parse, candidate insert, member
-// prefetch, by-hash, package_hash, atomic flip, success log.
-func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayload, etag, lastmod string) error {
-	// Step 0: global concurrency cap. nil channel skips the gate.
-	if a.concurrencySem != nil {
-		select {
-		case a.concurrencySem <- struct{}{}:
-			defer func() { <-a.concurrencySem }()
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
+// runHooks is what the Checker passes into an adoption it spawned.
+type runHooks struct {
+	// membersDone runs once the member pipeline is over, before the flip
+	// barrier; the Checker frees the host slot there (spec C4).
+	membersDone func()
+	// stop is the Checker's lifetime context: its end abandons the
+	// adoption before the commit and ends the barrier's waits.
+	stop context.Context
+}
 
-	// Step 0a: capture the prior adoption form. After CommitAdoption
-	// the prior snapshot is no longer current, so the lookup must
-	// happen before any mutation. Step 10 compares this against p.form
-	// and emits adoption_form_drift on a transition.
-	priorForm, hadPrior := a.priorAdoptionForm(ctx, suite)
+// runRequest runs the adoption a check requested; see runHooks.
+func (a *Adopter) runRequest(ctx context.Context, req *adoptionRequest, hooks runHooks) error {
+	p := &adoptionPayload{form: req.form, membersDone: hooks.membersDone, stop: hooks.stop}
+	switch req.form {
+	case adoptionFormInline:
+		p.inlineBytes = req.bytes
+	case adoptionFormDetached:
+		p.releaseBytes, p.sigBytes = req.releaseBytes, req.sigBytes
+	case adoptionFormUnsigned:
+		p.releaseBytes = req.releaseBytes
+	}
+	return a.runShared(ctx, req.suite, p, req.etag, req.lastmod)
+}
+
+// runShared is the SPEC2 §7.5 adoption pipeline shared across the anchor
+// forms. Form-specific dispatch happens at these points:
+//   - Step 1: VerifyInline vs VerifyDetached; the unsigned form's
+//     eligibility (spec C5) instead of a verification.
+//   - Step 2: persist 1 blob (InRelease, or the unsigned Release) vs 2
+//     blobs (Release, Release.gpg).
+//   - Step 3: the unsigned form's member cap.
+//   - Step 6: metadata-self rows — InRelease, Release + Release.gpg, or
+//     Release (unsigned).
+//   - Step 8: no package_hash rows for the unsigned form.
+//   - Before the barrier: the unsigned form's re-mark (ruling R-E1).
+//
+// The other steps are identical: parse, candidate insert, member
+// prefetch, by-hash, atomic flip, success log.
+func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayload, etag, lastmod string) error {
+	// Step 0a: capture the prior (current) snapshot. After
+	// CommitAdoption the prior snapshot is no longer current, so the
+	// lookup must happen before any mutation. Step 3a applies apt's Date
+	// rules against its release_date, Step 4 tells a rollback from a
+	// race with it, and Step 10 compares its form against p.form and
+	// emits adoption_form_drift on a transition. prior == nil means
+	// exactly "no current snapshot"; a read error fails the attempt as
+	// db_failed (retried on the normal schedule) rather than skipping
+	// those rules.
+	prior, err := a.priorSnapshot(ctx, suite)
+	if err != nil {
+		a.logger.Warn("adoption_read_prior_snapshot_failed",
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+			"err", err,
+		)
+		return err
+	}
+	priorForm, hadPrior := formOfSnapshot(prior)
 
 	// Step 1: GPG verify. The Verifier returns the verified Release-
 	// style plaintext (the cleartext between BEGIN/END markers in a
@@ -887,6 +1094,14 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		releaseText, verifyErr = a.verifier.VerifyInline(ctx, suite, p.inlineBytes)
 	case adoptionFormDetached:
 		releaseText, verifyErr = a.verifier.VerifyDetached(ctx, suite, p.releaseBytes, p.sigBytes)
+	case adoptionFormUnsigned:
+		// Spec C5: unsigned eligibility takes the verification's place —
+		// the first never-downgrade point, before anything is downloaded.
+		// Nothing verifies the text: it never vouches a .deb (Step 8).
+		if err := a.unsignedEligible(ctx, suite); err != nil {
+			return err // a refusal: the checker records and logs it
+		}
+		releaseText = p.releaseBytes
 	}
 	if verifyErr != nil {
 		a.logger.Info("adoption_gpg_failed",
@@ -940,6 +1155,17 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		}
 		p.releaseHash = rh
 		p.releaseGPGHash = gh
+	case adoptionFormUnsigned:
+		rh, err := a.writeBlobBytes(ctx, p.releaseBytes)
+		if err != nil {
+			a.logger.Warn("adoption: persist Release failed",
+				"canonical_host", suite.CanonicalHost,
+				"suite_path", suite.SuitePath,
+				"err", err,
+			)
+			return fmt.Errorf("%w: persist Release: %v", ErrAdoptionDBFailed, err)
+		}
+		p.releaseHash = rh
 	}
 
 	// Step 3: parse the verified Release-style plaintext.
@@ -955,11 +1181,34 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		)
 		return fmt.Errorf("%w: %v", ErrAdoptionParseFailed, err)
 	}
+	// Spec C5 safeguard 4: an unsigned Release declaring more than
+	// unsignedMemberCap members is refused before any download.
+	if p.form == adoptionFormUnsigned {
+		if err := unsignedCap(len(members)); err != nil {
+			return err
+		}
+	}
+
+	// Step 3a (spec C5): apt's Date rules, checked before the candidate
+	// insert so a refusal costs one verification and no member download.
+	// A missing or unparseable Date is 0 (apt). Snapshots adopted before
+	// v7 have no stored date (NULL): no rule applies to their successor.
+	relDate := releaseDate(releaseText)
+	if now := a.now(); relDate > now.Add(maxReleaseDateSkew).Unix() {
+		return fmt.Errorf("%w: Date is %ds ahead of the cache's clock",
+			ErrAdoptionReleaseDateInFuture, relDate-now.Unix())
+	}
+	if prior != nil && prior.ReleaseDate != nil && relDate < *prior.ReleaseDate {
+		return fmt.Errorf("%w: Date %d is older than the current snapshot's %d",
+			ErrAdoptionUpstreamOlder, relDate, *prior.ReleaseDate)
+	}
 
 	// Step 4: insert the candidate suite_snapshot row. The schema
 	// CHECK constraint enforces XOR between inrelease_hash and
 	// (release_hash + release_gpg_hash); we set whichever pair this
-	// adoption form uses. The validators (etag/lastmod) are stored
+	// adoption form uses, and always name the form explicitly (it is
+	// stored in suite_snapshot.anchor_form; the cache never derives
+	// the unsigned form). The validators (etag/lastmod) are stored
 	// alongside whichever metadata file the freshness checker
 	// conditional-GETs next time, so the inrelease_etag /
 	// inrelease_lastmod columns end up holding Release's validators
@@ -972,10 +1221,18 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	switch p.form {
 	case adoptionFormInline:
 		cand.InReleaseHash = &p.inlineHash
+		cand.Form = cache.FormInline
 	case adoptionFormDetached:
 		cand.ReleaseHash = &p.releaseHash
 		cand.ReleaseGPGHash = &p.releaseGPGHash
+		cand.Form = cache.FormDetached
+	case adoptionFormUnsigned:
+		// Spec C5: the unsigned Release sits in the single-anchor slot,
+		// and the form is named explicitly — the cache never derives it.
+		cand.InReleaseHash = &p.releaseHash
+		cand.Form = cache.FormUnsigned
 	}
+	cand.ReleaseDate = &relDate
 	if etag != "" {
 		v := etag
 		cand.InReleaseETag = &v
@@ -992,6 +1249,19 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// see the fix is active without having to grep for absence of WARNs.
 	snapshotID, reused, err := a.cache.InsertCandidateSnapshot(ctx, cand)
 	if err != nil {
+		// AIDEV-NOTE: content equal to an adopted snapshot that is no
+		// longer current is a rollback (spec C5 rollback_refused). Equal to
+		// the CURRENT snapshot is a race with a check that already saw the
+		// flip; the next check reports "unchanged", so it stays a plain
+		// DB-failure wrap. prior == nil means exactly "no current
+		// snapshot" (no row, a NULL pointer, or a dangling one; a read
+		// error already failed the attempt at Step 0a). That arm is
+		// defensive: no writer today leaves a suite without a pointer
+		// while an adopted, non-retired snapshot of it exists.
+		var nk *cache.NaturalKeyAdoptedError
+		if errors.As(err, &nk) && (prior == nil || nk.SnapshotID != prior.SnapshotID) {
+			return fmt.Errorf("%w: %w", ErrAdoptionRollbackRefused, err)
+		}
 		if errors.Is(err, cache.ErrSnapshotNaturalKeyAdopted) {
 			a.logger.Warn("adoption: natural key already adopted",
 				"canonical_host", suite.CanonicalHost,
@@ -1005,7 +1275,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 				"err", err,
 			)
 		}
-		return fmt.Errorf("%w: insert candidate: %v", ErrAdoptionDBFailed, err)
+		return fmt.Errorf("%w: insert candidate: %w", ErrAdoptionDBFailed, err)
 	}
 	if reused {
 		a.logger.Info("adoption: reusing orphaned candidate",
@@ -1044,12 +1314,25 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// ordering trap of two separate defers, which would Wait first
 	// and deadlock waiting on a goroutine whose ctx hasn't been
 	// cancelled yet).
-	tickerCtx, tickerCancel := context.WithCancel(ctx)
+	// AIDEV-NOTE: the ticker runs until runShared returns, not until ctx's
+	// deadline: the flip barrier may outlast adoption.max_duration (ruling
+	// R-C2), and the candidate and its member blobs must stay protected
+	// until the commit. Shutdown still ends it, through runShared's return.
+	tickerCtx, tickerCancel := context.WithCancel(context.WithoutCancel(ctx))
 	var tickerWG sync.WaitGroup
 	if a.heartbeatInterval > 0 {
 		tickerWG.Add(1)
 		go func() {
 			defer tickerWG.Done()
+			// AIDEV-NOTE: I-1. A panic in this goroutine is invisible to
+			// the adoption goroutine's recover. Recover here, log, and stop
+			// heartbeating; a candidate whose heartbeat lapses is reaped by
+			// snapshot GC and the adoption fails at commit, which is safe.
+			defer func() {
+				if r := recover(); r != nil {
+					unloggedPanic(func() { logPanic(a.logger, "adoption_panicked", "heartbeat", suite, r) })
+				}
+			}()
 			a.runHeartbeatTicker(tickerCtx, suite.CanonicalHost, snapshotID, tracker)
 		}()
 	}
@@ -1075,8 +1358,14 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// (buildPackageHashes) iterate this slice instead of `members` so
 	// that 4xx-skipped paths don't get phantom alias rows pointing at
 	// a non-existent blob (FK violation on snapshot_member.blob_hash)
-	// or a Packages-blob read against an empty pool entry.
+	// or a Packages-blob read against an empty pool entry. Its SHA256 is
+	// the verified bytes' hash (verifiedMember: derived for a
+	// SHA512-only member), so the Step 8 builders read the pool by it.
 	fetchedMembers := make([]ReleaseMember, 0, len(members))
+	// pendingAliases are Step 7's rows, built from each member's
+	// declaration while it is at hand: one alias per declared algorithm
+	// (spec C5), bound to the verified blob.
+	var pendingAliases []cache.SnapshotMember
 	skippedCount := 0
 	// integritySkipped collects the SPEC6_7 §2 repair records: members
 	// skipped over an integrity failure keep their signed declaration
@@ -1098,18 +1387,31 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		requiredGroupFetched = make(map[string]bool)
 	}
 	for _, m := range members {
+		// AIDEV-NOTE: the final review's R2 I-2. An ended context —
+		// adoption.max_duration or shutdown — ends the pipeline here, and
+		// the tolerance below never takes a fetch it cut short for an
+		// optional member's integrity failure. Otherwise every remaining
+		// optional member was skipped (a WARN adoption_member_skipped and a
+		// repair record each) and, the commit running under WithoutCancel,
+		// a deadline committed a degraded snapshot as a success. The error
+		// carries the context's: spawnAdoption makes a deadline timed_out
+		// and a shutdown adoption_abandoned_at_shutdown.
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%w: member pipeline: %w", ErrAdoptionMemberFetchFailed, err)
+		}
 		// SPEC6_5 §7.2: per-arch / per-source index filter. Inert when
 		// the allowlist is empty (Phase 6 default). Skipped members never
 		// reach upstream — saves bandwidth and pool disk on caches whose
 		// clients only fetch a subset of the upstream's published arches.
 		if a.architectureAllowlist != nil {
-			if arch, filtered := archFromFilteredPath(m.Path); filtered {
+			if arch, filtered := archFromFilteredPath(suite.SuitePath, m.Path); filtered {
 				if _, ok := a.architectureAllowlist[arch]; !ok {
 					a.logger.Warn("adoption_member_skipped",
 						"canonical_host", suite.CanonicalHost,
 						"suite_path", suite.SuitePath,
 						"path", m.Path,
 						"declared_sha256", m.SHA256,
+						"declared_sha512", m.SHA512,
 						"reason", "arch_not_in_allowlist",
 						"architecture", arch,
 					)
@@ -1126,7 +1428,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		// required arch's members are never filtered out above.
 		var requiredGroup string
 		if requiredGroupDeclared != nil {
-			if group, arch, ok := indexTargetGroup(m.Path); ok {
+			if group, arch, ok := indexTargetGroup(suite.SuitePath, m.Path); ok {
 				if _, want := a.requiredArchitectures[arch]; want {
 					requiredGroup = group
 					requiredGroupDeclared[group]++
@@ -1153,8 +1455,9 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			// served — apt 404s it, exactly as on the 404-skip path.
 			// IndexTarget members stay fatal regardless (isIndexTarget),
 			// and a local DB fault (ErrAdoptionDBFailed) is never
-			// tolerated — only upstream member fetch/mismatch failures.
-			if a.tolerateOptionalMembers && !isIndexTarget(m.Path) &&
+			// tolerated — only upstream member fetch/mismatch failures, and
+			// never once ctx has ended (the AIDEV-NOTE above the loop).
+			if a.tolerateOptionalMembers && ctx.Err() == nil && !isIndexTarget(suite.SuitePath, m.Path) &&
 				(errors.Is(err, ErrAdoptionMemberFetchFailed) || errors.Is(err, ErrAdoptionMemberMismatch)) {
 				detail := ""
 				var me *AdoptionMemberError
@@ -1166,18 +1469,25 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 					"suite_path", suite.SuitePath,
 					"path", m.Path,
 					"declared_sha256", m.SHA256,
+					"declared_sha512", m.SHA512,
 					"reason", "optional_member_integrity",
 					"detail", detail,
 				)
 				adoptionMembersSkippedTotal.Inc("optional_member_integrity")
-				integritySkipped = append(integritySkipped, cache.SkippedMember{
-					SnapshotID:     snapshotID,
-					Path:           m.Path,
-					DeclaredSHA256: m.SHA256,
-					Size:           m.Size,
-					Reason:         cache.SkipReasonOptionalMemberIntegrity,
-					Detail:         detail,
-				})
+				// A SHA512-only member has no SHA-256 for a repair record
+				// to verify against: it is not recorded (spec C5
+				// limitation; reconcile still heals requestable
+				// IndexTargets).
+				if m.SHA256 != "" {
+					integritySkipped = append(integritySkipped, cache.SkippedMember{
+						SnapshotID:     snapshotID,
+						Path:           m.Path,
+						DeclaredSHA256: m.SHA256,
+						Size:           m.Size,
+						Reason:         cache.SkipReasonOptionalMemberIntegrity,
+						Detail:         detail,
+					})
+				}
 				skippedCount++
 				continue
 			}
@@ -1187,9 +1497,10 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			SnapshotID:     snapshotID,
 			Path:           m.Path,
 			BlobHash:       blobHash,
-			DeclaredSHA256: m.SHA256,
+			DeclaredSHA256: blobHash,
 		})
-		fetchedMembers = append(fetchedMembers, m)
+		pendingAliases = append(pendingAliases, aliasRows(snapshotID, m, blobHash)...)
+		fetchedMembers = append(fetchedMembers, verifiedMember(m, blobHash))
 		if requiredGroup != "" {
 			requiredGroupFetched[requiredGroup] = true
 		}
@@ -1222,7 +1533,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 				"group", g,
 				"declared_variants", requiredGroupDeclared[g],
 			)
-			return newMemberErr(ErrAdoptionMemberFetchFailed, g,
+			return newMemberErr(ErrAdoptionGuardFailed, g,
 				fmt.Sprintf("required-architecture index target: all %d declared variants missing",
 					requiredGroupDeclared[g]))
 		}
@@ -1238,7 +1549,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// prefix.
 	if fetchedCount == 0 && len(members) > 0 {
 		return fmt.Errorf("%w: all %d declared members returned 4xx",
-			ErrAdoptionMemberFetchFailed, skippedCount)
+			ErrAdoptionGuardFailed, skippedCount)
 	}
 
 	// SPEC6_8 serve-contract guard: before committing, refuse to publish a
@@ -1253,10 +1564,10 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// checked, allowlist or not — a 404-skipped binary-all is the trap
 	// regardless of config — while foreign arches are only required when an
 	// allowlist scopes the cache to them.
-	if missing := missingRequestableIndexGroups(members, fetchedMembers, a.architectureAllowlist); len(missing) > 0 {
+	if missing := missingRequestableIndexGroups(suite.SuitePath, members, fetchedMembers, a.architectureAllowlist); len(missing) > 0 {
 		for _, g := range missing {
 			arch := "all"
-			if _, a2, ok := indexTargetGroup(g); ok {
+			if _, a2, ok := indexTargetGroup(suite.SuitePath, g); ok {
 				arch = a2
 			}
 			a.logger.Error("adoption_blocked_serve_target_missing",
@@ -1268,7 +1579,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			)
 			adoptionServeTargetMissingTotal.Inc(arch)
 		}
-		return newMemberErr(ErrAdoptionMemberFetchFailed, missing[0],
+		return newMemberErr(ErrAdoptionGuardFailed, missing[0],
 			fmt.Sprintf("requestable index target absent from snapshot: %s "+
 				"(committing would 404 apt update; deferring to keep prior snapshot)",
 				strings.Join(missing, ", ")))
@@ -1277,8 +1588,16 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// Step 6: metadata-self snapshot_member row(s). Without these
 	// the §6.1 snapshot-scoped lookup would 404 on the very URLs
 	// apt fetches first. Inline mode contributes one row (InRelease);
-	// detached mode contributes two (Release, Release.gpg).
+	// detached mode contributes two (Release, Release.gpg); the unsigned
+	// form one (Release).
 	switch p.form {
+	case adoptionFormUnsigned:
+		memberRows = append(memberRows, cache.SnapshotMember{
+			SnapshotID:     snapshotID,
+			Path:           "Release",
+			BlobHash:       p.releaseHash,
+			DeclaredSHA256: p.releaseHash,
+		})
 	case adoptionFormInline:
 		memberRows = append(memberRows, cache.SnapshotMember{
 			SnapshotID:     snapshotID,
@@ -1302,29 +1621,25 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	}
 
 	// Step 7: by-hash alias rows. apt's Acquire-By-Hash clients fetch
-	// from <suite>/<component>/by-hash/SHA256/<declared_sha256>; a
-	// snapshot_member row at that alias path lets §6.1 resolve those
-	// requests through the same blob. We dedupe — multiple members
-	// with the same content (e.g. "Sources" and "Sources.bz2") would
-	// produce the same alias path and trigger a unique violation.
+	// from <suite>/<component>/by-hash/<algorithm>/<declared hash> — the
+	// strongest hash the Release declares, so SHA512 whenever it is
+	// declared (spec C5) — and a snapshot_member row at that alias path
+	// lets §6.1 resolve those requests through the same blob. Each
+	// fetched member contributes one alias per declared algorithm
+	// (pendingAliases, Step 5). We dedupe — multiple members with the
+	// same content would produce the same alias path and trigger a
+	// unique violation.
 	//
-	// Iterates fetchedMembers, not members: a 4xx-skipped member has
-	// no blob in the pool, so an alias row pointing at its declared
-	// SHA256 would violate the snapshot_member.blob_hash → blob.hash
-	// foreign key.
-	aliasSeen := make(map[string]bool, len(fetchedMembers))
-	for _, m := range fetchedMembers {
-		alias := byHashAliasPath(m.Path, m.SHA256)
-		if alias == "" || aliasSeen[alias] {
+	// Only fetched members have aliases: a 4xx-skipped member has no
+	// blob in the pool, so an alias row pointing at it would violate the
+	// snapshot_member.blob_hash → blob.hash foreign key.
+	aliasSeen := make(map[string]bool, len(pendingAliases))
+	for _, r := range pendingAliases {
+		if aliasSeen[r.Path] {
 			continue
 		}
-		aliasSeen[alias] = true
-		memberRows = append(memberRows, cache.SnapshotMember{
-			SnapshotID:     snapshotID,
-			Path:           alias,
-			BlobHash:       m.SHA256,
-			DeclaredSHA256: m.SHA256,
-		})
+		aliasSeen[r.Path] = true
+		memberRows = append(memberRows, r)
 	}
 
 	// Step 8: parse every Packages member to populate package_hash
@@ -1344,11 +1659,16 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// denominator (a 4xx-skipped Packages directory must drop
 	// coverage to false, not disappear from the count); fetchedMembers
 	// drives the parse loop (only those have blobs in the pool).
-	pkgHashRes, err := a.buildPackageHashes(suite, snapshotID, members, fetchedMembers)
+	pkgHashRes, err := a.buildPackageHashes(suite, snapshotID, cand.Form, members, fetchedMembers)
 	if err != nil {
 		return err // already wrapped with category
 	}
 	packageHashes := pkgHashRes.rows
+	// Spec C5 safeguard 5: no package_hash row on any path for the
+	// unsigned form (buildPackageHashes returns none; the Sources and
+	// pdiff builders are not run), so it vouches no .deb and hot prefetch
+	// warms nothing for it.
+	unsigned := cand.Form == cache.FormUnsigned
 
 	// SPEC6_5 §7.1: source-package adoption. Walks the same
 	// fetchedMembers slice for Sources-shaped index files and folds
@@ -1359,11 +1679,13 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// different SHA256 for one .dsc) surfaces as ErrAdoptionParseFailed
 	// alongside the existing Packages-variant disagreement check
 	// (SPEC6_5 §11 H7).
-	sourceRows, _, err := a.buildSourceHashes(suite, snapshotID, fetchedMembers)
-	if err != nil {
-		return err
+	if !unsigned {
+		sourceRows, _, err := a.buildSourceHashes(suite, snapshotID, fetchedMembers)
+		if err != nil {
+			return err
+		}
+		packageHashes = append(packageHashes, sourceRows...)
 	}
-	packageHashes = append(packageHashes, sourceRows...)
 
 	// SPEC6_5 §7.3: pdiff Index adoption. Parses each
 	// Packages.diff/Index and Sources.diff/Index, populates
@@ -1375,11 +1697,13 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// and pdiff rows. Per-Index parse failures are tolerated; cross-
 	// Index disagreement on a patch path surfaces as
 	// ErrAdoptionParseFailed (§11 H7-equivalent).
-	pdiffRows, _, err := a.buildPdiffHashes(suite, snapshotID, fetchedMembers)
-	if err != nil {
-		return err
+	if !unsigned {
+		pdiffRows, _, err := a.buildPdiffHashes(suite, snapshotID, fetchedMembers)
+		if err != nil {
+			return err
+		}
+		packageHashes = append(packageHashes, pdiffRows...)
 	}
-	packageHashes = append(packageHashes, pdiffRows...)
 
 	// SPEC4 §7.5.2 site 3: heartbeat after Packages parsing returns.
 	// debian-main at multiple architectures can be tens of MiB of
@@ -1399,27 +1723,112 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// hot-set computation cannot rely on them being DB-visible yet.
 	prefetchedURLPaths, hotStats := a.runHotPrefetch(ctx, suite, snapshotID, packageHashes, tracker)
 
-	// SPEC4 §7.5.2 site 5: heartbeat right before CommitAdoption.
-	// Resets the grace clock at the latest possible moment before
-	// the adopted_at flip becomes the source of truth, defending
-	// against writer-queue depth between runHotPrefetch returning
-	// and CommitAdoption actually committing.
+	// SPEC4 §7.5.2 site 5: heartbeat at the end of the member pipeline,
+	// before the flip barrier and CommitAdoption. The barrier may wait up
+	// to 140 s before the commit; the site 6 ticker keeps heartbeating
+	// until the adoption returns (phase C design note 9), so the grace
+	// clock stays fresh through that wait and any writer-queue depth.
 	a.heartbeat(ctx, suite.CanonicalHost, snapshotID, tracker)
 
-	// Step 11: atomic flip transaction. Pass adoptionCtx as ctx so the
-	// budget-cancelled prefetch loop above never causes CommitAdoption
-	// to fail — the contract is "cancel hot fetches, then flip", not
-	// "cancel hot fetches, then also cancel the flip". coverageComplete
-	// is the SPEC3 §7.5.4 per-snapshot proof for strict mode.
-	if err := a.cache.CommitAdoption(ctx, snapshotID, memberRows, integritySkipped, packageHashes,
-		prefetchedURLPaths, pkgHashRes.coverageComplete); err != nil {
+	// Spec C4: the member pipeline is over; free the host slot so the
+	// next suite on this host can start. The global slot stays held
+	// through the flip barrier and the commit (ruling R-C1).
+	//
+	// AIDEV-NOTE: membersDone must stay BEFORE the barrier: the barrier
+	// may wait up to 140 s, and holding the host slot that long would stall
+	// the host's next adoption. Only the host slot is freed here
+	// (TestCheck_MembersDoneFreesOnlyTheHostSlot).
+	if p.membersDone != nil {
+		p.membersDone()
+	}
+
+	// A shutdown before the commit starts abandons the adoption, as SPEC2
+	// §9.5 step 5 says: starting a commit now would hold the stop for up
+	// to commitTimeout, far beyond the shipped unit's TimeoutStopSec.
+	// Nothing is recorded (the lifetime context is done); the abandoned
+	// candidate is reaped by GC after its stale grace, like any
+	// interrupted adoption, and the next start's checks see the change
+	// again. See stopErr (B-65).
+	if err := p.stopErr(ctx); err != nil {
+		return fmt.Errorf("adoption: shutdown before the commit: %w", err)
+	}
+
+	// Ruling R-E1: before an unsigned commit, re-run the cached
+	// signed-anchor mark of the suite (the adoption holds its mutex), so
+	// the commit's in-transaction marker re-read sees any signed anchor the
+	// suite has cached — even one phase D's backstop failed to mark. A
+	// failed re-mark refuses the commit (fail closed). It runs before the
+	// barrier, outside the hold, under the shutdown signal (not the
+	// adoption deadline: it would discard finished member work) and the
+	// commit's bound.
+	//
+	// AIDEV-NOTE: the refusal is recorded as unsigned_downgrade_refused,
+	// which here can mean "could not rule out signed history" (a pool or
+	// database fault), so the fault itself is logged first: ERROR for a
+	// pool read error, WARN otherwise (design review M-1).
+	if p.form == adoptionFormUnsigned {
+		mctx, cancel := context.WithTimeout(p.barrierCtx(ctx), commitTimeout)
+		err := a.remarkSignedAnchors(mctx, suite)
+		cancel()
+		if err != nil {
+			if stop := p.stopErr(ctx); stop != nil {
+				return fmt.Errorf("adoption: shutdown before the commit: %w", stop)
+			}
+			level := slog.LevelWarn
+			if errors.Is(err, errRemarkPoolRead) {
+				level = slog.LevelError
+			}
+			a.logger.Log(ctx, level, "adoption_signed_anchor_remark_failed",
+				"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "err", err)
+			return fmt.Errorf("%w: the cached signed anchors could not be re-marked: %w",
+				ErrAdoptionUnsignedDowngradeRefused, err)
+		}
+	}
+
+	// Step 11: the atomic flip transaction, behind the spec C8 flip
+	// barrier. The barrier's waits do not honour adoption.max_duration
+	// (they are bounded by 140 s, and giving up would throw away finished
+	// member work) but end on shutdown, when nothing commits (ruling
+	// R-C2). The commit runs under its own bound: the deadline must not
+	// abort it, and a shutdown does not abort one already in progress —
+	// the stop waits for it, up to commitTimeout. coverageComplete is the
+	// SPEC3 §7.5.4 per-snapshot proof for strict mode.
+	//
+	// AIDEV-NOTE: a commit that has started is never cancelled; a
+	// systemctl stop during a long commit is bounded by commitTimeout
+	// (5 min), and the unit's TimeoutStopSec (35 s) may SIGKILL first —
+	// SQLite rolls the transaction back, so nothing is lost.
+	commit := func() error {
+		if a.commitDelay > 0 {
+			time.Sleep(a.commitDelay) // test seam: a slow transaction (SetCommitDelayForTest)
+		}
+		if a.beforeCommit != nil {
+			a.beforeCommit() // test seam: the window the in-transaction recheck closes
+		}
+		commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
+		defer cancelCommit()
+		return a.cache.CommitAdoption(commitCtx, snapshotID, memberRows, integritySkipped, packageHashes,
+			prefetchedURLPaths, pkgHashRes.coverageComplete)
+	}
+	if err := a.flip(ctx, suite, p, prior == nil, snapshotID, commit); err != nil {
+		if errors.Is(err, flipgate.ErrAborted) {
+			return fmt.Errorf("adoption: shutdown in the flip barrier: %w", err)
+		}
+		// Ruling R-E2: a refusal raised inside the commit transaction (the
+		// never-downgrade recheck) is a state, not a failure — its own
+		// sentinel, no WARN, no db_failed wrap — also after a barrier that
+		// outlived adoption.max_duration (spawnAdoption keeps the commit's
+		// own classification then).
+		if errors.Is(err, cache.ErrUnsignedDowngradeRefused) {
+			return fmt.Errorf("%w: %w", ErrAdoptionUnsignedDowngradeRefused, err)
+		}
 		a.logger.Warn("adoption: commit failed",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"snapshot_id", snapshotID,
 			"err", err,
 		)
-		return fmt.Errorf("%w: commit: %v", ErrAdoptionDBFailed, err)
+		return fmt.Errorf("%w: commit: %w", ErrAdoptionDBFailed, err)
 	}
 
 	// Step 12 (SPEC3 §10.2): aggregate adoption_hot_prefetch_complete.
@@ -1485,42 +1894,67 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	return nil
 }
 
-// priorAdoptionForm returns the adoption form of the suite's current
-// snapshot, derived from its hash columns. Returns (form, true) when
-// a current snapshot exists with one of the known fingerprints; (0,
-// false) when there is no current snapshot, the lookup fails, or the
-// snapshot has neither hash set (the latter shouldn't happen given
-// the suite_snapshot CHECK constraint, but treat defensively).
+// priorSnapshot returns the suite's current snapshot, or (nil, nil) when
+// the suite has none: no suite_freshness row, a NULL pointer, or a
+// pointer whose row is gone (both readers' ErrNotFound). runShared reads
+// it before any mutation: after CommitAdoption the prior snapshot is no
+// longer current.
 //
-// First-ever adoption produces (0, false), which the caller treats as
-// "no prior" — first adoption is not drift.
-func (a *Adopter) priorAdoptionForm(ctx context.Context, suite SuiteRef) (adoptionForm, bool) {
+// AIDEV-NOTE: fail closed on a real read error, open only on "no prior".
+// The prior snapshot gates spec C5's Date and rollback rules, so any
+// other error is returned (wrapped in ErrAdoptionDBFailed) instead of
+// being read as "no prior", which would silently skip both rules. A
+// missing row stays fail-open so a brand-new suite or a dangling pointer
+// cannot freeze the suite.
+func (a *Adopter) priorSnapshot(ctx context.Context, suite SuiteRef) (*cache.SuiteSnapshot, error) {
 	fresh, err := a.cache.GetSuiteFreshness(ctx, suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath)
-	if err != nil || fresh == nil || fresh.CurrentSnapshotID == nil {
-		return 0, false
+	if errors.Is(err, cache.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: read prior snapshot: %w", ErrAdoptionDBFailed, err)
+	}
+	if fresh == nil || fresh.CurrentSnapshotID == nil {
+		return nil, nil
 	}
 	snap, err := a.cache.GetSuiteSnapshot(ctx, *fresh.CurrentSnapshotID)
-	if err != nil || snap == nil {
+	if errors.Is(err, cache.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: read prior snapshot: %w", ErrAdoptionDBFailed, err)
+	}
+	return snap, nil
+}
+
+// formOfSnapshot maps a snapshot's stored anchor form to the adoption
+// form; (0, false) for nil or a form adoption cannot drift from.
+func formOfSnapshot(snap *cache.SuiteSnapshot) (adoptionForm, bool) {
+	if snap == nil {
 		return 0, false
 	}
-	switch {
-	case snap.InReleaseHash != nil:
+	switch snap.Form {
+	case cache.FormInline:
 		return adoptionFormInline, true
-	case snap.ReleaseHash != nil:
+	case cache.FormDetached:
 		return adoptionFormDetached, true
+	case cache.FormUnsigned:
+		return adoptionFormUnsigned, true
 	}
 	return 0, false
 }
 
 // formName renders an adoptionForm as a stable string suitable for
-// structured logs. Operators pivot adoption_success on this to track
-// per-suite form drift over time.
+// structured logs (the cache.AnchorForm values). Operators pivot
+// adoption_success on this to track per-suite form drift over time.
 func formName(f adoptionForm) string {
 	switch f {
 	case adoptionFormInline:
 		return "inline"
 	case adoptionFormDetached:
 		return "detached"
+	case adoptionFormUnsigned:
+		return "unsigned"
 	default:
 		return "unknown"
 	}
@@ -1586,12 +2020,27 @@ func (a *Adopter) adoptMemberWithRetry(ctx context.Context, suite SuiteRef, m Re
 
 // adoptMember handles step 5 for one declared member: try pool reuse
 // (with rehash defense), else fetch from upstream. Returns the blob
-// hash on success — guaranteed to equal m.SHA256, since adoption
-// rejects any byte stream whose hash differs from the declaration.
+// hash on success: the SHA-256 of bytes that matched every hash m
+// declares (spec C5) — m.SHA256 itself when it is declared, the derived
+// SHA-256 for a SHA512-only member (verifyMember).
+//
+// AIDEV-NOTE: a SHA512-only member is never reused from the pool without
+// a fetch (its SHA-256 is not known before the fetch): it is fetched at
+// every adoption, as small repositories that publish only SHA512 can
+// afford. Its rehash on reuse runs after the fetch instead: once the
+// fetched bytes matched the declared SHA-512, an existing pool/<derived>
+// is re-hashed before Finalize's dedup could keep it (verifyMember's
+// rehashPooled hook, rehashPooledBlob), and a corrupt one is logged
+// (pool_corruption_during_adoption), counted and evicted, so the verified
+// bytes replace it (review fix round 1, Task 2).
 func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMember, acquireByHash bool) (string, error) {
-	exists, err := a.cache.BlobExists(m.SHA256)
-	if err != nil {
-		return "", fmt.Errorf("%w: BlobExists %s: %v", ErrAdoptionDBFailed, m.SHA256, err)
+	exists := false
+	if m.SHA256 != "" {
+		var err error
+		exists, err = a.cache.BlobExists(m.SHA256)
+		if err != nil {
+			return "", fmt.Errorf("%w: BlobExists %s: %v", ErrAdoptionDBFailed, m.SHA256, err)
+		}
 	}
 	if exists {
 		// "Rehash on reuse" — SPEC2 §7.5 step 5. Pool blobs predating
@@ -1599,9 +2048,34 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 		// on-disk content was not verified against a declared hash at
 		// the time. Re-hashing bounds the verified set to bytes we
 		// have *just* confirmed.
-		actual, err := hashFile(a.cache.BlobPath(m.SHA256))
+		// A SHA-512 is computed only for a member that declares one
+		// (deferred minor E-7): Debian's and Ubuntu's Releases declare
+		// SHA-256 alone.
+		var actual, actual512 string
+		var err error
+		if m.SHA512 == "" {
+			actual, err = hashFile(a.cache.BlobPath(m.SHA256))
+		} else {
+			actual, actual512, err = hashFileDigests(a.cache.BlobPath(m.SHA256))
+		}
 		if err != nil {
 			return "", fmt.Errorf("%w: rehash %s: %v", ErrAdoptionDBFailed, m.SHA256, err)
+		}
+		if actual == m.SHA256 && m.SHA512 != "" && actual512 != m.SHA512 {
+			// The pool bytes are exactly the declared SHA-256, so their
+			// SHA-512 is fixed: the Release's two declarations disagree.
+			// A fetch would bring the same bytes; fail the member (spec
+			// C5: every declared hash must match), and keep the pool file.
+			// The WARN carries the full digests (deferred minor E-6).
+			a.logger.Warn("adoption_member_mismatch",
+				"canonical_host", suite.CanonicalHost,
+				"suite_path", suite.SuitePath,
+				"path", m.Path,
+				"declared_sha512", m.SHA512,
+				"actual_sha512", actual512,
+			)
+			return "", newMemberErr(ErrAdoptionMemberMismatch, m.Path,
+				fmt.Sprintf("declared SHA512 %s, got %s", shortHash(m.SHA512), shortHash(actual512)))
 		}
 		if actual == m.SHA256 {
 			// Confirmed reuse. Make sure the row exists (may not, e.g.
@@ -1645,59 +2119,72 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 	// declared sha256 in its path, so it is immune to the publication
 	// race where the mutable path serves a newer-but-valid revision than
 	// our InRelease declared (the dominant intermittent failure on the
-	// Ubuntu archives). The probe is best-effort and side-effect-free:
-	// tryByHashFetch never logs adoption_member_skipped / increments the
-	// skip metric and never lets mismatched bytes reach pool/ (it uses
-	// FinalizeExpectingHash). On ANY by-hash failure we fall back to the
+	// Ubuntu archives). The probe is best-effort: tryByHashFetch never
+	// logs adoption_member_skipped / increments the skip metric and never
+	// lets mismatched bytes reach pool/ (verifyMember). On any by-hash
+	// failure of the upstream or its bytes we fall back to the
 	// authoritative plain-path fetch below, which keeps today's exact
-	// semantics (404/410 → skip; size/hash mismatch → typed-fatal).
-	if acquireByHash {
-		if bh := byHashAliasPath(m.Path, m.SHA256); bh != "" {
-			if hash, ferr := a.tryByHashFetch(ctx, suite, m, bh); ferr == nil {
-				return hash, nil
-			} else {
-				a.logger.Debug("adoption_byhash_fallback",
-					"canonical_host", suite.CanonicalHost,
-					"suite_path", suite.SuitePath,
-					"path", m.Path,
-					"err", ferr,
-				)
-			}
+	// semantics (404/410 → skip; size/hash mismatch → typed-fatal). A local
+	// fault (ErrAdoptionDBFailed, from the rehash-on-reuse hook of a
+	// SHA512-only member) is not "by-hash unavailable": it fails the
+	// member at once, so it costs no second download and a corrupt file
+	// the hook could not evict is logged and counted once (review fix
+	// round 2, Task 2). The probe uses the strongest declared hash, as apt
+	// does (spec §3).
+	if acquireByHash && m.Path != "" {
+		if hash, ferr := a.tryByHashFetch(ctx, suite, m, byHashProbePath(m)); ferr == nil {
+			return hash, nil
+		} else if errors.Is(ferr, ErrAdoptionDBFailed) {
+			return "", ferr
+		} else {
+			a.logger.Debug("adoption_byhash_fallback",
+				"canonical_host", suite.CanonicalHost,
+				"suite_path", suite.SuitePath,
+				"path", m.Path,
+				"err", ferr,
+			)
 		}
 	}
 	return a.fetchMemberURL(ctx, suite, m, m.Path)
 }
 
 // tryByHashFetch attempts to fetch a member from its content-addressed
-// by-hash URL (byHashRelPath). It is a SIDE-EFFECT-FREE probe: unlike
-// fetchMemberURL it emits no adoption_member_skipped WARN, increments no
-// skip metric, and — by finalizing through FinalizeExpectingHash — never
-// promotes bytes whose hash differs from the declaration into pool/ (a
-// by-hash URL that serves wrong bytes is rejected with the temp removed,
-// leaving no orphan). On success the verified blob is PutBlob'd and its
-// hash (== m.SHA256) returned. Any error means "by-hash unavailable or
-// wrong"; the caller falls back to the authoritative plain-path fetch.
+// by-hash URL (byHashRelPath). It is a probe: unlike fetchMemberURL it
+// emits no adoption_member_skipped WARN, increments no skip metric, and —
+// by verifying every declared hash before the bytes reach pool/
+// (verifyMember) — never promotes bytes whose hash differs from the
+// declaration into pool/ (a by-hash URL that serves wrong bytes is
+// rejected with the temp removed, leaving no orphan). On success the
+// verified blob is PutBlob'd and its SHA-256 returned.
+//
+// It is not free of side effects: for a SHA512-only member verifyMember
+// runs the rehash-on-reuse hook (rehashPooledBlob), which may WARN
+// pool_corruption_during_adoption, count it and evict a corrupt pool file.
+// A local fault there is returned as ErrAdoptionDBFailed, and the caller
+// fails the member with it; any other error means "by-hash unavailable or
+// wrong", and the caller falls back to the authoritative plain-path fetch.
 func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseMember, byHashRelPath string) (string, error) {
 	target := &fetch.Target{
 		CanonicalHost: suite.CanonicalHost,
 		URL:           buildMemberURL(suite, byHashRelPath),
 	}
-	w, err := a.cache.NewTempBlob()
+	// A local fault (the temp blob, the blob row) is ErrAdoptionDBFailed,
+	// as on the plain path, so the caller fails the member instead of
+	// downloading it again (deferred minor E-12).
+	w, err := newMemberWriter(a.cache)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: NewTempBlob %s: %v", ErrAdoptionDBFailed, byHashRelPath, err)
 	}
 	defer func() { _ = w.Abort() }() // no-op once a Finalize* wins
 	if _, err := a.fetcher.Fetch(ctx, target, w); err != nil {
 		return "", err // by-hash 404 (pruned), transport, etc. — silent fallback
 	}
-	// FinalizeExpectingHash gates on the declared sha256 (and size): on
-	// any mismatch the temp is removed and pool/ is never touched.
-	hashHex, err := w.FinalizeExpectingHash(m.SHA256, m.Size)
+	hashHex, err := verifyMember(w, m, m.Size, a.rehashPooledBlob(suite, m))
 	if err != nil {
 		return "", err
 	}
 	if err := a.cache.PutBlob(ctx, hashHex, w.Written()); err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: PutBlob %s: %v", ErrAdoptionDBFailed, hashHex, err)
 	}
 	return hashHex, nil
 }
@@ -1712,9 +2199,10 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 // serve"); a size/content-length mismatch, finalize error, transport
 // error, or other status returns a typed *AdoptionMemberError wrapping
 // ErrAdoptionMemberFetchFailed; a hash mismatch wraps
-// ErrAdoptionMemberMismatch. Verification always uses m.Size / m.SHA256
-// (the signed-Release declarations), independent of which URL served
-// the bytes.
+// ErrAdoptionMemberMismatch. Verification always uses m.Size and every
+// hash m declares (the signed-Release declarations; verifyMember),
+// independent of which URL served the bytes; mismatched bytes never reach
+// pool/.
 func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseMember, relPath string) (string, error) {
 	upstreamURL := buildMemberURL(suite, relPath)
 	target := &fetch.Target{
@@ -1722,7 +2210,7 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 		URL:           upstreamURL,
 	}
 
-	w, err := a.cache.NewTempBlob()
+	w, err := newMemberWriter(a.cache)
 	if err != nil {
 		return "", fmt.Errorf("%w: NewTempBlob %s: %v", ErrAdoptionDBFailed, m.Path, err)
 	}
@@ -1758,7 +2246,7 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 			// lifetime — so operators need to alert on it separately
 			// (and opt into the required_architectures guard).
 			reason := "4xx"
-			if isIndexTarget(m.Path) {
+			if isIndexTarget(suite.SuitePath, m.Path) {
 				reason = "4xx_index_target"
 			}
 			a.logger.Warn("adoption_member_skipped",
@@ -1766,6 +2254,7 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 				"suite_path", suite.SuitePath,
 				"path", m.Path,
 				"declared_sha256", m.SHA256,
+				"declared_sha512", m.SHA512,
 				"upstream_status", se.Code,
 				"reason", reason,
 			)
@@ -1786,31 +2275,74 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 			fmt.Sprintf("served %d vs declared %d", res.ContentLength, m.Size))
 	}
 
-	hashHex, err := w.Finalize(res.ContentLength)
-	if err != nil {
-		return "", newMemberErr(ErrAdoptionMemberFetchFailed, m.Path,
-			fmt.Sprintf("finalize: %v", err))
-	}
-	if hashHex != m.SHA256 {
-		// Mismatch. The blob is now in pool/ under hashHex (its
-		// actual hash, not the declared). Adoption rejects.
-		// Don't promote a divergent blob — but also don't evict it,
-		// since a different snapshot might legitimately reference
-		// hashHex elsewhere. Log loudly.
+	hashHex, err := verifyMember(w, m, res.ContentLength, a.rehashPooledBlob(suite, m))
+	var mm *memberHashMismatch
+	switch {
+	case errors.Is(err, ErrAdoptionDBFailed):
+		// rehashPooledBlob could not read or evict the pool file: a local
+		// fault, not the member's.
+		return "", err
+	case errors.As(err, &mm):
+		// Mismatch: adoption rejects, and the bytes never reached pool/
+		// (verifyMember removed the temp). Log loudly.
+		suffix, prefix := "sha256", ""
+		if mm.algo == "SHA512" {
+			suffix, prefix = "sha512", "SHA512 "
+		}
 		a.logger.Warn("adoption_member_mismatch",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"path", m.Path,
-			"declared_sha256", m.SHA256,
-			"actual_sha256", hashHex,
+			"declared_"+suffix, mm.declared,
+			"actual_"+suffix, mm.actual,
 		)
 		return "", newMemberErr(ErrAdoptionMemberMismatch, m.Path,
-			fmt.Sprintf("declared %s, got %s", shortHash(m.SHA256), shortHash(hashHex)))
+			fmt.Sprintf("%sdeclared %s, got %s", prefix, shortHash(mm.declared), shortHash(mm.actual)))
+	case err != nil:
+		return "", newMemberErr(ErrAdoptionMemberFetchFailed, m.Path,
+			fmt.Sprintf("finalize: %v", err))
 	}
 	if err := a.cache.PutBlob(ctx, hashHex, w.Written()); err != nil {
 		return "", fmt.Errorf("%w: PutBlob %s: %v", ErrAdoptionDBFailed, hashHex, err)
 	}
 	return hashHex, nil
+}
+
+// rehashPooledBlob returns verifyMember's rehashPooled hook for m, a
+// SHA512-only member of suite: SPEC2 §7.5 step 5's rehash on reuse for a
+// blob whose SHA-256 is known only once its fetched bytes verified. When
+// pool/<derived> exists its bytes are re-hashed; a file whose bytes are
+// not <derived> (corrupted at rest) is logged and counted as
+// pool_corruption_during_adoption and evicted, exactly as adoptMember and
+// writeBlobBytes do, so Finalize moves the verified bytes in instead of
+// keeping it. A missing file is nothing to check. A read or evict error
+// is ErrAdoptionDBFailed (a local fault).
+func (a *Adopter) rehashPooledBlob(suite SuiteRef, m ReleaseMember) func(derived string) error {
+	return func(derived string) error {
+		p := a.cache.BlobPath(derived)
+		actual, err := hashFile(p)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			return nil
+		case err != nil:
+			return fmt.Errorf("%w: rehash %s: %v", ErrAdoptionDBFailed, derived, err)
+		case actual == derived:
+			return nil
+		}
+		a.logger.Warn("pool_corruption_during_adoption",
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+			"path", m.Path,
+			"declared_sha512", m.SHA512,
+			"derived_sha256", derived,
+			"actual_sha256", actual,
+		)
+		integrity.IncPoolCorruptionDuringAdoption()
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: evict corrupted %s: %v", ErrAdoptionDBFailed, derived, err)
+		}
+		return nil
+	}
 }
 
 // writeBlobBytes persists in-memory bytes as a blob, returning the
@@ -1872,14 +2404,11 @@ func (a *Adopter) writeBlobBytes(ctx context.Context, content []byte) (string, e
 	return hashHex, nil
 }
 
-// hashFile streams a file through sha256 and returns the lowercase hex
-// digest. Used by writeBlobBytes and adoptMember for the "rehash on
-// reuse" defense — content sitting in pool/ from a prior fetch is
-// re-verified before being trusted as a snapshot member.
 // shortHash truncates a hex digest to its first 12 characters for
 // compact display in the admin reason chip. The full digests stay in
-// the adoption_member_mismatch Warn log (declared_sha256 /
-// actual_sha256), so operators can still recover the complete values.
+// the adoption_member_mismatch Warn log (declared_sha256 / actual_sha256,
+// or declared_sha512 / actual_sha512 for a member checked by its
+// SHA-512), so operators can still recover the complete values.
 func shortHash(h string) string {
 	if len(h) <= 12 {
 		return h
@@ -1887,6 +2416,13 @@ func shortHash(h string) string {
 	return h[:12]
 }
 
+// hashFile streams a file through sha256 and returns the lowercase hex
+// digest. Used by writeBlobBytes, by rehashPooledBlob (the rehash on
+// reuse of a SHA-512-only member's pool file, once its fetched bytes
+// verified), and by adoptMember's "rehash on reuse" defense for a member
+// that declares no SHA-512 (one that does goes through hashFileDigests) —
+// content sitting in pool/ from a prior fetch is re-verified before being
+// trusted as a snapshot member.
 func hashFile(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -1917,16 +2453,13 @@ func hashFile(path string) (string, error) {
 // Ubuntu serves it). The "" special case denied root members both the
 // adoption-time by-hash probe (the URL immune to the mirror-sync
 // revision race) and the served alias row — do not reintroduce it.
-// SPEC6_7 §4.
+// SPEC6_7 §4. Since phase E the SHA512 alias (byHashPath) follows the same
+// rule (spec C5).
 func byHashAliasPath(declaredPath, sha256hex string) string {
 	if declaredPath == "" {
 		return ""
 	}
-	dir := path.Dir(declaredPath)
-	if dir == "." || dir == "" {
-		return "by-hash/SHA256/" + sha256hex
-	}
-	return dir + "/by-hash/SHA256/" + sha256hex
+	return byHashPath(declaredPath, "SHA256", sha256hex)
 }
 
 // packageHashBuildResult bundles buildPackageHashes' outputs. SPEC3
@@ -1954,9 +2487,10 @@ type debPathDecl struct {
 
 // buildPackageHashes walks every Packages-shaped Release member, parses
 // it, and returns the dedup'd cache.PackageHash rows + the SPEC3 §7.5.4
-// coverage_complete bit for the snapshot. Returns coverage = false for
-// non-/dists/ layouts (with rows = nil); strict mode (§6.1) treats
-// such hosts as fail-through, never fail-closed.
+// coverage_complete bit for the snapshot. Returns coverage = false (with
+// rows = nil, logged reason non_dists_layout) for a suite path that is
+// neither a dists/ suite nor a canonical flat suite; strict mode (§6.1)
+// treats such hosts as fail-through, never fail-closed.
 //
 // allMembers is the full Release-declared set (used to compute the
 // coverage denominator — every declared Packages-basename directory
@@ -1967,9 +2501,41 @@ type debPathDecl struct {
 // fetchedMembers would silently drop a 4xx-skipped Packages directory
 // from the denominator and let coverage_complete = true vacuously hold
 // for an incomplete snapshot.
-func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
-	allMembers, fetchedMembers []ReleaseMember) (packageHashBuildResult, error) {
+//
+// form is the snapshot's anchor form: the unsigned form gets no row and no
+// coverage (spec C5 safeguard 5 — no package_hash row on any path:
+// adoption here, reconcile through the same call), so it vouches no .deb.
+//
+// A flat suite is materialised by spec C6: its root Packages* members (a
+// member path with no "/") are its Packages directory, and each stanza's
+// literal Filename F gives the row FlatBase(suite) + "/" + F with
+// flat_filename DotClean(F) — the exact row is a real path for `/ /` and
+// `./` sources and a harmless phantom for `sub/` and `a/b/` ones, whose
+// .debs DeclaredHashesForPath's suffix fallback finds by flat_filename.
+//
+// AIDEV-NOTE: the literal F is kept in the path (apt requests
+// <uri>/./x.deb verbatim; validateFilename refused anything that could
+// leave the base), and only a flat row carries a flat_filename: a dists
+// row's "" keeps it out of the fallback's partial index. A flat Release's
+// nested Packages (not an IndexTarget for a flat source, design note 3)
+// counts neither as rows nor in coverage. Sources and pdiff hashing stay
+// dists-only (spec C6): their builders return nothing without a dists
+// repository root.
+func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64, form cache.AnchorForm, allMembers, fetchedMembers []ReleaseMember) (packageHashBuildResult, error) {
+	if form == cache.FormUnsigned {
+		return packageHashBuildResult{}, nil
+	}
+	flat := aptpath.IsFlatSuitePath(suite.SuitePath)
 	repoRoot, ok := repoRootFromSuitePath(suite.SuitePath)
+	if flat {
+		repoRoot, ok = aptpath.FlatBase(suite.SuitePath)+"/", true
+	}
+	// packagesIndex reports whether member path p is one of the suite's
+	// Packages indexes: any Packages* for a dists suite, a root one for a
+	// flat suite.
+	packagesIndex := func(p string, shape func(string) bool) bool {
+		return shape(p) && (!flat || !strings.Contains(p, "/"))
+	}
 	if !ok {
 		a.logger.Info("package_coverage_incomplete",
 			"canonical_host", suite.CanonicalHost,
@@ -1991,7 +2557,7 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 	pkgDirs := make(map[string]bool)
 	hasParseable := make(map[string]bool)
 	for _, m := range allMembers {
-		if !isPackagesBasename(path.Base(m.Path)) {
+		if !packagesIndex(m.Path, func(p string) bool { return isPackagesBasename(path.Base(p)) }) {
 			continue
 		}
 		dir := path.Dir(m.Path)
@@ -2009,18 +2575,26 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 	//
 	// Iterates fetchedMembers only: a 4xx-skipped Packages member
 	// has no blob in the pool, so readPackagesBlob would miss.
+	//
+	// noSHA256 holds the deb paths of stanzas with a Filename but no
+	// SHA256 (spec C5 "Hash blocks"), deduplicated across variants: they
+	// vouch nothing and make coverage incomplete below (no_sha256).
 	dedup := make(map[string]debPathDecl)
+	noSHA256 := make(map[string]bool)
 	for _, m := range fetchedMembers {
-		if !isPackagesMember(m.Path) {
+		if !packagesIndex(m.Path, isPackagesMember) {
 			continue
 		}
 		body, err := a.readPackagesBlob(m.Path, m.SHA256)
 		if err != nil {
-			return packageHashBuildResult{}, fmt.Errorf("%w: read %q: %v", ErrAdoptionParseFailed, m.Path, err)
+			return packageHashBuildResult{}, fmt.Errorf("%w: read %q: %w", ErrAdoptionParseFailed, m.Path, err)
 		}
-		refs, err := ParsePackages(body)
+		refs, gaps, err := parsePackages(body)
 		if err != nil {
 			return packageHashBuildResult{}, fmt.Errorf("%w: parse %q: %v", ErrAdoptionParseFailed, m.Path, err)
+		}
+		for _, f := range gaps {
+			noSHA256[repoRoot+f] = true
 		}
 		hasParseable[path.Dir(m.Path)] = true
 		for _, ref := range refs {
@@ -2106,7 +2680,7 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 			skippedIncomplete++
 			continue
 		}
-		rows = append(rows, cache.PackageHash{
+		row := cache.PackageHash{
 			CanonicalScheme: suite.CanonicalScheme,
 			CanonicalHost:   suite.CanonicalHost,
 			Path:            debPath,
@@ -2115,7 +2689,11 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 			PackageName:     decl.packageName,
 			Architecture:    decl.architecture,
 			Version:         decl.version,
-		})
+		}
+		if flat {
+			row.FlatFilename = aptpath.DotClean(strings.TrimPrefix(debPath, repoRoot))
+		}
+		rows = append(rows, row)
 	}
 	if skippedIncomplete > 0 {
 		// Observability only — coverage is intentionally NOT downgraded here
@@ -2155,6 +2733,25 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64,
 			"snapshot_id", snapshotID,
 			"reason", "unsupported_variants",
 			"directories", missingDirs,
+		)
+		return packageHashBuildResult{rows: rows, coverageComplete: false}, nil
+	}
+	if len(noSHA256) > 0 {
+		// Spec C5 "Hash blocks": a stanza with a Filename but no SHA256
+		// (an index that declares only MD5sum/SHA1/SHA512 for it) vouches
+		// nothing, and is no silent drop: coverage cannot be proven, so it
+		// is incomplete — strict mode stays off for the host rather than
+		// refusing these packages while reporting complete coverage.
+		//
+		// AIDEV-NOTE: unlike the incomplete-identity skip above (round-5,
+		// non-punitive), one such stanza flips coverage: the spec names
+		// it, and the package it declares can never be vouched.
+		a.logger.Info("package_coverage_incomplete",
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+			"snapshot_id", snapshotID,
+			"reason", "no_sha256",
+			"no_sha256_stanzas", len(noSHA256),
 		)
 		return packageHashBuildResult{rows: rows, coverageComplete: false}, nil
 	}
@@ -2208,9 +2805,14 @@ type sourcePathDecl struct {
 // DROPS the conflicting artifact (never guesses a hash; it falls back
 // to trust-on-fetch serving) while the suite still adopts. The error
 // return is retained for the signature but is always nil today.
-// SPEC6_5 §11 H3/H4/H11 per-stanza skips happen inside ParseSources
+// SPEC6_5 §11 H3/H4 per-stanza skips happen inside ParseSources
 // silently — operators see the per-Sources-file granularity at the
-// source_parsed Debug log; per-stanza visibility is a future phase.
+// source_parsed Debug log; the H11 skips (a path validateMemberPath
+// refuses) are counted and logged once per Sources file at INFO,
+// source_paths_skipped (deferred minor GD-2; INFO, review M-8: it
+// repeats at every adoption and the operator cannot act on it) — also
+// for a file that then fails to parse, such as one whose every path was
+// refused, which source_parse_failed then names as its cause.
 //
 // Non-/dists/ layouts (where repoRootFromSuitePath returns false)
 // return (nil, 0, nil): source rows are simply not populated. Phase 1
@@ -2255,6 +2857,24 @@ func (a *Adopter) buildSourceHashes(suite SuiteRef, snapshotID int64,
 			continue
 		}
 		refs, stats, err := ParseSources(body)
+		if stats.PathsSkipped > 0 {
+			// Ruling PG-21 keeps validateMemberPath for a Sources file's
+			// paths: one with a "%" or a "." segment gets no source row.
+			//
+			// AIDEV-NOTE: logged before the err check (Task 10 review
+			// I-1): ParseSources fails a file whose every path it refused
+			// (stats come back with the error), and that file, which
+			// lost all its source rows, must still say so.
+			a.logger.Info("source_paths_skipped",
+				"canonical_scheme", suite.CanonicalScheme,
+				"canonical_host", suite.CanonicalHost,
+				"suite_path", suite.SuitePath,
+				"snapshot_id", snapshotID,
+				"member_path", m.Path,
+				"count", stats.PathsSkipped,
+				"first", stats.FirstSkipped,
+			)
+		}
 		if err != nil {
 			a.logger.Warn("source_parse_failed",
 				"suite_path", suite.SuitePath,
@@ -2610,16 +3230,13 @@ func (a *Adopter) readPackagesBlob(memberPath, blobHash string) ([]byte, error) 
 // "<scheme>://<host><suite_path>/InRelease"; member URLs follow the
 // same pattern with the relative path appended.
 //
-// AIDEV-NOTE: this composes URL strings textually rather than going
-// through net/url, because the inputs are already canonicalized: the
-// suite_path is opaque from canonicalization, and the relative
+// AIDEV-NOTE: the URL is built by aptpath.BuildUpstreamURL so the
+// member path is encoded exactly as apt would send it (spec C1.3).
+// The suite_path is opaque from canonicalization, and the relative
 // member path was validated by ParseRelease (no NUL, no absolute
-// prefix, no dotdot). A conservative approach is to ensure exactly
-// one "/" between suite and member.
+// prefix, no dotdot); this still ensures exactly one "/" between
+// suite and member. Canonical host is port-less (SPEC §3.2).
 func buildMemberURL(suite SuiteRef, relPath string) string {
-	base := suite.CanonicalScheme + "://" + suite.CanonicalHost + suite.SuitePath
-	if !strings.HasSuffix(base, "/") {
-		base += "/"
-	}
-	return base + relPath
+	p := strings.TrimSuffix(suite.SuitePath, "/") + "/" + relPath
+	return aptpath.BuildUpstreamURL(suite.CanonicalScheme, suite.CanonicalHost, p)
 }

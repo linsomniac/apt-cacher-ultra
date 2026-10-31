@@ -26,7 +26,7 @@ import (
 //
 // Verifier semantics for the detached path live in internal/gpg
 // (TestVerifier_Detached_*); this test exercises the integration:
-// handler → freshness.Check → checkLockedDetached → Adopter.RunDetached
+// handler → freshness.Check → checkDetached → Adopter.RunDetached
 // → Verifier.VerifyDetached → categorized error → no flip.
 func TestPhase2DetachedGPGForgery_RejectionLeavesSnapshotIntact(t *testing.T) {
 	if testing.Short() {
@@ -89,6 +89,11 @@ func TestPhase2DetachedGPGForgery_RejectionLeavesSnapshotIntact(t *testing.T) {
 		CanonicalHost:   upstreamURL.Hostname(),
 		SuitePath:       chaos2Suite,
 	}
+	// Spec C3: CommitAdoption is UPDATE-only; the detached suite's
+	// InRelease misses (404) created no row.
+	if err := stack.handler.cache.EnsureSuiteForTest(context.Background(), "http", upstreamURL.Hostname(), chaos2Suite); err != nil {
+		t.Fatal(err)
+	}
 	if err := stack.adopter.RunDetached(context.Background(), suiteRef, snapA.release, snapA.releaseGPG, "\"A\"", ""); err != nil {
 		t.Fatalf("adopt A via RunDetached: %v", err)
 	}
@@ -106,7 +111,7 @@ func TestPhase2DetachedGPGForgery_RejectionLeavesSnapshotIntact(t *testing.T) {
 
 	// Phase 3: trigger a freshness check by issuing a Release GET.
 	// detectForm sees the prior snapshot's release_hash != nil →
-	// detached. checkLockedDetached conditional-GETs Release, sees
+	// detached. checkDetached conditional-GETs Release, sees
 	// changed, fetches Release.gpg, spawns the adoption goroutine.
 	// The goroutine calls VerifyDetached → gateVerifier rejects →
 	// ErrAdoptionGPGFailed → no flip.

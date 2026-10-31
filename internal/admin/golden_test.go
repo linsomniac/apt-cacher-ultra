@@ -436,6 +436,8 @@ func newWatchingLaggingModel(nLag int) htmlRenderModel {
 			LastSuccessUnixTime:           &successAt,
 			InReleaseChangeSeenAtUnixTime: &seenAt,
 			Lagging:                       "(lagging 1h 6m)",
+			LagSeconds:                    3960,
+			LagWarn:                       true,
 		})
 	}
 	// Add one healthy suite so the panel still has a non-warn baseline.

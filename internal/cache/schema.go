@@ -14,8 +14,8 @@ import (
 // CurrentSchemaVersion is the schema this build of the binary creates and
 // expects. Forward-only: a database tagged with a higher version is treated
 // as written by a newer binary and the cache refuses to open it. SPEC §4.3,
-// SPEC2 §4.3, SPEC3 §4.3, SPEC4 §4.3.
-const CurrentSchemaVersion = 6
+// SPEC2 §4.3, SPEC3 §4.3, SPEC4 §4.3, flat-repositories design §6.
+const CurrentSchemaVersion = 7
 
 // migrations is indexed such that migrations[N] migrates the database from
 // schema version N to N+1. migrations[0] (v0 → v1) creates the entire
@@ -292,6 +292,108 @@ CREATE TABLE snapshot_skipped_member (
 ALTER TABLE package_hash ADD COLUMN version    TEXT NOT NULL DEFAULT '';
 ALTER TABLE url_path     ADD COLUMN dropped_at INTEGER;
 `,
+	// v6 → v7: flat repositories and suite lifecycle (design spec
+	// 2026-09-27 §6). Additive DDL; backfills that need "now" run in the
+	// Go step (migrationGoSteps[6]) so no SQL reads SQLite's clock.
+	//
+	// AIDEV-NOTE: suite_freshness.last_requested_at is the SUITE's
+	// client-interest stamp, distinct from url_path.last_requested_at.
+	// suite_snapshot.inrelease_hash is the single-anchor blob for both the
+	// inline and the unsigned form; anchor_form says which file it is.
+	// The trigger REJECTS a row without anchor_form (fail closed: a
+	// guessed form could turn an unsigned snapshot into a vouching one),
+	// and RAISE(ABORT) also defeats INSERT OR IGNORE. Every insert —
+	// production and test fixtures — names its form.
+	//
+	// AIDEV-NOTE: the backfilled 'inline' is provisional for pre-v7 rows:
+	// some hold a plain-text or R-1-polluted envelope. They wait in
+	// legacy_trust_audit, which the startup audit drains before anything
+	// serves (spec §6.1). No signed-seen marker is written here.
+	`
+ALTER TABLE suite_freshness ADD COLUMN last_requested_at      INTEGER;
+ALTER TABLE suite_freshness ADD COLUMN adoption_fail_hash     TEXT;
+ALTER TABLE suite_freshness ADD COLUMN adoption_fail_reason   TEXT;
+ALTER TABLE suite_freshness ADD COLUMN adoption_fail_count    INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE suite_freshness ADD COLUMN adoption_fail_first_at INTEGER;
+ALTER TABLE suite_freshness ADD COLUMN adoption_fail_last_at  INTEGER;
+ALTER TABLE suite_freshness ADD COLUMN adoption_next_retry_at INTEGER;
+ALTER TABLE suite_freshness ADD COLUMN adoption_fail_etag     TEXT;
+ALTER TABLE suite_freshness ADD COLUMN adoption_fail_lastmod  TEXT;
+ALTER TABLE suite_freshness ADD COLUMN check_fail_count       INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE suite_snapshot ADD COLUMN anchor_form TEXT NOT NULL DEFAULT ''
+  CHECK (anchor_form IN ('', 'inline', 'detached', 'unsigned'));
+ALTER TABLE suite_snapshot ADD COLUMN release_date INTEGER;
+ALTER TABLE suite_snapshot ADD COLUMN retired_at   INTEGER;
+UPDATE suite_snapshot
+   SET anchor_form = CASE WHEN inrelease_hash IS NOT NULL THEN 'inline' ELSE 'detached' END;
+CREATE TRIGGER suite_snapshot_anchor_form_required
+BEFORE INSERT ON suite_snapshot
+WHEN NEW.anchor_form = ''
+BEGIN
+  SELECT RAISE(ABORT, 'suite_snapshot.anchor_form required');
+END;
+
+DROP INDEX idx_suite_snapshot_natural;
+CREATE UNIQUE INDEX idx_suite_snapshot_natural_v7
+  ON suite_snapshot(canonical_scheme, canonical_host, suite_path,
+                    COALESCE(inrelease_hash, release_hash), anchor_form)
+  WHERE retired_at IS NULL;
+
+ALTER TABLE package_hash ADD COLUMN flat_filename TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_package_hash_flat_filename
+  ON package_hash(canonical_scheme, canonical_host, flat_filename)
+  WHERE flat_filename <> '';
+
+CREATE TABLE suite_signed_seen (
+  canonical_scheme TEXT NOT NULL,
+  canonical_host   TEXT NOT NULL,
+  base             TEXT NOT NULL,
+  last_seen_at     INTEGER NOT NULL,
+  PRIMARY KEY (canonical_scheme, canonical_host, base)
+);
+
+-- Every adopted pre-v7 snapshot awaits the startup legacy trust audit
+-- (design spec §6.1; freshness.RunLegacyTrustAudit drains it). Never-
+-- adopted candidates are inert and their anchors unpinned: not queued.
+CREATE TABLE legacy_trust_audit (
+  snapshot_id INTEGER PRIMARY KEY
+);
+INSERT INTO legacy_trust_audit (snapshot_id)
+  SELECT snapshot_id FROM suite_snapshot WHERE adopted_at IS NOT NULL;
+`,
+}
+
+// migrationGoSteps holds optional Go code run inside migrations[from]'s
+// transaction, after its SQL and before the version bump, with
+// now = nowUnix(). Used for backfills that need the current time
+// (production SQL must not read SQLite's clock — see
+// TestNoSQLiteClockFunctionsInProductionCode). A failing step rolls the
+// whole migration back.
+var migrationGoSteps = map[int]func(ctx context.Context, tx *sql.Tx, now int64) error{
+	6: migrateV7Backfill,
+}
+
+// interestWindowSeconds is the spec C4 eager-adoption interest window
+// (7 days); the v7 backfill uses the same constant for suites with no
+// client anchor stamp.
+const interestWindowSeconds = 7 * 24 * 60 * 60
+
+func migrateV7Backfill(ctx context.Context, tx *sql.Tx, now int64) error {
+	if _, err := tx.ExecContext(ctx, `
+UPDATE suite_freshness SET last_requested_at = COALESCE(
+  (SELECT MAX(u.last_requested_at) FROM url_path u
+    WHERE u.canonical_scheme = suite_freshness.canonical_scheme
+      AND u.canonical_host   = suite_freshness.canonical_host
+      AND u.path IN (suite_freshness.suite_path || '/InRelease',
+                     suite_freshness.suite_path || '/Release')),
+  ?)`, now-interestWindowSeconds); err != nil {
+		return fmt.Errorf("backfill last_requested_at: %w", err)
+	}
+	// Signed-seen markers are NOT backfilled here: "adopted" is not
+	// "signed", and the evidence lives in pool files (spec §6.1). The
+	// startup legacy trust audit writes them.
+	return nil
 }
 
 // migrate brings the database forward to CurrentSchemaVersion. It is safe
@@ -363,7 +465,8 @@ func readSchemaVersion(ctx context.Context, db *sql.DB) (int, error) {
 	return v, nil
 }
 
-// applyMigration runs migrations[from] inside a single transaction.
+// applyMigration runs migrations[from], then migrationGoSteps[from] if
+// one is registered, inside a single transaction.
 func applyMigration(ctx context.Context, db *sql.DB, from int) error {
 	if from < 0 || from >= len(migrations) {
 		return fmt.Errorf("no migration registered for version %d", from)
@@ -375,6 +478,11 @@ func applyMigration(ctx context.Context, db *sql.DB, from int) error {
 	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx, migrations[from]); err != nil {
 		return err
+	}
+	if step, ok := migrationGoSteps[from]; ok {
+		if err := step(ctx, tx, nowUnix()); err != nil {
+			return fmt.Errorf("migration %d go step: %w", from, err)
+		}
 	}
 	// migrations[0] inserts the schema_version row itself; for later
 	// versions this UPDATE is the source of truth.

@@ -186,6 +186,7 @@ table.data tbody tr[data-state="crit"]:hover td{background:color-mix(in srgb,var
 .b{display:inline-block;padding:1px 7px 2px;font-family:var(--font-mono);font-size:9.5px;letter-spacing:0.14em;font-weight:500;text-transform:uppercase;border:1px solid currentColor;border-radius:var(--r-badge);background:transparent;line-height:1.5;white-space:nowrap}
 .b--ok{color:var(--ok)}.b--warn{color:var(--warn)}.b--crit{color:var(--crit)}.b--stale{color:var(--stale)}
 .b--neutral{color:var(--ink-low);border-color:var(--rule-hard)}
+.b--nocopy{-webkit-user-select:none;user-select:none}
 .b--signal{color:var(--signal)}
 .b.reason{margin-left:6px;letter-spacing:0.08em}
 .notice-mount{display:contents}
@@ -360,19 +361,19 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
         <span class="vital__unit">TRACKED</span>
       </div>
       <div class="vital__sub">
-        {{$lagCount := 0}}{{range .Suites}}{{if .Lagging}}{{$lagCount = (add1 $lagCount)}}{{end}}{{end}}
-        {{if eq $lagCount 0}}<span><b>0 LAGGING</b> &middot; 0 FAILING</span>{{else}}<span><b class="accent-warn">{{$lagCount}} LAGGING</b> &middot; 0 FAILING</span>{{end}}
+        {{if not $adopting}}<span>ADOPTION DISABLED &mdash; METADATA NOT REFRESHED</span>{{else}}{{$lagCount := 0}}{{$failCount := 0}}{{$longCount := 0}}{{range .Suites}}{{if .LagWarn}}{{$lagCount = (add1 $lagCount)}}{{end}}{{if .AdoptionFailing}}{{$failCount = (add1 $failCount)}}{{end}}{{if .RefusedLong}}{{$longCount = (add1 $longCount)}}{{end}}{{end}}
+        <span>{{if eq $lagCount 0}}<b>0 LAGGING</b>{{else}}<b class="accent-warn">{{$lagCount}} LAGGING</b>{{end}} &middot; {{if eq $failCount 0}}0 FAILING{{else}}<b class="accent-warn">{{$failCount}} FAILING</b>{{end}}{{if gt $longCount 0}} &middot; <b class="accent-warn">{{$longCount}} REFUSED 24H+</b>{{end}}</span>{{end}}
       </div>
     </article>
 
     <article class="vital" data-vital="adoptions" data-state="{{$adoptionsState}}">
       <header class="vital__head"><span class="vital__label">Adoptions</span></header>
-      {{$nA := len .RecentAdoptions}}{{$okA := 0}}{{$failA := 0}}{{range .RecentAdoptions}}{{if eq .Outcome "success"}}{{$okA = (add1 $okA)}}{{else}}{{$failA = (add1 $failA)}}{{end}}{{end}}
+      {{$nA := len .RecentAdoptions}}{{$okA := 0}}{{$failA := 0}}{{$refA := 0}}{{range .RecentAdoptions}}{{if eq .Outcome "success"}}{{$okA = (add1 $okA)}}{{else if eq .Outcome "refused"}}{{$refA = (add1 $refA)}}{{else}}{{$failA = (add1 $failA)}}{{end}}{{end}}
       <div class="vital__readout">
         {{if eq $nA 0}}<span class="vital__num muted">&mdash;</span><span class="vital__unit">NO EVENTS</span>{{else}}<span class="vital__num">{{$okA}}</span><span class="vital__unit">/ {{$nA}} OK</span>{{end}}
       </div>
       <div class="vital__sub">
-        {{if eq $nA 0}}<span>RING EMPTY</span>{{else if eq $failA 0}}<span><b class="accent-ok">RING CLEAN</b></span>{{else}}<span><b class="accent-crit">{{$failA}} FAILED</b></span>{{end}}
+        {{if eq $nA 0}}<span>RING EMPTY</span>{{else if and (eq $failA 0) (eq $refA 0)}}<span><b class="accent-ok">RING CLEAN</b></span>{{else}}<span>{{if gt $failA 0}}<b class="accent-crit">{{$failA}} FAILED</b>{{end}}{{if gt $refA 0}}{{if gt $failA 0}} &middot; {{end}}<b class="accent-warn">{{$refA}} REFUSED</b>{{end}}</span>{{end}}
         <span>{{$nA}} EVENTS IN RING</span>
       </div>
     </article>
@@ -429,47 +430,54 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
       <!-- SUITES -->
       <section class="panel" id="suites">
         <div class="panel__eyebrow">
-          {{$lc := 0}}{{range .Suites}}{{if .Lagging}}{{$lc = (add1 $lc)}}{{end}}{{end}}
+          {{$lc := 0}}{{range .Suites}}{{if .LagWarn}}{{$lc = (add1 $lc)}}{{end}}{{end}}
           <span>Suites</span><span class="sep">&mdash;</span>
           <span>{{len .Suites}} TRACKED</span>
           {{if gt $lc 0}}<span class="sep">&middot;</span><span class="count-warn">{{$lc}} LAGGING</span>{{end}}
+          {{$fc := 0}}{{range .Suites}}{{if .AdoptionFailing}}{{$fc = (add1 $fc)}}{{end}}{{end}}{{if gt $fc 0}}<span class="sep">&middot;</span><span class="count-warn">{{$fc}} FAILING</span>{{end}}
+          {{$rl := 0}}{{range .Suites}}{{if .RefusedLong}}{{$rl = (add1 $rl)}}{{end}}{{end}}{{if gt $rl 0}}<span class="sep">&middot;</span><span class="count-warn">{{$rl}} REFUSED 24H+</span>{{end}}
         </div>
         <h2 class="panel__h">Suite adoption status</h2>
-        <p class="panel__desc">One row per (host, suite). Lagging rows indicate the upstream has published a newer <code>InRelease</code> than the snapshot the cache is currently serving.</p>
+        <p class="panel__desc">One row per (scheme, host, suite). Lagging rows indicate the upstream has published a newer <code>InRelease</code> than the snapshot the cache is currently serving. The Adoption column shows a failing or refused adoption and when it is retried.</p>
         {{if .Suites}}
         <div class="table-wrap">
           <table class="data">
             <thead><tr>
               <th>Host</th><th>Suite path</th><th>Last check</th><th>Last success</th>
+              <th>Last requested<details class="col-hint"><summary aria-label="What does Last requested mean?">i</summary><div class="col-hint__body">When a client last asked for this suite. A suite whose last request is older than gc.suite_idle_ttl (720 h by default; 0s disables reaping) is reaped.</div></details></th>
               <th class="num">Snapshot</th>
               <th>Adopted<details class="col-hint"><summary aria-label="What does Adopted mean?">i</summary><div class="col-hint__body">Adoption fires only when a fresh InRelease has been observed. Suites whose upstream has not republished since process start may stay empty here without being broken.</div></details></th>
               <th>InRelease changed</th>
+              <th>Adoption</th>
             </tr></thead>
             <tbody>
             {{range .Suites}}
-              <tr{{if .Lagging}} data-state="warn"{{end}}>
-                <td data-label="Host" class="host">{{.Host}}</td>
-                <td data-label="Suite path" class="mono">{{.SuitePath}}</td>
+              <tr{{if or .LagWarn .AdoptionFailing .RefusedLong}} data-state="warn"{{end}}>
+                <td data-label="Host" class="host">{{if .Scheme}}{{.Scheme}}://{{end}}{{.Host}}</td>
+                <td data-label="Suite path" class="mono">{{.SuitePath}}{{if .Flat}} <span class="b b--neutral b--nocopy">flat</span>{{end}}</td>
                 <td data-label="Last check" class="time">{{unixTimePtr .LastCheckUnixTime}}</td>
                 <td data-label="Last success" class="time">{{unixTimePtr .LastSuccessUnixTime}}</td>
+                <td data-label="Last requested" class="time">{{unixTimePtr .LastRequestedUnixTime}}</td>
                 <td data-label="Snapshot" class="num mono">{{i64Ptr .CurrentSnapshotID}}</td>
                 <td data-label="Adopted" class="time">{{unixTimePtr .CurrentSnapshotAdoptedAtUnixTime}}</td>
                 <td data-label="InRelease changed" class="time">{{unixTimePtr .InReleaseChangeSeenAtUnixTime}}{{if .Lagging}} <span class="lagging">{{.Lagging}}</span>{{end}}</td>
+                <td data-label="Adoption" class="mono">{{.AdoptionStatus}}{{if and .AdoptionStatus .CheckStatus}} &middot; {{end}}{{.CheckStatus}}</td>
               </tr>
             {{end}}
             </tbody>
           </table>
         </div>
-        {{else}}<div class="empty"><div class="empty__head">NO SUITES TRACKED YET</div><div class="empty__body">Suites populate after the first adoption cycle.</div></div>{{end}}
+        {{else}}<div class="empty"><div class="empty__head">NO SUITES TRACKED YET</div><div class="empty__body">A suite is tracked once a client requests its InRelease through the proxy (with adoption enabled, also its Release, or, for a flat repository, its root <code>Packages</code> or <code>Sources</code>).</div></div>{{end}}
       </section>
 
       <!-- RECENT ADOPTIONS -->
       <section class="panel" id="adoptions">
-        {{$na := len .RecentAdoptions}}{{$okN := 0}}{{$failN := 0}}{{range .RecentAdoptions}}{{if eq .Outcome "success"}}{{$okN = (add1 $okN)}}{{else}}{{$failN = (add1 $failN)}}{{end}}{{end}}
+        {{$na := len .RecentAdoptions}}{{$okN := 0}}{{$failN := 0}}{{$refN := 0}}{{range .RecentAdoptions}}{{if eq .Outcome "success"}}{{$okN = (add1 $okN)}}{{else if eq .Outcome "refused"}}{{$refN = (add1 $refN)}}{{else}}{{$failN = (add1 $failN)}}{{end}}{{end}}
         <div class="panel__eyebrow">
           <span>Adoptions</span><span class="sep">&mdash;</span>
           <span>{{$na}} IN RING</span>
           {{if gt $failN 0}}<span class="sep">&middot;</span><span class="count-crit">{{$failN}} FAILED</span>{{end}}
+          {{if gt $refN 0}}<span class="sep">&middot;</span><span class="count-warn">{{$refN}} REFUSED</span>{{end}}
           {{if gt $okN 0}}<span class="sep">&middot;</span><span class="count-ok">{{$okN}} SUCCESS</span>{{end}}
         </div>
         <h2 class="panel__h">Recent adoption outcomes</h2>
@@ -484,8 +492,8 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
             </tr></thead>
             <tbody>
             {{range .RecentAdoptions}}
-              <tr{{if ne .Outcome "success"}} data-state="crit"{{end}} data-outcome="{{.Outcome}}"{{if .Reason}} data-reason="{{.Reason}}"{{end}}{{if .MemberPath}} data-member="{{.MemberPath}}"{{end}}>
-                <td data-label="Host" class="host">{{.Host}}</td>
+              <tr{{if eq .Outcome "refused"}} data-state="warn"{{else if ne .Outcome "success"}} data-state="crit"{{end}} data-outcome="{{.Outcome}}"{{if .Reason}} data-reason="{{.Reason}}"{{end}}{{if .MemberPath}} data-member="{{.MemberPath}}"{{end}}>
+                <td data-label="Host" class="host">{{if .Scheme}}{{.Scheme}}://{{end}}{{.Host}}</td>
                 <td data-label="Suite path" class="mono">{{.SuitePath}}</td>
                 <td data-label="Outcome">{{$ott := reasonTooltip .Outcome}}<span class="b {{outcomeBadgeClass .Outcome}}"{{if ne $ott .Outcome}} title="{{$ott}}"{{end}}>{{.Outcome}}</span>{{if and .Reason (ne .Reason .Outcome)}} <span class="b b--neutral reason" title="{{reasonTooltip .Reason}}">{{.Reason}}</span>{{end}}{{if .MemberPath}} <span class="b b--neutral mono member" title="{{.Detail}}">{{.MemberPath}}</span>{{if .Detail}} <span class="muted member-detail">{{.Detail}}</span>{{end}}{{end}}</td>
                 <td data-label="Completed" class="time">{{unixTime .CompletedUnixTime}}</td>
@@ -625,6 +633,8 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
           <div class="v"><code>{{.GC.OrphanCandidatesReaped}}</code></div>
           <div class="k">Displaced reaped</div>
           <div class="v"><code>{{.GC.DisplacedReaped}}</code></div>
+          <div class="k">Retired reaped</div>
+          <div class="v"><code>{{.GC.RetiredReaped}}</code></div>
           <div class="k">Pool orphans repaired</div>
           <div class="v"><code>{{.GC.PoolOrphansRepaired}}</code> <span class="muted">({{formatBytes .GC.PoolOrphanBytesRepaired}})</span></div>
           <div class="k">Pool unlink errors</div>
@@ -735,7 +745,7 @@ pill.setAttribute('data-state',verdict);lbl.textContent=label;})();
 
 (function(){var mount=document.getElementById('adoptions-notice');if(!mount)return;
 var rows=document.querySelectorAll('#adoptions tr[data-outcome]');var total=rows.length;if(total===0)return;
-var counts={};rows.forEach(function(tr){var o=tr.getAttribute('data-outcome');if(o==='success'||!o)return;counts[o]=(counts[o]||0)+1;});
+var counts={};rows.forEach(function(tr){var o=tr.getAttribute('data-outcome');if(o==='success'||o==='refused'||!o)return;counts[o]=(counts[o]||0)+1;});
 var top='',topN=0;for(var k in counts){if(counts[k]>topN){top=k;topN=counts[k];}}
 var THRESHOLD=0.10;if(top===''||(topN/total)<THRESHOLD)return;
 var keyringPanel=document.getElementById('keyring');
@@ -748,9 +758,12 @@ var hints={
 'parse_failed':{text:'Likely cause: malformed Release / Sources / Packages payload from upstream. Capture a failing fetch and inspect.'},
 'member_mismatch':{text:'Likely cause: a Release-listed member hash diverged from the cached blob. The failing member is shown per-row; inspect it in the proxy logs.'},
 'member_fetch_failed':{text:'Likely cause: a Release-listed member could not be fetched intact — an index republished mid-fetch, a size/content-length mismatch, or a mirror serving the wrong body (e.g. the .gz at the uncompressed URL). The failing member is shown per-row.'},
-'db_failed':{text:'Likely cause: a local cache/DB error (blob write, rehash, or snapshot insert), not an upstream problem. Check disk space and the proxy logs; adoption retries on the next freshness tick.'},
+'db_failed':{text:'Likely cause: a local cache/DB error (blob write, rehash, or snapshot insert), not an upstream problem. Check disk space and the proxy logs; adoption is retried on the backoff schedule.'},
 'unpinned_suite':{text:"Likely cause: this suite is not allow-listed for adoption. Add it to the operator's adoption pin list to enable verification."},
-'run_failed':{text:'Likely cause: upstream unreachable, TLS failure, rate-limiting, or another transport-level error. Check the proxy logs for the upstream host.'}
+'run_failed':{text:'Likely cause: upstream unreachable, TLS failure, rate-limiting, or another transport-level error. Check the proxy logs for the upstream host.'},
+'release_date_in_future':{text:"Likely cause: the upstream Release's Date is more than 10 s ahead of this host's clock (apt's Acquire::Max-FutureTime refuses it too). Check this host's clock first, then the repository's publishing clock; adoption is retried on the backoff schedule."},
+'timed_out':{text:'Likely cause: an adoption ran past adoption.max_duration, usually a member that drips or stalls on a slow mirror. The failing suite is shown per-row; it is retried on the backoff schedule.'},
+'panicked':{text:'Likely cause: a bug — an adoption goroutine panicked and was recovered. The stack is in the proxy log (adoption_panicked); please report it. The suite is retried on the backoff schedule.'}
 };
 var h=hints[top]||{text:'See per-row details below.'};
 var note=document.createElement('div');note.className='notice';note.setAttribute('role','alert');

@@ -9,12 +9,15 @@ import (
 	"strings"
 )
 
-// ReleaseMember is one row of the SHA256: block in a Release/InRelease
-// file. Path is suite-relative, e.g. "main/binary-amd64/Packages".
+// ReleaseMember is one member a Release/InRelease declares, its SHA256:
+// and SHA512: entries merged (spec C5 "Hash blocks"). Path is
+// suite-relative, e.g. "main/binary-amd64/Packages". At least one hash is
+// set.
 type ReleaseMember struct {
 	Path   string
-	SHA256 string // lowercase 64 hex chars
-	Size   int64
+	SHA256 string // lowercase 64 hex chars; "" when only SHA512 is declared
+	SHA512 string // lowercase 128 hex chars; "" when not declared
+	Size   int64  // the SHA512 entry's size when there is one, else the SHA256 entry's
 }
 
 // MaxReleaseMembers caps how many entries ParseRelease will return. A
@@ -31,12 +34,24 @@ const MaxReleaseMembers = 1_000_000
 // bufio.ErrTooLong with no diagnostic. 1 MiB is comfortable headroom.
 const scanBufCap = 1 << 20
 
-// ParseRelease extracts the SHA256: block from verified Release-equivalent
-// text — the cleartext payload of an InRelease, or the body of a detached
-// Release file. Members are returned in source order.
+// ParseRelease extracts the SHA256: and SHA512: blocks from verified
+// Release-equivalent text — the cleartext payload of an InRelease, or the
+// body of a detached or unsigned Release file — merging them per member
+// path, as apt does (spec C5 "Hash blocks"): a member carries every hash
+// declared for it, and its size comes from the SHA512 entry when there is
+// one, else from the SHA256 entry. Members are returned in the order of
+// their first entry.
 //
-// MD5Sum: and SHA1: blocks are ignored on purpose; Phase 2 trusts SHA256
-// only. A Release that lists no SHA256 block at all is an error.
+// MD5Sum: and SHA1: blocks are ignored on purpose: a member declared only
+// there is not returned. A Release with neither a SHA256 nor a SHA512
+// block is an error, and so is a member declared twice in one block with
+// a different hash or size (a malformed line in either block fails the
+// parse, as before).
+//
+// AIDEV-NOTE: SHA512-only members (libnvidia-container's Release has only
+// a SHA512 block) carry SHA256 == "": every consumer goes through the
+// shared member verifier (member_verify.go), which derives the SHA-256 of
+// the verified bytes, never through m.SHA256 alone.
 //
 // Metadata-self entries — "Release", "InRelease", "Release.gpg" — are
 // silently dropped. apt-ftparchive's `release` subcommand emits the
@@ -61,9 +76,15 @@ func ParseRelease(text []byte) ([]ReleaseMember, error) {
 	scanner.Buffer(make([]byte, 0, scanBufCap), scanBufCap)
 
 	var out []ReleaseMember
-	parsedRows := 0 // distinct from len(out) — counts filtered entries too
-	inSHA256 := false
-	sawSHA256Block := false
+	at := make(map[string]int) // member path → its index in out
+	type entry struct {
+		hash string
+		size int64
+	}
+	seen := map[string]map[string]entry{"SHA256": {}, "SHA512": {}} // per block, the first entry per path
+	parsedRows := 0                                                 // distinct from len(out) — counts filtered entries too
+	block := ""                                                     // "SHA256" or "SHA512" inside one of those blocks
+	sawBlock := false
 	lineNo := 0
 	for scanner.Scan() {
 		lineNo++
@@ -71,14 +92,14 @@ func ParseRelease(text []byte) ([]ReleaseMember, error) {
 		if line == "" {
 			// Blank line ends the current block. apt's spec allows
 			// (but does not require) one between sections.
-			inSHA256 = false
+			block = ""
 			continue
 		}
 		if line[0] == ' ' || line[0] == '\t' {
-			if !inSHA256 {
+			if block == "" {
 				continue
 			}
-			m, err := parseReleaseHashLine(line)
+			m, err := parseReleaseHashLine(line, block)
 			if err != nil {
 				return nil, fmt.Errorf("release: line %d: %w", lineNo, err)
 			}
@@ -97,27 +118,54 @@ func ParseRelease(text []byte) ([]ReleaseMember, error) {
 			if isMetadataSelfPath(m.Path) {
 				continue
 			}
-			out = append(out, m)
+			hash := m.SHA256
+			if block == "SHA512" {
+				hash = m.SHA512
+			}
+			if prev, dup := seen[block][m.Path]; dup {
+				if prev.hash != hash || prev.size != m.Size {
+					return nil, fmt.Errorf("release: line %d: %s declared twice in the %s block with different values", lineNo, m.Path, block)
+				}
+				continue
+			}
+			seen[block][m.Path] = entry{hash, m.Size}
+			i, ok := at[m.Path]
+			if !ok {
+				i = len(out)
+				at[m.Path] = i
+				out = append(out, ReleaseMember{Path: m.Path})
+			}
+			switch block {
+			case "SHA256":
+				out[i].SHA256 = hash
+				if out[i].SHA512 == "" {
+					out[i].Size = m.Size
+				}
+			case "SHA512":
+				out[i].SHA512 = hash
+				out[i].Size = m.Size
+			}
 			continue
 		}
 		// Header line. Trim trailing whitespace; the header label
 		// itself never legitimately contains spaces.
 		switch strings.TrimRight(line, " \t") {
 		case "SHA256:":
-			inSHA256 = true
-			sawSHA256Block = true
+			block, sawBlock = "SHA256", true
+		case "SHA512:":
+			block, sawBlock = "SHA512", true
 		default:
-			inSHA256 = false
+			block = ""
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("release: scan: %w", err)
 	}
-	if !sawSHA256Block {
-		return nil, errors.New("release: no SHA256 block")
+	if !sawBlock {
+		return nil, errors.New("release: no SHA256 or SHA512 block")
 	}
 	if len(out) == 0 {
-		return nil, errors.New("release: empty SHA256 block")
+		return nil, errors.New("release: empty SHA256 and SHA512 blocks")
 	}
 	return out, nil
 }
@@ -152,7 +200,9 @@ func parseAcquireByHash(text []byte) bool {
 	return false
 }
 
-func parseReleaseHashLine(line string) (ReleaseMember, error) {
+// parseReleaseHashLine parses one entry of block ("SHA256" or "SHA512"):
+// the hash lands in the member's field of that algorithm.
+func parseReleaseHashLine(line, block string) (ReleaseMember, error) {
 	// strings.Fields collapses runs of whitespace and strips the
 	// leading indent. Real Release files pad the size column with
 	// spaces for alignment; Fields sees through that.
@@ -161,8 +211,12 @@ func parseReleaseHashLine(line string) (ReleaseMember, error) {
 		return ReleaseMember{}, fmt.Errorf("malformed line %q (want 3 fields, got %d)", line, len(fields))
 	}
 	hash := fields[0]
-	if !validHexSHA256(hash) {
-		return ReleaseMember{}, fmt.Errorf("invalid sha256: %q", hash)
+	valid := validHexSHA256
+	if block == "SHA512" {
+		valid = validHexSHA512
+	}
+	if !valid(hash) {
+		return ReleaseMember{}, fmt.Errorf("invalid %s: %q", strings.ToLower(block), hash)
 	}
 	size, err := strconv.ParseInt(fields[1], 10, 64)
 	if err != nil {
@@ -174,6 +228,9 @@ func parseReleaseHashLine(line string) (ReleaseMember, error) {
 	path := fields[2]
 	if err := validateMemberPath(path); err != nil {
 		return ReleaseMember{}, fmt.Errorf("invalid path %q: %w", path, err)
+	}
+	if block == "SHA512" {
+		return ReleaseMember{Path: path, SHA512: hash, Size: size}, nil
 	}
 	return ReleaseMember{Path: path, SHA256: hash, Size: size}, nil
 }
@@ -194,6 +251,11 @@ func validHexSHA256(s string) bool {
 		}
 	}
 	return true
+}
+
+// validHexSHA512 reports whether s is exactly 128 lowercase hex characters.
+func validHexSHA512(s string) bool {
+	return len(s) == 128 && validHexSHA256(s[:64]) && validHexSHA256(s[64:])
 }
 
 // isMetadataSelfPath reports whether p names a metadata file the

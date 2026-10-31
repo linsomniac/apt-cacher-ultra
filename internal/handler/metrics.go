@@ -16,6 +16,17 @@ import (
 // metric calls. The unvouched_deb_passthrough_no_coverage outcome is
 // a separate rate-limited Info log line (not via logRequest); its
 // counter is emitted explicitly at logUnvouchedPassthrough.
+//
+// AIDEV-NOTE: added by the flat-repository work, outside the SPEC5
+// §10.4.1 inventory: acu_serve_byhash_displaced_total{host} (spec C8
+// retained by-hash); acu_suite_seed_rejected_total{host} (a suite refused
+// a row by the spec C3 caps; counted once per refusal that reached the
+// writer, i.e. at most once per suite per 10-minute rejection-cache
+// window — 1-minute for a refusal while every eviction candidate was
+// busy — unless the cache had to clear itself at its 4,096-suite bound)
+// and acu_suites_seed_rejected (unlabelled gauge: suites in that cache
+// now, kept current within a minute by its sweep timer even without
+// traffic).
 var (
 	requestsTotal = metrics.NewCounterWithCap(
 		"acu_requests_total",
@@ -81,5 +92,34 @@ var (
 		"Authoritative not-in-snapshot 404s served for an apt IndexTarget (broken apt update), by architecture (SPEC6_8).",
 		metrics.DefaultMaxSeries,
 		"architecture",
+	)
+
+	// serveByHashDisplacedTotal counts spec C8 retained by-hash serves: a
+	// by-hash member the current snapshot lacks, served from one of the
+	// suite's displaced snapshots (to a client that fetched an earlier
+	// anchor). Host-labelled, no suite labels (spec C11).
+	serveByHashDisplacedTotal = metrics.NewCounterWithCap(
+		"acu_serve_byhash_displaced_total",
+		"by-hash requests served from a displaced (earlier) snapshot of their suite, by upstream host (spec C8).",
+		metrics.DefaultMaxSeries,
+		"host",
+	)
+
+	// suiteSeedRejectedTotal counts suites refused a suite row by the spec
+	// C3 caps (refusals that reached the writer). Host-labelled.
+	suiteSeedRejectedTotal = metrics.NewCounterWithCap(
+		"acu_suite_seed_rejected_total",
+		"Suites refused a suite row by freshness.max_suites (global or per-host cap): they will not refresh until retried. By upstream host (spec C3).",
+		metrics.DefaultMaxSeries,
+		"host",
+	)
+
+	// seedRejectedSuites is the size of the spec C3 cap-rejection cache:
+	// suites refused a row within the last 10 minutes (1 minute for a
+	// refusal while every eviction candidate was busy). Unlabelled.
+	seedRejectedSuites = metrics.NewGaugeWithCap(
+		"acu_suites_seed_rejected",
+		"Suites refused a suite row by freshness.max_suites within the last 10 minutes, or 1 minute while every eviction candidate was busy (spec C3 rejection cache).",
+		0,
 	)
 )

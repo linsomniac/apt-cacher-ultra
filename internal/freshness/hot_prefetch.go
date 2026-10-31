@@ -33,9 +33,11 @@ type hotPrefetchStats struct {
 // aborts because of a hot-prefetch problem — the post-flip request
 // path will rebuild the missing url_path on demand via the standard
 // cache-miss flow. The only cancellations the caller cares about are
-// budget elapse (handled internally — emits adoption_hot_prefetch_partial
-// once with the unattempted-paths list) and parent context shutdown
-// (handled by checking ctx.Err() at the top of every iteration).
+// a deadline — hot_prefetch_budget or adoption.max_duration — (handled
+// internally — emits adoption_hot_prefetch_partial once with the
+// unattempted-paths list) and parent context shutdown (handled by
+// checking ctx.Err() at the top of every iteration; runShared's stopErr
+// check then abandons the attempt before its commit).
 func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 	snapshotID int64, candidatePackageHashes []cache.PackageHash,
 	tracker *blobHeartbeatTracker) ([]cache.PrefetchedURLPath, hotPrefetchStats) {
@@ -88,8 +90,10 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 	// Set up the prefetch context. SPEC3 §7.5 step 10: prefetchCtx is
 	// derived from adoptionCtx — a parent SIGTERM/lifecycle cancel
 	// propagates here — but only the prefetch loop sees the budget
-	// timeout. The flip below uses adoptionCtx directly so a
-	// budget-elapsed prefetch never aborts the flip.
+	// timeout, so a budget-elapsed prefetch never aborts the flip. The
+	// flip itself (runShared Step 11) runs under its own commit context
+	// (WithoutCancel + commitTimeout, spec C4); a shutdown before it
+	// starts skips it.
 	prefetchCtx := adoptionCtx
 	prefetchCancel := func() {}
 	if a.hotPrefetchBudget > 0 {
@@ -103,15 +107,21 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 		// Top-of-iteration cancellation check. SPEC3 §7.5 step 10 routes
 		// "deb in flight when budget fires" through fetchHotDeb's failed
 		// bucket (it emits hot_prefetch_deb_failed for that path), so the
-		// only case that lands here is "budget already elapsed and we
+		// only case that lands here is "a deadline already passed and we
 		// haven't even started entry i yet" — entry i and everything
 		// after it are unattempted. That's the §10.2 partial contract:
-		// missing = paths NOT YET ATTEMPTED at cancellation.
+		// missing = paths NOT YET ATTEMPTED at cancellation. The deadline
+		// (DeadlineExceeded) is hot_prefetch_budget's or the adoption
+		// context's own, adoption.max_duration: either is logged as
+		// adoption_hot_prefetch_partial, and the adoption goes on to its
+		// commit, which runs under its own bound (WithoutCancel +
+		// commitTimeout, spec C4).
 		//
 		// Parent adoptionCtx cancellation (Canceled, not DeadlineExceeded)
-		// is Phase 2 §9.5 shutdown semantics — abandon silently so the
-		// caller's CommitAdoption fails naturally under the same cancelled
-		// adoptionCtx.
+		// is a shutdown (Phase 2 §9.5): end the loop silently. runShared's
+		// stopErr check before the flip barrier catches the shutdown and
+		// abandons the attempt, so nothing commits (the final review's
+		// R2 #3: the commit no longer fails under the cancelled context).
 		if err := prefetchCtx.Err(); err != nil {
 			stats.unattempted = stats.hotCount - i
 			if errors.Is(err, context.DeadlineExceeded) {
@@ -176,13 +186,15 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 		case hotFetchCancelled:
 			// fetchHotDeb returns hotFetchCancelled in two narrow
 			// cases: parent adoptionCtx cancelled (Canceled) or
-			// hostSem.Acquire raced with the budget firing
-			// (DeadlineExceeded before any fetch was initiated).
+			// hostSem.Acquire raced with a deadline firing — the
+			// budget's or adoption.max_duration's (DeadlineExceeded
+			// before any fetch was initiated).
 			// SPEC3 §10.2: adoption_hot_prefetch_partial fires ONLY on
-			// budget elapse — but here entry i was never actually
-			// fetched, so partial includes it (hotSet[i:]). Parent
-			// shutdown abandons silently; the caller's CommitAdoption
-			// will fail naturally under the same cancelled adoptionCtx.
+			// a deadline — hot_prefetch_budget or adoption.max_duration —
+			// but here entry i was never actually fetched, so partial
+			// includes it (hotSet[i:]). A parent shutdown ends the loop
+			// silently; runShared's stopErr check before the flip
+			// barrier abandons the attempt (the final review's R2 #3).
 			stats.unattempted = stats.hotCount - i
 			if errors.Is(prefetchCtx.Err(), context.DeadlineExceeded) {
 				missing := make([]string, 0, stats.unattempted)
@@ -264,10 +276,11 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 	res, err := a.fetcher.Fetch(ctx, target, w)
 	if err != nil {
 		// Three-way disambiguation:
-		//   - ctx.Err() == DeadlineExceeded: budget elapse with this
-		//     deb in flight. SPEC3 §12.3 variant 1: "the hung fetch
-		//     was attempted but cancelled when prefetchCtx hit the
-		//     budget" → log hot_prefetch_deb_failed (with the wrapped
+		//   - ctx.Err() == DeadlineExceeded: the budget, or
+		//     adoption.max_duration (the parent's deadline), elapsed
+		//     with this deb in flight. SPEC3 §12.3 variant 1: "the
+		//     hung fetch was attempted but cancelled when prefetchCtx
+		//     hit the budget" → log hot_prefetch_deb_failed (with the wrapped
 		//     context-cancellation error) and bucket as failed. The
 		//     subsequent loop iteration's top check sees prefetchCtx
 		//     done and emits the once-fires partial event with paths

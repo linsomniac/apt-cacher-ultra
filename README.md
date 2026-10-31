@@ -28,18 +28,28 @@ client configs work unchanged.
 - TLS MITM (optional) — local CA signs per-host leaf certs so HTTPS repos (e.g. download.docker.com) can be cached,
 - Availability-first caching — cache hits never block on upstream; snapshot is served when upstream is down/slow
   rather than failing.
-- Atomic snapshot adoption — per-suite InRelease + all referenced Packages/by-hash blobs are staged, GPG-verified, and
-  flipped in a single SQLite transaction so clients always see a coherent metadata set.
-- Hash validation — every metadata file is checked against InRelease, every .deb against Packages; mismatches are
-rejected.
+- Atomic snapshot adoption — per-suite InRelease + all referenced Packages/by-hash blobs are staged, GPG-verified
+  (signed repositories; see [Repositories](#repositories)), and flipped in a single SQLite transaction. The flip
+  waits (bounded) until clients that received the old InRelease have had `adoption.flip_quiet_period` to fetch its
+  indexes, so the index requests an apt client sends within that period
+  of its InRelease match it (by-hash requests are served from the displaced snapshot even later); the residuals (a
+  client whose old InRelease is still being sent 15 s into a hold, or finished less than `flip_quiet_period` before then, a commit slower than the 20 s hold, a switch that waits
+  60 s for its turn to hold, responses slower than apt's own timeout, more than 256 held requests) each have a
+  counter and are documented in [Flip consistency](docs/configuration.md#flip-consistency).
+- Hash validation — every metadata file is checked against InRelease, every .deb against Packages (signed
+  repositories; see [Repositories](#repositories)); mismatches are rejected.
 - by-hash dedup — indices stored by content hash, deduplicated across suites.
 - Singleflight coalescing — N concurrent clients requesting the same uncached file produce one upstream fetch.
 - Resumable upstream fetches — HTTP Range used to resume on transient failure.
 gated by an allowed-host regex.
 - Freshness control — periodic and on-request InRelease checks with cooldown; hot-package proactive refresh.
+- Flat, unsigned and Release-less repositories — refreshed like `dists/` repositories, with adoption enabled (see
+  [Repositories](#repositories)).
 - Concurrency caps — per-host and global max_concurrent_adoptions semaphores keep adoption traffic from starving
 request-path callers.
 - Garbage collection — refcounted blobs are swept when no snapshot references them.
+- Suite reaping — a suite no client has asked for in 30 days is dropped with its cached index files (see
+  [Suites no client uses](#suites-no-client-uses)).
 - Self-healing snapshots — a snapshot adopted while a required index was briefly unavailable is repaired in place,
   automatically on the next unchanged freshness check or on demand via `POST /reconcile` (see "Recovering a degraded
   repository").
@@ -103,8 +113,9 @@ The packaged configuration listens on `0.0.0.0:3142`, allows all upstreams,
 and enables HTTPS MITM;
 [HTTPS proxy clients must trust the cache's CA](#configure-the-mitm-https-proxy-optional).
 Snapshot adoption is initially disabled. The admin interface, including
-`POST /reconcile`, listens on `127.0.0.1:6789`. Review these settings before
-making either listener available beyond your trusted network.
+`POST /reconcile` and `POST /forget`, listens on `127.0.0.1:6789`. Review
+these settings before making either listener available beyond your trusted
+network.
 
 To fetch through another proxy, set `proxy = "http://proxy.example.net:3128"`
 in `[upstream]`. Direct access remains the default. See
@@ -245,6 +256,56 @@ connection. To access HTTPS repositories directly, explicitly set
    use it for this MITM setup, or replace its HTTPS proxy value with `DIRECT`
    for HTTP-only caching.
 
+## Repositories
+
+Snapshot adoption (`[adoption] enabled = true`, after loading the
+repositories' signing keys on the cache host, in `/etc/apt/keyrings` or
+`adoption.keyring_dirs`; restart after adding one) is what keeps metadata
+fresh: the cache checks each repository its clients use and serves every
+change as one coherent snapshot, adopted at the repository's first
+`apt update` through the cache when an adoption slot is free. It is off
+in the packaged configuration:
+until you enable it, each metadata file is served as the cache first
+stored it, and suites are only checked for changes.
+
+- **`dists/` repositories** (Debian, Ubuntu, most vendors), signed with an
+  `InRelease` or with `Release` and `Release.gpg`; a suite moves between
+  the two forms by itself. `Release` files that list only SHA512 hashes
+  are supported.
+- **Flat repositories**, with no `dists/` tree, configured either way apt
+  accepts: `deb https://pkgs.k8s.io/core:/stable:/v1.34/deb/ /` or
+  `deb https://pkgs.k8s.io/core:/stable:/v1.34/deb ./`, and with a
+  subdirectory, `deb https://pkg.jenkins.io/debian-stable binary/`. The
+  `/` and `./` forms of one directory are tracked as two suites. A flat
+  repository at the root of its host (`deb https://example.com/ ./`) is
+  not supported: it is served from the cache but never refreshed, with a
+  WARN `flat_host_root_unsupported`. A signed flat repository's key is
+  often installed only on the clients (`signed-by=`): the cache host
+  needs it too (unless `adoption.accept_any_signer = true` and no
+  `[[trusted_signer]]` names the host), or its adoption fails
+  (`gpg_failed`) and is retried.
+- **Unsigned repositories** (a `Release` with no signature, for
+  `[trusted=yes]` clients) are adopted as unsigned snapshots, served
+  coherently but never trusted: they vouch for no package. A new one is
+  adopted once two checks have seen the same `Release` at least 5 minutes
+  apart (with the default `cooldown` and `periodic_refresh`, usually
+  5 to 15 minutes after its first `apt update` through the cache; at least
+  an hour when its host answers 401 or 403 for the missing signature
+  file, as Amazon S3 does), and a repository the cache has seen signed is
+  never adopted unsigned. Read the [threat
+  notes](docs/configuration.md#anchor-forms-and-unsigned-repositories)
+  before serving them; `adoption.adopt_unsigned = false` turns this off
+  (and the refresh below).
+- **Flat repositories that publish no `Release` at all** (Gemfury,
+  goreleaser) are refreshed file by file: each cached index is
+  revalidated with upstream, and an HTML page never replaces one.
+
+The [configuration reference](docs/configuration.md) has the rules and
+limits: [eager first adoption](docs/configuration.md#eager-first-adoption),
+[flat repositories](docs/configuration.md#flat-repositories), and [strict
+mode](docs/configuration.md#integrity-corruption-checks)
+(`integrity.refuse_unvouched_debs`), which now protects flat hosts too.
+
 ## Inspecting the cache
 
 Two read-only management subcommands let you see what's in the blob store
@@ -278,22 +339,37 @@ it — which shows up client-side as `apt update` failing to fetch that file.
 apt-cacher-ultra heals such snapshots **in place** (no re-adoption, no serving
 gap), two ways:
 
-- **Automatically** — on every freshness check where the upstream `InRelease`
-  is unchanged, the daemon re-parses the snapshot's signed `Release`, fetches
-  any declared-but-missing index, validates it, and inserts it into the live
+- **Automatically** — on a freshness check where the upstream `InRelease`
+  is unchanged and an adoption slot is free (`max_concurrent_adoptions`; a
+  check that finds none skips the heal until a later unchanged check), the
+  daemon re-parses the snapshot's signed `Release`, fetches any
+  declared-but-missing index, validates it, and inserts it into the live
   snapshot. Nothing to do; this is on by default (`[adoption].repair_skipped_members`).
 - **On demand** — force an immediate reconcile of one suite through the admin
   listener (default `127.0.0.1:6789`; protect it with `admin.htpasswd_file`
-  and/or the bind address). `host` and `suite` are the canonical host and suite
-  path as they appear in the daemon's `adoption_success` / freshness logs;
-  `scheme` is optional (default `https`):
+  and/or the bind address). Pass the scheme, host and suite path the status
+  page shows: its Host column reads `scheme://host`, so the part before `://`
+  is `scheme` (optional, default `https`; Debian's and Ubuntu's default
+  sources are `http`) and the rest is `host`. The request needs the header
+  `X-ACU-Admin: 1` and, without `admin.htpasswd_file`, must name the listener
+  by IP address, as `localhost` or by the host name in `admin.listen` (see
+  [the admin listener's checks](docs/configuration.md#admin-status-metrics-and-maintenance)):
 
 ```sh
-curl -fsS -X POST http://127.0.0.1:6789/reconcile \
+curl -sS -X POST http://127.0.0.1:6789/reconcile -H 'X-ACU-Admin: 1' \
+    --data-urlencode 'scheme=https' \
     --data-urlencode 'host=packages.microsoft.com' \
     --data-urlencode 'suite=/ubuntu/24.04/prod/dists/noble'
 # 202 Accepted = reconcile triggered (runs asynchronously)
-# 409 = busy, unknown suite, or no current snapshot
+# 400 = host or suite missing, a scheme other than http or https, a host
+#       holding scheme:// (pass the scheme in scheme), or a body that is not a form
+# 401 = admin.htpasswd_file is set and the credentials are missing or wrong
+#       (add -u user)
+# 403 = the header is missing, a browser request from another origin, or
+#       another host name without admin.htpasswd_file
+# 409 = busy, adoption disabled, unknown suite (check the scheme), no current
+#       snapshot, or no free adoption slot
+# 413 = a body over 8 KiB
 ```
 
 The metric `acu_serve_snapshot_index_target_404_total` (and the
@@ -301,13 +377,61 @@ The metric `acu_serve_snapshot_index_target_404_total` (and the
 is being denied a required index; `acu_adoption_reconciled_total` rises as the
 suite heals.
 
+## Suites no client uses
+
+A suite no client has asked for in `gc.suite_idle_ttl` (30 days by
+default) is reaped by a pass that runs every hour: it is no longer
+tracked, its cached index files are deleted and its snapshots retired
+(GC deletes them). Its packages stay cached, without the version
+retention its snapshot gave them. A client that comes back makes it new
+again, fetched from upstream. The pass runs whatever `gc.enabled` says.
+An offline or archive cache that
+must keep serving suites nobody asks for sets `suite_idle_ttl = "0s"` in
+the `[gc]` section — before upgrading from 1.0, whose suites count as idle
+from the last request before the upgrade ([Suite
+reaping](docs/configuration.md#suite-reaping)); the `apt-cacher-ultra
+starting` log line then shows `gc_suite_idle_ttl=0s`
+(`"gc_suite_idle_ttl":0` with `log.format = "json"`; a key in another
+section is ignored without a warning).
+
+## Forgetting a suite
+
+`POST /forget` reaps one suite at once, however recently it was used. It
+is the way out of two refusal states the status page shows: a deliberate
+upstream rollback (`refused: upstream_older` or `rollback_refused`) and a
+vendor that stopped signing (`refused: unsigned_downgrade_refused`). The
+next request makes the suite new again and, with adoption enabled, adopts
+what upstream serves then (for `unsigned_downgrade_refused`, forget the
+path's other suites too — its `/.` twin, or its copy under the other
+scheme — or it is refused again). It takes the same header and host rules as
+`POST /reconcile`; pass the scheme, host and suite path the status page
+shows:
+
+```sh
+curl -sS -X POST http://127.0.0.1:6789/forget -H 'X-ACU-Admin: 1' \
+    --data-urlencode 'scheme=https' \
+    --data-urlencode 'host=packages.microsoft.com' \
+    --data-urlencode 'suite=/ubuntu/24.04/prod/dists/noble'
+# 202 Accepted = forgotten; the body names the suite, counts the
+#                signed-seen markers (records that the path was seen
+#                signed) it deleted, and names any suite that kept them
+# 401 = admin.htpasswd_file is set and the credentials are missing or wrong
+#       (add -u user)
+# 409 = busy (try again) or no such suite
+```
+
+[Forgetting a suite](docs/configuration.md#forgetting-a-suite-post-forget)
+lists its other answers and what forgetting deletes.
+
 ## Build
 
 ```sh
 make build           # binary at ./build/apt-cacher-ultra
 make test            # unit tests
-make lint            # golangci-lint (must be installed)
+make lint            # golangci-lint (must be installed), plain and -tags e2ehooks, and ShellCheck (Docker)
 make deb             # .deb package (nfpm must be installed)
+make e2e-flat        # real apt against fixture repositories through the cache (Docker)
+make e2e-live        # the manual smoke against live flat repositories (Docker, network)
 make clean
 ```
 
@@ -317,6 +441,18 @@ dynamic loader or glibc. The operating system and architecture must match the
 destination; for Linux amd64 explicitly, use `GOOS=linux GOARCH=amd64 make build`.
 Like the container build, this uses Go's DNS resolver. This also applies to
 `make deb`; race-enabled tests keep cgo available.
+
+`make e2e-flat` runs real apt clients — apt 2.2 to 3.2, on six Debian and
+Ubuntu images — against fixtures of every supported repository layout
+through the cache: about 25 minutes in sequence with cached image builds,
+up to about 45 cold. CI runs one job per image; when CI's `e2e-flat` is
+red, start at [Flake, environment or daemon
+bug?](e2e/flat/README.md#flake-environment-or-daemon-bug). `make e2e-live`
+checks the live repositories those fixtures copy, by hand before 1.1.0
+and before later releases that change the request path, adoption or
+vouching ([e2e/live](e2e/live/README.md)). A binary built with `-tags
+e2ehooks` is a test binary and must never ship: CI and the release
+workflow refuse one.
 
 ## License
 

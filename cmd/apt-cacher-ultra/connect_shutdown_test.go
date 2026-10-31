@@ -113,10 +113,9 @@ func TestServe_GracefulShutdown_DrainsInflightCONNECT(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	serveDone := make(chan error, 1)
-	go func() {
-		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
-	}()
+	serveDone := serveUntilCleanup(t, ctx, cancel, func(ctx context.Context) error {
+		return serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
+	})
 
 	// Wait for the daemon's serve loop to be accepting+handling — the
 	// listener is bound before serveListeners runs, so a Dial succeeds
@@ -284,10 +283,9 @@ func TestServe_GracefulShutdown_StalledCONNECT_DrainBudget(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	serveDone := make(chan error, 1)
-	go func() {
-		serveDone <- serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
-	}()
+	serveDone := serveUntilCleanup(t, ctx, cancel, func(ctx context.Context) error {
+		return serveListeners(ctx, cfg, newTestLogger(), cacheLn, nil, nil, nil)
+	})
 
 	if err := waitForDaemonReady(t, cacheAddr, 10*time.Second); err != nil {
 		t.Fatalf("daemon never became ready: %v", err)

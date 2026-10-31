@@ -2,8 +2,9 @@ package proxy
 
 import (
 	"path"
-	"regexp"
 	"strings"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 )
 
 // metadataPrefixes lists filename prefixes that classify a path as
@@ -16,6 +17,23 @@ var metadataPrefixes = []string{
 	"Translation-",
 	"Components-",
 	"icons-",
+}
+
+// poolArtifactSuffixes are the extensions of Debian pool artifacts: a
+// basename ending in one is never metadata (isPoolArtifact, ruling PG-2).
+var poolArtifactSuffixes = []string{".deb", ".udeb", ".ddeb", ".dsc", ".buildinfo", ".changes", ".diff.gz"}
+
+// isPoolArtifact reports whether base names a Debian pool artifact: one of
+// poolArtifactSuffixes, or a source tarball — a "_" and a ".tar." component
+// (foo_1.0.orig.tar.xz, foo_1.0-1.debian.tar.xz). icons-48x48.tar.gz (no
+// "_") and Translation-pt_BR.xz (no ".tar.") stay metadata.
+func isPoolArtifact(base string) bool {
+	for _, s := range poolArtifactSuffixes {
+		if strings.HasSuffix(base, s) {
+			return true
+		}
+	}
+	return strings.Contains(base, "_") && strings.Contains(base, ".tar.")
 }
 
 // metadataExact lists exact filenames that classify a path as metadata.
@@ -55,6 +73,21 @@ func IsMetadata(p string) bool {
 			return true
 		}
 	}
+	// AIDEV-NOTE: ruling PG-2 (phase G). The prefixes below collide with
+	// real package names — a package icons-foo puts
+	// pool/…/icons-foo_1.0_all.deb under "icons-", and a flat repository
+	// may publish Packages_1.0_all.deb — and a pool artifact classified as
+	// metadata is freshness-revalidated, never hash-checked and never
+	// refused by strict mode. So an artifact's basename is never metadata,
+	// whatever its prefix; by-hash and .diff/Index keep their rules above.
+	// Residual: a url_path row an earlier binary stored for such a .deb
+	// keeps is_metadata = 1 until it is refetched; serving and strict mode
+	// read the request's classification (this function), so only the
+	// admin page's hot paths (their Kind column and JSON is_metadata)
+	// show the stale flag.
+	if isPoolArtifact(base) {
+		return false
+	}
 	for _, prefix := range metadataPrefixes {
 		if strings.HasPrefix(base, prefix) {
 			return true
@@ -63,33 +96,7 @@ func IsMetadata(p string) bool {
 	return false
 }
 
-// suiteRegex matches the SPEC §4.4 suite identification pattern:
-//
-//	^/(?:(.+)/)?dists/([^/]+)(?:/.*)?$
-//
-// Captures the optional repo path before "dists/" and the suite codename
-// after. repo_path may be empty for upstreams that serve /dists/ off the
-// host root (apt.corretto.aws, repo.charm.sh).
-var suiteRegex = regexp.MustCompile(`^/(?:(.+)/)?dists/([^/]+)(?:/.*)?$`)
-
-// SuitePath returns the canonical suite path for p (the longest prefix
-// that identifies a single suite for freshness purposes), or "" when p
-// is not under any /dists/<suite> hierarchy.
-//
-// Examples:
-//
-//	/ubuntu/dists/noble/InRelease       -> /ubuntu/dists/noble
-//	/dists/stable/InRelease             -> /dists/stable
-//	/ubuntu/pool/main/h/hello/...       -> "" (a blob, not under a suite)
-func SuitePath(p string) string {
-	m := suiteRegex.FindStringSubmatch(p)
-	if m == nil {
-		return ""
-	}
-	repo := m[1]
-	suite := m[2]
-	if repo == "" {
-		return "/dists/" + suite
-	}
-	return "/" + repo + "/dists/" + suite
-}
+// SuitePath returns the canonical suite path for p (see
+// aptpath.SuitePath, which owns the grammar). Kept as a proxy-level name
+// because callers throughout the package use it.
+func SuitePath(p string) string { return aptpath.SuitePath(p) }

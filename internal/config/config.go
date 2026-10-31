@@ -133,8 +133,16 @@ type FreshnessConfig struct {
 
 	// MaxConcurrentAdoptions caps how many SPEC2 §7.5 adoption
 	// goroutines may run at once across the whole cache. SPEC2 §9.3.1.
+	// The same global slots admit repair and reconcile passes (spec C4).
 	// 0 = unlimited; default 2.
 	MaxConcurrentAdoptions int `toml:"max_concurrent_adoptions"`
+
+	// MaxSuites is freshness.max_suites (spec C3, C4, C11): at most this
+	// many suite rows (at the cap, cap eviction makes room for a new suite
+	// when an idle one without a snapshot exists), at most a tenth of it
+	// per canonical host, and at most this many suites in the scheduler's
+	// queues. Default 5000; at least 10.
+	MaxSuites int `toml:"max_suites"`
 }
 
 // AdoptionConfig holds the SPEC2 §5.1 [adoption] block. The defaults
@@ -146,9 +154,14 @@ type AdoptionConfig struct {
 	// the divergence, do not adopt). Default false during rollout.
 	Enabled bool `toml:"enabled"`
 
-	// RequireSignature rejects an InRelease that fails GPG verification.
-	// Default true. Setting false is loud (WARN at startup) and is
-	// only sensible for explicitly trusted unsigned upstreams.
+	// RequireSignature, when true, refuses to start with an empty apt
+	// keyring unless accept_any_signer is set; it does not affect
+	// verification. Default true. Setting false only allows starting
+	// with an empty keyring; it is loud (WARN at startup) but does not
+	// relax verification: only a decodable clearsigned InRelease is
+	// adopted as inline metadata in every mode (a plain-text body or an
+	// undecodable envelope still fails closed). Unsigned repositories
+	// are handled by the unsigned form (adopt_unsigned, spec C5).
 	RequireSignature bool `toml:"require_signature"`
 
 	// RequirePinnedSigner causes adoption to fail closed when a suite
@@ -164,6 +177,26 @@ type AdoptionConfig struct {
 	// Presence-sensitive: explicit 0 means "operator opted out of the
 	// wall-clock guard" and is preserved through Load.
 	HotPrefetchBudget Duration `toml:"hot_prefetch_budget"`
+
+	// MaxDuration bounds every adoption, repair and reconcile run (spec
+	// C4, C11). Default 30m; at least 1m.
+	MaxDuration Duration `toml:"max_duration"`
+
+	// FlipQuietPeriod is adoption.flip_quiet_period (spec C8, C11): how
+	// long after the last client finished receiving a suite's anchor the
+	// cache keeps the suite's snapshot before switching to a new one, so
+	// that client's index requests still match the anchor it holds.
+	// Default 10s; 0s disables the flip barrier (the previous behaviour);
+	// otherwise between 1s and 15s.
+	FlipQuietPeriod Duration `toml:"flip_quiet_period"`
+
+	// AdoptUnsigned is adoption.adopt_unsigned (spec C5 safeguard 1, C11):
+	// adopt suites whose upstream publishes only an unsigned Release, in
+	// the unsigned form — which never vouches a .deb, never counts for
+	// strict mode, and is refused whenever the suite has signed history.
+	// Default true (pre-populated in defaultConfig: no zero value can tell
+	// "absent" from "false").
+	AdoptUnsigned bool `toml:"adopt_unsigned"`
 
 	// Architectures is the SPEC6_5 §5.1 per-arch adoption allowlist.
 	// Empty (default) preserves Phase 6 behavior: every Release-listed
@@ -191,8 +224,10 @@ type AdoptionConfig struct {
 	// Set false for the stricter posture: short-keyid-only signatures
 	// are rejected with adoption_gpg_failed regardless of whether the
 	// keyid maps to a loaded key. Each (host, suite) pair logs one
-	// INFO line the first time the fallback accepts a signature, so
-	// operators can inventory which repos depend on it.
+	// INFO line (adoption_short_keyid_fallback) the first time the
+	// fallback accepts a signature — and again once the verifier's set
+	// of logged suites has started over past 10,000 suites (gpg's
+	// onceSetMax) — so operators can inventory which repos depend on it.
 	AllowShortKeyID bool `toml:"allow_short_keyid"`
 
 	// AcceptAnySigner relaxes adoption-time trust verification for
@@ -210,15 +245,21 @@ type AdoptionConfig struct {
 	// before. This lets operators opt some suites into strict pinning
 	// while keeping broad relaxation for the rest.
 	//
-	// require_signature is orthogonal: when true, a clearsign envelope
-	// (or Release.gpg) must still be structurally present even though
-	// it is not verified. Set require_signature = false to also accept
-	// upstreams that publish unsigned Release files.
+	// require_signature is orthogonal: a decodable clearsign envelope
+	// (or structurally valid detached Release/Release.gpg pair) must
+	// still be present even though it is not cryptographically verified
+	// here.
+	// require_signature = false only allows starting with an empty
+	// keyring; it does not admit plain-text or undecodable envelopes,
+	// and does not make unsigned upstreams adoptable (adopt_unsigned
+	// governs the unsigned form, spec C5).
 	//
 	// One adoption_unverified_signer INFO line is emitted per
 	// (canonical_host, suite_path) per process the first time a suite
-	// adopts under this relaxation. A loud startup WARN names the
-	// configuration so the choice is auditable.
+	// adopts under this relaxation, and again once the verifier's set of
+	// logged suites has started over past 10,000 suites (gpg's
+	// onceSetMax). A loud startup WARN names the configuration so the
+	// choice is auditable.
 	AcceptAnySigner bool `toml:"accept_any_signer"`
 
 	// TolerateOptionalMemberFailures controls whether an
@@ -422,6 +463,15 @@ type GCConfig struct {
 	// Values >0 must be >= 1m to avoid thrashing under request
 	// bursts; rejected at load below that bound.
 	URLPathTTL Duration `toml:"url_path_ttl"`
+
+	// SuiteIdleTTL is gc.suite_idle_ttl (spec C9, C11): the suite reaper
+	// deletes a suite no client asked for in this long — its metadata
+	// url_path rows and its row, its snapshots retired for snapshot GC —
+	// so a returning client's suite re-adopts as new. Default 720h (30
+	// days); 0s disables suite reaping (the reaper's other duties still
+	// run); otherwise at least 24h. Checked whatever gc.enabled says: the
+	// reaper runs with the freshness checker, not with GC.
+	SuiteIdleTTL Duration `toml:"suite_idle_ttl"`
 }
 
 // AdminConfig holds the SPEC5 §5.1 [admin] block. Drives the Phase 5
@@ -660,6 +710,11 @@ func Load(path string) (*Config, error) {
 	if !md.IsDefined("freshness", "max_concurrent_adoptions") {
 		cfg.Freshness.MaxConcurrentAdoptions = 2
 	}
+	// freshness.max_suites: applied only when absent, so an explicit value
+	// below 10 (0 included) fails Validate instead of being rescued.
+	if !md.IsDefined("freshness", "max_suites") {
+		cfg.Freshness.MaxSuites = 5000
+	}
 	if !md.IsDefined("integrity", "validate_at_rest_interval") {
 		cfg.Integrity.ValidateAtRestInterval.Duration = 24 * time.Hour
 	}
@@ -684,6 +739,14 @@ func Load(path string) (*Config, error) {
 	}
 	if !md.IsDefined("adoption", "hot_prefetch_budget") {
 		cfg.Adoption.HotPrefetchBudget.Duration = 5 * time.Minute
+	}
+	if !md.IsDefined("adoption", "max_duration") {
+		cfg.Adoption.MaxDuration.Duration = 30 * time.Minute
+	}
+	// adoption.flip_quiet_period = 0s disables the flip barrier: a
+	// meaningful value that must survive Load.
+	if !md.IsDefined("adoption", "flip_quiet_period") {
+		cfg.Adoption.FlipQuietPeriod.Duration = 10 * time.Second
 	}
 	// Version-aware retention presence-sensitive defaults:
 	// hold_packages.window = 0 (no grace) is a documented meaningful value
@@ -737,6 +800,9 @@ func Load(path string) (*Config, error) {
 	if !md.IsDefined("gc", "url_path_ttl") {
 		cfg.GC.URLPathTTL.Duration = 168 * time.Hour
 	}
+	if !md.IsDefined("gc", "suite_idle_ttl") {
+		cfg.GC.SuiteIdleTTL.Duration = 720 * time.Hour
+	}
 	// SPEC5 §5.2 presence-sensitive defaults for [admin]. Non-bool
 	// ints/durations need IsDefined-gated defaults so an operator's
 	// explicit value (or explicit zero — though zero is invalid for
@@ -789,7 +855,9 @@ func Load(path string) (*Config, error) {
 //
 // Phase 2 additions: adoption.require_signature defaults true (the
 // secure posture; operators must explicitly opt out via the loud
-// require_signature = false config). adoption.enabled and
+// require_signature = false config, which only allows starting with
+// an empty keyring — it does not admit unsigned or undecodable inline
+// metadata; see RequireSignature). adoption.enabled and
 // require_pinned_signer remain false (match apt's broad-trust default
 // during rollout; flip-to-true is a per-deployment decision).
 //
@@ -824,6 +892,9 @@ func defaultConfig() *Config {
 			// self-heals instead of persisting for the snapshot's
 			// lifetime). Opt out with `repair_skipped_members = false`.
 			RepairSkippedMembers: true,
+			// Spec C5 safeguard 1, C11: unsigned adoption on by default,
+			// safeguarded (deferred minor E-72).
+			AdoptUnsigned: true,
 		},
 		GC: GCConfig{
 			// SPEC4 §5.1: gc.enabled defaults true. Bool fields must
@@ -938,6 +1009,9 @@ func (c *Config) Validate() error {
 	if c.Freshness.MaxConcurrentAdoptions < 0 {
 		errs = append(errs, errors.New("freshness.max_concurrent_adoptions must not be negative"))
 	}
+	if c.Freshness.MaxSuites < 10 {
+		errs = append(errs, errors.New("freshness.max_suites must be at least 10"))
+	}
 	if c.Integrity.ValidateAtRestInterval.Duration < 0 {
 		errs = append(errs, errors.New("integrity.validate_at_rest_interval must not be negative"))
 	}
@@ -958,6 +1032,14 @@ func (c *Config) Validate() error {
 	}
 	if c.Adoption.HotPrefetchBudget.Duration < 0 {
 		errs = append(errs, errors.New("adoption.hot_prefetch_budget must not be negative"))
+	}
+	if c.Adoption.MaxDuration.Duration < time.Minute {
+		errs = append(errs, errors.New("adoption.max_duration must be at least 1m"))
+	}
+	// A sub-second quiet period gives almost no protection: 0s (off) or
+	// 1s..15s (controller ruling, phase C plan).
+	if q := c.Adoption.FlipQuietPeriod.Duration; q != 0 && (q < time.Second || q > 15*time.Second) {
+		errs = append(errs, errors.New("adoption.flip_quiet_period must be 0s or between 1s and 15s"))
 	}
 
 	// SPEC6_5 §5.2: [adoption].architectures shape and cardinality.
@@ -1092,6 +1174,12 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf(
 			"gc.url_path_ttl (%s) must be 0s (disabled) or >= 1m to avoid thrashing under request bursts",
 			c.GC.URLPathTTL.Duration))
+	}
+	if c.GC.SuiteIdleTTL.Duration < 0 {
+		errs = append(errs, errors.New("gc.suite_idle_ttl must not be negative (0s disables suite reaping)"))
+	} else if c.GC.SuiteIdleTTL.Duration > 0 && c.GC.SuiteIdleTTL.Duration < 24*time.Hour {
+		errs = append(errs, fmt.Errorf(
+			"gc.suite_idle_ttl (%s) must be 0s (disabled) or >= 24h", c.GC.SuiteIdleTTL.Duration))
 	}
 
 	// SPEC5 §5.2: [admin] block validation. Only when admin.enabled

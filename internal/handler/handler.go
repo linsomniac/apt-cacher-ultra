@@ -14,17 +14,23 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
+	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
+	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
 // Compile-time assertion: *cache.BlobWriter satisfies fetch.FetchDst.
@@ -32,6 +38,19 @@ import (
 // to fetch.Fetch as the destination — so an interface drift in either
 // package surfaces here at build time rather than as a runtime panic.
 var _ fetch.FetchDst = (*cache.BlobWriter)(nil)
+
+// Fetcher is the subset of *fetch.Client the handler uses; an interface
+// so virtual-clock simulations can drive the handler with an in-memory
+// upstream — the real client does not advance testing/synctest time.
+type Fetcher interface {
+	HostAllowed(host string) bool
+	Fetch(ctx context.Context, target *fetch.Target, dst fetch.FetchDst) (*fetch.FetchResult, error)
+}
+
+// Compile-time assertion: *fetch.Client satisfies Fetcher. Production
+// wiring (cmd/apt-cacher-ultra/main.go) keeps passing a *fetch.Client
+// unchanged; this assertion catches an interface drift at build time.
+var _ Fetcher = (*fetch.Client)(nil)
 
 // FreshnessChecker is the subset of *freshness.Checker the handler uses
 // to fire SPEC §7.1 T1 triggers. Defined as an interface so handler
@@ -41,12 +60,27 @@ type FreshnessChecker interface {
 	Check(ctx context.Context, scheme, host, suitePath string)
 }
 
+// AdoptionWaiter is strict mode's view of the freshness checker's signed
+// adoptions in flight (spec C10, D10; *freshness.Checker implements it).
+// nil (adoption disabled) refuses at once, as before.
+type AdoptionWaiter interface {
+	// AdoptionsInFlight reports whether a signed adoption is in flight on
+	// the canonical host.
+	AdoptionsInFlight(host string) bool
+	// WaitHostAdoptions waits until none is — at most min(15 s, 25 s −
+	// the time since the request started at start) — and reports whether
+	// to re-run the lookup once: false when 64 requests already wait on
+	// the host or less than 1 s of the budget is left, and false too when
+	// ctx ended during the wait (the caller answers client_canceled).
+	WaitHostAdoptions(ctx context.Context, host string, start time.Time) bool
+}
+
 // Config carries handler dependencies. All non-pointer fields are
 // optional and defaulted in New.
 type Config struct {
 	Parser *proxy.Parser
 	Cache  *cache.Cache
-	Fetch  *fetch.Client
+	Fetch  Fetcher
 	Logger *slog.Logger
 
 	// HostLimiter bounds concurrent upstream connections to a single
@@ -59,6 +93,11 @@ type Config struct {
 	// triggers are disabled (tests, or operators who explicitly
 	// disabled freshness in config).
 	Freshness FreshnessChecker
+
+	// Adoptions lets strict mode wait for adoptions in flight on the
+	// request's host before refusing an unvouched .deb (spec C10). nil:
+	// no wait.
+	Adoptions AdoptionWaiter
 
 	// Serve is the SPEC §6.4 / §8 stale-serve policy. Zero value is
 	// safe (both flags off): the handler will always 502 on a metadata
@@ -81,6 +120,26 @@ type Config struct {
 	// stale current_snapshot_id rows persist from prior runs (SPEC3
 	// §6.1 / Q17).
 	AdoptionEnabled bool
+
+	// FlipGate is the spec C8 flip barrier, shared with the adopter
+	// (freshness.Adopter.FlipGate). nil, or a gate with a zero quiet
+	// period, never holds or tracks anything (the pre-C8 behaviour).
+	FlipGate *flipgate.Gate
+
+	// KeepDisplaced is gc.keep_displaced. Spec C8 retained by-hash serves
+	// a by-hash request the current snapshot lacks from the suite's newest
+	// KeepDisplaced+1 displaced, non-retired snapshots; 0 disables it.
+	KeepDisplaced int
+
+	// MaxSuites is freshness.max_suites: the spec C3 suite-row caps (this
+	// many rows in all, a tenth of it per canonical host). 0 is unbounded
+	// (tests); production configs validate it to at least 10.
+	MaxSuites int
+
+	// SuiteGuard holds a suite's in-memory mutex for cap eviction (spec
+	// C3); production passes the freshness checker. nil evicts without
+	// holding one (no checker, so no in-memory suite state).
+	SuiteGuard cache.SuiteGuard
 }
 
 // ConnectHandler is the SPEC6 §2.2 CONNECT pipeline contract.
@@ -108,10 +167,11 @@ type ConnectHandler interface {
 type Handler struct {
 	parser    *proxy.Parser
 	cache     *cache.Cache
-	fetch     *fetch.Client
+	fetch     Fetcher
 	sf        *sfGroup
 	sem       *hostsem.Sem
 	freshness FreshnessChecker
+	adoptions AdoptionWaiter
 	serve     config.ServeConfig
 	logger    *slog.Logger
 
@@ -122,6 +182,47 @@ type Handler struct {
 	// rows.
 	refuseUnvouchedDebs bool
 	adoptionEnabled     bool
+
+	// flipGate is the spec C8 barrier (see anchorStart); nil or disabled
+	// when off.
+	flipGate *flipgate.Gate
+
+	// keepDisplaced bounds retained by-hash (see tryDisplacedByHash).
+	keepDisplaced int
+
+	// Spec C3 suite rows: the caps, the eviction guard, the cap-rejection
+	// cache and suite_seed_rejected's rate limiter.
+	maxSuites  int
+	suiteGuard cache.SuiteGuard
+	rejections seedRejections
+	seedWarn   observability.LogLimiter
+
+	// flatRoot is flat_host_root_unsupported's rate limiter (spec C2).
+	flatRoot observability.LogLimiter
+
+	// cachedAnchorsHook, when set (tests only), runs right after
+	// cachedAnchors' read: the window in which a changed anchor row makes
+	// a creation unproven.
+	cachedAnchorsHook func()
+
+	// backstopHook, when set (tests only), runs at the top of
+	// markCachedSignedAnchors with the backstop's bounded context: a hook
+	// that waits on it stands in for a pool or writer that never answers
+	// (TestServeHTTP_BackstopIsBoundedBeforeTheBody).
+	backstopHook func(ctx context.Context)
+
+	// strictLookupHook, when set (tests only), runs on the hit path between
+	// its two strict-mode lookups — after DeclaredHashesForPath found no row
+	// for a .deb, before the host's coverage read — the one window in which
+	// the request's context can end with the first lookup done
+	// (TestServeHTTP_StrictCanceledBetweenTheLookups, deferred minor E-71).
+	strictLookupHook func()
+
+	// existsReads counts anchorStart's registration reads (tests: deferred
+	// minor C-23, no read while the barrier is off); suiteExistsForTest,
+	// when set (tests only), answers them instead of the cache.
+	existsReads        atomic.Int64
+	suiteExistsForTest func(cache.SuiteKey) (bool, error)
 
 	// unvouchedPassthroughLog rate-limits the
 	// unvouched_deb_passthrough_no_coverage event to once per (host,
@@ -153,33 +254,55 @@ func New(cfg Config) (*Handler, error) {
 	if cfg.Cache == nil {
 		return nil, errors.New("handler: nil Cache")
 	}
+	// AIDEV-NOTE: Fetch is an interface: a typed-nil *fetch.Client passes
+	// this check and panics on first use. Callers pass a constructed
+	// client (main.go) or a test fake.
 	if cfg.Fetch == nil {
 		return nil, errors.New("handler: nil Fetch")
 	}
 	if cfg.HostLimiter == nil {
 		return nil, errors.New("handler: nil HostLimiter")
 	}
+	if cfg.KeepDisplaced < 0 {
+		return nil, errors.New("handler: negative KeepDisplaced")
+	}
+	if cfg.MaxSuites < 0 {
+		return nil, errors.New("handler: negative MaxSuites")
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
-	return &Handler{
+	h := &Handler{
 		parser:                  cfg.Parser,
 		cache:                   cfg.Cache,
 		fetch:                   cfg.Fetch,
 		sf:                      newSFGroup(),
 		sem:                     cfg.HostLimiter,
 		freshness:               cfg.Freshness,
+		adoptions:               cfg.Adoptions,
 		serve:                   cfg.Serve,
 		logger:                  logger,
 		refuseUnvouchedDebs:     cfg.RefuseUnvouchedDebs,
 		adoptionEnabled:         cfg.AdoptionEnabled,
+		flipGate:                cfg.FlipGate,
+		keepDisplaced:           cfg.KeepDisplaced,
+		maxSuites:               cfg.MaxSuites,
+		suiteGuard:              cfg.SuiteGuard,
 		unvouchedPassthroughLog: make(map[string]int64),
 		lifecycleCtx:            lifecycleCtx,
 		lifecycleCancel:         lifecycleCancel,
-	}, nil
+	}
+	h.rejections.onPanic = func(v any) {
+		h.logGoroutinePanic("handler_goroutine_panicked", &rejectionPanicStackLogged, v, "where", "seed_rejections")
+	}
+	return h, nil
 }
+
+// rejectionPanicStackLogged limits the cap-rejection sweep's panic stack to
+// one per process.
+var rejectionPanicStackLogged atomic.Bool
 
 // allowHeader returns the SPEC6 §2.5 Allow header for a 405
 // response: "GET, HEAD, CONNECT" when MITM is enabled, "GET, HEAD"
@@ -225,6 +348,7 @@ func (h *Handler) SetConnectHandler(c ConnectHandler) {
 // after Server.Shutdown returns guarantees no new ServeHTTP starts.
 func (h *Handler) Close() {
 	h.lifecycleCancel()
+	h.rejections.close()
 	h.activeWG.Wait()
 }
 
@@ -278,6 +402,12 @@ var (
 	// (Phase 2 declared-hash failure) and bad_gateway (Phase 1 fetch
 	// failure) so operators can grep for the strict-mode contribution.
 	ErrUnvouchedDebRefused = errors.New("handler: unvouched .deb refused (strict mode)")
+
+	// errUnvouchedRetryable: strict mode would refuse a missed .deb while
+	// a signed adoption is in flight on its host (spec C10). runFetch
+	// returns it inside singleflight; serveCacheMiss waits and retries
+	// once, and turns a second one into ErrUnvouchedDebRefused.
+	errUnvouchedRetryable = errors.New("handler: unvouched .deb, an adoption is in flight on the host")
 )
 
 // ServeHTTP routes one apt request through the cache.
@@ -326,13 +456,42 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.logRequest(r, "", "", "bad_request", http.StatusBadRequest, 0, false, 0, start)
 		return
 	}
+	// Spec C2: a flat repository at the host root gets no suite; say so
+	// (rate-limited) and serve the request as before. A host the allowlist
+	// forbids never takes the minute's one line: its miss is refused below,
+	// and the line's canonical_host and detail would be wrong.
+	if req.IsMetadata && req.SuitePath == "" && aptpath.IsFlatHostRootPath(req.Path) && h.fetch.HostAllowed(req.CanonicalHost) {
+		h.noteFlatHostRoot(req)
+	}
+
+	// Spec C3: what this request knows about its suite's row, threaded
+	// through the hit, miss and stale paths. Its barrier token's Done runs
+	// once the response has been written, also for a token registered
+	// after the request created the suite's row.
+	sr := newSuiteReq(req)
+	defer func() { sr.tok.Done() }()
+
+	// Spec C8: register an anchor serve with the flip barrier before
+	// anything reads the snapshot pointer (it may wait here while the
+	// suite's flip holds anchors) and before host-slot acquisition and
+	// singleflight.
+	if t := h.anchorStart(r, req); t != nil {
+		sr.tok = t
+		if r = heldContext(r, t); clientLeft(w, r) {
+			h.logRequest(r, req.CanonicalHost, req.Path, "client_canceled", http.StatusServiceUnavailable, 0, false, 0, start)
+			return
+		}
+	}
 
 	// Fast path: SPEC §6.1.
-	if served, outcome, status, body, validation := h.tryCacheHit(w, r, req, start); served {
+	if served, outcome, status, body, validation := h.tryCacheHit(w, r, req, start, sr); served {
 		if outcome == "" {
 			outcome = "hit"
 		}
-		h.logRequestWithValidation(r, req.CanonicalHost, req.Path, outcome, status, body, false, 0, start, validation)
+		// A hit's late registration (onboarding, or a row created after
+		// anchorStart's read) may have waited too (heldContext of the entry
+		// token again is harmless).
+		h.logRequestWithValidation(heldContext(r, sr.tok), req.CanonicalHost, req.Path, outcome, status, body, false, 0, start, validation)
 		return
 	}
 
@@ -349,7 +508,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Miss: SPEC §6.2.
-	h.serveCacheMiss(w, r, req, start)
+	h.serveCacheMiss(w, r, req, start, sr)
 }
 
 // tryCacheHit attempts to serve from disk. Returns served=true if the
@@ -363,7 +522,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //  1. Metadata under a suite with current_snapshot_id != NULL: lookup
 //     goes through suite_freshness → snapshot_member, with NO Phase 1
 //     url_path fallback. A miss in snapshot_member returns 404 — once
-//     a suite is adopted, the snapshot is the contract.
+//     a suite is adopted, the snapshot is the contract. The one
+//     exception is a by-hash member one of the suite's displaced
+//     snapshots declared (spec C8 retained by-hash).
 //  2. Metadata without a snapshot pointer (pre-Phase-2 / never-adopted):
 //     Phase 1 url_path lookup, identical to SPEC §6.1.
 //  3. Non-metadata (.deb, etc.): Phase 1 url_path lookup, then
@@ -378,13 +539,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //
 // The fast path on every successful return is one DB read, one stat, one
 // open(2), and one ServeContent — order-of-microseconds.
-func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) (served bool, outcome string, status int, bytesWritten int64, validation packageValidation) {
+func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time, sr *suiteReq) (served bool, outcome string, status int, bytesWritten int64, validation packageValidation) {
 	if req.IsMetadata && req.SuitePath != "" {
-		if served, status, body, handled := h.trySnapshotHit(w, r, req, start); handled {
-			return served, "", status, body, packageValidation{}
+		served, status, body, handled, displaced := h.trySnapshotHit(w, r, req, start, sr)
+		if !handled {
+			// Spec C8 (final review R4 #1): an anchor of a suite whose row
+			// appeared after ServeHTTP's anchorStart read it absent — another
+			// request's miss or onboarding created it in between — registers
+			// now, before its suite's snapshot pointer is read again or its
+			// url_path anchor is served, and re-dispatches through the
+			// snapshot path as a late registration always does (FW-4 (c)).
+			// registerLate does nothing for a registered serve, an untracked
+			// suite or a file the barrier does not hold.
+			if t := h.registerLate(r, req, sr); t != nil {
+				if clientLeft(w, r) {
+					return true, "client_canceled", http.StatusServiceUnavailable, 0, packageValidation{}
+				}
+				served, status, body, handled, displaced = h.trySnapshotHit(w, r, req, start, sr)
+			}
+		}
+		if handled {
+			return served, "", status, body, packageValidation{SnapshotDisplaced: displaced}
 		}
 	}
-	if served, outcome, status, body, v := h.tryURLPathHit(w, r, req); served {
+	if served, outcome, status, body, v := h.tryURLPathHit(w, r, req, start, sr); served {
 		return served, outcome, status, body, v
 	}
 	// SPEC2 §0 #4: when both lookups missed for a non-adopted metadata
@@ -395,18 +573,21 @@ func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy
 	// snapshot_member row, but the gate above ensures we never bypass
 	// an adopted suite's §6.1 contract.
 	if req.IsMetadata {
-		served, status, body := h.tryByHashContentAddressed(w, r, req)
+		served, status, body := h.tryByHashContentAddressed(w, r, req, sr)
 		return served, "", status, body, packageValidation{}
 	}
 	return false, "", 0, 0, packageValidation{}
 }
 
 // trySnapshotHit is the SPEC2 §6.1 metadata fast path. Returns
-// handled=true when the request was satisfied (served from a snapshot,
-// 404 not-in-snapshot, or 502 fail-closed). Returns handled=false only
-// when the suite has not been adopted (no suite_freshness row, or
-// current_snapshot_id IS NULL), in which case the caller falls through
-// to the Phase 1 url_path lookup.
+// handled=true when the request was satisfied (served from a snapshot —
+// with displaced=true when that was one of the suite's displaced
+// snapshots, spec C8 retained by-hash — 404 not-in-snapshot, or 502
+// fail-closed). Returns handled=false when the suite has not been
+// adopted (no suite_freshness row, or current_snapshot_id IS NULL), in
+// which case the caller falls through to the Phase 1 url_path lookup, and
+// for an anchor serve of a tracked suite that is not registered with the
+// flip barrier yet, which tryCacheHit registers and calls it again for.
 //
 // AIDEV-NOTE: every failure mode after a suite has been confirmed
 // adopted (DB error on snapshot_member, etc.) must fail closed with a
@@ -417,14 +598,17 @@ func (h *Handler) tryCacheHit(w http.ResponseWriter, r *http.Request, req *proxy
 // contract." A SuiteFreshness DB error is the one ambiguous case —
 // we don't know whether the suite is adopted, so we fail closed too;
 // the realistic failure mode is "DB is broken everywhere", and a 502
-// across the board is the right operator signal.
+// across the board is the right operator signal. The one exception: a
+// DB error in retained by-hash's displaced-snapshot lookup answers the
+// pre-C8 404 (logged WARN, phase C design note 15) — the current
+// snapshot lacks the member either way, and the miss path stays shut.
 //
 // The "blob missing" case is the one place we *can* recover safely:
 // snapshot_member.declared_sha256 is itself a trust anchor, so a
 // re-fetch validated against that hash is as safe as the original
 // adoption fetch. SPEC2 §6.2 names this as the local-fault recovery
 // path. serveSnapshotMemberMiss owns it.
-func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) (served bool, status int, bytesWritten int64, handled bool) {
+func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time, sr *suiteReq) (served bool, status int, bytesWritten int64, handled, displaced bool) {
 	suite, err := h.cache.GetSuiteFreshness(r.Context(),
 		req.CanonicalScheme, req.CanonicalHost, req.SuitePath)
 	switch {
@@ -432,18 +616,34 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 		// Suite has never been seen — pre-Phase-2 regime. Falling through
 		// to url_path is safe because no §6.1 contract has been
 		// established for this (host, suite).
-		return false, 0, 0, false
+		sr.tracked = false
+		return false, 0, 0, false, false
 	case err != nil:
 		h.logger.Warn("suite_freshness lookup failed",
 			"err", err,
 			"canonical_host", req.CanonicalHost,
 			"suite_path", req.SuitePath,
 		)
-		return h.writeFailClosed(w, "suite lookup failed"), http.StatusBadGateway, 0, true
+		return h.writeFailClosed(w, "suite lookup failed"), http.StatusBadGateway, 0, true, false
+	}
+	sr.tracked = true
+	// Spec C8 (final review R4 #1): an anchor serve of a tracked suite with
+	// no registration — the row appeared after ServeHTTP's anchorStart read
+	// it absent — must not use the pointer read before it registers: hand
+	// it back unhandled, and tryCacheHit registers it and re-dispatches.
+	//
+	// AIDEV-NOTE: every caller but tryCacheHit's first call registered the
+	// serve before it calls (the late registrations re-dispatch only with a
+	// token), so this returns unhandled once per request at most. Without
+	// it, a suite created and adopted in that window served its snapshot
+	// anchor unregistered, invisible to the next flip's barrier
+	// (TestServeHTTP_HitOfASuiteTrackedAfterAnchorStartRegistersLate).
+	if sr.tok == nil && h.barrierAnchor(req) {
+		return false, 0, 0, false, false
 	}
 	if suite.CurrentSnapshotID == nil {
 		// Suite known but never adopted — pre-Phase-2 regime.
-		return false, 0, 0, false
+		return false, 0, 0, false, false
 	}
 	snapshotID := *suite.CurrentSnapshotID
 
@@ -451,6 +651,14 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 	mem, err := h.cache.GetSnapshotMember(r.Context(), snapshotID, memberPath)
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
+		// Spec C8 retained by-hash: a by-hash member the current snapshot
+		// lacks may be one a displaced snapshot declared — a client that
+		// fetched an earlier anchor asks for exactly those bytes.
+		if ok, st, n := h.tryDisplacedByHash(w, r, req, snapshotID, memberPath); ok {
+			go h.touchAsync(req, true, nil)
+			h.maybeFireFreshness(req)
+			return true, st, n, true, true
+		}
 		// SPEC2 §6.1: snapshot is the contract. Path not in the snapshot
 		// → 404. No Phase 1 fallback would be allowed to satisfy this
 		// request, regardless of whether url_path has a row for it.
@@ -463,8 +671,8 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 		// request-log archaeology dig). by-hash / pdiff / optional members
 		// are excluded — apt has fallbacks, so they are not on their own a
 		// broken update.
-		if isIndexTargetPath(memberPath) {
-			arch := archFromPath(memberPath)
+		if isIndexTargetPath(req.SuitePath, memberPath) {
+			arch := indexTargetArch(req.SuitePath, memberPath)
 			h.logger.Warn("snapshot_index_target_404",
 				"canonical_host", req.CanonicalHost,
 				"suite_path", req.SuitePath,
@@ -475,7 +683,7 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 			serveSnapshotIndexTarget404Total.Inc(boundedArchLabel(arch))
 		}
 		http.Error(w, "not in snapshot", http.StatusNotFound)
-		return true, http.StatusNotFound, 0, true
+		return true, http.StatusNotFound, 0, true, false
 	case err != nil:
 		h.logger.Warn("snapshot_member lookup failed",
 			"err", err,
@@ -483,12 +691,19 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 			"path", req.Path,
 			"snapshot_id", snapshotID,
 		)
-		return h.writeFailClosed(w, "snapshot lookup failed"), http.StatusBadGateway, 0, true
+		return h.writeFailClosed(w, "snapshot lookup failed"), http.StatusBadGateway, 0, true, false
 	}
 
+	// Spec C8: a snapshot anchor's Last-Modified is its snapshot's
+	// adopted_at, which grows by at least 1 s per flip.
+	var modTime time.Time
+	if isAnchorMember(memberPath) {
+		modTime = h.anchorModTime(r.Context(), snapshotID)
+	}
 	served, status, bytesWritten = h.serveBlobWithHeaders(w, r, req, mem.BlobHash, snapshotMeta{
 		snapshotID:    snapshotID,
 		lastFetchedAt: nil, // snapshot rows don't carry per-blob last-fetched
+		modTime:       modTime,
 	})
 	if !served {
 		// Pool blob is missing for a known snapshot member (operator
@@ -503,12 +718,15 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 			"snapshot_id", snapshotID,
 			"blob_hash", mem.BlobHash,
 		)
-		served, status, bytesWritten = h.serveSnapshotMemberMiss(w, r, req, mem, snapshotID, start)
-		return served, status, bytesWritten, true
+		served, status, bytesWritten = h.serveSnapshotMemberMiss(w, r, req, mem, snapshotID, modTime, start)
+		if suites := servedSuite(sr, status); served && suites != nil {
+			go h.touchAsync(req, false, suites)
+		}
+		return served, status, bytesWritten, true, false
 	}
-	go h.touchAsync(req)
+	go h.touchAsync(req, true, servedSuite(sr, status))
 	h.maybeFireFreshness(req)
-	return true, status, bytesWritten, true
+	return true, status, bytesWritten, true, false
 }
 
 // writeFailClosed writes a 502 + Retry-After: 30 response for an
@@ -532,7 +750,7 @@ func (h *Handler) writeFailClosed(w http.ResponseWriter, reason string) bool {
 //     §6.2 miss path).
 //   - 2+ distinct declared hashes → 502 + Retry-After 60, log
 //     package_hash_conflict.
-func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *proxy.Request) (served bool, outcome string, status int, bytesWritten int64, validation packageValidation) {
+func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time, sr *suiteReq) (served bool, outcome string, status int, bytesWritten int64, validation packageValidation) {
 	row, err := h.cache.LookupURL(r.Context(), req.CanonicalScheme, req.CanonicalHost, req.Path)
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
@@ -551,12 +769,38 @@ func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *pro
 
 	var v packageValidation
 	if !req.IsMetadata {
-		if served, outcome, status, body, fellThrough, gotV := h.checkPackageHash(w, r, req, *row.BlobHash); fellThrough {
+		if served, outcome, status, body, fellThrough, gotV := h.checkPackageHash(w, r, req, *row.BlobHash, start); fellThrough {
 			return false, "", 0, 0, packageValidation{}
 		} else if served {
 			return true, outcome, status, body, gotV
 		} else {
 			v = gotV
+		}
+	}
+
+	// Spec C3 legacy onboarding: a cached anchor (or flat index) of a suite
+	// without a row creates the row before its body is served, and the
+	// serve registers with the flip barrier right after.
+	if req.IsMetadata {
+		if t := h.onboard(r, req, sr, *row.BlobHash); t != nil {
+			if clientLeft(w, r) {
+				return true, "client_canceled", http.StatusServiceUnavailable, 0, packageValidation{}
+			}
+			// A late registration serves what is current now: a flip may
+			// have committed a snapshot (design note 9).
+			//
+			// AIDEV-NOTE: always re-dispatch, never only when t.Held() > 0
+			// (final fix wave FW-4 (c)). Held() is the wait measured by the
+			// clock: a hold released at the reading the request joined it
+			// (a coarse clocksource; one instant in a synctest bubble)
+			// reads 0, and a flip that committed just before the
+			// registration held nothing at all — either way the request
+			// served the bytes it read before the commit, a C8 straddle
+			// (TestServeHTTP_LateRegistrationAfterACommitServesTheNewSnapshot).
+			// Cost: one snapshot-pointer read per onboarding serve.
+			if served, status, body, handled, displaced := h.trySnapshotHit(w, r, req, start, sr); handled {
+				return served, "", status, body, packageValidation{SnapshotDisplaced: displaced}
+			}
 		}
 	}
 
@@ -566,8 +810,14 @@ func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *pro
 	if !served {
 		return false, "", 0, 0, packageValidation{}
 	}
-	go h.touchAsync(req)
-	h.maybeFireFreshness(req)
+	go h.touchAsync(req, true, append(servedSuite(sr, status), vouchedSuites(req, v, status)...))
+	// T1 only for a tracked suite (ruling PD-11, design review M18:
+	// onboarding above tracks it first); an untracked suite's check would
+	// only read its absent row and skip (I-4). The other T1 sites serve
+	// snapshot or known-suite content.
+	if sr.tracked {
+		h.maybeFireFreshness(req)
+	}
 	return true, "", status, bytesWritten, v
 }
 
@@ -579,7 +829,8 @@ func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *pro
 // AIDEV-NOTE: SPEC2 §0 #4 by-hash content-addressed serve — pool's
 // content addressing makes this safe without a snapshot_member row, but
 // ONLY for non-adopted suites; adopted suites must keep going through
-// trySnapshotHit per SPEC2 §6.1.
+// trySnapshotHit per SPEC2 §6.1. Since phase D only known suites (with a
+// suite_freshness row) get it (I-4, spec C3).
 var byHashSuffixRegex = regexp.MustCompile(`/by-hash/SHA256/([0-9a-f]{64})$`)
 
 // tryByHashContentAddressed is the SPEC2 §0 #4 last-resort fast path: a
@@ -595,18 +846,20 @@ var byHashSuffixRegex = regexp.MustCompile(`/by-hash/SHA256/([0-9a-f]{64})$`)
 // "snapshot is the contract" invariant must not be bypassed; gating on
 // non-adoption upholds it.
 //
-// Three security gates apply *before* a serve:
+// Four security gates apply *before* a serve (deferred minor D-33):
 //
 //  1. SuitePath != "" — by-hash URLs are only meaningful under
 //     /dists/<suite>/. A request without a suite path is not a legitimate
 //     apt by-hash request; reject without consulting the pool.
-//  2. HostAllowed — ServeHTTP delays the §6.6 allowlist check until after
+//  2. A known suite (sr.tracked: the suite has a row, I-4, spec C3) — a
+//     minted suite name falls through to the miss path.
+//  3. HostAllowed — ServeHTTP delays the §6.6 allowlist check until after
 //     tryCacheHit (lines 213/225). For Phase 1/2 hits that's safe because
 //     url_path rows are host-scoped — only previously-allowed hosts have
 //     them. The pool is *not* host-scoped, so the fallback explicitly
 //     re-runs the allowlist check; otherwise a client could request a
 //     known SHA256 under a disallowed host and bypass §6.6.
-//  3. Same-host provenance (HostHasBlob) — the blob must have been
+//  4. Same-host provenance (HostHasBlob) — the blob must have been
 //     fetched under this host before. Without this, a caller who learns
 //     a SHA256 from one cached host could request it under any other
 //     allowlisted host and receive content that host has never vouched
@@ -618,8 +871,14 @@ var byHashSuffixRegex = regexp.MustCompile(`/by-hash/SHA256/([0-9a-f]{64})$`)
 // faster tryURLPathHit path. Failure to insert the row is non-fatal —
 // the response was already served; the next request will repeat the
 // fallback.
-func (h *Handler) tryByHashContentAddressed(w http.ResponseWriter, r *http.Request, req *proxy.Request) (served bool, status int, bytesWritten int64) {
+func (h *Handler) tryByHashContentAddressed(w http.ResponseWriter, r *http.Request, req *proxy.Request, sr *suiteReq) (served bool, status int, bytesWritten int64) {
 	if req.SuitePath == "" {
+		return false, 0, 0
+	}
+	// I-4, handler side (spec C3): only a known suite (one with a row) is
+	// served from the pool by hash; a minted suite name falls through to
+	// the miss path and creates nothing here.
+	if !sr.tracked {
 		return false, 0, 0
 	}
 	if !h.fetch.HostAllowed(req.CanonicalHost) {
@@ -669,6 +928,67 @@ func (h *Handler) tryByHashContentAddressed(w http.ResponseWriter, r *http.Reque
 	return true, status, bytesWritten
 }
 
+// byHashMemberRE matches a suite-relative by-hash member path, SHA256 or
+// SHA512, capturing the hex when the algorithm is SHA256.
+//
+// AIDEV-NOTE: the leading (?:^|/) is load-bearing, not defensive: the ^
+// alternative matches aliases directly under the suite root — the dists
+// root's Contents-* aliases today, every flat suite's indexes from phase
+// G (TestServeHTTP_RetainedByHashServesASuiteRootAlias).
+var byHashMemberRE = regexp.MustCompile(`(?:^|/)by-hash/(?:SHA256/([0-9a-f]{64})|SHA512/[0-9a-f]{128})$`)
+
+// tryDisplacedByHash is spec C8's retained by-hash: a by-hash member the
+// current snapshot lacks is served from one of the suite's displaced,
+// non-retired snapshots — the newest of the newest keep_displaced+1 that
+// holds it — with that snapshot's X-Cache-Snapshot. A SHA256 alias is
+// served only when its blob is the hash the URL names; a SHA512 alias
+// relies on the snapshot_member binding verified at adoption. There is no
+// recovery fetch: a displaced member whose blob is gone stays a 404.
+// keep_displaced = 0 disables it.
+//
+// AIDEV-NOTE: the one place a non-current snapshot serves. It is limited
+// to content-addressed paths (a client holding an earlier anchor asks for
+// exactly those bytes) and to the snapshots GC still keeps. A lookup
+// failure answers the pre-C8 404 (logged), never the unverified miss path.
+func (h *Handler) tryDisplacedByHash(w http.ResponseWriter, r *http.Request, req *proxy.Request, currentID int64, memberPath string) (served bool, status int, bytesWritten int64) {
+	if h.keepDisplaced <= 0 {
+		return false, 0, 0
+	}
+	m := byHashMemberRE.FindStringSubmatch(memberPath)
+	if m == nil {
+		return false, 0, 0
+	}
+	rows, err := h.cache.DisplacedSnapshotMembers(r.Context(), req.CanonicalScheme, req.CanonicalHost,
+		req.SuitePath, memberPath, currentID, h.keepDisplaced+1)
+	if err != nil {
+		h.logger.Warn("displaced_snapshot_lookup_failed",
+			"err", err,
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+		)
+		return false, 0, 0
+	}
+	for _, row := range rows {
+		if m[1] != "" && row.BlobHash != m[1] {
+			continue // a SHA256 alias must be the bytes its URL names
+		}
+		if served, status, bytesWritten = h.serveBlobWithHeaders(w, r, req, row.BlobHash, snapshotMeta{snapshotID: row.SnapshotID}); served {
+			serveByHashDisplacedTotal.Inc(req.CanonicalHost)
+			return true, status, bytesWritten
+		}
+		// Deferred minor C-25: no recovery fetch for a displaced member,
+		// but its missing blob is logged like a current member's.
+		h.logger.Warn("snapshot_member_blob_missing",
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+			"snapshot_id", row.SnapshotID,
+			"blob_hash", row.BlobHash,
+			"snapshot_displaced", true,
+		)
+	}
+	return false, 0, 0
+}
+
 // recordByHashURLPath inserts the url_path row for a successful by-hash
 // content-addressed serve. Best-effort: a write failure here just means
 // the next request repeats the fallback path. Mirrors the row shape
@@ -676,7 +996,7 @@ func (h *Handler) tryByHashContentAddressed(w http.ResponseWriter, r *http.Reque
 func (h *Handler) recordByHashURLPath(req *proxy.Request, hash string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	now := time.Now().Unix()
+	now := wallclock.Unix()
 	row := cache.URLPath{
 		CanonicalScheme: req.CanonicalScheme,
 		CanonicalHost:   req.CanonicalHost,
@@ -698,6 +1018,15 @@ func (h *Handler) recordByHashURLPath(req *proxy.Request, hash string) {
 	}
 }
 
+// logUnvouchedRefused logs the miss path's strict-mode refusal.
+func (h *Handler) logUnvouchedRefused(req *proxy.Request, count int) {
+	h.logger.Info("unvouched_deb_refused",
+		"canonical_host", req.CanonicalHost,
+		"path", req.Path,
+		"current_snapshot_count", count,
+	)
+}
+
 // checkPackageHash runs the SPEC2 §6.1 defense-in-depth on a .deb hit.
 //
 // Returns served=true when the function wrote a 502 (conflict or strict-
@@ -715,10 +1044,32 @@ func (h *Handler) recordByHashURLPath(req *proxy.Request, hash string) {
 // the matching row's Package name so logRequest can surface
 // validated_hash=true + package_name=<name>. The mismatch + conflict
 // branches also increment acu_serve_hash_validated_total{outcome=mismatch}.
-func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
+func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string, start time.Time) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
+	return h.checkPackageHashWait(w, r, req, blobHash, start, true)
+}
+
+// checkPackageHashWait is checkPackageHash; mayWait lets a strict-mode
+// refusal first wait for the host's signed adoptions in flight and run
+// the lookup once more (spec C10: at most 15 s and at most 25 s since the
+// request started at start, at most 64 waiters per host, beyond which the
+// refusal is immediate) — with none in flight, read the declared hashes
+// once more at once (recheckRefusal, final review R1 #2). A request whose
+// context ended during the wait is answered 503 with outcome
+// client_canceled (design note 31).
+func (h *Handler) checkPackageHashWait(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string, start time.Time, mayWait bool) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
 	rows, err := h.cache.DeclaredHashesForPath(r.Context(),
 		req.CanonicalScheme, req.CanonicalHost, req.Path)
 	if err != nil {
+		// AIDEV-NOTE: a lookup that failed because the request's context
+		// ended is no database fault: answer client_canceled (503), never
+		// the .deb (final fix wave FW-5 (a), final spec review M1). For a
+		// MITM client the tunnel manager's Drain cancels the inner
+		// request's context while the tunnel's writer stays live, so the
+		// fail-open below delivered an unvouched .deb at shutdown — the
+		// class the Task 9 fix closed only after the strict wait.
+		if clientLeft(w, r) {
+			return true, "client_canceled", http.StatusServiceUnavailable, 0, false, packageValidation{}
+		}
 		h.logger.Warn("package_hash lookup failed",
 			"err", err,
 			"canonical_host", req.CanonicalHost,
@@ -726,7 +1077,9 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 		)
 		// Fall through to a normal serve — the on-disk url_path row is
 		// our best Phase-1-grade answer. A hard fail-closed here would
-		// turn a transient SQLite hiccup into a global .deb 502 storm.
+		// turn a transient SQLite hiccup into a global .deb 502 storm
+		// (documented in configuration.md: strict mode fails open on a
+		// database error).
 		return false, "", 0, 0, false, packageValidation{}
 	}
 	distinct := distinctDeclared(rows)
@@ -742,9 +1095,48 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 		if !isDebPath(req.Path) {
 			return false, "", 0, 0, false, packageValidation{}
 		}
+		if h.strictLookupHook != nil {
+			h.strictLookupHook()
+		}
 		switch sm, snapID, count := h.classifyStrictMode(r.Context(),
 			req.CanonicalScheme, req.CanonicalHost); sm {
+		case strictCanceled:
+			// The coverage lookup failed on the request's ended context:
+			// client_canceled, never the .deb (FW-5 (a)).
+			clientLeft(w, r)
+			return true, "client_canceled", http.StatusServiceUnavailable, 0, false, packageValidation{}
 		case strictRefuse:
+			if mayWait && h.adoptions != nil {
+				if !h.adoptions.AdoptionsInFlight(req.CanonicalHost) {
+					// Final review R1 #2: nothing to wait for (E-59), but
+					// an adoption may have committed the rows that vouch
+					// for this .deb and ended since the lookup above: look
+					// once more, at once, before refusing.
+					return h.recheckRefusal(w, r, req, blobHash, count)
+				}
+				waited := h.adoptions.WaitHostAdoptions(r.Context(), req.CanonicalHost, start)
+				// A client that left during the wait gets no retry, as on
+				// the miss path (design note 31): 503, client_canceled.
+				//
+				// AIDEV-NOTE: check the context before any re-run. The
+				// re-run lookup with a dead context fails, and a lookup
+				// error fails open — the unvouched .deb was served, and a
+				// MITM tunnel's writer (alive while Drain cancels the inner
+				// request's context) delivered it (review fix round 1,
+				// Task 9). Whatever the wait reports.
+				if clientLeft(w, r) {
+					return true, "client_canceled", http.StatusServiceUnavailable, 0, false, packageValidation{}
+				}
+				// AIDEV-NOTE: the re-run after the wait decides afresh,
+				// both reads included, so a database fault in it fails
+				// open, as on a first lookup (phase E as built). The
+				// re-check with nothing in flight (recheckRefusal) does
+				// not: there a fault keeps the refusal (final review R1
+				// re-review #1, which left this re-run as it is).
+				if waited {
+					return h.checkPackageHashWait(w, r, req, blobHash, start, false)
+				}
+			}
 			st, body := h.refuseUnvouchedDeb(w, req.CanonicalHost, req.Path, count)
 			return true, "unvouched_deb_refused", st, body, false, packageValidation{}
 		case strictPassthrough:
@@ -753,7 +1145,18 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 		default:
 			return false, "", 0, 0, false, packageValidation{}
 		}
-	case 1:
+	default:
+		return h.checkDeclared(w, req, blobHash, rows)
+	}
+}
+
+// checkDeclared is checkPackageHash's answer for a .deb hit whose path
+// current snapshots declare (rows holds at least one declaration): the
+// hit served validated, the row evicted for the miss path on a mismatch,
+// or a 502 on a conflict.
+func (h *Handler) checkDeclared(w http.ResponseWriter, req *proxy.Request, blobHash string, rows []cache.DeclaredHash) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
+	distinct := distinctDeclared(rows)
+	if len(distinct) == 1 {
 		if distinct[0] == blobHash {
 			// SPEC6_5 §10.3: serve-time validation match. Capture the
 			// matching row's package_name (Phase 3 v3) for the §2.3
@@ -762,6 +1165,7 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 			return false, "", 0, 0, false, packageValidation{
 				Validated:   true,
 				PackageName: firstPackageName(rows, distinct[0]),
+				Suites:      vouchingSuites(rows, distinct[0]),
 			}
 		}
 		// One row mismatches: stale Phase 1 row covered by a Phase 2
@@ -785,22 +1189,54 @@ func (h *Handler) checkPackageHash(w http.ResponseWriter, r *http.Request, req *
 			"snapshot_id", rows[0].SnapshotID,
 		)
 		return false, "", 0, 0, true, packageValidation{}
-	default:
-		// Two or more distinct hashes: snapshots disagree. SPEC2 §6.1
-		// step 6 / §6.2 share fail-closed behavior — 502 + Retry-After
-		// 60 + log package_hash_conflict. Serving an arbitrary one of
-		// the conflicting hashes is worse than refusing.
-		serveHashValidatedTotal.Inc(classifyPath(req.Path), "mismatch")
-		w.Header().Set("Retry-After", "60")
-		http.Error(w, "package hash conflict", http.StatusBadGateway)
-		h.logger.Error("package_hash_conflict",
+	}
+	// Two or more distinct hashes: snapshots disagree. SPEC2 §6.1
+	// step 6 / §6.2 share fail-closed behavior — 502 + Retry-After
+	// 60 + log package_hash_conflict. Serving an arbitrary one of
+	// the conflicting hashes is worse than refusing.
+	serveHashValidatedTotal.Inc(classifyPath(req.Path), "mismatch")
+	w.Header().Set("Retry-After", "60")
+	http.Error(w, "package hash conflict", http.StatusBadGateway)
+	h.logger.Error("package_hash_conflict",
+		"canonical_host", req.CanonicalHost,
+		"path", req.Path,
+		"row_blob_hash", blobHash,
+		"declared", declaredAttrs(rows),
+	)
+	return true, "package_hash_conflict", http.StatusBadGateway, 0, false, packageValidation{}
+}
+
+// recheckRefusal is the hit path's second look before a strict-mode
+// refusal with no signed adoption in flight on the host (final review
+// R1 #2): one more package_hash read, at once. Rows it finds are checked as
+// on any hit (checkDeclared): an adoption committed them and ended since
+// the first read. Anything else keeps the refusal already decided — count
+// is its current_snapshot_count — and the host's coverage is not read
+// again. A request whose context ended is answered client_canceled.
+//
+// AIDEV-NOTE: this relies on an adoption's in-flight count ending after its
+// commit (freshness inflight.go), so a count that reads zero comes after
+// any commit it covered. A read fault here keeps the refusal, logged WARN:
+// re-running the whole check (as R1 #2's fix first did) failed open on a
+// fault of either read and served the .deb the first look had refused
+// (final review R1 re-review #1). One more read per such refusal.
+func (h *Handler) recheckRefusal(w http.ResponseWriter, r *http.Request, req *proxy.Request, blobHash string, count int) (served bool, outcome string, status int, bytesWritten int64, fellThrough bool, validation packageValidation) {
+	rows, err := h.cache.DeclaredHashesForPath(r.Context(),
+		req.CanonicalScheme, req.CanonicalHost, req.Path)
+	switch {
+	case err != nil && clientLeft(w, r):
+		return true, "client_canceled", http.StatusServiceUnavailable, 0, false, packageValidation{}
+	case err != nil:
+		h.logger.Warn("package_hash lookup failed",
+			"err", err,
 			"canonical_host", req.CanonicalHost,
 			"path", req.Path,
-			"row_blob_hash", blobHash,
-			"declared", declaredAttrs(rows),
 		)
-		return true, "package_hash_conflict", http.StatusBadGateway, 0, false, packageValidation{}
+	case len(rows) > 0:
+		return h.checkDeclared(w, req, blobHash, rows)
 	}
+	st, body := h.refuseUnvouchedDeb(w, req.CanonicalHost, req.Path, count)
+	return true, "unvouched_deb_refused", st, body, false, packageValidation{}
 }
 
 // firstPackageName returns the PackageName of the first DeclaredHash
@@ -825,10 +1261,15 @@ func firstPackageName(rows []cache.DeclaredHash, match string) string {
 // snapshotMeta carries the metadata used by serveBlobWithHeaders to set
 // the response headers. snapshotID = 0 marks a Phase 1 / non-snapshot
 // serve (X-Cache-Snapshot suppressed); a positive value emits the
-// header. lastFetchedAt is the source for X-Cache-Age and may be nil.
+// header. lastFetchedAt is the source for X-Cache-Age and may be nil; a
+// url_path serve's, it also floors a metadata file's Last-Modified
+// (urlPathModTime). modTime, when set, is the response's Last-Modified
+// instead of the pool file's mtime (spec C8: a snapshot anchor's
+// adopted_at).
 type snapshotMeta struct {
 	snapshotID    int64
 	lastFetchedAt *int64
+	modTime       time.Time
 }
 
 // serveBlobWithHeaders opens pool/<blobHash>, sets the SPEC2 §3 headers,
@@ -864,7 +1305,7 @@ func (h *Handler) serveBlobWithHeaders(w http.ResponseWriter, r *http.Request, r
 		w.Header().Set(hdrXCacheSnapshot, strconv.FormatInt(meta.snapshotID, 10))
 	}
 	if meta.lastFetchedAt != nil {
-		age := time.Now().Unix() - *meta.lastFetchedAt
+		age := wallclock.Unix() - *meta.lastFetchedAt
 		if age < 0 {
 			age = 0
 		}
@@ -872,7 +1313,7 @@ func (h *Handler) serveBlobWithHeaders(w http.ResponseWriter, r *http.Request, r
 	}
 
 	cw := &countingWriter{ResponseWriter: w}
-	http.ServeContent(cw, r, req.Path, st.ModTime(), f)
+	http.ServeContent(cw, r, req.Path, urlPathModTime(req, modTimeOr(meta.modTime, st.ModTime()), meta.lastFetchedAt), f)
 	return true, cw.statusCode(), cw.bytes
 }
 
@@ -891,6 +1332,80 @@ func suiteRelativePath(suitePath, fullPath string) string {
 	// sees a well-defined "not in snapshot" miss rather than a partial
 	// match.
 	return fullPath
+}
+
+// isAnchorMember reports whether a suite-relative member path is a
+// snapshot anchor file: InRelease, Release or Release.gpg (spec C8).
+func isAnchorMember(p string) bool {
+	return p == "InRelease" || p == "Release" || p == "Release.gpg"
+}
+
+// anchorModTime is the spec C8 Last-Modified of a snapshot-served anchor
+// (InRelease, Release, Release.gpg): its snapshot's adopted_at — the
+// snapshot that served it, never the suite's current one, which a flip
+// may have changed since. CommitAdoption keeps adopted_at strictly
+// increasing per suite (A(N+1) ≥ A(N) + 1), and a first adoption's stamp
+// passes every url_path Last-Modified, so a client's If-Modified-Since
+// from the previous anchor always gets a 200 after a flip, whatever the
+// clock or a recovery rewrite of a pool file did. A read failure returns
+// zero: the pool mtime then serves (the pre-C8 behaviour), logged unless
+// the request has ended.
+//
+// AIDEV-NOTE: the pool mtime must not be folded back in (final review,
+// spec I-1): max(pool mtime, adopted_at) let a pool file written before a
+// backward clock step, or rewritten by a snapshot-member recovery, carry a
+// Last-Modified the next flip's stamp did not exceed, so the client got
+// 304s and kept stale lists. Last-Modified can lead the response's Date
+// (by 1 s after two flips in one second, by up to a backward step's
+// length after one); apt only echoes it back.
+func (h *Handler) anchorModTime(ctx context.Context, snapshotID int64) time.Time {
+	snap, err := h.cache.GetSuiteSnapshot(ctx, snapshotID)
+	if err == nil && snap.AdoptedAt != nil {
+		return time.Unix(*snap.AdoptedAt, 0)
+	}
+	if ctx.Err() == nil {
+		h.logger.Warn("snapshot_adopted_at_lookup_failed",
+			"err", err,
+			"snapshot_id", snapshotID,
+		)
+	}
+	return time.Time{}
+}
+
+// urlPathModTime is the Last-Modified of a url_path serve of req (spec
+// C4, plan design note 14): for a metadata file, the later of mtime (its
+// pool file's) and lastFetchedAt (its row's last_fetched_at), so apt's
+// If-Modified-Since on an index sees a replacement whose bytes were
+// already in the pool (the anchorless refresh points the row at an
+// existing pool file and moves last_fetched_at past the previous stamp);
+// a .deb, and a serve with no stamp (lastFetchedAt nil: a snapshot serve
+// or the content-addressed by-hash fallback), keep mtime. A by-hash
+// path's own url_path row (recordByHashURLPath) carries a stamp, so its
+// later hits answer max as any row does: harmless, as its bytes never
+// change.
+//
+// AIDEV-NOTE: ruling R-G3. adoptionStampTx's first-adoption floor is the
+// anchors' MAX(last_fetched_at) + 1, which passes this only while no pool
+// file is newer than its row's last_fetched_at: every writer of a row's
+// stamp (runFetch, cache.RefreshURLPathBlob) reads it after the pool file
+// is final. Blob mtimes are not folded into that floor.
+func urlPathModTime(req *proxy.Request, mtime time.Time, lastFetchedAt *int64) time.Time {
+	if !req.IsMetadata || lastFetchedAt == nil {
+		return mtime
+	}
+	if fetched := time.Unix(*lastFetchedAt, 0); fetched.After(mtime) {
+		return fetched
+	}
+	return mtime
+}
+
+// modTimeOr returns modTime, or the pool file's mtime when modTime is
+// zero.
+func modTimeOr(modTime, mtime time.Time) time.Time {
+	if modTime.IsZero() {
+		return mtime
+	}
+	return modTime
 }
 
 // distinctDeclared collapses a DeclaredHash slice down to its unique
@@ -916,14 +1431,16 @@ func distinctDeclared(rows []cache.DeclaredHash) []string {
 
 // declaredAttrs renders a DeclaredHash slice as a structured
 // log-attribute value for the package_hash_conflict log line. The
-// repeated (declared_sha256, snapshot_id) tuples let an operator trace
-// which specific snapshots disagreed.
+// repeated (declared_sha256, snapshot_id, suite_path) tuples let an
+// operator trace which specific snapshots — and suites: a flat suite and
+// its ./ twin, two channels a fallback ties — disagreed (ruling PG-33).
 func declaredAttrs(rows []cache.DeclaredHash) []map[string]any {
 	out := make([]map[string]any, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, map[string]any{
 			"declared_sha256": r.DeclaredSHA256,
 			"snapshot_id":     r.SnapshotID,
+			"suite_path":      r.SuitePath,
 		})
 	}
 	return out
@@ -949,31 +1466,140 @@ func (h *Handler) maybeFireFreshness(req *proxy.Request) {
 	h.activeWG.Add(1)
 	go func() {
 		defer h.activeWG.Done()
+		// AIDEV-NOTE: I-1. A panic in the T1 check must not kill the
+		// daemon. This recover runs before Done, so Close still drains.
+		defer func() {
+			if r := recover(); r != nil {
+				// The same suite fields as internal/freshness's logPanic,
+				// which logs every other freshness_check_panicked line.
+				h.logGoroutinePanic("freshness_check_panicked", &t1PanicStackLogged, r,
+					"where", "t1", "canonical_scheme", req.CanonicalScheme, "canonical_host", req.CanonicalHost,
+					"suite_path", req.SuitePath)
+			}
+		}()
 		h.freshness.Check(h.lifecycleCtx, req.CanonicalScheme, req.CanonicalHost, req.SuitePath)
 	}()
 }
 
-// touchAsync updates last_requested_at + request_count without blocking
-// the response. Uses a fresh ctx so an already-disconnected client does
-// not orphan the write before the writer goroutine picks it up.
-func (h *Handler) touchAsync(req *proxy.Request) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := h.cache.TouchURLPath(ctx, req.CanonicalScheme, req.CanonicalHost, req.Path); err != nil {
-		h.logger.Debug("touch failed",
-			"err", err,
-			"canonical_host", req.CanonicalHost,
-			"path", req.Path,
-		)
+// t1PanicStackLogged limits the T1 panic stack to one per process (spec C5).
+var t1PanicStackLogged atomic.Bool
+
+// logGoroutinePanic logs a recovered panic of a handler goroutine as
+// event, with the stack the first time stackOnce is claimed in this
+// process (one flag per where: the T1 check, the cap-rejection sweep, the
+// touch goroutine).
+func (h *Handler) logGoroutinePanic(event string, stackOnce *atomic.Bool, v any, attrs ...any) {
+	attrs = append(attrs, "panic", fmt.Sprint(v))
+	if stackOnce.CompareAndSwap(false, true) {
+		attrs = append(attrs, "stack", string(debug.Stack()))
 	}
+	h.logger.Error(event, attrs...)
+}
+
+// flipHeldKey carries, in a request's context, how long it waited in a
+// spec C8 flip hold (a time.Duration); heldContext sets it, the request
+// line logs it as flip_held_ms.
+type flipHeldKey struct{}
+
+// heldContext records a flip-barrier registration's wait in a hold in r's
+// context, for the request line's flip_held_ms (no wait, or a nil token:
+// r unchanged).
+func heldContext(r *http.Request, t *flipgate.Token) *http.Request {
+	if held := t.Held(); held > 0 {
+		return r.WithContext(context.WithValue(r.Context(), flipHeldKey{}, held))
+	}
+	return r
+}
+
+// clientLeft answers a request whose context ended — its client left
+// while it waited in a flip hold, or during anchorStart's registration
+// read; the gate did not register it — as a client abort (503) and
+// reports it; the caller logs client_canceled.
+// Serving it would only fail its snapshot read: a WARN and a 502 "hit"
+// line (design review M1, for the entry and the late registrations).
+func clientLeft(w http.ResponseWriter, r *http.Request) bool {
+	if r.Context().Err() == nil {
+		return false
+	}
+	w.Header().Set("Retry-After", "5")
+	http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+	return true
+}
+
+// anchorStart is spec C8's handler side. For <suite>/InRelease and
+// <suite>/Release of a suite with a suite_freshness row it registers the
+// serve with the flip barrier and returns its token; while a flip of the
+// suite holds anchors it first waits — at most flipgate.HoldMax, and no
+// longer than the request or the handler lives. It returns nil otherwise:
+// Release.gpg is never held, and untracked suites create no gate state.
+//
+// AIDEV-NOTE: the registration must precede every read of the snapshot
+// pointer (trySnapshotHit re-reads it), or a flip could commit between the
+// read and the registration and hand the client the old anchor after the
+// flip. The row check before it — which is what decides whether a suite is
+// tracked — therefore costs one indexed EXISTS read (HasSuiteRow; deferred
+// minor C-21) per <suite>/InRelease and <suite>/Release request, tracked or
+// not, while the barrier is on (none when it is off; existsReads counts
+// them). A failed read registers anyway (deferred minor C-22): an
+// unneeded registration only delays a flip by this serve, a missed one
+// could hand the client the old anchor after the flip. The wait's end on
+// h.lifecycleCtx is defence in depth: the daemon closes the gate at the
+// shutdown signal (design note 18), so no hold is left when the handler
+// closes. A request whose own context ends while it waits, or during the
+// read (final review R4 #3), comes back unregistered — a token whose Done
+// does nothing — and its caller answers it as a client abort. An HTTPS
+// request through the MITM pipeline keeps its inner context when its
+// client disconnects (internal/proxy/connect.go), so such a waiter stays
+// until the hold ends (at most HoldMax) and counts against the waiter cap
+// meanwhile (design note 3).
+func (h *Handler) anchorStart(r *http.Request, req *proxy.Request) *flipgate.Token {
+	if !h.barrierAnchor(req) {
+		return nil
+	}
+	h.existsReads.Add(1)
+	exists, err := h.suiteExists(r.Context(), suiteKeyOf(req))
+	switch {
+	case err == nil && !exists:
+		return nil // an untracked suite creates no gate state
+	case err != nil && r.Context().Err() != nil:
+		// The client left during the read: an unregistered token, as
+		// AnchorStart returns for one that leaves while it waits, so the
+		// caller answers it as a client abort (final review R4 #3).
+		return &flipgate.Token{}
+	}
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	stop := context.AfterFunc(h.lifecycleCtx, cancel)
+	defer stop()
+	return h.flipGate.AnchorStart(ctx, flipgate.Key(req.CanonicalScheme, req.CanonicalHost, req.SuitePath))
+}
+
+// barrierAnchor reports whether req is an anchor serve spec C8's barrier
+// registers: <suite>/InRelease or <suite>/Release while the barrier is on
+// (Release.gpg is never held).
+func (h *Handler) barrierAnchor(req *proxy.Request) bool {
+	if !h.flipGate.Enabled() || !req.IsMetadata || req.SuitePath == "" {
+		return false
+	}
+	return req.Path == req.SuitePath+inReleaseSuffix || req.Path == req.SuitePath+releaseSuffix
+}
+
+// suiteExists is anchorStart's registration read: one indexed EXISTS
+// (suiteExistsForTest replaces it in tests).
+func (h *Handler) suiteExists(ctx context.Context, key cache.SuiteKey) (bool, error) {
+	if h.suiteExistsForTest != nil {
+		return h.suiteExistsForTest(key)
+	}
+	return h.cache.HasSuiteRow(ctx, key)
 }
 
 // serveCacheMiss runs the singleflight fetch and serves the cached file
 // (or an error response) afterward.
-func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time) {
+func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *proxy.Request, start time.Time, sr *suiteReq) {
 	key := req.CanonicalScheme + "|" + req.CanonicalHost + "|" + req.Path
 
-	res, shared, waiters := h.sf.Do(key, func() sfResult {
+	file, trackedAtStart := sr.file, sr.tracked
+	fetchOnce := func() sfResult {
 		// Use the handler's lifecycle ctx, not the request ctx. Two
 		// goals: (1) a leader who disconnects must not kill the fetch
 		// for waiters that are still connected, and (2) on graceful
@@ -982,8 +1608,44 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 		// fetch.TotalTimeout. Without this, a hung upstream would
 		// keep the cache from closing for several minutes after the
 		// drain budget elapses.
-		return h.runFetch(h.lifecycleCtx, req)
-	})
+		return h.runFetch(h.lifecycleCtx, req, file, trackedAtStart)
+	}
+	res, shared, waiters := h.sf.Do(key, fetchOnce)
+	if errors.Is(res.err, errUnvouchedRetryable) {
+		// Spec C10: strict mode would refuse this .deb while a signed
+		// adoption runs on its host. Wait for it here — outside
+		// singleflight and the host slot — at most 15 s, then retry the
+		// miss once; a second "retryable" is the refusal.
+		//
+		// AIDEV-NOTE: the retry is one more singleflight call: requests
+		// that waited together coalesce again, and a waiter over the
+		// 64-per-host cap, or with less than 1 s of its 25 s budget left,
+		// is refused at once. A client that left while it waited gets no
+		// retry (it ends client_canceled). The refusal is logged once per
+		// fetch, by the singleflight leader (design review O1), as
+		// runFetch logged it before phase E. Two accepted residuals: the
+		// retry can re-join the call it retries — its leader signals Done
+		// before it deletes the key, deliberately — and read that call's
+		// stale errUnvouchedRetryable, at worst one spurious refusal, the
+		// outcome before phase E (deferred minor E-57); and the retry's
+		// call replaces shared and waiters, so the first call's
+		// "singleflight coalesced" line is not logged and a joiner
+		// refused off the first call logs no unvouched_deb_refused of its
+		// own (log attribution only; deferred minor E-60).
+		waited := h.adoptions != nil && h.adoptions.WaitHostAdoptions(r.Context(), req.CanonicalHost, start)
+		switch {
+		case r.Context().Err() != nil:
+			res.err = r.Context().Err()
+		case waited:
+			res, shared, waiters = h.sf.Do(key, fetchOnce)
+		}
+		if errors.Is(res.err, errUnvouchedRetryable) {
+			if !shared {
+				h.logUnvouchedRefused(req, res.snapshotCount)
+			}
+			res.err = ErrUnvouchedDebRefused
+		}
+	}
 
 	// SPEC §10: leader emits a structured log line whenever waiters
 	// joined the call (i.e. coalescing actually occurred). A leader
@@ -999,6 +1661,82 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	if res.err != nil {
 		h.respondError(w, r, req, res, start)
 		return
+	}
+	// Spec C3 T1-on-seed (phase D plan, design note 2): a miss that created
+	// its suite's row fires T1 once its response is done, so the new
+	// suite's eager first adoption (spec C4 Dispatch 3) starts at first
+	// contact. Only the creating request fires (a coalesced waiter shares
+	// its result), and only with adoption enabled: without it a created
+	// row is the Phase 1 observation seed (TestServeHTTP_AdoptionDisabledSeedParity).
+	// The hit path fires T1 after onboarding already (ruling PD-11). A
+	// creating miss whose late registration finds a snapshot current (it
+	// waited in a hold, or a flip committed just before it) is served
+	// through trySnapshotHit, which fires T1 too: the seed T1 then is a
+	// cooldown skip, one mutex peek (deferred minor E-64).
+	if res.created && !shared && h.adoptionEnabled {
+		defer h.maybeFireFreshness(req)
+	}
+	outcome, logOutcome := cacheMiss, "miss"
+	if shared {
+		outcome, logOutcome = cacheCoalesced, "hit_coalesced"
+	}
+	if res.suiteTracked {
+		sr.tracked = true
+	}
+	// Phase C carry-forward: the serve of an anchor whose suite row this
+	// miss created (or found created by a concurrent request) registers
+	// with the flip barrier right after the creation, before anything else
+	// (ruling PD-5). The registration then serves what is current now — a
+	// flip may have committed a snapshot (design note 9; whether or not it
+	// waited in a hold, FW-4 (c)) — and its line keeps the miss's outcome,
+	// fetch and upstream status; a client that left while it waited is a
+	// client abort (design review M1).
+	t := h.registerLate(r, req, sr)
+	if res.unproven && !shared {
+		// The creation's transaction could not prove a cached anchor that
+		// changed after it was sniffed, or that cachedAnchors could not
+		// read: mark it now (the backstop), right after the registration
+		// and before either early return below, so no path skips it (final
+		// review, concurrency M5).
+		//
+		// AIDEV-NOTE: the body waits on the backstop, so backstopTimeout
+		// (5 s) bounds its database steps (Task 9 review, controller
+		// addition d; TestServeHTTP_BackstopIsBoundedBeforeTheBody); its
+		// pool reads (readHead, at most HeadBytes of a local file) take no
+		// context (deferred minor D-37). Before it the body may also wait
+		// in a flip's hold of the just-created suite (at most
+		// flipgate.HoldMax): reachable since eager first adoption — so the
+		// deadline also counts from the request's start (design review
+		// M-15, missBackstopDeadline): at most missBodyBudget (25 s) after
+		// it, under apt's 30 s inactivity timeout.
+		// On a timeout or any other failure markCachedSignedAnchors logs
+		// WARN and the body is served anyway: the body in hand was marked in
+		// the creating transaction when it earns a marker, and the startup
+		// marker pass marks the other cached anchors at the next start —
+		// the one residual (spec C3).
+		bctx, cancel := context.WithDeadline(h.lifecycleCtx, missBackstopDeadline(start))
+		h.markCachedSignedAnchors(bctx, sr.key, req.Path)
+		cancel()
+	}
+	if t != nil {
+		if r = heldContext(r, t); clientLeft(w, r) {
+			h.logRequest(r, req.CanonicalHost, req.Path, "client_canceled", http.StatusServiceUnavailable, 0, true, res.status, start)
+			return
+		}
+		// AIDEV-NOTE: always re-dispatch through the snapshot path, never
+		// only when t.Held() > 0 (final fix wave FW-4 (c)): a hold released
+		// at the clock reading the request joined it reads 0, and a flip
+		// that committed just before the registration held nothing — the
+		// miss then served the bytes it fetched before the commit, a C8
+		// straddle. With no current snapshot the fetched body is what is
+		// current (the miss just stored it), so only the snapshot path is
+		// tried: no second url_path read, touch or T1 per creating miss.
+		// Cost: one snapshot-pointer read per creating miss of an anchor.
+		if served, status, body, handled, displaced := h.trySnapshotHit(w, r, req, start, sr); handled && served {
+			h.logRequestWithValidation(r, req.CanonicalHost, req.Path, logOutcome, status, body, true, res.status, start,
+				packageValidation{SnapshotDisplaced: displaced})
+			return
+		}
 	}
 
 	hash := res.blobHash
@@ -1024,12 +1762,6 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 		return
 	}
 
-	outcome := cacheMiss
-	logOutcome := "miss"
-	if shared {
-		outcome = cacheCoalesced
-		logOutcome = "hit_coalesced"
-	}
 	w.Header().Set(hdrXCache, outcome)
 	w.Header().Set(hdrXCacheAge, "0")
 	if res.status > 0 {
@@ -1037,11 +1769,12 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	}
 
 	cw := &countingWriter{ResponseWriter: w}
-	http.ServeContent(cw, r, req.Path, st.ModTime(), f)
-	h.logRequestWithValidation(r, req.CanonicalHost, req.Path, logOutcome, cw.statusCode(), cw.bytes, true, res.status, start, packageValidation{
-		Validated:   res.validatedHash,
-		PackageName: res.packageName,
-	})
+	http.ServeContent(cw, r, req.Path, urlPathModTime(req, st.ModTime(), &res.fetchedAt), f)
+	v := packageValidation{Validated: res.validatedHash, PackageName: res.packageName, Suites: res.vouchingSuites}
+	if suites := append(servedSuite(sr, cw.statusCode()), vouchedSuites(req, v, cw.statusCode())...); len(suites) > 0 {
+		go h.touchAsync(req, false, suites)
+	}
+	h.logRequestWithValidation(r, req.CanonicalHost, req.Path, logOutcome, cw.statusCode(), cw.bytes, true, res.status, start, v)
 }
 
 // serveSnapshotMemberMiss runs the SPEC2 §6.2 metadata recovery: an
@@ -1066,10 +1799,11 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 // Returns (served, status, bytesWritten) so the trySnapshotHit caller
 // can fold the result into its own return tuple. The access-log line
 // is emitted upstream by ServeHTTP under the existing tryCacheHit
-// path.
+// path. modTime is the spec C8 Last-Modified of a snapshot anchor (its
+// adopted_at; zero for non-anchors, which keep the pool file's mtime).
 func (h *Handler) serveSnapshotMemberMiss(
 	w http.ResponseWriter, r *http.Request, req *proxy.Request,
-	mem *cache.SnapshotMember, snapshotID int64, start time.Time,
+	mem *cache.SnapshotMember, snapshotID int64, modTime, start time.Time,
 ) (served bool, status int, bytesWritten int64) {
 	cw := &countingWriter{ResponseWriter: w}
 
@@ -1136,7 +1870,7 @@ func (h *Handler) serveSnapshotMemberMiss(
 	if res.status > 0 {
 		cw.Header().Set(hdrXUpstreamStat, strconv.Itoa(res.status))
 	}
-	http.ServeContent(cw, r, req.Path, st.ModTime(), f)
+	http.ServeContent(cw, r, req.Path, modTimeOr(modTime, st.ModTime()), f)
 	return true, cw.statusCode(), cw.bytes
 }
 
@@ -1298,7 +2032,7 @@ func (h *Handler) respondRecoveryError(w http.ResponseWriter, r *http.Request, r
 // trySnapshotHit fails closed before metadata can reach runFetch on an
 // adopted suite. Metadata on non-adopted suites is the Phase 1 trust-
 // upstream path with no snapshot to validate against.
-func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
+func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath.SuiteFile, trackedAtStart bool) sfResult {
 	release, err := h.sem.Acquire(ctx, req.CanonicalHost)
 	if err != nil {
 		return sfResult{err: fmt.Errorf("handler: acquire host slot: %w", err)}
@@ -1313,6 +2047,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 	var (
 		validatedHash bool
 		packageName   string
+		vouchers      []string
 	)
 
 	// Pre-fetch bandwidth optimization: refuse the conflict case
@@ -1335,43 +2070,17 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 	// reads from many distinct .deb misses on one allowed host. A
 	// strict-mode refusal that has to wait for a host slot is fine:
 	// strict mode is opt-in and the 502 carries Retry-After: 60.
+	//
+	// prefetchUnread: this check could not read the vouching hashes, so
+	// strict mode decides on the read after the download (final review
+	// R4 #2).
+	prefetchUnread := false
 	if !req.IsMetadata {
-		rows, derr := h.cache.DeclaredHashesForPath(ctx,
-			req.CanonicalScheme, req.CanonicalHost, req.Path)
-		if derr == nil {
-			distinct := distinctDeclared(rows)
-			if len(distinct) >= 2 {
-				h.logger.Error("package_hash_conflict",
-					"canonical_host", req.CanonicalHost,
-					"path", req.Path,
-					"fetched", false,
-					"declared", declaredAttrs(rows),
-				)
-				return sfResult{err: ErrPackageHashConflict}
-			}
-			// SPEC3 §6.1 strict mode fires only on .deb paths; the
-			// predicate must not refuse source tarballs, udebs, etc.
-			// that legitimately have no package_hash row.
-			if len(distinct) == 0 && isDebPath(req.Path) {
-				switch sm, snapID, count := h.classifyStrictMode(ctx,
-					req.CanonicalScheme, req.CanonicalHost); sm {
-				case strictRefuse:
-					h.logger.Info("unvouched_deb_refused",
-						"canonical_host", req.CanonicalHost,
-						"path", req.Path,
-						"current_snapshot_count", count,
-					)
-					return sfResult{err: ErrUnvouchedDebRefused}
-				case strictPassthrough:
-					h.logUnvouchedPassthrough(req.CanonicalHost, req.Path, snapID)
-				}
-			}
+		res, end, unread := h.prefetchCheck(ctx, req)
+		if end {
+			return res
 		}
-		// derr != nil → fall through; the post-fetch lookup will
-		// retry. Do not pre-emit a Warn line here; if the same DB is
-		// flaky it will surface in the post-fetch path's structured
-		// log instead, with one line per failed validation rather
-		// than two.
+		prefetchUnread = unread
 	}
 
 	bw, err := h.cache.NewTempBlob()
@@ -1438,6 +2147,14 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 					"canonical_host", req.CanonicalHost,
 					"path", req.Path,
 				)
+				// Final review R4 #2: strict mode's decision, which the
+				// check before the download could not make, is made here.
+				if prefetchUnread && isDebPath(req.Path) {
+					if res, end := h.strictAfterDownload(ctx, req); end {
+						res.status = fres.Status
+						return res
+					}
+				}
 				var ferr2 error
 				hash, ferr2 = bw.Finalize(fres.ContentLength)
 				if ferr2 != nil {
@@ -1486,6 +2203,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 				serveHashValidatedTotal.Inc(classifyPath(req.Path), "match")
 				validatedHash = true
 				packageName = firstPackageName(rows, distinct[0])
+				vouchers = vouchingSuites(rows, distinct[0])
 			default:
 				// Conflict surfaced post-fetch — most often during an
 				// adoption flip while the fetch was in flight.
@@ -1519,7 +2237,14 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 		return sfResult{err: fmt.Errorf("handler: put blob row: %w", err), status: fres.Status}
 	}
 
-	now := time.Now().Unix()
+	// AIDEV-NOTE: ruling R-G3. The row's stamp is read here, after the pool
+	// file is final: a metadata serve's Last-Modified is max(pool mtime,
+	// last_fetched_at) (urlPathModTime), and adoptionStampTx's
+	// first-adoption floor (the anchors' MAX(last_fetched_at) + 1) passes it
+	// only while no pool file is newer than its row's stamp. Never read it
+	// before the body is in the pool
+	// (TestServeHTTP_AMissStampsItsRowAfterItsPoolFile).
+	now := wallclock.Unix()
 	row := cache.URLPath{
 		CanonicalScheme: req.CanonicalScheme,
 		CanonicalHost:   req.CanonicalHost,
@@ -1539,56 +2264,220 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request) sfResult {
 		lm := fres.LastModified
 		row.UpstreamLastMod = &lm
 	}
-	if err := h.cache.PutURLPath(dbCtx, row); err != nil {
+	// Spec C3: one writer operation stores the url_path row and, for a
+	// suite file whose body passes its sniff, creates the suite's row
+	// (InRelease always; Release and flat indexes with an adopter wired)
+	// with the markers its cached signed anchors earn (ruling PD-5),
+	// re-stamps it on an adoption-disabled refresh miss (ruling PD-6), and
+	// writes the signed-seen marker of a signed anchor (InRelease,
+	// Release.gpg) — before the body is served. A failed operation fails
+	// the miss (502, no body) as a url_path write failure always has, so a
+	// signed anchor body is never served before its base has a marker.
+	// A suite row created here — the scheduler scans suite_freshness —
+	// replaces the old InRelease seed.
+	//
+	// AIDEV-NOTE: the sniff reads the finalized pool file (SniffReleaseGPG
+	// requires a binary signature's version byte: ruling PD-10). T1-on-seed
+	// keys on stored.Create.Outcome == cache.SuiteCreated (sfResult.created);
+	// stored.Tracked is what the late flip-barrier registration uses.
+	// A pool file that cannot be read back (a local disk fault) is logged
+	// WARN: for a signed anchor (file.Marks()) the miss fails like a failed
+	// writer operation — 502, no body, nothing stored — because its sniff
+	// decides its marker; any other suite file is stored and served with no
+	// row creation or re-stamp (Task 9 review, ruling a).
+	sr := &suiteReq{key: suiteKeyOf(req), file: file}
+	fetched := cache.FetchedRow{Row: row}
+	if file != aptpath.NotSuiteFile {
+		fetched.Suite = sr.key
+		head, herr := readHead(h.cache.BlobPath(hash), file.HeadBytes())
+		if herr != nil {
+			h.logger.Warn("suite_file_head_read_failed",
+				"err", herr, "canonical_host", req.CanonicalHost, "suite_path", req.SuitePath, "path", req.Path)
+			if file.Marks() {
+				// A local disk fault, labelled like every other one
+				// (cache_write_failed; deferred minor D-38).
+				return sfResult{err: fmt.Errorf("handler: read suite file head: %w: %w", fetch.ErrCacheWriteFailed, herr), status: fres.Status}
+			}
+		}
+		if herr == nil && file.Sniff(req.Path, head) {
+			if file.Marks() {
+				fetched.MarkSeenAt = now
+			}
+			seed := h.suiteSeed(sr, true, fres.ETag, fres.LastModified, now) // deferred minor D-32: built once
+			if !trackedAtStart && file.CreatesRow(h.adoptionEnabled) && !h.rejections.rejected(sr.key) {
+				create := *seed
+				create.Cached = h.cachedAnchors(dbCtx, sr.key, req.Path)
+				fetched.Create = &create
+			}
+			if file == aptpath.FileInRelease && !h.adoptionEnabled {
+				fetched.Restamp = seed
+			}
+		}
+	}
+	stored, err := h.cache.StoreFetched(dbCtx, fetched, h.suiteCaps(), h.suiteGuard)
+	if err != nil {
 		return sfResult{err: fmt.Errorf("handler: put url row: %w", err), status: fres.Status}
 	}
-
-	// Seed suite_freshness on a successful InRelease miss. Without
-	// this, a freshly-cached suite is invisible to the periodic
-	// scheduler (which scans suite_freshness, not url_path) until the
-	// first cache-hit T1 fires — and that first T1 has no validators,
-	// so it does an unconditional GET when a 304 was achievable.
-	// Seed failures are non-fatal (the file IS cached); we just lose
-	// the periodic-scheduler benefit until the next miss/T1.
-	if req.IsMetadata && req.SuitePath != "" && req.Path == req.SuitePath+inReleaseSuffix {
-		seed := cache.SuiteFreshness{
-			CanonicalScheme: req.CanonicalScheme,
-			CanonicalHost:   req.CanonicalHost,
-			SuitePath:       req.SuitePath,
-			LastCheckAt:     &now,
-			LastSuccessAt:   &now,
-		}
-		if fres.ETag != "" {
-			etag := fres.ETag
-			seed.InReleaseETag = &etag
-		}
-		if fres.LastModified != "" {
-			lm := fres.LastModified
-			seed.InReleaseLastMod = &lm
-		}
-		if err := h.cache.PutSuiteFreshness(dbCtx, seed); err != nil {
-			h.logger.Warn("seed suite_freshness failed",
-				"err", err,
-				"canonical_host", req.CanonicalHost,
-				"suite_path", req.SuitePath,
-			)
-		}
+	if fetched.Create != nil {
+		h.noteCreate(sr.key, stored.Create)
 	}
 
 	return sfResult{
-		blobHash:      hash,
-		size:          fres.ContentLength,
-		status:        fres.Status,
-		validatedHash: validatedHash,
-		packageName:   packageName,
+		blobHash:       hash,
+		size:           fres.ContentLength,
+		status:         fres.Status,
+		validatedHash:  validatedHash,
+		packageName:    packageName,
+		vouchingSuites: vouchers,
+		suiteTracked:   stored.Tracked,
+		created:        stored.Create.Outcome == cache.SuiteCreated,
+		unproven:       stored.Create.Outcome == cache.SuiteCreated && stored.Create.Unproven,
+		fetchedAt:      now,
 	}
 }
 
+// prefetchCheck is runFetch's check before the download of a non-metadata
+// file: it ends the attempt (end, with res) on a package_hash conflict, or
+// when strict mode refuses an unvouched .deb. As on the hit path
+// (checkPackageHashWait), a refusal first ends the attempt
+// errUnvouchedRetryable while a signed adoption is in flight on the host,
+// for serveCacheMiss to wait for outside singleflight (spec C10), or, with
+// none in flight, takes a second look at once (prefetchRecheck, final
+// review R1 #2). unread: the vouching hashes could not be read (logged
+// WARN), so runFetch's read after the download makes strict mode's
+// decision (strictAfterDownload).
+func (h *Handler) prefetchCheck(ctx context.Context, req *proxy.Request) (res sfResult, end, unread bool) {
+	rows, derr := h.cache.DeclaredHashesForPath(ctx,
+		req.CanonicalScheme, req.CanonicalHost, req.Path)
+	if derr != nil {
+		// Final review R4 #2: logged, as every read strict mode fails open
+		// on is (this one was silent, and with the read after the download
+		// finding no row an unvouched .deb was served on a strict host
+		// with nothing above DEBUG). The download goes ahead; the read
+		// after it validates the bytes and decides strict mode.
+		h.logger.Warn("package_hash_prefetch_lookup_failed",
+			"err", derr,
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+		)
+		return sfResult{}, false, true
+	}
+	distinct := distinctDeclared(rows)
+	if len(distinct) >= 2 {
+		h.logger.Error("package_hash_conflict",
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+			"fetched", false,
+			"declared", declaredAttrs(rows),
+		)
+		return sfResult{err: ErrPackageHashConflict}, true, false
+	}
+	// SPEC3 §6.1 strict mode fires only on .deb paths; the predicate must
+	// not refuse source tarballs, udebs, etc. that legitimately have no
+	// package_hash row.
+	if len(distinct) != 0 || !isDebPath(req.Path) {
+		return sfResult{}, false, false
+	}
+	switch sm, snapID, count := h.classifyStrictMode(ctx,
+		req.CanonicalScheme, req.CanonicalHost); sm {
+	case strictRefuse:
+		if h.adoptions != nil {
+			// Spec C10: with a signed adoption in flight on the host, end
+			// this attempt (releasing the host slot) and let serveCacheMiss
+			// wait outside singleflight.
+			if h.adoptions.AdoptionsInFlight(req.CanonicalHost) {
+				return sfResult{err: errUnvouchedRetryable, snapshotCount: count}, true, false
+			}
+			// Final review R1 #2: an adoption that committed the rows
+			// vouching for this .deb may have ended since the lookup above
+			// (its count ends after its commit): look once more, at once.
+			res, end = h.prefetchRecheck(ctx, req, count)
+			return res, end, false
+		}
+		h.logUnvouchedRefused(req, count)
+		return sfResult{err: ErrUnvouchedDebRefused}, true, false
+	case strictPassthrough:
+		h.logUnvouchedPassthrough(req.CanonicalHost, req.Path, snapID)
+	}
+	return sfResult{}, false, false
+}
+
+// prefetchRecheck is the miss path's second look before a strict-mode
+// refusal with no signed adoption in flight on the host, recheckRefusal's
+// twin (final review R1 #2): one more package_hash read, at once. Rows that
+// agree let the download go ahead (end false): the read after it validates
+// the bytes. Rows that disagree are refused here, before the download, as
+// prefetchCheck refuses them. Anything else keeps the refusal already
+// decided — count is its current_snapshot_count — and nothing is
+// downloaded; the host's coverage is not read again.
+//
+// AIDEV-NOTE: a read fault here keeps the refusal, logged WARN. Re-running
+// the whole check (as R1 #2's fix first did) failed open on a coverage-read
+// fault and deferred a package_hash-read fault to the reads after the
+// download, which could fail open too (final review R1 re-review #1). A
+// conflict is refused here for the same reason: left to the read after
+// the download, a fault of that read served the file unchecked (the D4/D5
+// re-review).
+func (h *Handler) prefetchRecheck(ctx context.Context, req *proxy.Request, count int) (res sfResult, end bool) {
+	rows, err := h.cache.DeclaredHashesForPath(ctx,
+		req.CanonicalScheme, req.CanonicalHost, req.Path)
+	switch {
+	case err != nil:
+		h.logger.Warn("package_hash_prefetch_lookup_failed",
+			"err", err,
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+		)
+	case len(distinctDeclared(rows)) >= 2:
+		h.logger.Error("package_hash_conflict",
+			"canonical_host", req.CanonicalHost,
+			"path", req.Path,
+			"fetched", false,
+			"declared", declaredAttrs(rows),
+		)
+		return sfResult{err: ErrPackageHashConflict}, true
+	case len(rows) > 0:
+		return sfResult{}, false
+	}
+	h.logUnvouchedRefused(req, count)
+	return sfResult{err: ErrUnvouchedDebRefused}, true
+}
+
+// strictAfterDownload is strict mode's decision for a downloaded .deb no
+// current snapshot vouches for, after prefetchCheck could not read the
+// vouching hashes (final review R4 #2): the decision prefetchCheck makes,
+// on runFetch's read after the download — the attempt ends (end, with res)
+// refused, or errUnvouchedRetryable while a signed adoption is in flight on
+// the host (serveCacheMiss waits and retries the miss once; the retry
+// checks before its download again).
+//
+// AIDEV-NOTE: no second look here (prefetchRecheck, R1 #2): the
+// race it closes — an adoption committing and ending between the lookup
+// and the in-flight check — would need the read before the download to
+// have failed too; its cost is one refusal, Retry-After 60. A failure of
+// both reads fails open: the post-download read's WARN path serves.
+func (h *Handler) strictAfterDownload(ctx context.Context, req *proxy.Request) (res sfResult, end bool) {
+	switch sm, snapID, count := h.classifyStrictMode(ctx,
+		req.CanonicalScheme, req.CanonicalHost); sm {
+	case strictRefuse:
+		if h.adoptions != nil && h.adoptions.AdoptionsInFlight(req.CanonicalHost) {
+			return sfResult{err: errUnvouchedRetryable, snapshotCount: count}, true
+		}
+		h.logUnvouchedRefused(req, count)
+		return sfResult{err: ErrUnvouchedDebRefused}, true
+	case strictPassthrough:
+		h.logUnvouchedPassthrough(req.CanonicalHost, req.Path, snapID)
+	}
+	return sfResult{}, false
+}
+
 // inReleaseSuffix is the path suffix that identifies the InRelease
-// file under a suite path. Kept as a package constant so the same
-// literal is used for the seed-detection check above and (in the
-// freshness package) the check itself.
+// file under a suite path (anchorStart's anchor test).
 const inReleaseSuffix = "/InRelease"
+
+// releaseSuffix is the detached form's anchor under a suite path; spec C8
+// holds it like InRelease (and never Release.gpg).
+const releaseSuffix = "/Release"
 
 // respondError maps a fetch error to an HTTP response.
 //
@@ -1683,10 +2572,11 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		// matches the conflict-case shape; outcome
 		// "unvouched_deb_refused" pivots in the per-request line. The
 		// detailed log was already emitted in runFetch where the
-		// strict-mode predicate fired.
+		// strict-mode predicate fired. A refusal decided after a download
+		// (strictAfterDownload) carries its upstream status.
 		w.Header().Set("Retry-After", "60")
 		http.Error(w, "unvouched .deb refused (strict mode)", http.StatusBadGateway)
-		h.logRequest(r, req.CanonicalHost, req.Path, "unvouched_deb_refused", http.StatusBadGateway, 0, false, 0, start)
+		h.logRequest(r, req.CanonicalHost, req.Path, "unvouched_deb_refused", http.StatusBadGateway, 0, res.status > 0, res.status, start)
 		return
 	case errors.Is(err, fetch.ErrInvalidURL):
 		// URL parse / scheme / host-mismatch failure — fired before
@@ -1789,7 +2679,7 @@ func (h *Handler) tryServeStale(w http.ResponseWriter, r *http.Request, req *pro
 
 	w.Header().Set(hdrXCache, cacheHitStale)
 	if row.LastFetchedAt != nil {
-		age := time.Now().Unix() - *row.LastFetchedAt
+		age := wallclock.Unix() - *row.LastFetchedAt
 		if age < 0 {
 			age = 0
 		}
@@ -1797,7 +2687,14 @@ func (h *Handler) tryServeStale(w http.ResponseWriter, r *http.Request, req *pro
 	}
 
 	cw := &countingWriter{ResponseWriter: w}
-	http.ServeContent(cw, r, req.Path, st.ModTime(), f)
+	http.ServeContent(cw, r, req.Path, urlPathModTime(req, st.ModTime(), row.LastFetchedAt), f)
+	// Spec C3: a stale anchor serve records client interest too. Whether
+	// the suite has a row is not known here; TouchSuite is UPDATE-only, so
+	// an untracked suite costs one no-op write per stale serve.
+	stale := &suiteReq{key: suiteKeyOf(req), file: aptpath.ClassifySuiteFile(req.SuitePath, req.Path), tracked: true}
+	if suites := servedSuite(stale, cw.statusCode()); suites != nil {
+		go h.touchAsync(req, false, suites)
+	}
 
 	if h.serve.LogStaleServes {
 		h.logger.Info("stale_serve",
@@ -1825,17 +2722,29 @@ func retryAfterForRequest(req *proxy.Request) string {
 
 // packageValidation carries the SPEC6_5 §2.3 validated_hash +
 // package_name signal from a hash-validation site (hit-path
-// checkPackageHash or miss-path post-fetch dispatch) back to logRequest.
+// checkPackageHash or miss-path post-fetch dispatch) back to logRequest,
+// and spec C8's snapshot provenance flag (SnapshotDisplaced) from
+// trySnapshotHit.
 //
 // Validated is true iff the served bytes were matched against a
 // package_hash row's declared SHA256. PackageName is the matching row's
 // Phase 3 v3 package_name column — empty when the row has no package
 // name (pdiff patches, legacy pre-v3 rows). The zero value
 // (`packageValidation{}`) means "no validation occurred for this
-// request" and emits neither field.
+// request, served from no displaced snapshot" and emits none of the
+// three fields.
 type packageValidation struct {
 	Validated   bool
 	PackageName string
+
+	// SnapshotDisplaced marks a spec C8 retained by-hash serve (from a
+	// displaced snapshot); logged as snapshot_displaced=true.
+	SnapshotDisplaced bool
+
+	// Suites are the suite paths whose current snapshots vouched the
+	// served bytes (spec C3: a vouched .deb serve touches them). Not
+	// logged.
+	Suites []string
 }
 
 // logRequest emits the per-request slog line. SPEC §10.
@@ -1849,9 +2758,12 @@ func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, s
 
 // logRequestWithValidation is the SPEC6_5 §2.3 variant: also emits
 // validated_hash + package_name when the caller's validation argument
-// indicates a hash-validated serve. Fields are emitted only when
-// meaningful — the false / empty cases are omitted to match the
-// existing field-presence-as-signal pattern (`mitm`, `upstream_status`).
+// indicates a hash-validated serve, snapshot_displaced for a spec C8
+// retained by-hash serve, and flip_held_ms (from the request context)
+// for an anchor request that waited in a flip hold. Fields are emitted
+// only when meaningful — the false / empty / zero cases are omitted to
+// match the existing field-presence-as-signal pattern (`mitm`,
+// `upstream_status`).
 //
 // AIDEV-NOTE: never log r.RequestURI directly — proxy-form requests can
 // (in principle) carry userinfo like http://user:pass@host/path. The
@@ -1906,6 +2818,17 @@ func (h *Handler) logRequestWithValidation(r *http.Request, canonHost, path, out
 		if validation.PackageName != "" {
 			attrs = append(attrs, "package_name", validation.PackageName)
 		}
+	}
+	// Spec C8: snapshot_displaced marks a retained by-hash serve (from a
+	// displaced snapshot, which X-Cache-Snapshot names); emitted only when
+	// true.
+	if validation.SnapshotDisplaced {
+		attrs = append(attrs, "snapshot_displaced", true)
+	}
+	// Spec C8: flip_held_ms is how long an anchor request waited in a flip
+	// hold (it is part of duration_ms); emitted only when positive.
+	if held, _ := r.Context().Value(flipHeldKey{}).(time.Duration); held.Milliseconds() > 0 {
+		attrs = append(attrs, "flip_held_ms", held.Milliseconds())
 	}
 	if fetchAttempted {
 		attrs = append(attrs, "upstream_status", upstreamStatus)
@@ -2041,20 +2964,48 @@ func archFromPath(p string) string {
 // not on its own "apt update is broken."
 //
 // AIDEV-NOTE: keep in lockstep with internal/freshness indexTargetGroupRE
-// (the adoption-side group key). The two live in different packages on
-// purpose (no import edge), but they describe the SAME surface — the
-// files apt installs from. Widen/narrow them together.
+// and flatIndexTargetGroupRE (the adoption-side group keys). They live in
+// different packages on purpose (no import edge), but they describe the
+// SAME surface — the files apt installs from — in two layouts, and the
+// layout rule (spec C5: the root shapes count only for a flat suite,
+// aptpath.IsFlatSuitePath) is the same on both sides. Widen/narrow them
+// together.
 var indexTargetPathRE = regexp.MustCompile(
 	`(?:^|/)(?:binary-[a-z][a-z0-9]*/Packages|source/Sources)(?:\.[a-z0-9]+)?$`)
 
-// isIndexTargetPath reports whether a request path is an apt IndexTarget
-// (see indexTargetPathRE). The handler increments a dedicated counter and
-// emits an alertable WARN when it serves an authoritative "not in
-// snapshot" 404 for one of these — the direct, cause-agnostic signal that
-// a client's `apt update` is broken against the current snapshot (the
-// 2026-06-14 binary-all incident's symptom).
-func isIndexTargetPath(p string) bool {
+// flatIndexTargetPathRE is indexTargetPathRE for a flat suite: its root
+// Packages* / Sources* (spec C5), which the handler sees as bare
+// suite-relative member paths ("Packages.gz"). No pdiff Index, as above.
+var flatIndexTargetPathRE = regexp.MustCompile(`^(?:Packages|Sources)(?:\.[a-z0-9]+)?$`)
+
+// isIndexTargetPath reports whether a suite-relative member path of
+// suitePath is an apt IndexTarget (see indexTargetPathRE; layout-aware,
+// spec C5: a flat suite's are its root Packages*/Sources* only, and a
+// root Packages under a dists suite is none). The handler increments a
+// dedicated counter and emits an alertable WARN when it serves an
+// authoritative "not in snapshot" 404 for one of these — the direct,
+// cause-agnostic signal that a client's `apt update` is broken against
+// the current snapshot (the 2026-06-14 binary-all incident's symptom).
+func isIndexTargetPath(suitePath, p string) bool {
+	if aptpath.IsFlatSuitePath(suitePath) {
+		return flatIndexTargetPathRE.MatchString(p)
+	}
 	return indexTargetPathRE.MatchString(p)
+}
+
+// indexTargetArch is the architecture label of an IndexTarget member path
+// of suitePath for the snapshot_index_target_404 alert (the flat arch
+// labels of plan design note 4): a flat suite's root Packages carries
+// every architecture (the pseudo-arch "all"), its root Sources is
+// "source"; any other path takes archFromPath's label.
+func indexTargetArch(suitePath, p string) string {
+	if aptpath.IsFlatSuitePath(suitePath) {
+		if strings.HasPrefix(p, "Sources") {
+			return "source"
+		}
+		return "all"
+	}
+	return archFromPath(p)
 }
 
 // knownArchLabels bounds the cardinality of the
@@ -2094,7 +3045,7 @@ func isDebPath(p string) bool {
 }
 
 // strictModeRefusal classifies an unvouched .deb GET against the SPEC3
-// §6.1 predicate. The three return modes correspond directly to the
+// §6.1 predicate. The first three return modes correspond directly to the
 // three branches in the spec:
 //
 //   - strictRefuse: refuseUnvouchedDebs is on AND adoption.enabled is
@@ -2110,6 +3061,9 @@ func isDebPath(p string) bool {
 //   - strictInactive: any of (refuseUnvouchedDebs is off, adoption.enabled
 //     is false, host has no current snapshots, or a DB error). The
 //     handler proceeds with Phase 1 / Phase 2 behavior unchanged.
+//   - strictCanceled (phase E final fix wave): the lookup failed because
+//     the request's context ended; the hit path answers client_canceled
+//     (503) instead of failing open.
 //
 // classifyStrictMode is the test seam — it returns the category and
 // the identifying snapshot id (for the passthrough log line) without
@@ -2121,6 +3075,10 @@ const (
 	strictInactive strictModeOutcome = iota
 	strictRefuse
 	strictPassthrough
+	// strictCanceled: the coverage lookup failed because the request's
+	// context ended — never a fail-open serve (FW-5 (a)). The miss path's
+	// fetch, which needs the same context, fails on it anyway.
+	strictCanceled
 )
 
 // classifyStrictMode runs the SPEC3 §6.1 predicate against a .deb
@@ -2138,11 +3096,18 @@ func (h *Handler) classifyStrictMode(ctx context.Context, scheme, host string) (
 	}
 	rows, err := h.cache.HostCurrentSnapshotsCoverage(ctx, scheme, host)
 	if err != nil {
+		// A lookup that failed because ctx ended (the client left, or
+		// Drain cancelled a MITM tunnel's request) is no database fault
+		// and must not fail open: strictCanceled, and the hit path answers
+		// client_canceled (final fix wave FW-5 (a), final spec review M1).
+		if ctx.Err() != nil {
+			return strictCanceled, 0, 0
+		}
 		// SPEC3 §6.1 is silent on DB failures of this lookup. The
 		// least-disruptive behavior is "fail open" — strict mode is
 		// an opt-in tightening; a transient SQLite hiccup must not
 		// turn into a global .deb refusal storm. Log at Warn so the
-		// signal is visible.
+		// signal is visible (documented in configuration.md).
 		h.logger.Warn("strict-mode coverage lookup failed",
 			"err", err,
 			"canonical_host", host,
@@ -2150,8 +3115,10 @@ func (h *Handler) classifyStrictMode(ctx context.Context, scheme, host string) (
 		return strictInactive, 0, 0
 	}
 	if len(rows) == 0 {
-		// Host has no adopted suites — strict mode has no contract to
-		// uphold. Phase 1 trust-upstream regime.
+		// The host has no signed (inline or detached) current snapshot —
+		// no adopted suite, or only unsigned ones, which vouch nothing —
+		// so strict mode has no contract to uphold. Phase 1
+		// trust-upstream regime.
 		return strictInactive, 0, 0
 	}
 	count := len(rows)

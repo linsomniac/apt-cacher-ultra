@@ -37,11 +37,13 @@ import (
 //     branch of checkLocked because the prior snapshot has
 //     release_hash != nil).
 //
-// AIDEV-NOTE: SPEC2 §12.3's per-client coherence claim is documented
-// elsewhere as architecturally permitting straddle (see
-// TestPhase2Chaos_AdoptionFlipUnderConcurrency); the same caveat
-// applies here. We log straddle counts for regression tracking and
-// strictly assert per-request coherence.
+// AIDEV-NOTE: SPEC2 §12.3's per-client coherence comes from the spec C8
+// flip barrier (see TestPhase2Chaos_AdoptionFlipUnderConcurrency); as
+// there, neither burst crosses the flip, so its zero-straddle assertions
+// (each client's Release against its Packages.gz:
+// chaos2CountMetadataStraddles takes Release as the detached anchor) pin
+// the burst structure (they do not exercise the barrier), and it
+// strictly asserts per-request coherence.
 func TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 	if testing.Short() {
 		t.Skip("phase 2 detached chaos test skipped in -short mode")
@@ -107,6 +109,11 @@ func TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 		CanonicalHost:   upstreamURL.Hostname(),
 		SuitePath:       chaos2Suite,
 	}
+	// Spec C3: CommitAdoption is UPDATE-only; the detached suite's
+	// InRelease misses (404) created no row.
+	if err := stack.handler.cache.EnsureSuiteForTest(context.Background(), "http", upstreamURL.Hostname(), chaos2Suite); err != nil {
+		t.Fatal(err)
+	}
 	if err := stack.adopter.RunDetached(context.Background(), suiteRef, snapA.release, snapA.releaseGPG, "\"A\"", ""); err != nil {
 		t.Fatalf("adopt A directly via RunDetached: %v", err)
 	}
@@ -122,8 +129,8 @@ func TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSuiteSnapshot(A): %v", err)
 	}
-	if snapASnap.InReleaseHash != nil {
-		t.Errorf("post-A detached adoption: snapshot has unexpected inrelease_hash=%s", *snapASnap.InReleaseHash)
+	if snapASnap.SingleAnchorHash != nil {
+		t.Errorf("post-A detached adoption: snapshot has unexpected inrelease_hash=%s", *snapASnap.SingleAnchorHash)
 	}
 	if snapASnap.ReleaseHash == nil {
 		t.Error("post-A detached adoption: snapshot missing release_hash")
@@ -147,21 +154,25 @@ func TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 	}
 	stack.checker.WaitForAdoptions()
 
-	// Phase 2: close gate, swap upstream to B, drive ONE Release GET
+	// Phase 2: close gate, swap upstream to B, drive a Release GET
 	// to start adoption. The freshness check sees snap.ReleaseHash !=
 	// nil, picks the detached branch, conditional-GETs Release,
 	// observes change, fetches Release.gpg, and spawns the adoption
 	// goroutine. The goroutine VerifyDetaches → reaches member fetch
 	// → blocks on the gate.
 	memberFetchGate.Close()
-	current.Store(&snapB)
 
-	rec := httptest.NewRecorder()
-	stack.handler.ServeHTTP(rec, proxyReq("GET", srv.URL, chaos2Suite+"/Release"))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("trigger detached adoption: status=%d body=%q", rec.Code, rec.Body.String())
-	}
-	if err := memberFetchGate.WaitForWaiter(5 * time.Second); err != nil {
+	// Deferred minor C-39: a phase-1c T1 check may still hold the suite
+	// when the trigger's T1 check peeks, and that check is then dropped
+	// (resultBusy: the check's TryLock peek), so no adoption starts. Hold
+	// the suite for 100 ms across the first trigger GET, making the window
+	// certain, and trigger until the gate parks the adoption. The hold
+	// comes before the swap: a leftover phase-1c check can then only have
+	// seen A, so it starts no adoption that would park at the gate holding
+	// the suite, where the hold could never be taken.
+	holdSuiteBriefly(t, stack, upstreamURL.Hostname(), 100*time.Millisecond)
+	current.Store(&snapB)
+	if err := triggerUntilParked(t, stack, memberFetchGate, srv.URL, chaos2Suite+"/Release", 5*time.Second); err != nil {
 		t.Fatalf("detached adoption never reached member-fetch gate: %v", err)
 	}
 
@@ -194,13 +205,15 @@ func TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 		}
 	}
 
-	preStraddles := chaos2CountMetadataStraddles(pre)
-	postStraddles := chaos2CountMetadataStraddles(post)
-	t.Logf("detached metadata straddle counts: pre-flip=%d post-flip=%d (architecturally allowed; inflation = regression)",
-		preStraddles, postStraddles)
+	// Per-client metadata coherence: no client's Release and Packages.gz
+	// responses came from different snapshots (neither burst crosses the
+	// flip; see the AIDEV-NOTE on the test function).
+	if preN, postN := chaos2CountMetadataStraddles(pre), chaos2CountMetadataStraddles(post); preN != 0 || postN != 0 {
+		t.Errorf("detached metadata straddles: pre-flip=%d post-flip=%d, want 0", preN, postN)
+	}
 
 	// Final state: current_snapshot_id points at a detached snapshot
-	// with B's release_hash + release_gpg_hash, and InReleaseHash is
+	// with B's release_hash + release_gpg_hash, and SingleAnchorHash is
 	// still nil (a confused inline adoption against detached fixtures
 	// would set inrelease_hash).
 	suite, err = stack.handler.cache.GetSuiteFreshness(context.Background(),
@@ -215,8 +228,8 @@ func TestPhase2DetachedChaos_AdoptionFlipUnderConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("post-chaos: GetSuiteSnapshot(%d): %v", *suite.CurrentSnapshotID, err)
 	}
-	if finalSnap.InReleaseHash != nil {
-		t.Errorf("post-chaos: unexpected inrelease_hash=%s — flip went to inline form?", *finalSnap.InReleaseHash)
+	if finalSnap.SingleAnchorHash != nil {
+		t.Errorf("post-chaos: unexpected inrelease_hash=%s — flip went to inline form?", *finalSnap.SingleAnchorHash)
 	}
 	wantRH := chaos2Sha256Hex(snapB.release)
 	if finalSnap.ReleaseHash == nil || *finalSnap.ReleaseHash != wantRH {
@@ -257,7 +270,9 @@ func makeChaos2DetachedSnapshot(label string) chaos2Snapshot {
 	rel := chaos2BuildRelease(map[string][]byte{
 		chaos2PackagesGzPath: pkgsGz,
 	})
-	sig := []byte(fmt.Sprintf("--detached-sig-%s--", label))
+	// An armor header (spec C3's Release.gpg sniff passes): after phase E
+	// a signature that fails the sniff is absent, not adopted.
+	sig := []byte(fmt.Sprintf("-----BEGIN PGP SIGNATURE-----\n\ndetached-sig-%s\n-----END PGP SIGNATURE-----\n", label))
 
 	return chaos2Snapshot{
 		label:      label,

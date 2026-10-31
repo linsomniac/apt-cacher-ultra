@@ -49,7 +49,7 @@ func TestAdminAggregatesCurrentSnapshots(t *testing.T) {
 		}
 		exec(`INSERT INTO blob(hash, size, created_at) VALUES (?, 1, 1)`, hash(id))
 		exec(`INSERT INTO suite_snapshot(snapshot_id, canonical_scheme, canonical_host,
-suite_path, inrelease_hash, created_at, adopted_at) VALUES (?, ?, ?, ?, ?, 1, ?)`,
+suite_path, inrelease_hash, anchor_form, created_at, adopted_at) VALUES (?, ?, ?, ?, ?, 'inline', 1, ?)`,
 			id, s.scheme, s.host, s.suite, hash(id), adoptedAt)
 		if s.current {
 			exec(`INSERT INTO suite_freshness(canonical_scheme, canonical_host, suite_path,

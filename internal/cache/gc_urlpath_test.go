@@ -105,8 +105,8 @@ func seedCurrentSnapshot(t *testing.T, c *Cache, scheme, host, suite, inrelease 
 	}
 	res, err := c.db.Exec(`INSERT INTO suite_snapshot
 	  (canonical_scheme, canonical_host, suite_path,
-	   inrelease_hash, created_at, adopted_at, heartbeat_at, package_coverage_complete)
-	  VALUES (?, ?, ?, ?, ?, ?, ?, 1)`, scheme, host, suite, inrelease, now, now, now)
+	   inrelease_hash, anchor_form, created_at, adopted_at, heartbeat_at, package_coverage_complete)
+	  VALUES (?, ?, ?, ?, 'inline', ?, ?, ?, 1)`, scheme, host, suite, inrelease, now, now, now)
 	if err != nil {
 		t.Fatalf("seed suite_snapshot: %v", err)
 	}
@@ -320,9 +320,9 @@ func TestRunURLPathGCBatch_DisplacedSnapshotDoesNotProtect(t *testing.T) {
 		t.Fatalf("seed suite_freshness: %v", err)
 	}
 	res, err := c.db.Exec(`INSERT INTO suite_snapshot
-	  (canonical_scheme, canonical_host, suite_path, inrelease_hash,
+	  (canonical_scheme, canonical_host, suite_path, inrelease_hash, anchor_form,
 	   created_at, adopted_at, heartbeat_at, package_coverage_complete)
-	  VALUES (?, ?, ?, ?, ?, ?, ?, 1)`, scheme, host, suite, ir, now, now, now)
+	  VALUES (?, ?, ?, ?, 'inline', ?, ?, ?, 1)`, scheme, host, suite, ir, now, now, now)
 	if err != nil {
 		t.Fatalf("seed suite_snapshot: %v", err)
 	}
@@ -566,7 +566,7 @@ func TestCommitAdoption_PrefetchUpsertClearsDroppedAt(t *testing.T) {
 		t.Fatalf("seed dropped_at: %v", err)
 	}
 
-	id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{
+	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
 		CanonicalScheme: "http", CanonicalHost: host, SuitePath: suite,
 		InReleaseHash: &ir,
 	})
@@ -622,9 +622,9 @@ func TestRunURLPathGCBatch_DetachedReleaseAndGPGProtected(t *testing.T) {
 		t.Fatalf("seed suite_freshness: %v", err)
 	}
 	res, err := c.db.Exec(`INSERT INTO suite_snapshot
-	  (canonical_scheme, canonical_host, suite_path, release_hash, release_gpg_hash,
+	  (canonical_scheme, canonical_host, suite_path, release_hash, release_gpg_hash, anchor_form,
 	   created_at, adopted_at, heartbeat_at, package_coverage_complete)
-	  VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`, scheme, host, suite, rel, rgpg, now, now, now)
+	  VALUES (?, ?, ?, ?, ?, 'detached', ?, ?, ?, 1)`, scheme, host, suite, rel, rgpg, now, now, now)
 	if err != nil {
 		t.Fatalf("seed suite_snapshot: %v", err)
 	}

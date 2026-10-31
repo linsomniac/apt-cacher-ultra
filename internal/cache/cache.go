@@ -9,10 +9,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
-	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 	_ "modernc.org/sqlite"
 )
 
@@ -23,6 +24,17 @@ var ErrClosed = errors.New("cache: closed")
 // caller blocks (or hits ctx.Done). Apt traffic is bursty but each write
 // is small, so a few hundred slots is plenty without burning memory.
 const writeBufferSize = 256
+
+// minIdleConns is the floor of maxIdleConns.
+const minIdleConns = 16
+
+// maxIdleConns is how many spare read connections the pool keeps: 2 per
+// GOMAXPROCS, at least minIdleConns. openDB reads it once; a GOMAXPROCS
+// that changes later (a container's CPU quota) does not move it, and on
+// small hosts the floor decides anyway.
+func maxIdleConns() int {
+	return max(minIdleConns, 2*runtime.GOMAXPROCS(0))
+}
 
 // Cache owns the SQLite handle, the on-disk pool, and a single writer
 // goroutine that serializes all write transactions. Reads share the
@@ -43,6 +55,43 @@ type Cache struct {
 	revisionMu    sync.Mutex
 	revisionConn  *sql.Conn
 	revisionEpoch uint64
+
+	// touches coalesces TouchSuite writes (spec C3).
+	touches suiteTouches
+
+	// flatRows is the "flat rows may exist" flag (ruling PG-31): false
+	// while package_hash holds no row with a non-empty flat_filename, so
+	// DeclaredHashesForPath skips the suffix fallback, which only such a
+	// row can answer. Open primes it (flatRowsExistSQL); noteFlatRows sets
+	// it; nothing clears it at run time.
+	//
+	// AIDEV-NOTE: false is never stale. Every writer that inserts a flat
+	// row (CommitAdoption, InsertReconciledMembers) calls noteFlatRows
+	// before it submits its transaction, so the flag is true before such a
+	// row can commit, and it is never cleared while the process runs (a
+	// stale true — the suite reaped, its rows gone — costs only the
+	// fallback's query, until the next Open primes it again). A stale false
+	// would skip the fallback for a flat .deb: strict mode would refuse it
+	// (fail closed) and a non-strict serve would go unhashed — the
+	// vouching lost silently. A new package_hash writer must call
+	// noteFlatRows too.
+	flatRows atomic.Bool
+
+	// heldHook, when set (tests only), runs on the creating goroutine right
+	// after creationAttempt holds an eviction candidate, before the writer
+	// operation: a panic there stands in for a bug between the hold and the
+	// settle (TestCreateSuite_APanicReleasesTheHeldCandidate).
+	heldHook func(SuiteKey)
+
+	// committedHook, when set (tests only), runs on the writer goroutine
+	// right after the transaction of a creation attempt, of ReapIdleSuite
+	// or of ForgetSuite commits, before its result is handed back: it lets
+	// a test end the caller's context there, so a submit fails although its
+	// eviction or delete committed
+	// (TestCreateSuite_AFailedSubmitWhoseEvictionCommittedPurges, deferred
+	// minor D-20; TestReapAndForget_AFailedSubmitWhoseDeleteCommittedIsGone,
+	// design review M-2).
+	committedHook func()
 }
 
 // Open initializes (or attaches to) the cache rooted at dir. Creates
@@ -78,6 +127,12 @@ func Open(ctx context.Context, dir string, logger *slog.Logger) (*Cache, error) 
 		writes:  make(chan writeReq, writeBufferSize),
 		closeCh: make(chan struct{}),
 	}
+	var flat bool
+	if err := db.QueryRowContext(ctx, flatRowsExistSQL).Scan(&flat); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("read whether flat package_hash rows exist: %w", err)
+	}
+	c.flatRows.Store(flat)
 	c.wg.Add(1)
 	go c.writer()
 	return c, nil
@@ -134,6 +189,25 @@ func openDB(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
 	}
+	// AIDEV-NOTE: security review E-5/I-9. database/sql keeps only 2 idle
+	// connections by default, so every concurrent read beyond the second
+	// opened a SQLite connection (running the pragmas above) and closed it
+	// again: in the review's hit flood that churn starved the writer (77% of
+	// url_path writes hit their timeout) and let the WAL grow to 183 MB for
+	// a 3.5 MB database. The idle cap only keeps connections a burst already
+	// opened, so it does not raise the peak connection count, but it keeps
+	// their memory after the burst: up to about 4 MB each with a warm page
+	// cache (32 measured at +122 MB RSS), so at most about cap x 4 MB (64 MB
+	// at the floor). It is less in practice, since a connection drops its
+	// cache at its next read after a write. There is deliberately no
+	// SetConnMaxIdleTime or SetConnMaxLifetime (the maintainer's decision,
+	// 2026-10-24): a 5-minute idle timeout made every quiet gap reopen each
+	// connection, doubling the 90-day simulation under -race, to free memory
+	// the cap already bounds. Do not add a tight SetMaxOpenConns: it trades
+	// the churn for readers waiting on a connection. The writer's and the
+	// revision observer's pinned connections are in use, not idle, so they
+	// do not count against the cap.
+	db.SetMaxIdleConns(maxIdleConns())
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping sqlite %q: %w", path, err)
@@ -202,6 +276,15 @@ func (c *Cache) writer() {
 	}
 	defer func() { _ = conn.Close() }()
 
+	// AIDEV-NOTE: no recover in this goroutine, by the maintainer's
+	// decision of 2026-10-26 (docs/open-decisions.md, *Decided*: "The
+	// cache's writer stays fail-fast on a panic"). A panic inside a write
+	// op ends the process and systemd restarts it: a panic mid-transaction
+	// leaves this one write connection in an unknown state, and the
+	// restart rolls the transaction back. The rejected alternative —
+	// recover, roll back, fail that one write and reopen the connection —
+	// would avoid the crash loop of a panic that persisted data triggers
+	// at every start; change that entry before adding one here.
 	for {
 		select {
 		case req := <-c.writes:
@@ -225,5 +308,6 @@ func (c *Cache) drainWrites(err error) {
 	}
 }
 
-// nowUnix is the test seam for "what time is it"; default is time.Now.
-var nowUnix = func() int64 { return time.Now().Unix() }
+// nowUnix is the test seam for "what time is it". Production reads the
+// shared wall clock (internal/wallclock) so simulations can step it.
+var nowUnix = func() int64 { return wallclock.Unix() }

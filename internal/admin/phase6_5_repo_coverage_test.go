@@ -131,14 +131,14 @@ func seedRepoCoverageSnapshot(t *testing.T, s *Server, c *cache.Cache,
 		t.Fatalf("PutBlob: %v", err)
 	}
 
-	if err := c.PutSuiteFreshness(context.Background(), cache.SuiteFreshness{
+	if err := c.SeedSuiteForTest(context.Background(), cache.SuiteFreshness{
 		CanonicalScheme: scheme,
 		CanonicalHost:   host,
 		SuitePath:       suite,
 	}); err != nil {
-		t.Fatalf("PutSuiteFreshness: %v", err)
+		t.Fatalf("SeedSuiteForTest: %v", err)
 	}
-	id, _, err := c.InsertCandidateSnapshot(context.Background(),
+	id, _, err := c.InsertTrackedCandidateForTest(context.Background(),
 		cache.SnapshotCandidate{
 			CanonicalScheme: scheme,
 			CanonicalHost:   host,

@@ -5,12 +5,15 @@ import (
 	"context"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 func TestMissingRequestableMembers(t *testing.T) {
@@ -24,7 +27,7 @@ func TestMissingRequestableMembers(t *testing.T) {
 	present := []cache.SnapshotMember{{Path: "main/binary-amd64/Packages"}}
 	allow := map[string]struct{}{"amd64": {}}
 
-	got := missingRequestableMembers(declared, present, allow)
+	got := missingRequestableMembers(testDistsSuite, declared, present, allow)
 	want := []ReleaseMember{
 		rm("main/binary-all/Packages", "b"),
 		rm("main/binary-all/Packages.gz", "c"),
@@ -32,6 +35,88 @@ func TestMissingRequestableMembers(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("missingRequestableMembers() = %v, want %v", got, want)
 	}
+}
+
+// Spec C5 (layout-aware IndexTargets): reconcile heals a flat suite's root
+// Packages — every declared variant of its "all" group — even with no
+// allowlist; under a dists suite the same root members are no group, and
+// nothing is missing.
+func TestMissingRequestableMembers_Flat(t *testing.T) {
+	rm := func(path, sha string) ReleaseMember { return ReleaseMember{Path: path, SHA256: sha} }
+	declared := []ReleaseMember{rm("Packages", "a"), rm("Packages.gz", "b"), rm("Sources.gz", "c")}
+	present := []cache.SnapshotMember{{Path: "Sources.gz"}}
+	want := []ReleaseMember{rm("Packages", "a"), rm("Packages.gz", "b")}
+	if got := missingRequestableMembers(testFlatSuite, declared, present, nil); !reflect.DeepEqual(got, want) {
+		t.Errorf("flat: missingRequestableMembers() = %v, want %v", got, want)
+	}
+	if got := missingRequestableMembers(testDistsSuite, declared, present, nil); got != nil {
+		t.Errorf("dists: missingRequestableMembers() = %v, want nil", got)
+	}
+}
+
+// Spec C5 (layout-aware IndexTargets) on the reconcile side: a flat
+// snapshot that lost its root Packages members is pending a reconcile —
+// its "all" group is required with no allowlist — and the heal fetches
+// both variants back into the same snapshot, each counted under the
+// "all" architecture of acu_adoption_reconciled_total (the flat label).
+func TestReconcileSnapshot_HealsAFlatSuitesPackages(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	ad := newReconcileAdopter(t, env, nil)
+	suite := SuiteRef{CanonicalScheme: "https", CanonicalHost: "pkgs.k8s.io", SuitePath: testFlatSuite}
+	trackSuite(t, env.cache, suite)
+	pkgs := fakePackagesStanzas(map[string]string{"amd64/kubelet_1.deb": strings.Repeat("a", 64)})
+	gz := gzipBytes(pkgs)
+	rel, hashes := makeRelease(map[string][]byte{"Packages": pkgs, "Packages.gz": gz})
+	base := "https://pkgs.k8s.io" + testFlatSuite + "/"
+	env.fetcher.put(base+"Packages", pkgs)
+	env.fetcher.put(base+"Packages.gz", gz)
+	if err := ad.Run(ctx, suite, simtest.ClearsignedFixture(string(rel)), "", ""); err != nil {
+		t.Fatal(err)
+	}
+	snapID := currentID(t, env.cache, suite)
+	if err := env.cache.DeleteSnapshotMembersForTest(ctx, snapID, "Packages", "Packages.gz"); err != nil {
+		t.Fatal(err)
+	}
+	if _, pending, err := ad.reconcilePending(ctx, suite, snapID); err != nil || !pending {
+		t.Fatalf("reconcilePending = %v, %v; want the flat suite's missing Packages pending", pending, err)
+	}
+	before := reconciledAll(t)
+	if n, err := ad.ReconcileSnapshot(ctx, suite, snapID, false); err != nil || n != 2 {
+		t.Fatalf("ReconcileSnapshot = %d, %v; want both Packages variants healed", n, err)
+	}
+	if d := reconciledAll(t) - before; d != 2 {
+		t.Errorf(`acu_adoption_reconciled_total{architecture="all"} moved by %v, want 2 (one per healed flat variant)`, d)
+	}
+	paths := snapshotPaths(t, env.cache, snapID)
+	for _, m := range []string{"Packages", "Packages.gz"} {
+		if paths[m] != hashes[m] {
+			t.Errorf("healed %s = %q, want %q", m, paths[m], hashes[m])
+		}
+	}
+}
+
+// reconciledAll returns acu_adoption_reconciled_total{architecture="all"}
+// as metrics.Default renders it (0 before its first heal). The registry is
+// process-wide and no freshness test runs in parallel, so callers compare
+// before and after.
+func reconciledAll(t *testing.T) float64 {
+	t.Helper()
+	return renderedFloat(t, renderedMetricLabels("acu_adoption_reconciled_total", `architecture="all"`))
+}
+
+// renderedFloat parses a value renderedMetric or renderedMetricLabels
+// returned; "" (no series yet) is 0.
+func renderedFloat(t *testing.T, v string) float64 {
+	t.Helper()
+	if v == "" {
+		return 0
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	if err != nil {
+		t.Fatalf("parse metric value %q: %v", v, err)
+	}
+	return f
 }
 
 // newReconcileAdopter constructs an Adopter over env.cache with the given
@@ -47,6 +132,7 @@ func newReconcileAdopter(t *testing.T, env *adoptionTestEnv, arches []string) *A
 		HostLimiter:                    hostsem.New(8),
 		Architectures:                  arches,
 		TolerateOptionalMemberFailures: true,
+		Logger:                         discardLogger(), // silent test loggers (the final review's tests lens M-6)
 	})
 	if err != nil {
 		t.Fatalf("newReconcileAdopter: %v", err)
@@ -72,6 +158,7 @@ func adoptCompleteSnapshot(t *testing.T, env *adoptionTestEnv, ad *Adopter) int6
 		"main/binary-amd64/Packages": pkgsAmd64,
 		"main/binary-all/Packages":   pkgsAll,
 	})
+	releaseText = simtest.ClearsignedFixture(string(releaseText)) // reconcile parses only clearsigned InRelease
 	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
 	env.fetcher.put(base+"main/binary-amd64/Packages", pkgsAmd64)
 	env.fetcher.put(base+"main/binary-all/Packages", pkgsAll)
@@ -229,12 +316,17 @@ func TestReconcileSnapshot_RejectsCorruptedAnchor(t *testing.T) {
 			"pool/main/x/x/x_9_amd64.deb": strings.Repeat("9", 64),
 		}),
 	})
+	// Clearsigned, so only the hash check can refuse it.
+	corrupt = simtest.ClearsignedFixture(string(corrupt))
 	if err := os.WriteFile(env.cache.BlobPath(inRel.BlobHash), corrupt, 0o644); err != nil {
 		t.Fatalf("corrupt anchor: %v", err)
 	}
 
-	if _, err := ad.ReconcileSnapshot(ctx, env.suite, snapID, false); err == nil {
-		t.Error("ReconcileSnapshot accepted a corrupted (hash-mismatched) anchor blob — must reject")
+	// Deferred minor D-27: refused by the hash check, not by anything else
+	// (the anchor check's own text: "hash mismatch" alone also matches
+	// adoption.go's "hash mismatch sanity").
+	if _, err := ad.ReconcileSnapshot(ctx, env.suite, snapID, false); err == nil || !strings.Contains(err.Error(), "anchor blob hash mismatch") {
+		t.Errorf("ReconcileSnapshot = %v; want the corrupted (hash-mismatched) anchor blob refused by its hash check", err)
 	}
 }
 
@@ -285,5 +377,46 @@ func TestReconcileMetric_Increments(t *testing.T) {
 	metrics.Default.Render(&buf)
 	if !strings.Contains(buf.String(), "acu_adoption_reconciled_total") {
 		t.Errorf("acu_adoption_reconciled_total not present after a heal:\n%s", buf.String())
+	}
+}
+
+// Deferred minor B-28: a tick's heal parses the snapshot's pinned Release
+// once — the decision's parse is reused.
+func TestCheck_ReconcileOnTheTickParsesTheReleaseOnce(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adopter.repairSkippedMembers = true
+	ctx := context.Background()
+	all := fakePackagesStanzas(map[string]string{"pool/main/c/c/c_1_all.deb": testHex64})
+	const allPath = "main/binary-all/Packages" // a required group (arch all) the snapshot lacks
+	r.members.put("http://h/r/dists/x/"+allPath, all)
+	in := signedRelease("degraded", 0, map[string][]byte{"main/binary-amd64/Packages": r.pkgs, allPath: all})
+	ah, err := r.adopter.writeBlobBytes(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ph, err := r.adopter.writeBlobBytes(ctx, r.pkgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _, err := r.cache.InsertTrackedCandidateForTest(ctx, cache.SnapshotCandidate{CanonicalScheme: "http",
+		CanonicalHost: rigHost, SuitePath: rigSuite, InReleaseHash: &ah})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.cache.CommitAdoption(ctx, id, []cache.SnapshotMember{
+		{SnapshotID: id, Path: "InRelease", BlobHash: ah, DeclaredSHA256: ah},
+		{SnapshotID: id, Path: "main/binary-amd64/Packages", BlobHash: ph, DeclaredSHA256: ph},
+	}, nil, nil, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	var parses atomic.Int32
+	r.adopter.reparseHook = func() { parses.Add(1) }
+	r.up.set(in) // unchanged: the tick decides and heals
+	r.check()
+	if _, err := r.cache.GetSnapshotMember(ctx, id, allPath); err != nil {
+		t.Fatalf("the missing member was not healed: %v", err)
+	}
+	if n := parses.Load(); n != 1 {
+		t.Fatalf("the Release was parsed %d times for one heal, want 1", n)
 	}
 }

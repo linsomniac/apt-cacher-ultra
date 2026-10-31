@@ -20,6 +20,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 // silentLogger discards all log output so test failures do not get drowned
@@ -629,6 +630,73 @@ func TestSFGroup_ArrivalDuringCleanupWindow(t *testing.T) {
 	}
 }
 
+// Final review, concurrency M1: a leader whose fn panics completes its
+// call on the way out — its waiters get an error result instead of
+// blocking for good (and holding Handler.Close), the key is freed so a
+// later Do runs fn again, and the panic continues to the leader's caller
+// (net/http recovers it).
+func TestSFGroup_PanickingLeaderReleasesItsWaiters(t *testing.T) {
+	g := newSFGroup()
+	const key = "onboard|http|h|/dists/s"
+	inFn, release := make(chan struct{}), make(chan struct{})
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() { panicked <- recover() }() // what net/http does for the leader
+		g.Do(key, func() sfResult {
+			close(inFn)
+			<-release
+			panic("boom")
+		})
+	}()
+	<-inFn
+	waiter := make(chan sfResult, 1)
+	go func() {
+		res, _, _ := g.Do(key, func() sfResult {
+			t.Error("the waiter ran fn; want it to join the leader's call")
+			return sfResult{}
+		})
+		waiter <- res
+	}()
+	for deadline := time.Now().Add(5 * time.Second); sfWaiters(g, key) != 1; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the waiter never joined the leader's call")
+		}
+	}
+	close(release)
+	select {
+	case v := <-panicked:
+		if v != "boom" {
+			t.Fatalf("the leader's caller recovered %v, want the panic to continue", v)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the leader never returned")
+	}
+	select {
+	case res := <-waiter:
+		if res.err == nil {
+			t.Fatalf("waiter result %+v, want an error", res)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the waiter is still blocked 5 s after the leader panicked: the key is wedged")
+	}
+	next := make(chan sfResult, 1)
+	go func() {
+		res, shared, _ := g.Do(key, func() sfResult { return sfResult{blobHash: "next"} })
+		if shared {
+			t.Error("a later Do joined the dead call")
+		}
+		next <- res
+	}()
+	select {
+	case res := <-next:
+		if res.blobHash != "next" {
+			t.Fatalf("later Do = %+v, want its own fn's result", res)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a later Do on the key is still blocked 5 s after the leader panicked")
+	}
+}
+
 // TestServeHTTP_DisallowedHostShortCircuits asserts the handler's
 // pre-fetch allowlist check rejects unknown hosts before allocating any
 // per-host bookkeeping. This is the open-proxy DoS hardening from
@@ -871,13 +939,13 @@ func newTestHandlerWithFreshness(t *testing.T, fc FreshnessChecker) *Handler {
 }
 
 // TestServeHTTP_MissOnInReleaseSeedsFreshness asserts the codex fix:
-// after a successful miss-fetch of a suite's InRelease, the cache
-// upserts a suite_freshness row carrying the upstream validators —
-// so the periodic scheduler picks the suite up immediately and the
-// first follow-up freshness check can issue a real conditional GET
+// after a successful miss-fetch of a suite's (clearsigned, spec C3 sniff)
+// InRelease, the cache creates a suite_freshness row carrying the upstream
+// validators — so the periodic scheduler picks the suite up immediately
+// and the first follow-up freshness check can issue a real conditional GET
 // (instead of an unconditional one because validators are nil).
 func TestServeHTTP_MissOnInReleaseSeedsFreshness(t *testing.T) {
-	body := []byte("Origin: Ubuntu\nSuite: noble\n")
+	body := simtest.ClearsignedFixture("Origin: Ubuntu\nSuite: noble\n")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("ETag", `"v1"`)
 		w.Header().Set("Last-Modified", "Mon, 01 Jan 2024 00:00:00 GMT")
@@ -938,7 +1006,7 @@ func TestServeHTTP_MissOnPackagesDoesNotSeedFreshness(t *testing.T) {
 // hit on an InRelease (metadata under a suite) fires the SPEC §7.1 T1
 // trigger with the right (scheme, host, suite_path).
 func TestServeHTTP_FreshnessTriggeredOnMetadataHit(t *testing.T) {
-	body := []byte("Origin: Ubuntu\nSuite: noble\n")
+	body := simtest.ClearsignedFixture("Origin: Ubuntu\nSuite: noble\n")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 		_, _ = w.Write(body)
@@ -980,6 +1048,67 @@ func TestServeHTTP_FreshnessTriggeredOnMetadataHit(t *testing.T) {
 	}
 }
 
+// TestServeHTTP_FlatRepositoryFreshness is PR #8's evidence (spec §9's G
+// row), ported with our results: a flat repository's InRelease — `deb
+// <uri>/ /` requests <dir>/InRelease, `deb <uri> ./` <dir>/./InRelease —
+// creates one suite row each on its miss, the literal directory, and fires
+// a freshness check (T1) under it once the response is written (phase E's
+// T1-on-seed); a later hit fires T1 again. A package whose name starts
+// "Packages", the host root and an empty segment create no row and fire
+// nothing. Before phase G no flat path had a suite, so neither happened
+// and the first InRelease cached was served forever. PR #8's plain-text
+// body would fail spec C3's InRelease sniff: the port serves a clearsigned
+// one.
+func TestServeHTTP_FlatRepositoryFreshness(t *testing.T) {
+	const k8s = "/core:/stable:/v1.34/deb"
+	r := newSuiteRig(t, true, 0)
+	calls := func(suite string) int {
+		n := 0
+		for _, c := range r.fresh.snapshot() {
+			if c.suitePath == suite {
+				n++
+			}
+		}
+		return n
+	}
+	for _, tc := range []struct{ path, suite string }{
+		{k8s + "/InRelease", k8s},
+		{k8s + "/./InRelease", k8s + "/."},
+	} {
+		r.serve(tc.path, upFile{body: rowInRelease})
+		if miss := r.get(tc.path); miss.Code != http.StatusOK || miss.Header().Get(hdrXCache) != cacheMiss {
+			t.Fatalf("%s: miss = %d %q", tc.path, miss.Code, miss.Header().Get(hdrXCache))
+		}
+		if r.suite(tc.suite) == nil {
+			t.Fatalf("%s: the miss created no row for %s", tc.path, tc.suite)
+		}
+		waitFor(t, "the miss's T1 under "+tc.suite, func() bool { return calls(tc.suite) == 1 })
+		if hit := r.get(tc.path); hit.Code != http.StatusOK || hit.Header().Get(hdrXCache) != cacheHit {
+			t.Fatalf("%s: hit = %d %q", tc.path, hit.Code, hit.Header().Get(hdrXCache))
+		}
+		waitFor(t, "the hit's T1 under "+tc.suite, func() bool { return calls(tc.suite) == 2 })
+	}
+	for _, p := range []string{k8s + "/Packages_1.0_all.deb", "/InRelease", k8s + "//InRelease"} {
+		r.serve(p, upFile{body: rowInRelease})
+		for range 2 { // a miss, then a hit
+			if rec := r.get(p); rec.Code != http.StatusOK {
+				t.Fatalf("%s = %d", p, rec.Code)
+			}
+		}
+	}
+	r.h.Close() // drains the T1 goroutines
+	all, err := r.c.ListSuites(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("suite rows = %+v, want only %s and %s/.", all, k8s, k8s)
+	}
+	if got := len(r.fresh.snapshot()); got != 4 {
+		t.Fatalf("T1 calls = %+v, want 4 (a miss and a hit per flat suite, none for the other paths)", r.fresh.snapshot())
+	}
+}
+
 // TestServeHTTP_FreshnessNotTriggeredOnBlobHit asserts that a hit on a
 // non-metadata path (a .deb) does not fire the T1 trigger.
 func TestServeHTTP_FreshnessNotTriggeredOnBlobHit(t *testing.T) {
@@ -1012,7 +1141,7 @@ func TestServeHTTP_FreshnessNotTriggeredOnBlobHit(t *testing.T) {
 // does not fire the T1 trigger — the spec says "cached metadata file
 // is requested", which presupposes the file is already cached.
 func TestServeHTTP_FreshnessNotTriggeredOnMiss(t *testing.T) {
-	body := []byte("InRelease bytes")
+	body := simtest.ClearsignedFixture("InRelease bytes")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 		_, _ = w.Write(body)
@@ -1040,7 +1169,7 @@ func TestServeHTTP_FreshnessNotTriggeredOnMiss(t *testing.T) {
 // goroutine is still using the cache — leading to a write to a closed
 // DB at process shutdown.
 func TestHandler_Close_DrainsFreshnessGoroutine(t *testing.T) {
-	body := []byte("InRelease body")
+	body := simtest.ClearsignedFixture("InRelease body")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(body)
 	}))
@@ -1222,7 +1351,7 @@ func TestServeHTTP_UpstreamUnavailable_MetadataRetryAfter30(t *testing.T) {
 // served so the caller can compare them against tryServeStale's output.
 func stalePrime(t *testing.T, h *Handler, srvURL, path string) []byte {
 	t.Helper()
-	body := []byte("staled-bytes-" + path)
+	body := staleBody(path)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, proxyReq("GET", srvURL, path)) // server already started by caller
 	if rec.Code != http.StatusOK {
@@ -1235,13 +1364,22 @@ func stalePrime(t *testing.T, h *Handler, srvURL, path string) []byte {
 	return body
 }
 
+// staleBody is the canonical body the stale tests' upstream serves for
+// path: an InRelease is clearsigned (spec §7 "Fixtures").
+func staleBody(path string) []byte {
+	if strings.HasSuffix(path, "/InRelease") {
+		return simtest.ClearsignedFixture("staled-bytes-" + path)
+	}
+	return []byte("staled-bytes-" + path)
+}
+
 // staleUpstream returns a server whose body for any GET is the same
 // canonical bytes stalePrime expects. Used to seed cached entries with
 // known-good blobs.
 func staleUpstream(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body := []byte("staled-bytes-" + r.URL.Path)
+		body := staleBody(r.URL.Path)
 		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 		_, _ = w.Write(body)
 	}))
@@ -1514,7 +1652,7 @@ func TestServeHTTP_OrphanRowUpstreamDownReturns502(t *testing.T) {
 		// First request: 200 with body so the cache primes. Subsequent
 		// requests: 503 to drive the miss-path through respondError.
 		if hits.Add(1) == 1 {
-			body := []byte("staled-bytes-" + r.URL.Path)
+			body := staleBody(r.URL.Path)
 			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 			_, _ = w.Write(body)
 			return

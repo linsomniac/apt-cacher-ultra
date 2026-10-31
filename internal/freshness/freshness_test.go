@@ -1,9 +1,11 @@
 package freshness
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,6 +20,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 // fakeCache is the in-memory Cache used by these tests. The real cache
@@ -31,10 +34,15 @@ type fakeCache struct {
 	snapshots map[int64]cache.SuiteSnapshot   // key: snapshot_id
 	listErr   error
 	getErr    error
+	getErrFn  func() error // consulted after getErr: a non-nil result fails that read
 	putErr    error
 	lookupErr error
+	listHook  func() // called at the top of ListSuitesWithAdoption, before the mutex
 
 	putCount atomic.Int64
+	// existsCalls counts HasSuiteRow reads (the I-4 row gate); they fail
+	// like GetSuiteFreshness through getErr and getErrFn.
+	existsCalls atomic.Int64
 }
 
 func newFakeCache() *fakeCache {
@@ -55,6 +63,11 @@ func (f *fakeCache) GetSuiteFreshness(ctx context.Context, scheme, host, suitePa
 	if f.getErr != nil {
 		return nil, f.getErr
 	}
+	if f.getErrFn != nil {
+		if err := f.getErrFn(); err != nil {
+			return nil, err
+		}
+	}
 	s, ok := f.suites[keyOf(scheme, host, suitePath)]
 	if !ok {
 		return nil, cache.ErrNotFound
@@ -63,26 +76,101 @@ func (f *fakeCache) GetSuiteFreshness(ctx context.Context, scheme, host, suitePa
 	return &cp, nil
 }
 
-func (f *fakeCache) PutSuiteFreshness(ctx context.Context, s cache.SuiteFreshness) error {
+// HasSuiteRow is the I-4 row gate's existence read; it fails like
+// GetSuiteFreshness (getErr, then getErrFn), so read-failure tests reach
+// the gate too.
+func (f *fakeCache) HasSuiteRow(ctx context.Context, key cache.SuiteKey) (bool, error) {
+	f.existsCalls.Add(1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.getErr != nil {
+		return false, f.getErr
+	}
+	if f.getErrFn != nil {
+		if err := f.getErrFn(); err != nil {
+			return false, err
+		}
+	}
+	_, ok := f.suites[keyOf(key.CanonicalScheme, key.CanonicalHost, key.SuitePath)]
+	return ok, nil
+}
+
+// SeedSuiteForTest stores s whole, creating the suite: the fixture
+// upsert, like cache.(*Cache).SeedSuiteForTest.
+func (f *fakeCache) SeedSuiteForTest(ctx context.Context, s cache.SuiteFreshness) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.suites[keyOf(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)] = s
+	return nil
+}
+
+// track gives a suite an empty row (spec C3: the checker checks only
+// tracked suites).
+func (f *fakeCache) track(scheme, host, suitePath string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := keyOf(scheme, host, suitePath)
+	if _, ok := f.suites[k]; !ok {
+		f.suites[k] = cache.SuiteFreshness{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suitePath}
+	}
+}
+
+// interest stamps a tracked suite's client interest (last_requested_at,
+// spec C4) at unix time at.
+func (f *fakeCache) interest(scheme, host, suitePath string, at int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := keyOf(scheme, host, suitePath)
+	s := f.suites[k]
+	s.LastRequestedAt = &at
+	f.suites[k] = s
+}
+
+// UpdateSuiteFreshness mirrors the production writer: UPDATE-only (an
+// unknown suite is left alone) and only the check columns.
+func (f *fakeCache) UpdateSuiteFreshness(ctx context.Context, s cache.SuiteFreshness) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.putCount.Add(1)
 	if f.putErr != nil {
 		return f.putErr
 	}
-	f.suites[keyOf(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)] = s
+	k := keyOf(s.CanonicalScheme, s.CanonicalHost, s.SuitePath)
+	cur, ok := f.suites[k]
+	if !ok {
+		return nil
+	}
+	cur.LastCheckAt, cur.LastSuccessAt = s.LastCheckAt, s.LastSuccessAt
+	cur.InReleaseETag, cur.InReleaseLastMod = s.InReleaseETag, s.InReleaseLastMod
+	cur.InReleaseChangeSeenAt, cur.CheckFailCount = s.InReleaseChangeSeenAt, s.CheckFailCount
+	f.suites[k] = cur
 	return nil
 }
 
-func (f *fakeCache) ListSuites(ctx context.Context) ([]cache.SuiteFreshness, error) {
+func (f *fakeCache) ListSuitesWithAdoption(ctx context.Context) ([]cache.SuiteWithAdoption, error) {
+	if h := f.listHook; h != nil {
+		h()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
-	out := make([]cache.SuiteFreshness, 0, len(f.suites))
+	out := make([]cache.SuiteWithAdoption, 0, len(f.suites))
 	for _, s := range f.suites {
-		out = append(out, s)
+		row := cache.SuiteWithAdoption{SuiteFreshness: s}
+		if s.CurrentSnapshotID != nil {
+			if snap, ok := f.snapshots[*s.CurrentSnapshotID]; ok {
+				row.CurrentAnchorForm = string(snap.Form)
+			}
+		}
+		out = append(out, row)
 	}
 	return out, nil
 }
@@ -122,7 +210,69 @@ func (f *fakeCache) GetSuiteSnapshot(ctx context.Context, snapshotID int64) (*ca
 	return &cp, nil
 }
 
+func (f *fakeCache) RecordAdoptionFailure(_ context.Context, scheme, host, suitePath string, r cache.AdoptionFailure) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := keyOf(scheme, host, suitePath)
+	s, ok := f.suites[k]
+	if !ok {
+		return nil
+	}
+	hash, reason, first, last, next := r.Hash, r.Reason, r.FirstAt, r.LastAt, r.NextRetryAt
+	s.AdoptionFailHash, s.AdoptionFailReason, s.AdoptionFailCount = &hash, &reason, r.Count
+	s.AdoptionFailFirstAt, s.AdoptionFailLastAt, s.AdoptionNextRetryAt = &first, &last, &next
+	s.AdoptionFailETag, s.AdoptionFailLastMod = r.ETag, r.LastMod
+	f.suites[k] = s
+	return nil
+}
+
+func (f *fakeCache) ClearAdoptionFailure(_ context.Context, scheme, host, suitePath string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := keyOf(scheme, host, suitePath)
+	if s, ok := f.suites[k]; ok {
+		s.AdoptionFailHash, s.AdoptionFailReason, s.AdoptionFailCount = nil, nil, 0
+		s.AdoptionFailFirstAt, s.AdoptionFailLastAt, s.AdoptionNextRetryAt = nil, nil, nil
+		s.AdoptionFailETag, s.AdoptionFailLastMod = nil, nil
+		f.suites[k] = s
+	}
+	return nil
+}
+
+func (f *fakeCache) SetAdoptionNextRetry(_ context.Context, scheme, host, suitePath string, next int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := keyOf(scheme, host, suitePath)
+	if s, ok := f.suites[k]; ok && s.AdoptionFailCount > 0 {
+		s.AdoptionNextRetryAt = &next
+		f.suites[k] = s
+	}
+	return nil
+}
+
+func (f *fakeCache) RescheduleFailingAdoptions(_ context.Context, now int64, offset func() int64) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for k, s := range f.suites {
+		if s.AdoptionFailCount < 1 || s.AdoptionFailReason == nil ||
+			cache.IsRefusalReason(*s.AdoptionFailReason) || *s.AdoptionFailReason == cache.ReasonPanic {
+			continue
+		}
+		next := now + offset()
+		s.AdoptionNextRetryAt = &next
+		f.suites[k] = s
+		n++
+	}
+	return n, nil
+}
+
 func (f *fakeCache) putSnapshot(s cache.SuiteSnapshot) {
+	// Production snapshots always carry a Form (the v7 trigger rejects
+	// form-less rows), so a fixture without one models an impossible row.
+	if s.Form == "" {
+		panic("fakeCache.putSnapshot: fixture must set Form")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.snapshots[s.SnapshotID] = s
@@ -176,8 +326,13 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
+// TestCheck_NoCachedInRelease_Skips: a tracked, never-adopted suite whose
+// InRelease url_path row is gone (GC reaped it) is skipped without a
+// write. The suite must be tracked: an untracked one stops at I-4's
+// pre-check and never reaches this branch.
 func TestCheck_NoCachedInRelease_Skips(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("upstream should not be contacted; got %s", r.URL.Path)
 	}))
@@ -195,7 +350,7 @@ func TestCheck_NoCachedInRelease_Skips(t *testing.T) {
 	}
 	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
 	if fc.putCount.Load() != 0 {
-		t.Errorf("PutSuiteFreshness was called; want skip without write")
+		t.Errorf("UpdateSuiteFreshness was called; want skip without write")
 	}
 }
 
@@ -298,7 +453,7 @@ func TestCheck_Cooldown_Skips(t *testing.T) {
 	}
 	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
 	if fc.putCount.Load() != 0 {
-		t.Errorf("PutSuiteFreshness called inside cooldown")
+		t.Errorf("UpdateSuiteFreshness called inside cooldown")
 	}
 }
 
@@ -349,6 +504,7 @@ func TestCheck_OK_ContentMatches_RefreshesValidators(t *testing.T) {
 
 func TestCheck_OK_ContentChanged_RecordsObservation(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
 	cachedBody := []byte("OLD InRelease")
 	upstreamBody := []byte("NEW InRelease")
 	cachedHash := hashOf(cachedBody)
@@ -496,6 +652,7 @@ func TestCheck_UpstreamError_BumpsCheckOnly(t *testing.T) {
 
 func TestCheck_TryLock_SecondCallSkips(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
 	bh := hashOf([]byte("x"))
 
 	// gate blocks the upstream handler so the first Check stays in
@@ -606,7 +763,7 @@ func TestTick_FilersByLastSuccessAt(t *testing.T) {
 		Logger:   discardLogger(),
 		now:      func() time.Time { return now },
 	})
-	c.tick(context.Background())
+	drainTick(context.Background(), c)
 
 	if hits.Load() != 1 {
 		t.Errorf("upstream hits = %d, want 1 (stale only)", hits.Load())
@@ -623,19 +780,27 @@ func TestStaleSuiteCounts(t *testing.T) {
 	mk := func(lastSuccess, snap *int64) cache.SuiteFreshness {
 		return cache.SuiteFreshness{LastSuccessAt: lastSuccess, CurrentSnapshotID: snap}
 	}
+	const now = int64(3000)
 	suites := []cache.SuiteFreshness{
 		mk(i(2000), i(7)), // fresh adopted        -> not stale
 		mk(i(500), i(7)),  // stale adopted        -> count adopted
 		mk(i(999), i(7)),  // just-stale adopted   -> count adopted
 		mk(i(400), nil),   // stale unadopted      -> count unadopted
 		mk(nil, i(7)),     // never-succeeded      -> not "went stale", skip
+		mk(i(9000), i(7)), // in the future (clock step) -> infinitely old: count adopted
+		mk(i(3001), i(7)), // 1 s ahead, within tolerance -> fresh
+		mk(i(3002), i(7)), // 2 s ahead: the tolerance edge -> fresh
+		mk(i(3003), i(7)), // 3 s ahead -> infinitely old: count adopted
 	}
-	adopted, unadopted := staleSuiteCounts(suites, staleBefore)
-	if adopted != 2 {
-		t.Errorf("adopted stale = %d, want 2", adopted)
+	adopted, unadopted, refused := staleSuiteCounts(suites, staleBefore, now)
+	if adopted != 4 {
+		t.Errorf("adopted stale = %d, want 4", adopted)
 	}
 	if unadopted != 1 {
 		t.Errorf("unadopted stale = %d, want 1", unadopted)
+	}
+	if refused != 0 {
+		t.Errorf("refused stale = %d, want 0 (no suite has a record)", refused)
 	}
 }
 
@@ -672,6 +837,7 @@ func TestCheck_HostLimiterBoundsConcurrency(t *testing.T) {
 	// Two suites on the same canonical host. Both have a cached
 	// InRelease and matching url_path rows.
 	for _, sp := range []string{"/a", "/b"} {
+		fc.track("http", "127.0.0.1", sp)
 		fc.putURL(cache.URLPath{
 			CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
 			Path: sp + "/InRelease", BlobHash: &bh, IsMetadata: true,
@@ -807,10 +973,60 @@ func TestCheck_DBReadFailure_LogsAndReturns(t *testing.T) {
 	}
 }
 
+// TestCheck_RowReadFailsAfterPreCheck_LogsAndSkips reaches checkLocked's
+// own read-error branch: I-4's pre-check read succeeds (the suite is
+// tracked), then checkLocked's read fails. The check logs the failure
+// once, writes nothing, does not panic, keeps the lock-map entry (a read
+// error is not a vanished row) and leaves the mutex free.
+func TestCheck_RowReadFailsAfterPreCheck_LogsAndSkips(t *testing.T) {
+	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
+	var reads atomic.Int64
+	fc.getErrFn = func() error {
+		if reads.Add(1) == 1 {
+			return nil // I-4's pre-check
+		}
+		return fmt.Errorf("simulated DB read failure")
+	}
+	logs := &lockedBuffer{}
+	c, err := New(Config{
+		Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
+		Logger: slog.New(slog.NewTextHandler(logs, nil)),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ref := SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble"}
+	if got := c.check(context.Background(), ref, checkOpts{}).result; got != resultSkipped {
+		t.Errorf("result = %q, want %q", got, resultSkipped)
+	}
+	if n := reads.Load(); n < 2 {
+		t.Fatalf("GetSuiteFreshness called %d times; want the pre-check and checkLocked's read", n)
+	}
+	if fc.putCount.Load() != 0 {
+		t.Errorf("write attempted despite read error")
+	}
+	out := logs.String()
+	if n := strings.Count(out, "freshness: read suite row failed"); n != 1 {
+		t.Errorf("read-failure WARN logged %d times, want 1 (checkLocked's):\n%s", n, out)
+	}
+	if strings.Contains(out, "freshness_check_panicked") {
+		t.Errorf("check panicked on a read error:\n%s", out)
+	}
+	if n := c.LockCount(); n != 1 {
+		t.Errorf("LockCount = %d, want 1: a read error must not drop the entry of a suite that has a row", n)
+	}
+	fc.getErrFn = nil
+	if got := c.check(context.Background(), ref, checkOpts{}).result; got == resultBusy {
+		t.Errorf("the suite mutex is still held after the read-error check")
+	}
+}
+
 // confirm errors.Is on errFromConditional doesn't accidentally reach
 // the success branch — defense against future drift.
 func TestCheck_4xxFromUpstream_BumpsCheckOnly(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
 	bh := hashOf([]byte("x"))
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
@@ -877,8 +1093,9 @@ func TestCheck_UsesSnapshotHashForComparison(t *testing.T) {
 		CurrentSnapshotID: &snapID,
 	})
 	fc.putSnapshot(cache.SuiteSnapshot{
-		SnapshotID:    snapID,
-		InReleaseHash: &bodyHash,
+		SnapshotID:       snapID,
+		SingleAnchorHash: &bodyHash,
+		Form:             cache.FormInline,
 	})
 
 	c, err := New(Config{
@@ -928,7 +1145,7 @@ func TestCheck_RecoversWhenAnchorMissingButSnapshotPresent(t *testing.T) {
 	// so the rolled-forward upstream body reads as "changed".
 	staleHash := strings.Repeat("a", 64)
 	snapID := int64(1481)
-	fc.putSnapshot(cache.SuiteSnapshot{SnapshotID: snapID, InReleaseHash: &staleHash})
+	fc.putSnapshot(cache.SuiteSnapshot{SnapshotID: snapID, SingleAnchorHash: &staleHash, Form: cache.FormInline})
 	fc.putSuite(cache.SuiteFreshness{
 		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
 		SuitePath:         "/dists/noble-updates",
@@ -1012,6 +1229,7 @@ func TestCheck_DetachedRecoversWhenAnchorsMissing(t *testing.T) {
 	fc.putSnapshot(cache.SuiteSnapshot{
 		SnapshotID: snapID, CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
 		SuitePath: "/dists/noble", ReleaseHash: &staleRH, ReleaseGPGHash: &rgh,
+		Form: cache.FormDetached,
 	})
 	fc.putSuite(cache.SuiteFreshness{
 		CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble",
@@ -1052,6 +1270,7 @@ func TestCheck_DetachedRecoversWhenAnchorsMissing(t *testing.T) {
 // unchanged when no Adopter is wired in.
 func TestCheck_NoAdopter_ChangeOnlyLogged(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
 	body := []byte("new InRelease bytes")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
@@ -1087,12 +1306,14 @@ func TestCheck_NoAdopter_ChangeOnlyLogged(t *testing.T) {
 // the Adopter via the goroutine + mutex handoff.
 func TestCheck_AdopterInvokedOnChange(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
+	fc.interest("http", "127.0.0.1", "/dists/noble", 11000)
 	memberBody := []byte("member content")
 	memberHash := hashOf(memberBody)
 	releaseText := fmt.Sprintf(
 		"Origin: Test\nSuite: noble\nSHA256:\n %s %d main/Sources\n",
 		memberHash, len(memberBody))
-	body := []byte(releaseText)
+	body := simtest.ClearsignedFixture(releaseText)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
@@ -1104,17 +1325,18 @@ func TestCheck_AdopterInvokedOnChange(t *testing.T) {
 	fc.putURL(cache.URLPath{
 		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
 		Path: "/dists/noble/InRelease", BlobHash: &stale,
-		UpstreamURL: srv.URL + "/dists/noble/InRelease", IsMetadata: true,
+		UpstreamURL: srv.URL + "/dists/noble/InRelease", IsMetadata: true, RequestCount: 1,
 	})
 
 	// Real *cache.Cache for the Adopter side-effect; fakeCache for
 	// the Checker. They don't share state.
 	dir := t.TempDir()
-	realCache, err := cache.Open(context.Background(), dir, nil)
+	realCache, err := cache.Open(context.Background(), dir, discardLogger()) // A-30
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = realCache.Close() })
+	trackSuite(t, realCache, SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble"})
 
 	// Adopter's fetcher serves member content at the URL the Adopter
 	// will construct from the suite. The Adopter builds URLs from
@@ -1133,6 +1355,7 @@ func TestCheck_AdopterInvokedOnChange(t *testing.T) {
 		Fetcher:     memberFetcher,
 		Verifier:    passThroughVerifier{},
 		HostLimiter: hostsem.New(8),
+		Logger:      discardLogger(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1158,9 +1381,9 @@ func TestCheck_AdopterInvokedOnChange(t *testing.T) {
 	if snap.AdoptedAt == nil {
 		t.Errorf("snapshot adopted_at not stamped — adoption goroutine didn't reach commit")
 	}
-	if snap.InReleaseHash == nil || *snap.InReleaseHash != hashOf(body) {
+	if snap.SingleAnchorHash == nil || *snap.SingleAnchorHash != hashOf(body) {
 		t.Errorf("snapshot.inrelease_hash mismatch: got %v, want %s",
-			snap.InReleaseHash, hashOf(body))
+			snap.SingleAnchorHash, hashOf(body))
 	}
 }
 
@@ -1180,7 +1403,7 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
 		"Origin: Test\nSuite: noble\nSHA256:\n %s %d main/Sources\n",
 		memberHash, len(memberBody),
 	))
-	sigBody := []byte("placeholder Release.gpg bytes")
+	sigBody := armoredSig("placeholder Release.gpg bytes")
 
 	staleHash := strings.Repeat("0", 64)
 
@@ -1197,8 +1420,8 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
 			w.WriteHeader(200)
 			_, _ = w.Write(sigBody)
 		case "/dists/noble/InRelease":
-			// Detached path must NOT hit InRelease for a known-detached
-			// suite — the form is dispatched up front.
+			// Spec C4 Dispatch 1: a known-detached suite probes InRelease
+			// on every check (a lateral move to inline); absent here.
 			gotInReleaseFetch.Store(true)
 			w.WriteHeader(http.StatusNotFound)
 		default:
@@ -1233,6 +1456,7 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
 		SuitePath:       "/dists/noble",
 		ReleaseHash:     &rh,
 		ReleaseGPGHash:  &rgh,
+		Form:            cache.FormDetached,
 	})
 	id := int64(42)
 	fc.putSuite(cache.SuiteFreshness{
@@ -1245,11 +1469,12 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
 	// snapshot row, plus a fake AdoptionFetcher serving the declared
 	// member.
 	dir := t.TempDir()
-	realCache, err := cache.Open(context.Background(), dir, nil)
+	realCache, err := cache.Open(context.Background(), dir, discardLogger()) // A-30
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = realCache.Close() })
+	trackSuite(t, realCache, SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble"})
 
 	memberURL := "http://127.0.0.1/dists/noble/main/Sources"
 	memberFetcher := newFakeFetcher()
@@ -1260,6 +1485,7 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
 		Fetcher:     memberFetcher,
 		Verifier:    passThroughVerifier{},
 		HostLimiter: hostsem.New(8),
+		Logger:      discardLogger(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1278,8 +1504,8 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
 	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
 	c.WaitForAdoptions()
 
-	if gotInReleaseFetch.Load() {
-		t.Error("known-detached suite unexpectedly fetched InRelease")
+	if !gotInReleaseFetch.Load() {
+		t.Error("known-detached suite did not probe InRelease")
 	}
 	if releaseHits.Load() != 1 {
 		t.Errorf("Release hits = %d, want 1", releaseHits.Load())
@@ -1303,16 +1529,21 @@ func TestCheck_DetachedKnownSuite_AdoptsOnReleaseChange(t *testing.T) {
 		t.Errorf("snapshot.release_gpg_hash mismatch: got %v, want %s",
 			snap.ReleaseGPGHash, hashOf(sigBody))
 	}
-	if snap.InReleaseHash != nil {
-		t.Errorf("snapshot.inrelease_hash should be nil in detached mode, got %s", *snap.InReleaseHash)
+	if snap.SingleAnchorHash != nil {
+		t.Errorf("snapshot.inrelease_hash should be nil in detached mode, got %s", *snap.SingleAnchorHash)
 	}
 }
 
 // TestCheck_DetachedFallback_OnInRelease404 covers the bootstrap
 // case: a fresh suite whose upstream returns 404 on InRelease must
-// fall back to detached mode and adopt via Release + Release.gpg.
+// adopt the detached form via Release + Release.gpg. With an adopter
+// wired that is the probe tree's work since phase E (spec C4 Dispatch 3:
+// InRelease absent → Release → Release.gpg); the inline path's 404
+// fallback is Phase 1's (TestCheck_Phase1DetachedFallback_OnInRelease404).
 func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
+	fc.interest("http", "127.0.0.1", "/dists/noble", 12000)
 
 	memberBody := []byte("fallback member content")
 	memberHash := hashOf(memberBody)
@@ -1320,7 +1551,7 @@ func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 		"Origin: Test\nSuite: noble\nSHA256:\n %s %d main/Sources\n",
 		memberHash, len(memberBody),
 	))
-	sigBody := []byte("placeholder Release.gpg bytes for fallback")
+	sigBody := armoredSig("placeholder Release.gpg bytes for fallback")
 
 	var inReleaseHits, releaseHits, gpgHits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1359,7 +1590,7 @@ func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 	fc.putURL(cache.URLPath{
 		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
 		Path: "/dists/noble/Release", BlobHash: &staleRH,
-		UpstreamURL: srv.URL + "/dists/noble/Release", IsMetadata: true,
+		UpstreamURL: srv.URL + "/dists/noble/Release", IsMetadata: true, RequestCount: 1,
 	})
 	fc.putURL(cache.URLPath{
 		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
@@ -1368,11 +1599,12 @@ func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 	})
 
 	dir := t.TempDir()
-	realCache, err := cache.Open(context.Background(), dir, nil)
+	realCache, err := cache.Open(context.Background(), dir, discardLogger()) // A-30
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = realCache.Close() })
+	trackSuite(t, realCache, SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble"})
 
 	memberURL := "http://127.0.0.1/dists/noble/main/Sources"
 	memberFetcher := newFakeFetcher()
@@ -1383,6 +1615,7 @@ func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 		Fetcher:     memberFetcher,
 		Verifier:    passThroughVerifier{},
 		HostLimiter: hostsem.New(8),
+		Logger:      discardLogger(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1419,8 +1652,48 @@ func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 		t.Errorf("snapshot.release_hash mismatch: got %v, want %s",
 			snap.ReleaseHash, hashOf(releaseText))
 	}
-	if snap.InReleaseHash != nil {
+	if snap.SingleAnchorHash != nil {
 		t.Errorf("fallback adoption set inrelease_hash; want detached form (nil)")
+	}
+}
+
+// Final fix wave FW-6 (final tests review X1; Task 6 minor: the phase-D
+// fallback lost its test when the adopter-wired path moved to the probe
+// tree): with no adopter (Phase 1, a global constraint: adoption-disabled
+// behaviour stays as today) a never-adopted suite whose InRelease answers
+// 404 while a Release url_path row exists falls back to the detached
+// check: Release and Release.gpg are fetched and the change is observed
+// in the detached form — not a failed check.
+func TestCheck_Phase1DetachedFallback_OnInRelease404(t *testing.T) {
+	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
+	stale := strings.Repeat("0", 64)
+	up := simtest.NewUpstream() // InRelease: 404
+	up.Set("http://127.0.0.1/dists/noble/Release", simtest.Serve([]byte("Origin: Test\nSuite: noble\n")))
+	up.Set("http://127.0.0.1/dists/noble/Release.gpg", simtest.Serve(armoredSig("phase 1 fallback")))
+	for _, name := range []string{"InRelease", "Release", "Release.gpg"} {
+		h := stale
+		fc.putURL(cache.URLPath{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", Path: "/dists/noble/" + name,
+			BlobHash: &h, UpstreamURL: "http://127.0.0.1/dists/noble/" + name, IsMetadata: true})
+	}
+	logs := &lockedBuffer{}
+	c, err := New(Config{Cache: fc, Fetcher: up, HostLimiter: hostsem.New(8),
+		Logger: slog.New(slog.NewJSONHandler(logs, nil)), now: func() time.Time { return time.Unix(12000, 0) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep := c.check(context.Background(), SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble"}, checkOpts{})
+	for _, name := range []string{"InRelease", "Release", "Release.gpg"} {
+		if n := len(up.Calls("http://127.0.0.1/dists/noble/" + name)); n != 1 {
+			t.Fatalf("%s requested %d times, want 1 (the 404, then the detached check)", name, n)
+		}
+	}
+	lines := logRecords(t, logs, "freshness_check")
+	if rep.result != "changed" || len(lines) != 1 || lines[0]["form"] != "detached" || lines[0]["result"] != "changed" {
+		t.Fatalf("report %q, freshness_check lines %v; want one detached \"changed\" observation", rep.result, lines)
+	}
+	if n := len(logRecords(t, logs, "freshness check failed")); n != 0 {
+		t.Fatalf("%d failed-check lines, want 0: the 404 falls back, it does not fail", n)
 	}
 }
 
@@ -1428,11 +1701,15 @@ func TestCheck_DetachedFallback_OnInRelease404(t *testing.T) {
 // other detached-fallback bootstrap path: the suite has Release +
 // Release.gpg url_path rows but no InRelease row at all (real-world:
 // upstream never served InRelease, so apt's first request 404'd and
-// the handler created no row). The inline path's LookupURL returns
-// ErrNotFound; the fallback fires without ever issuing a wasted
-// InRelease GET.
+// the handler created no row). With an adopter wired the probe tree
+// handles it since phase E: it asks for InRelease once (absent), then
+// Release and Release.gpg, and adopts the detached form. (Before phase E
+// the inline path's LookupURL returned ErrNotFound and the fallback fired
+// without an InRelease GET; that path is Phase 1's now.)
 func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
+	fc.interest("http", "127.0.0.1", "/dists/noble", 14000)
 
 	memberBody := []byte("missing-row member content")
 	memberHash := hashOf(memberBody)
@@ -1440,14 +1717,16 @@ func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 		"Origin: Test\nSuite: noble\nSHA256:\n %s %d main/Sources\n",
 		memberHash, len(memberBody),
 	))
-	sigBody := []byte("placeholder Release.gpg")
+	sigBody := armoredSig("placeholder Release.gpg")
 
 	var inReleaseHits, releaseHits, gpgHits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/dists/noble/InRelease":
+			// Spec C4 Dispatch 3: the probe tree asks for InRelease
+			// first, with or without a cached row.
 			inReleaseHits.Add(1)
-			t.Errorf("InRelease fetched despite missing url_path row — fallback should not issue a GET")
+			w.WriteHeader(404)
 		case "/dists/noble/Release":
 			releaseHits.Add(1)
 			w.WriteHeader(200)
@@ -1469,7 +1748,7 @@ func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 	fc.putURL(cache.URLPath{
 		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
 		Path: "/dists/noble/Release", BlobHash: &staleRH,
-		UpstreamURL: srv.URL + "/dists/noble/Release", IsMetadata: true,
+		UpstreamURL: srv.URL + "/dists/noble/Release", IsMetadata: true, RequestCount: 1,
 	})
 	fc.putURL(cache.URLPath{
 		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
@@ -1478,11 +1757,12 @@ func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 	})
 
 	dir := t.TempDir()
-	realCache, err := cache.Open(context.Background(), dir, nil)
+	realCache, err := cache.Open(context.Background(), dir, discardLogger()) // A-30
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = realCache.Close() })
+	trackSuite(t, realCache, SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble"})
 
 	memberURL := "http://127.0.0.1/dists/noble/main/Sources"
 	memberFetcher := newFakeFetcher()
@@ -1493,6 +1773,7 @@ func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 		Fetcher:     memberFetcher,
 		Verifier:    passThroughVerifier{},
 		HostLimiter: hostsem.New(8),
+		Logger:      discardLogger(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1511,8 +1792,8 @@ func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble")
 	c.WaitForAdoptions()
 
-	if inReleaseHits.Load() != 0 {
-		t.Errorf("InRelease hits = %d, want 0", inReleaseHits.Load())
+	if inReleaseHits.Load() != 1 {
+		t.Errorf("InRelease hits = %d, want 1 (the probe tree's absent InRelease)", inReleaseHits.Load())
 	}
 	if releaseHits.Load() != 1 {
 		t.Errorf("Release hits = %d, want 1", releaseHits.Load())
@@ -1528,7 +1809,7 @@ func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 	if snap.ReleaseHash == nil {
 		t.Errorf("snapshot.release_hash unset after detached fallback")
 	}
-	if snap.InReleaseHash != nil {
+	if snap.SingleAnchorHash != nil {
 		t.Errorf("snapshot.inrelease_hash unexpectedly set in detached fallback")
 	}
 }
@@ -1540,6 +1821,7 @@ func TestCheck_DetachedFallback_OnMissingInReleaseURLRow(t *testing.T) {
 // an inline-only suite would log a misleading detached-mode fetch.
 func TestCheck_404OnInRelease_NoFallback_WhenReleaseRowsMissing(t *testing.T) {
 	fc := newFakeCache()
+	fc.track("http", "127.0.0.1", "/dists/noble")
 
 	var releaseHits, gpgHits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1624,6 +1906,7 @@ func TestCheck_UnchangedTick_ReconcilesDegraded(t *testing.T) {
 		Architectures:                  []string{"amd64"},
 		TolerateOptionalMemberFailures: true,
 		RepairSkippedMembers:           true,
+		Logger:                         discardLogger(),
 	})
 	if err != nil {
 		t.Fatalf("NewAdopter: %v", err)
@@ -1640,10 +1923,12 @@ func TestCheck_UnchangedTick_ReconcilesDegraded(t *testing.T) {
 		"main/binary-amd64/Packages": pkgsAmd64,
 		"main/binary-all/Packages":   pkgsAll,
 	})
+	releaseText = simtest.ClearsignedFixture(string(releaseText)) // reconcile parses only clearsigned InRelease
 	base := "http://127.0.0.1/ubuntu/dists/noble/"
 	env.fetcher.put(base+"main/binary-amd64/Packages", pkgsAmd64)
 	env.fetcher.put(base+"main/binary-all/Packages", pkgsAll)
 
+	trackSuite(t, env.cache, env.suite)
 	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
 		t.Fatalf("adoption setup: %v", err)
 	}
@@ -1685,7 +1970,7 @@ func TestCheck_UnchangedTick_ReconcilesDegraded(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// Seed the url_path anchor row so checkLockedInline finds it and uses
+	// Seed the url_path anchor row so checkInline finds it and uses
 	// the test server. The BlobHash must match sha256(releaseText) so the
 	// body-equality comparison classifies the result as "unchanged".
 	inReleaseHash := hashOf(releaseText)
@@ -1752,6 +2037,7 @@ func TestCheck_FailedTick_DoesNotReconcile(t *testing.T) {
 		Architectures:                  []string{"amd64"},
 		TolerateOptionalMemberFailures: true,
 		RepairSkippedMembers:           true,
+		Logger:                         discardLogger(),
 	})
 	if err != nil {
 		t.Fatalf("NewAdopter: %v", err)
@@ -1763,9 +2049,14 @@ func TestCheck_FailedTick_DoesNotReconcile(t *testing.T) {
 		"main/binary-amd64/Packages": pkgsAmd64,
 		"main/binary-all/Packages":   pkgsAll,
 	})
+	// Clearsigned so a reconcile that wrongly ran would heal binary-all:
+	// reconcile refuses a plain-text InRelease before healing anything,
+	// which would make this negative test pass vacuously.
+	releaseText = simtest.ClearsignedFixture(string(releaseText))
 	base := "http://127.0.0.1/ubuntu/dists/noble/"
 	env.fetcher.put(base+"main/binary-amd64/Packages", pkgsAmd64)
 	env.fetcher.put(base+"main/binary-all/Packages", pkgsAll) // member fetcher CAN serve it
+	trackSuite(t, env.cache, env.suite)
 	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
 		t.Fatalf("adoption setup: %v", err)
 	}
@@ -1814,6 +2105,90 @@ func TestCheck_FailedTick_DoesNotReconcile(t *testing.T) {
 	}
 }
 
+// TestCheck_UnchangedTick_LogsReconcileFailure: the tick-path reconcile
+// must not swallow its error. R-1 made reconcile fail closed on a stored
+// InRelease that carries the clearsign marker but no decodable frame; on
+// the confirmed-unchanged tick that error has to reach the operator as the
+// same Warn line the on-demand path (Checker.Reconcile) emits, otherwise
+// such a snapshot silently stops healing. Harness as in
+// TestCheck_UnchangedTick_ReconcilesDegraded; the snapshot comes from
+// storeInlineSnapshot with an undecodable envelope.
+func TestCheck_UnchangedTick_LogsReconcileFailure(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	env.suite = SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/ubuntu/dists/noble"}
+
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:                env.cache,
+		Fetcher:              env.fetcher,
+		Verifier:             passThroughVerifier{},
+		HostLimiter:          hostsem.New(8),
+		Architectures:        []string{"amd64"},
+		RepairSkippedMembers: true, // gates the tick-path reconcile too
+		Logger:               discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+
+	// Current inline snapshot whose stored envelope lost its END marker:
+	// it still carries a parseable SHA256 block in the raw text, but no
+	// longer decodes, so reconcile must fail closed.
+	signed := clearsignForTest(t, "Origin: Test\nSuite: noble\nSHA256:\n "+
+		strings.Repeat("a", 64)+" 10 main/binary-amd64/Packages\n")
+	anchor := append([]byte{}, signed[:bytes.LastIndex(signed, []byte("-----END PGP SIGNATURE-----"))]...)
+	snapID := storeInlineSnapshot(t, env, anchor)
+
+	// Upstream serves the byte-identical anchor → "unchanged" → repair != nil.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ubuntu/dists/noble/InRelease" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(anchor)
+	}))
+	defer srv.Close()
+	anchorHash := hashOf(anchor)
+	if err := env.cache.PutURLPath(ctx, cache.URLPath{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		Path: "/ubuntu/dists/noble/InRelease", BlobHash: &anchorHash,
+		UpstreamURL: srv.URL + "/ubuntu/dists/noble/InRelease", IsMetadata: true,
+	}); err != nil {
+		t.Fatalf("PutURLPath: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	checker, err := New(Config{
+		Cache: env.cache, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8),
+		Adopter: ad, Logger: slog.New(slog.NewJSONHandler(&logBuf, nil)),
+		now: func() time.Time { return time.Unix(11000, 0) },
+	})
+	if err != nil {
+		t.Fatalf("New checker: %v", err)
+	}
+
+	checker.Check(ctx, "http", "127.0.0.1", "/ubuntu/dists/noble")
+	checker.WaitForAdoptions() // the reconcile goroutine has logged by now
+
+	var found bool
+	for _, line := range bytes.Split(logBuf.Bytes(), []byte("\n")) {
+		var rec map[string]any
+		if json.Unmarshal(line, &rec) != nil || rec["msg"] != "adoption_reconcile_failed" {
+			continue
+		}
+		found = true
+		errText, _ := rec["err"].(string)
+		if rec["level"] != "WARN" || rec["stage"] != "decision" || rec["canonical_host"] != "127.0.0.1" ||
+			rec["suite_path"] != "/ubuntu/dists/noble" || rec["snapshot_id"] != float64(snapID) ||
+			!strings.Contains(errText, "not a valid clearsigned message") {
+			t.Errorf("adoption_reconcile_failed record = %v; want WARN with host, suite path, snapshot_id %d and the decode error", rec, snapID)
+		}
+	}
+	if !found {
+		t.Fatalf("no adoption_reconcile_failed line on the tick path; log:\n%s", logBuf.String())
+	}
+}
+
 // newCheckerForReconcile builds a Checker backed by an empty fakeCache (no
 // known suites). Used by TestCheckerReconcile_UnknownSuiteAllocatesNoLock to
 // verify that Reconcile returns false and does NOT allocate a per-suite lock
@@ -1849,5 +2224,41 @@ func TestCheckerReconcile_UnknownSuiteAllocatesNoLock(t *testing.T) {
 	c.locks.Range(func(_, _ any) bool { count++; return true })
 	if count != 0 {
 		t.Errorf("lock map grew to %d for an unknown suite", count)
+	}
+}
+
+// I-4 (spec C3): a suite without a row is not checked — no upstream
+// request, no row created, no lock-map entry — however its T1 fires.
+func TestCheck_UntrackedSuiteIsNotChecked(t *testing.T) {
+	fc := newFakeCache()
+	bh := hashOf([]byte("x"))
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer srv.Close()
+	fc.putURL(cache.URLPath{
+		CanonicalScheme: "http", CanonicalHost: "127.0.0.1", Path: "/dists/minted/InRelease",
+		BlobHash: &bh, UpstreamURL: srv.URL + "/dists/minted/InRelease", IsMetadata: true,
+	})
+	c, err := New(Config{Cache: fc, Fetcher: newTestFetcher(t), HostLimiter: hostsem.New(8), Logger: discardLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep := c.check(context.Background(), SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1",
+		SuitePath: "/dists/minted"}, checkOpts{bypassCooldown: true}); rep.result != resultSkipped {
+		t.Fatalf("result = %q, want %q", rep.result, resultSkipped)
+	}
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("upstream requests = %d, want 0", n)
+	}
+	if _, ok := fc.suite("http", "127.0.0.1", "/dists/minted"); ok {
+		t.Fatal("the check created a suite row")
+	}
+	locks := 0
+	c.locks.Range(func(any, any) bool { locks++; return true })
+	if locks != 0 {
+		t.Fatalf("lock map holds %d entries, want 0", locks)
 	}
 }

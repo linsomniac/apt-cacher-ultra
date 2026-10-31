@@ -5,8 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	sqlite "modernc.org/sqlite"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 )
 
 // ErrSnapshotAlreadyAdopted is returned by CommitAdoption when invoked
@@ -14,14 +17,39 @@ import (
 // would double-bump refcounts for every member, so the writer refuses.
 var ErrSnapshotAlreadyAdopted = errors.New("cache: snapshot already adopted")
 
+// ErrSnapshotRetired: the candidate was retired — by the legacy trust
+// audit's quarantine, or the reaper's retirement path (a reap, POST
+// /forget, cap eviction) — and must never become current.
+var ErrSnapshotRetired = errors.New("cache: snapshot is retired")
+
+// ErrUnsignedDowngradeRefused is the never-downgrade refusal of an unsigned
+// candidate whose suite has signed history (spec C5 safeguard 3,
+// refuseUnsignedDowngrade): CommitAdoption's recheck inside the writer
+// transaction returns it with nothing written, and CheckUnsignedDowngrade
+// returns it for the early exits. A refusal state, not a failure: the
+// adopter records it as unsigned_downgrade_refused.
+var ErrUnsignedDowngradeRefused = errors.New("cache: unsigned adoption refused: the suite has signed history")
+
 // ErrSnapshotNaturalKeyAdopted is returned by InsertCandidateSnapshot
-// when a row matching the natural key (scheme, host, suite_path,
-// COALESCE(inrelease_hash, release_hash)) already exists *and* is
-// already adopted (adopted_at IS NOT NULL). The adoption pipeline
+// when a non-retired row matching the natural key (scheme, host,
+// suite_path, COALESCE(inrelease_hash, release_hash), anchor_form)
+// already exists *and* is already adopted (adopted_at IS NOT NULL). The adoption pipeline
 // surfaces this as a distinct WARN; auto-reusing an adopted row is
 // out of scope (would bypass the lifecycle and refcount accounting
 // in CommitAdoption).
+// It arrives wrapped in a *NaturalKeyAdoptedError (errors.Is matches it; errors.As recovers the snapshot id).
 var ErrSnapshotNaturalKeyAdopted = errors.New("cache: snapshot natural key already adopted")
+
+// NaturalKeyAdoptedError names the adopted snapshot a candidate collided
+// with, so the adopter can tell a rollback to a displaced snapshot (spec
+// C5 rollback_refused) from a race with the current one.
+type NaturalKeyAdoptedError struct{ SnapshotID int64 }
+
+func (e *NaturalKeyAdoptedError) Error() string {
+	return fmt.Sprintf("%v: snapshot_id=%d", ErrSnapshotNaturalKeyAdopted, e.SnapshotID)
+}
+
+func (e *NaturalKeyAdoptedError) Unwrap() error { return ErrSnapshotNaturalKeyAdopted }
 
 // sqliteConstraintUnique is the extended result code SQLITE_CONSTRAINT_UNIQUE.
 // We use the literal here rather than depending on modernc.org/sqlite/lib
@@ -65,6 +93,39 @@ func (c *Cache) HeartbeatSnapshot(ctx context.Context, snapshotID int64) error {
 	})
 }
 
+// candidateForm derives (or validates) the anchor form of a candidate.
+// Inline and unsigned use the single-anchor slot (InReleaseHash);
+// detached uses Release + Release.gpg.
+//
+// AIDEV-NOTE: deriving an empty Form exists for the unambiguous shapes
+// only (test fixtures and legacy callers). FormUnsigned is NEVER derived:
+// an unsigned candidate that forgot its Form would be stored as inline
+// and vouch .debs. Production candidate construction (runShared) always
+// sets Form, and phase E's tests assert that an unsigned adoption stores
+// "unsigned".
+func candidateForm(sc SnapshotCandidate) (AnchorForm, error) {
+	single := sc.InReleaseHash != nil && sc.ReleaseHash == nil && sc.ReleaseGPGHash == nil
+	detached := sc.InReleaseHash == nil && sc.ReleaseHash != nil && sc.ReleaseGPGHash != nil
+	switch sc.Form {
+	case "":
+		if single {
+			return FormInline, nil
+		}
+		if detached {
+			return FormDetached, nil
+		}
+	case FormInline, FormUnsigned:
+		if single {
+			return sc.Form, nil
+		}
+	case FormDetached:
+		if detached {
+			return FormDetached, nil
+		}
+	}
+	return "", fmt.Errorf("%w: form=%q", ErrInvalidAnchorForm, sc.Form)
+}
+
 // InsertCandidateSnapshot inserts a fresh suite_snapshot row with
 // adopted_at = NULL and returns the auto-assigned snapshot_id. SPEC2
 // §7.5 step 4. Caller uses the returned id to key the snapshot_member
@@ -81,16 +142,25 @@ func (c *Cache) HeartbeatSnapshot(ctx context.Context, snapshotID int64) error {
 //
 // All non-nil *Hash fields must point at blob.hash values the caller
 // has already persisted via PutBlob; the FK constraints fail closed
-// otherwise. The schema CHECK on suite_snapshot enforces the
-// "exactly one of inline-or-detached" invariant; passing both modes
-// or all-NULL produces a constraint-violation error.
+// otherwise. candidateForm checks the hash shape against sc.Form before
+// any SQL runs: both modes, all-NULL, or a Form that does not fit the
+// hashes returns ErrInvalidAnchorForm. The schema CHECK on
+// suite_snapshot still enforces the "exactly one of single-anchor or
+// detached" invariant at the DB layer, and the v7 trigger rejects any
+// row without an anchor_form.
 //
 // AIDEV-NOTE: idempotent on natural-key collision — reuses an existing
 // unadopted candidate row so a Step-5/6/7/8 failure in runShared does
 // not poison subsequent adoption attempts. The natural key
-// (scheme, host, suite_path, COALESCE(inrelease_hash, release_hash))
-// already requires "one row per (suite, content)"; this method makes
-// the API surface that fact instead of choking with a UNIQUE error.
+// (scheme, host, suite_path, COALESCE(inrelease_hash, release_hash),
+// anchor_form) among non-retired rows (spec §6; the partial unique
+// index idx_suite_snapshot_natural_v7 ... WHERE retired_at IS NULL)
+// already requires "one live row per (suite, content, form)"; this
+// method makes the API surface that fact instead of choking with a
+// UNIQUE error. The collision lookup carries the same predicates as
+// the index: without anchor_form an unsigned candidate could reuse an
+// inline row with the same hash (and vouch .debs); without
+// retired_at IS NULL it could match a retired incarnation.
 // reused == true on the second-and-later attempts at the same content;
 // callers can log it once for diagnostics. CommitAdoption is its own
 // transaction guarded by adopted_at IS NULL, so retrying with a reused
@@ -100,29 +170,45 @@ func (c *Cache) HeartbeatSnapshot(ctx context.Context, snapshotID int64) error {
 // ErrSnapshotNaturalKeyAdopted instead — reusing an adopted row would
 // bypass the snapshot lifecycle and refcount bookkeeping.
 func (c *Cache) InsertCandidateSnapshot(ctx context.Context, sc SnapshotCandidate) (id int64, reused bool, err error) {
+	form, err := candidateForm(sc)
+	if err != nil {
+		return 0, false, err
+	}
 	const insertQ = `
 INSERT INTO suite_snapshot
   (canonical_scheme, canonical_host, suite_path,
    inrelease_hash, inrelease_etag, inrelease_lastmod,
-   release_hash, release_gpg_hash, created_at, adopted_at,
+   release_hash, release_gpg_hash, anchor_form, release_date, created_at, adopted_at,
    package_coverage_complete, heartbeat_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
 	const lookupQ = `
 SELECT snapshot_id, adopted_at FROM suite_snapshot
  WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?
-   AND COALESCE(inrelease_hash, release_hash) = ?`
+   AND COALESCE(inrelease_hash, release_hash) = ?
+   AND anchor_form = ?
+   AND retired_at IS NULL`
 	now := nowUnix()
 	coverage := int64(0)
 	if sc.PackageCoverageComplete {
 		coverage = 1
 	}
+	// AIDEV-NOTE: the op writes gotID/gotReused, never the named results:
+	// on a ctx/close path submitWrite returns before the writer goroutine
+	// finishes the op (cache.go submitWrite), and `return 0, false, werr`
+	// would then race the op's writes. Read them only after a nil werr
+	// (the RescheduleFailingAdoptions pattern). The adoption deadline
+	// (adoption.max_duration) makes that path reachable mid-op.
+	var (
+		gotID     int64
+		gotReused bool
+	)
 	werr := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
 		res, execErr := conn.ExecContext(ctx, insertQ,
 			sc.CanonicalScheme, sc.CanonicalHost, sc.SuitePath,
 			sc.InReleaseHash, sc.InReleaseETag, sc.InReleaseLastMod,
-			sc.ReleaseHash, sc.ReleaseGPGHash, now, coverage, now)
+			sc.ReleaseHash, sc.ReleaseGPGHash, string(form), sc.ReleaseDate, now, coverage, now)
 		if execErr == nil {
-			id, execErr = res.LastInsertId()
+			gotID, execErr = res.LastInsertId()
 			if execErr != nil {
 				return fmt.Errorf("InsertCandidateSnapshot: last id: %w", execErr)
 			}
@@ -151,14 +237,14 @@ SELECT snapshot_id, adopted_at FROM suite_snapshot
 			adoptedAt  sql.NullInt64
 		)
 		lookupErr := conn.QueryRowContext(ctx, lookupQ,
-			sc.CanonicalScheme, sc.CanonicalHost, sc.SuitePath, coalesceHash).
+			sc.CanonicalScheme, sc.CanonicalHost, sc.SuitePath, coalesceHash, string(form)).
 			Scan(&existingID, &adoptedAt)
 		if lookupErr != nil {
 			return fmt.Errorf("InsertCandidateSnapshot: lookup colliding row: %w (orig: %v)",
 				lookupErr, execErr)
 		}
 		if adoptedAt.Valid {
-			return fmt.Errorf("%w: snapshot_id=%d", ErrSnapshotNaturalKeyAdopted, existingID)
+			return &NaturalKeyAdoptedError{SnapshotID: existingID}
 		}
 		// Refresh mutable, non-natural-key columns so a retry that
 		// supplies (e.g.) a re-signed Release.gpg or fresher validators
@@ -170,7 +256,9 @@ SELECT snapshot_id, adopted_at FROM suite_snapshot
 		// old (failed-attempt) signature — an internal inconsistency.
 		// inrelease_hash / release_hash are part of the natural key
 		// and cannot have changed (we only got here because they
-		// matched); leave them.
+		// matched); leave them. release_date (spec C5) is refreshed
+		// alongside the validators for the same reason: a retry may
+		// have parsed a Date the earlier attempt could not.
 		// SPEC4 §7.5.2 site 1 (reused-orphan path): refresh heartbeat_at
 		// alongside the other mutable columns. Without this, a reused
 		// candidate inherits its prior incarnation's heartbeat_at; if
@@ -181,21 +269,22 @@ UPDATE suite_snapshot
    SET release_gpg_hash   = ?,
        inrelease_etag     = ?,
        inrelease_lastmod  = ?,
+       release_date       = ?,
        heartbeat_at       = ?
  WHERE snapshot_id = ?`
 		if _, err := conn.ExecContext(ctx, refreshQ,
-			sc.ReleaseGPGHash, sc.InReleaseETag, sc.InReleaseLastMod, now,
+			sc.ReleaseGPGHash, sc.InReleaseETag, sc.InReleaseLastMod, sc.ReleaseDate, now,
 			existingID); err != nil {
 			return fmt.Errorf("InsertCandidateSnapshot: refresh mutable cols on reuse: %w", err)
 		}
-		id = existingID
-		reused = true
+		gotID = existingID
+		gotReused = true
 		return nil
 	})
 	if werr != nil {
 		return 0, false, werr
 	}
-	return id, reused, nil
+	return gotID, gotReused, nil
 }
 
 // PrefetchedURLPath carries one Phase 3 hot-deb prefetch outcome into
@@ -231,9 +320,12 @@ type PrefetchedURLPath struct {
 //     member rows point at it.
 //  5. Read the prior current_snapshot_id from suite_freshness (NULL if
 //     this is the first adoption for the suite).
-//  6. Upsert suite_freshness.current_snapshot_id to snapshotID. The
-//     other suite_freshness columns are left untouched.
-//  7. Stamp suite_snapshot.adopted_at = now.
+//  6. UPDATE suite_freshness.current_snapshot_id to snapshotID, set the
+//     row's validators to the candidate's, and clear
+//     inrelease_change_seen_at and the adoption failure record (spec C4,
+//     C7). UPDATE-only (spec C3): no row rolls everything back with
+//     ErrSuiteGone.
+//  7. Stamp suite_snapshot.adopted_at (adoptionStampTx: max(now, prior + 1)).
 //  8. If prior_id was non-NULL, decrement refcount for each distinct
 //     blob_hash referenced by the prior snapshot's members. A blob
 //     shared between old and new nets to zero (+1 then -1) so the
@@ -277,6 +369,7 @@ type PrefetchedURLPath struct {
 func (c *Cache) CommitAdoption(ctx context.Context, snapshotID int64,
 	members []SnapshotMember, skipped []SkippedMember, packageHashes []PackageHash,
 	prefetchedURLPaths []PrefetchedURLPath, coverageComplete bool) error {
+	c.noteFlatRows(packageHashes) // ruling PG-31: before the transaction can commit
 	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
@@ -290,13 +383,15 @@ func (c *Cache) CommitAdoption(ctx context.Context, snapshotID int64,
 		// strictly safer than trusting them from a separate caller
 		// argument.
 		var (
-			scheme, host, suite string
-			adoptedAt           sql.NullInt64
+			scheme, host, suite, form string
+			adoptedAt, retiredAt      sql.NullInt64
+			candETag, candLastMod     sql.NullString
 		)
 		err = tx.QueryRowContext(ctx, `
-SELECT canonical_scheme, canonical_host, suite_path, adopted_at
+SELECT canonical_scheme, canonical_host, suite_path, anchor_form, adopted_at, retired_at,
+       inrelease_etag, inrelease_lastmod
 FROM suite_snapshot
-WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &adoptedAt)
+WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &form, &adoptedAt, &retiredAt, &candETag, &candLastMod)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			return fmt.Errorf("CommitAdoption: snapshot %d not found", snapshotID)
@@ -305,6 +400,36 @@ WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &adoptedAt)
 		}
 		if adoptedAt.Valid {
 			return ErrSnapshotAlreadyAdopted
+		}
+		// AIDEV-NOTE: a retired snapshot (quarantined by the legacy trust
+		// audit, spec §6.1, or reaped from phase F) must never become
+		// current again — its pins were released when it was retired.
+		if retiredAt.Valid {
+			return fmt.Errorf("%w: snapshot_id=%d", ErrSnapshotRetired, snapshotID)
+		}
+
+		// Step 1a (spec C5 safeguard 3, never-downgrade): an unsigned
+		// candidate is refused, before anything is written, when the
+		// suite has signed history (refuseUnsignedDowngrade: a signed-seen
+		// marker for its base, or an adopted signed snapshot, under either
+		// scheme).
+		//
+		// AIDEV-NOTE: this in-transaction re-read is the authority; the
+		// check's eligibility read and the adopter's are only early exits
+		// (CheckUnsignedDowngrade, the same rule). The suite mutex cannot
+		// close the race on its own: the handler and the checker write
+		// markers in their own writer operations, and the /. twin shares
+		// the base without sharing the mutex. The writer is FIFO, so a
+		// marker write enqueued before this commit is visible here
+		// (TestStoreFetched_MarkerPrecedesALaterWriterOperation; the
+		// adopter's re-mark before an unsigned commit, ruling R-E1).
+		if AnchorForm(form) == FormUnsigned {
+			if err := refuseUnsignedDowngrade(ctx, tx, host, suite); err != nil {
+				// The prefix tells this authoritative read from the early
+				// exits' (deferred minor E-4); errors.Is still finds
+				// ErrUnsignedDowngradeRefused.
+				return fmt.Errorf("CommitAdoption: %w", err)
+			}
 		}
 
 		// Step 2: insert snapshot_member rows. Each member is validated
@@ -354,26 +479,34 @@ VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
 			if _, err := tx.ExecContext(ctx, `
 INSERT INTO package_hash (canonical_scheme, canonical_host, path,
                           declared_sha256, snapshot_id,
-                          package_name, architecture, version)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                          package_name, architecture, version, flat_filename)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				p.CanonicalScheme, p.CanonicalHost, p.Path,
 				p.DeclaredSHA256, snapshotID,
-				p.PackageName, p.Architecture, p.Version); err != nil {
+				p.PackageName, p.Architecture, p.Version, p.FlatFilename); err != nil {
 				return fmt.Errorf("CommitAdoption: insert package_hash %q: %w", p.Path, err)
 			}
+		}
+
+		now := nowUnix()
+		// Spec C8 (monotonic Last-Modified): the adoption stamp, taken
+		// before Step 3c re-seeds the url_path anchor rows with now.
+		stamp, err := adoptionStampTx(ctx, tx, scheme, host, suite, now)
+		if err != nil {
+			return fmt.Errorf("CommitAdoption: %w", err)
 		}
 
 		// Step 3a (Phase 3, SPEC3 §7.5.1): insert/upsert url_path rows
 		// for the hot debs warmed during the SPEC3 §7.5 prefetch loop.
 		// This **deliberately diverges** from PutURLPath
-		// (queries.go:45-75): the DO UPDATE omits last_requested_at
-		// and request_count so the existing row's hotness signal
-		// survives the upsert. Hot prefetch is a cache-warming write,
-		// not a client-served write; overwriting the hotness columns
-		// here would erase the very evidence that made this path hot
-		// in the first place, dropping it from the next adoption's
-		// hot-set computation.
-		now := nowUnix()
+		// (putURLPathSQL, queries.go): the DO UPDATE omits
+		// last_requested_at and request_count so the existing row's
+		// hotness signal survives the upsert. Hot prefetch is a
+		// cache-warming write, not a client-served write; overwriting the
+		// hotness columns here would erase the very evidence that made
+		// this path hot in the first place, dropping it from the next
+		// adoption's hot-set computation (deferred minor C-14 moved the
+		// stamp above this comment).
 		for _, up := range prefetchedURLPaths {
 			if !validBlobHash(up.BlobHash) {
 				return fmt.Errorf("CommitAdoption: prefetched %q blob_hash %w", up.Path, ErrInvalidHash)
@@ -419,37 +552,45 @@ UPDATE suite_snapshot SET package_coverage_complete = ?
 
 		// Step 3c (freshness-freeze fix, SPEC3 §7.5.1 / SPEC2 §7.4):
 		// seed/sync the metadata anchor url_path row(s) — InRelease
-		// (inline) or Release + Release.gpg (detached) — to point at the
-		// blob this snapshot adopted. Historically adoption left the
-		// anchor's blob_hash pointing at whatever bytes a client
-		// cache-miss last stored, so it diverged from the snapshot's
-		// inrelease_hash and the SPEC4 §5 GC guards (b)/(c) could never
-		// vouch for it; the anchor was then reaped on a low-traffic lull
-		// and the suite froze (the checker silently skips when the anchor
-		// is absent, SPEC2 §7.4). Syncing it here keeps the hash-based
-		// guards matching — the SPEC4 §5 identity guard (d) is the belt
-		// to this suspenders.
+		// (inline), Release + Release.gpg (detached) or Release
+		// (unsigned) — to point at the blob this snapshot adopted.
+		// Historically adoption left the anchor's blob_hash pointing at
+		// whatever bytes a client cache-miss last stored, so it diverged
+		// from the snapshot's anchor hash and the SPEC4 §5 GC guards
+		// (b)/(c) could never vouch for it; the anchor was then reaped on
+		// a low-traffic lull and the suite froze (the checker silently
+		// skips when the anchor is absent, SPEC2 §7.4). Syncing it here
+		// keeps the hash-based guards matching — the SPEC4 §5 identity
+		// guard (d) is the belt to this suspenders.
 		//
 		// AIDEV-NOTE: ON CONFLICT preserves the existing (port-correct)
 		// upstream_url, last_requested_at, and request_count — only
 		// blob_hash / is_metadata / last_fetched_at are (re)written, plus
 		// dropped_at cleared to NULL (re-establish-clears-hold invariant).
 		// Mirrors Step 3a's hotness-preservation rationale. The INSERT
-		// branch (anchor was already reaped) reconstructs upstream_url as
-		// scheme://host+path, which is port-less (SPEC §3.2) — acceptable
-		// because it only fires when the original row is already gone.
-		var anchorInRel, anchorRel, anchorRelGPG sql.NullString
+		// branch (anchor was already reaped) reconstructs upstream_url
+		// with aptpath.BuildUpstreamURL(scheme, host, path), which is
+		// port-less (SPEC §3.2) — acceptable because it only fires when
+		// the original row is already gone.
+		//
+		// AIDEV-NOTE: the files seeded are the form's anchors
+		// (aptpath.AnchorPaths, anchorHash): an unsigned snapshot keeps
+		// its Release hash in inrelease_hash, and its anchor is
+		// <suite>/Release — seeding <suite>/InRelease with it would serve
+		// a Release body as an InRelease (spec C5, phase E).
+		var anchorInRel, anchorRel, anchorRelGPG *string
 		if err := tx.QueryRowContext(ctx, `
 SELECT inrelease_hash, release_hash, release_gpg_hash
   FROM suite_snapshot WHERE snapshot_id = ?`, snapshotID).
 			Scan(&anchorInRel, &anchorRel, &anchorRelGPG); err != nil {
 			return fmt.Errorf("CommitAdoption: read anchor hashes: %w", err)
 		}
-		seedAnchor := func(filename string, h sql.NullString) error {
-			if !h.Valid || h.String == "" {
+		seedAnchor := func(name string) error {
+			h := anchorHash(AnchorForm(form), name, anchorInRel, anchorRel, anchorRelGPG)
+			if h == nil || *h == "" {
 				return nil
 			}
-			anchorPath := suite + filename
+			anchorPath := suite + "/" + name
 			_, err := tx.ExecContext(ctx, `
 INSERT INTO url_path
   (canonical_scheme, canonical_host, path, blob_hash, upstream_url,
@@ -465,18 +606,14 @@ ON CONFLICT(canonical_scheme, canonical_host, path) DO UPDATE SET
   -- url_path upsert site (the metadata guards already protect anchors,
   -- so this is defense-in-depth, not the primary keep).
   dropped_at      = NULL`,
-				scheme, host, anchorPath, h.String,
-				scheme+"://"+host+anchorPath, now)
+				scheme, host, anchorPath, *h,
+				aptpath.BuildUpstreamURL(scheme, host, anchorPath), now)
 			return err
 		}
-		if err := seedAnchor("/InRelease", anchorInRel); err != nil {
-			return fmt.Errorf("CommitAdoption: seed InRelease anchor: %w", err)
-		}
-		if err := seedAnchor("/Release", anchorRel); err != nil {
-			return fmt.Errorf("CommitAdoption: seed Release anchor: %w", err)
-		}
-		if err := seedAnchor("/Release.gpg", anchorRelGPG); err != nil {
-			return fmt.Errorf("CommitAdoption: seed Release.gpg anchor: %w", err)
+		for _, name := range aptpath.AnchorPaths(form) {
+			if err := seedAnchor(name); err != nil {
+				return fmt.Errorf("CommitAdoption: seed %s anchor: %w", name, err)
+			}
 		}
 
 		// Step 4 (SPEC4 §7.5.1 Rule 2): bump refcount for blobs
@@ -501,10 +638,8 @@ UPDATE blob
 			return fmt.Errorf("CommitAdoption: bump new refcounts: %w", err)
 		}
 
-		// Step 5: read prior current_snapshot_id from suite_freshness.
-		// A missing row means the suite has never had a freshness
-		// check (highly unusual since adoption is downstream of one,
-		// but the upsert in step 6 handles it).
+		// Step 5: read prior current_snapshot_id from suite_freshness. A
+		// missing row leaves prior NULL here and fails Step 6.
 		var prior sql.NullInt64
 		err = tx.QueryRowContext(ctx, `
 SELECT current_snapshot_id FROM suite_freshness
@@ -514,51 +649,63 @@ SELECT current_snapshot_id FROM suite_freshness
 			return fmt.Errorf("CommitAdoption: read prior: %w", err)
 		}
 
-		// Step 6: upsert the pointer. Other suite_freshness columns are
-		// preserved on conflict — adoption flips the snapshot pointer
-		// only, not the freshness state.
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO suite_freshness
-  (canonical_scheme, canonical_host, suite_path, current_snapshot_id)
-VALUES (?, ?, ?, ?)
-ON CONFLICT(canonical_scheme, canonical_host, suite_path) DO UPDATE SET
-  current_snapshot_id = excluded.current_snapshot_id`,
-			scheme, host, suite, snapshotID); err != nil {
+		// Step 6: flip the pointer and make the row describe the adopted
+		// anchor (spec C4 "Validators"): its validators become the
+		// candidate's, the pending-change stamp and the adoption failure
+		// record are cleared (spec C4, C7). Check and success stamps,
+		// check_fail_count and last_requested_at stay as they are.
+		//
+		// AIDEV-NOTE: UPDATE-only (spec C3). A suite whose row is gone
+		// rolls the whole flip back with ErrSuiteGone: an adoption never
+		// resurrects a suite that cap eviction (or phase F's reaper)
+		// deleted, and createSuiteTx stays the only INSERT.
+		res, err := tx.ExecContext(ctx, `
+UPDATE suite_freshness
+   SET current_snapshot_id      = ?,
+       inrelease_etag           = ?,
+       inrelease_lastmod        = ?,
+       inrelease_change_seen_at = NULL,
+       `+clearAdoptionFailureSet+`
+ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,
+			snapshotID, candETag, candLastMod, scheme, host, suite)
+		if err != nil {
 			return fmt.Errorf("CommitAdoption: flip pointer: %w", err)
 		}
+		if n, err := res.RowsAffected(); err != nil {
+			return fmt.Errorf("CommitAdoption: flip pointer: %w", err)
+		} else if n == 0 {
+			return fmt.Errorf("%w: %s://%s%s", ErrSuiteGone, scheme, host, suite)
+		}
 
-		// Step 7: mark the new snapshot adopted. Reuses `now` captured
-		// at the top of the transaction for step 3a's last_fetched_at
-		// — both writes belong to the same logical commit moment, so a
-		// shared timestamp is more honest than two separate
-		// nowUnix() calls.
+		// Step 7: mark the new snapshot adopted with the spec C8 stamp:
+		// `now` (the commit moment Step 3a also uses) unless the previous
+		// anchor's stamp is not older, which keeps a client's
+		// If-Modified-Since from hiding the flip.
 		if _, err := tx.ExecContext(ctx, `
 UPDATE suite_snapshot SET adopted_at = ? WHERE snapshot_id = ?`,
-			now, snapshotID); err != nil {
+			stamp, snapshotID); err != nil {
 			return fmt.Errorf("CommitAdoption: stamp adopted_at: %w", err)
+		}
+
+		// Step 7a (spec C3): a signed snapshot records signed-seen history
+		// for its base in the same transaction, so every binary from phase
+		// A on keeps the never-downgrade authority current even before the
+		// handler writes markers (phase D).
+		if AnchorForm(form) == FormInline || AnchorForm(form) == FormDetached {
+			if err := markSignedSeen(ctx, tx, scheme, host, aptpath.MarkerBase(suite), now); err != nil {
+				return fmt.Errorf("CommitAdoption: %w", err)
+			}
 		}
 
 		// Step 8 (SPEC4 §7.5.1 Rule 3): decrement refcounts for blobs
 		// the prior snapshot pinned. A blob shared between old and new
 		// gets +1 then -1 (net 0) — exactly the bookkeeping Phase 4 GC
-		// relies on.
-		//
-		// COALESCE preserves an existing refcount_zeroed_at on a 0 → -1
-		// transition (the grace clock should continue, not restart).
-		// The inner IIF only writes a fresh `now` when refcount - 1 is
-		// the *first* ≤ 0 crossing (i.e. refcount was strictly positive
-		// before this UPDATE).
+		// relies on. The decrement itself (and its refcount_zeroed_at
+		// rule) lives in decrementSnapshotRefcountsTx, shared with the
+		// legacy trust audit's quarantine.
 		if prior.Valid {
-			if _, err := tx.ExecContext(ctx, `
-UPDATE blob
-   SET refcount = refcount - 1,
-       refcount_zeroed_at = COALESCE(
-         refcount_zeroed_at,
-         IIF(refcount - 1 <= 0, ?, NULL)
-       )
- WHERE hash IN (SELECT blob_hash FROM snapshot_member WHERE snapshot_id = ?)`,
-				now, prior.Int64); err != nil {
-				return fmt.Errorf("CommitAdoption: decrement prior refcounts: %w", err)
+			if err := decrementSnapshotRefcountsTx(ctx, tx, prior.Int64, now); err != nil {
+				return fmt.Errorf("CommitAdoption: %w", err)
 			}
 		}
 
@@ -569,55 +716,106 @@ UPDATE blob
 	})
 }
 
-// GetSuiteSnapshot returns the suite_snapshot row by id, or ErrNotFound.
-// Read path; reads use the connection pool freely.
-func (c *Cache) GetSuiteSnapshot(ctx context.Context, snapshotID int64) (*SuiteSnapshot, error) {
-	const q = `
-SELECT snapshot_id, canonical_scheme, canonical_host, suite_path,
-       inrelease_hash, inrelease_etag, inrelease_lastmod,
-       release_hash, release_gpg_hash, created_at, adopted_at,
-       package_coverage_complete
-FROM suite_snapshot
-WHERE snapshot_id = ?`
-	var (
-		s        SuiteSnapshot
-		coverage int64
-	)
-	err := c.db.QueryRowContext(ctx, q, snapshotID).Scan(
-		&s.SnapshotID, &s.CanonicalScheme, &s.CanonicalHost, &s.SuitePath,
-		&s.InReleaseHash, &s.InReleaseETag, &s.InReleaseLastMod,
-		&s.ReleaseHash, &s.ReleaseGPGHash, &s.CreatedAt, &s.AdoptedAt,
-		&coverage,
-	)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return nil, ErrNotFound
-	case err != nil:
-		return nil, fmt.Errorf("GetSuiteSnapshot: %w", err)
+// decrementSnapshotRefcountsTx releases one pin per distinct blob the
+// snapshot's members reference (SPEC4 §7.5.1 Rule 3). It must run exactly
+// once per snapshot, when it stops being current: CommitAdoption Step 8
+// (displacement), the legacy trust audit's quarantine (spec §6.1) and the
+// reaper's retirement path (retireSuiteSnapshotsTx: cap eviction, the
+// reaper and POST /forget, spec C9) are its callers.
+//
+// AIDEV-NOTE: COALESCE keeps an existing refcount_zeroed_at on a 0 → -1
+// transition; the IIF writes `now` only on the first <= 0 crossing.
+func decrementSnapshotRefcountsTx(ctx context.Context, tx *sql.Tx, snapshotID, now int64) error {
+	if _, err := tx.ExecContext(ctx, `
+UPDATE blob
+   SET refcount = refcount - 1,
+       refcount_zeroed_at = COALESCE(
+         refcount_zeroed_at,
+         IIF(refcount - 1 <= 0, ?, NULL)
+       )
+ WHERE hash IN (SELECT blob_hash FROM snapshot_member WHERE snapshot_id = ?)`,
+		now, snapshotID); err != nil {
+		return fmt.Errorf("decrement refcounts of snapshot %d: %w", snapshotID, err)
 	}
-	s.PackageCoverageComplete = coverage != 0
-	return &s, nil
+	return nil
 }
 
-// GetSnapshotMember returns the snapshot_member row for (snapshot_id, path),
-// or ErrNotFound. Hot path: §6.1 metadata hit-path validation looks up
-// every served byte through this query.
-func (c *Cache) GetSnapshotMember(ctx context.Context, snapshotID int64, path string) (*SnapshotMember, error) {
-	const q = `
-SELECT snapshot_id, path, blob_hash, declared_sha256
-FROM snapshot_member
-WHERE snapshot_id = ? AND path = ?`
-	var m SnapshotMember
-	err := c.db.QueryRowContext(ctx, q, snapshotID, path).Scan(
-		&m.SnapshotID, &m.Path, &m.BlobHash, &m.DeclaredSHA256,
-	)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return nil, ErrNotFound
-	case err != nil:
-		return nil, fmt.Errorf("GetSnapshotMember: %w", err)
+// adoptionStampTx returns the adopted_at a commit at now stamps (spec C8,
+// monotonic Last-Modified): max(now, the newest adopted_at of any snapshot
+// of the suite + 1) — current, displaced or retired, while it is still
+// there — and, for a suite with no current snapshot (a first adoption, or
+// one after a quarantine or a reap), also above the newest last_fetched_at
+// of the suite's InRelease/Release/Release.gpg url_path rows + 1 — those
+// rows are what clients were served, with that Last-Modified or older.
+// The handler serves snapshot anchors with adopted_at as their
+// Last-Modified (never the pool file's mtime), so a client's
+// If-Modified-Since from the previous anchor gets a 200 after a flip,
+// whatever the clock does — within the residual below.
+//
+// AIDEV-NOTE: call it before CommitAdoption Step 3c, which re-seeds the
+// anchor rows' last_fetched_at with now. adopted_at can now lead the wall
+// clock (by 1 s per same-second flip, by up to a backward step's length
+// after one), so the floor is every snapshot of the suite, not only the
+// current one (deferred minor C-11): once current_snapshot_id is cleared
+// (a quarantine) or the row deleted (a reap, an eviction, POST /forget —
+// the re-created suite starts without one), the suite's remaining
+// snapshots may lead the clock, and a stamp below theirs would misorder
+// GC's keep_displaced ranking and retained by-hash's newest-first window,
+// and could answer a client's If-Modified-Since from a retired snapshot
+// 304. Stamps are strictly increasing per suite, so those readers need
+// only their order; the legacy audit's markSnapshotBaseTx
+// (legacy_audit.go) reads one as a wall-clock stamp, and the clock-step
+// rule (internal/freshness/clockstep.go, spec C4) lists adopted_at as a
+// past-event stamp — no gate reads it that way, so a stamp in the future
+// is harmless there. Residual (the Task 5 review's minor 1): the floor
+// covers only the snapshots still present. Sub-job C deletes a retired
+// snapshot at a periodic GC tick (normally the next; a startup GC pass
+// deletes none: ruling PF-15), a reap or /forget deletes the anchor rows,
+// and Step 3c seeds them with now, so after a backward step longer than
+// the time from a reap (or /forget) to the re-adoption, with that periodic
+// tick in between, the re-adoption can stamp below the reaped snapshot
+// again and a client holding that anchor gets a 304 until a later flip is
+// stamped above it. C-11's own readers do not care then (the row is
+// gone); a durable per-suite floor needs a schema change, which phase F
+// forbids.
+//
+// AIDEV-NOTE: ruling R-G3 (phase G). url_path-served metadata answers
+// Last-Modified = max(pool mtime, last_fetched_at) (the handler's
+// urlPathModTime), so the first-adoption floor below (the anchors'
+// MAX(last_fetched_at) + 1) passes every url_path anchor's Last-Modified
+// only while no pool file is newer than its row's last_fetched_at:
+// runFetch and the anchorless refresh (RefreshURLPathBlob) finalize the
+// pool file before they stamp the row. Keep that order; blob mtimes are
+// not folded into this floor
+// (TestServeHTTP_AMissStampsItsRowAfterItsPoolFile).
+func adoptionStampTx(ctx context.Context, tx *sql.Tx, scheme, host, suite string, now int64) (int64, error) {
+	var newest, current sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+SELECT (SELECT MAX(adopted_at) FROM suite_snapshot
+         WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?),
+       (SELECT current_snapshot_id FROM suite_freshness
+         WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?)`,
+		scheme, host, suite, scheme, host, suite).Scan(&newest, &current); err != nil {
+		return 0, fmt.Errorf("read the suite's newest adopted_at: %w", err)
 	}
-	return &m, nil
+	stamp := now
+	if newest.Valid {
+		stamp = max(stamp, newest.Int64+1)
+	}
+	if current.Valid {
+		return stamp, nil
+	}
+	var fetched sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+SELECT MAX(last_fetched_at) FROM url_path
+ WHERE canonical_scheme = ? AND canonical_host = ? AND path IN (?, ?, ?)`,
+		scheme, host, suite+"/InRelease", suite+"/Release", suite+"/Release.gpg").Scan(&fetched); err != nil {
+		return 0, fmt.Errorf("read anchor last_fetched_at: %w", err)
+	}
+	if fetched.Valid {
+		stamp = max(stamp, fetched.Int64+1)
+	}
+	return stamp, nil
 }
 
 // ListSnapshotMembers returns every snapshot_member row for the snapshot,
@@ -682,12 +880,17 @@ type DeclaredHash struct {
 	// whose source format does not carry a package name (e.g. pdiff
 	// patches). Callers must tolerate the empty case.
 	PackageName string
+	// SuitePath is the suite whose current snapshot the row belongs to
+	// (spec C3: a vouched .deb serve touches that suite).
+	SuitePath string
 }
 
 // DeclaredHashesForPath returns every package_hash row covering this .deb
-// path under any current snapshot. Joins package_hash → suite_freshness
-// on current_snapshot_id so a row whose snapshot was displaced (orphaned
-// rows from a prior adoption) does not count. SPEC2 §6.1 step 2 / §6.2.
+// path under any signed (inline or detached) current snapshot — an
+// unsigned one never vouches (deferred minor E-2). Joins package_hash →
+// suite_freshness on current_snapshot_id so a row whose snapshot was
+// displaced (orphaned rows from a prior adoption) does not count. SPEC2
+// §6.1 step 2 / §6.2.
 //
 // Returns rows in no defined order. Empty slice + nil error means "no
 // snapshot covers this path" — Phase 1 trust-upstream regime.
@@ -702,15 +905,81 @@ type DeclaredHash struct {
 // the §6.1 hit-path dispatch; the conflict log surface shows every row
 // (snapshot id included) so an operator can trace which adoptions
 // disagreed.
+//
+// Spec C6: the exact lookup runs first, and only when it finds no row the
+// suffix fallback (declaredHashesBySuffix) looks the path up by a flat
+// suite's flat_filename — apt requests a flat repository's .deb at
+// <uri>/<Filename>, <uri> any ancestor-or-self of the Release directory.
+//
+// AIDEV-NOTE: the fallback is a constraint lookup, not a grant: a row it
+// finds only lets bytes through that hash to a signed declaration, and it
+// never runs when an exact row exists (so a dists suite's vouching is
+// unchanged). Its cost — one partial-index query of at most 32 names — is
+// paid, once the cache holds any flat row (Cache.flatRows, ruling PG-31:
+// none on a cache with adoption off or without flat suites), by every
+// non-metadata request no exact row covers, including every .deb of a
+// host with no flat suite (an empty index range per name): on the hit
+// path once, on a miss twice (the pre-fetch gate and the post-fetch
+// dispatch), and once more for a strict-mode re-run after an adoption
+// wait.
 func (c *Cache) DeclaredHashesForPath(ctx context.Context, scheme, host, path string) ([]DeclaredHash, error) {
-	const q = `
-SELECT DISTINCT p.declared_sha256, p.snapshot_id, p.package_name
+	out, err := c.declaredHashesExact(ctx, scheme, host, path)
+	if err != nil || len(out) > 0 || !c.flatRows.Load() {
+		// Ruling PG-31: with no flat row in package_hash (every cache
+		// with adoption off, or without flat suites) the fallback could
+		// find nothing — see Cache.flatRows for why false is never stale.
+		return out, err
+	}
+	return c.declaredHashesBySuffix(ctx, scheme, host, path)
+}
+
+// noteFlatRows sets Cache.flatRows when rows hold a flat row (a non-empty
+// FlatFilename). Every package_hash writer calls it before it submits the
+// transaction that inserts rows (ruling PG-31).
+func (c *Cache) noteFlatRows(rows []PackageHash) {
+	for _, r := range rows {
+		if r.FlatFilename != "" {
+			c.flatRows.Store(true)
+			return
+		}
+	}
+}
+
+// declaredExactSQL is the exact lookup's query (spec C6 step 1): the
+// current signed snapshots' rows of (scheme, host) whose path is the
+// request path, with the row's suite path.
+//
+// AIDEV-NOTE: spec C5 safeguard 5 — an unsigned snapshot never vouches
+// a .deb. Adoption builds no package_hash rows for one; the form
+// filter keeps any that exist out (defence in depth).
+//
+// AIDEV-NOTE: design review M-2 (phase G). Both lookups (this query and
+// declaredBySuffixSQL) join suite_freshness on its primary key — the
+// snapshot's own suite, read from suite_snapshot — and current_snapshot_id,
+// never on current_snapshot_id alone: that column has no index, so the
+// bare join scanned suite_freshness once per matched row (up to
+// max_suites rows for each current, displaced or retired snapshot that
+// declares the name). A snapshot belongs to its suite_snapshot row's
+// suite, so the key terms change no answer.
+// TestDeclaredHashesForPath_TheExactLookupProbesSuiteFreshnessByItsKey and
+// TestDeclaredHashesForPath_TheFallbackUsesThePartialIndex pin both plans.
+const declaredExactSQL = `
+SELECT DISTINCT p.declared_sha256, p.snapshot_id, p.package_name, sf.suite_path
   FROM package_hash p
-  JOIN suite_freshness sf ON sf.current_snapshot_id = p.snapshot_id
+  JOIN suite_snapshot ss  ON ss.snapshot_id = p.snapshot_id
+  JOIN suite_freshness sf ON sf.canonical_scheme    = ss.canonical_scheme
+                         AND sf.canonical_host      = ss.canonical_host
+                         AND sf.suite_path          = ss.suite_path
+                         AND sf.current_snapshot_id = p.snapshot_id
  WHERE p.canonical_scheme = ?
    AND p.canonical_host   = ?
-   AND p.path             = ?`
-	rows, err := c.db.QueryContext(ctx, q, scheme, host, path)
+   AND p.path             = ?
+   AND ss.anchor_form    <> 'unsigned'`
+
+// declaredHashesExact is DeclaredHashesForPath's exact lookup (spec C6
+// step 1): the rows whose path is path.
+func (c *Cache) declaredHashesExact(ctx context.Context, scheme, host, path string) ([]DeclaredHash, error) {
+	rows, err := c.db.QueryContext(ctx, declaredExactSQL, scheme, host, path)
 	if err != nil {
 		return nil, fmt.Errorf("DeclaredHashesForPath: %w", err)
 	}
@@ -718,7 +987,7 @@ SELECT DISTINCT p.declared_sha256, p.snapshot_id, p.package_name
 	var out []DeclaredHash
 	for rows.Next() {
 		var d DeclaredHash
-		if err := rows.Scan(&d.DeclaredSHA256, &d.SnapshotID, &d.PackageName); err != nil {
+		if err := rows.Scan(&d.DeclaredSHA256, &d.SnapshotID, &d.PackageName, &d.SuitePath); err != nil {
 			return nil, fmt.Errorf("DeclaredHashesForPath scan: %w", err)
 		}
 		out = append(out, d)
@@ -729,60 +998,160 @@ SELECT DISTINCT p.declared_sha256, p.snapshot_id, p.package_name
 	return out, nil
 }
 
-// SnapshotMemberLookup is the result of the §6.1 metadata hit-path query:
-// the snapshot id under which the path was found and the blob_hash the
-// snapshot vouches for. The snapshot id is surfaced so the handler can
-// emit the X-Cache-Snapshot diagnostic header SPEC2 §3 mandates.
-type SnapshotMemberLookup struct {
-	SnapshotID int64
-	BlobHash   string
+// flatRowsExistSQL primes Cache.flatRows at Open (ruling PG-31): whether
+// package_hash holds a flat row, one probe of the partial index
+// idx_package_hash_flat_filename (whose WHERE is the same term).
+const flatRowsExistSQL = `SELECT EXISTS(SELECT 1 FROM package_hash WHERE flat_filename <> '')`
+
+// maxFallbackSegments bounds spec C6's suffix fallback: a dot-cleaned
+// request path of more segments is never looked up by suffix (a constant;
+// it also bounds the fallback query's IN list).
+const maxFallbackSegments = 32
+
+// maxFallbackPathBytes bounds the dot-cleaned request path the suffix
+// fallback splits (ruling PG-30): a split matches a row only when B is an
+// ancestor-or-self of a suite's FlatBase (at most
+// aptpath.MaxSuitePathBytes) and F a stored flat_filename (at most
+// aptpath.MaxFilenameBytes), so a longer path has no split that could.
+const maxFallbackPathBytes = aptpath.MaxSuitePathBytes + 1 + aptpath.MaxFilenameBytes
+
+// flatSplits returns spec C6's splits of a request path for the suffix
+// fallback: P' = aptpath.DotClean(path) cut as B + "/" + F at every
+// segment boundary, from the host root (B = "") to the parent of the
+// last segment, as parallel slices. It returns nothing when P' is not
+// absolute, has an empty or ".." segment, has more than
+// maxFallbackSegments segments (a ".." could step a request outside the
+// base its row is kept for), or is longer than maxFallbackPathBytes; it
+// skips a split whose B is longer than aptpath.MaxSuitePathBytes or whose
+// F is longer than aptpath.MaxFilenameBytes. The ".." and empty-segment
+// stops are defence in depth — with valid rows no such split could match
+// (a B holding them is never an ancestor of a canonical FlatBase, an F
+// never equals a validated flat_filename) — so TestFlatSplits pins them on
+// this function.
+//
+// AIDEV-NOTE: ruling PG-30 (the final review's concurrency lens I-2). The
+// fallback runs on the hit path and in the miss's pre-fetch gate for every
+// request no exact row covers, and nothing else bounds a request path's
+// length (net/http's 1 MiB header cap): building each B and F with
+// strings.Join cost 32 times the path's length per request. The length
+// bound and the per-split skips change no answer — no row can match what
+// they drop (the length bound is implied by the skips: it only ends the
+// scan early) — and B and F are substrings of P', so a split allocates
+// nothing. The bound is on P', not path: "/." segments do not count.
+func flatSplits(path string) (bases, names []string) {
+	p := aptpath.DotClean(path)
+	if !strings.HasPrefix(p, "/") || len(p) > maxFallbackPathBytes {
+		return nil, nil
+	}
+	// cuts are p's separators: the split at c is B = p[:c], F = p[c+1:].
+	var buf [maxFallbackSegments]int
+	cuts := buf[:0]
+	for i := 0; i < len(p); i++ {
+		if p[i] != '/' {
+			continue
+		}
+		if len(cuts) == maxFallbackSegments {
+			return nil, nil
+		}
+		cuts = append(cuts, i)
+	}
+	for k, c := range cuts {
+		end := len(p)
+		if k+1 < len(cuts) {
+			end = cuts[k+1]
+		}
+		if seg := p[c+1 : end]; seg == "" || seg == ".." {
+			return nil, nil
+		}
+	}
+	for _, c := range cuts {
+		if c > aptpath.MaxSuitePathBytes || len(p)-c-1 > aptpath.MaxFilenameBytes {
+			continue
+		}
+		if bases == nil {
+			bases, names = make([]string, 0, len(cuts)), make([]string, 0, len(cuts))
+		}
+		bases, names = append(bases, p[:c]), append(names, p[c+1:])
+	}
+	return bases, names
 }
 
-// LookupSnapshotMember resolves the §6.1 metadata hit path: given the
-// suite's (scheme, host, suitePath) and a member path (suite-relative,
-// e.g. "main/binary-amd64/Packages"), it joins suite_freshness to
-// snapshot_member via current_snapshot_id and returns the matching blob.
+// declaredBySuffixSQL is the suffix fallback's query for n names: the
+// current signed snapshots' flat rows of (scheme, host) whose
+// flat_filename is one of them, with the row's suite path.
 //
-// Returns ErrNotFound when:
-//   - the suite has no suite_freshness row, OR
-//   - the suite has a row but current_snapshot_id IS NULL (pre-Phase-2
-//     regime — the caller should fall back to LookupURL), OR
-//   - the snapshot exists but contains no member at this path.
-//
-// The caller is responsible for distinguishing "no snapshot in place" from
-// "snapshot in place but path not in it"; this method collapses both into
-// ErrNotFound. SPEC2 §6.1 mandates a snapshot-in-place + missing-member
-// to 404 (no Phase 1 fallback), so the handler must check
-// CurrentSnapshotID separately before classifying the miss.
-//
-// AIDEV-NOTE: the callers want both "is there a snapshot here?" (drives
-// the §6.1 step-3 fallthrough decision) and "is this path a member of the
-// snapshot?" (drives serve-vs-404). Returning the joined row in one query
-// would conflate the two when CurrentSnapshotID is NULL. Use
-// GetSuiteFreshness + GetSnapshotMember directly from the handler — see
-// handler.tryCacheHit for the full §6.1 control flow. This helper is kept
-// as a single-shot convenience for tests and is documented as such.
-func (c *Cache) LookupSnapshotMember(ctx context.Context, scheme, host, suitePath, memberPath string) (*SnapshotMemberLookup, error) {
-	const q = `
-SELECT sf.current_snapshot_id, sm.blob_hash
-  FROM suite_freshness sf
-  JOIN snapshot_member sm ON sm.snapshot_id = sf.current_snapshot_id
- WHERE sf.canonical_scheme = ?
-   AND sf.canonical_host   = ?
-   AND sf.suite_path       = ?
-   AND sm.path             = ?`
-	var (
-		snapID   int64
-		blobHash string
-	)
-	err := c.db.QueryRowContext(ctx, q, scheme, host, suitePath, memberPath).Scan(&snapID, &blobHash)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return nil, ErrNotFound
-	case err != nil:
-		return nil, fmt.Errorf("LookupSnapshotMember: %w", err)
+// AIDEV-NOTE: the term requiring a non-empty flat_filename is what lets
+// SQLite use the partial index idx_package_hash_flat_filename (whose WHERE
+// is the same term); without it every lookup scans the host's rows. The
+// suite_freshness join is declaredExactSQL's: by its primary key (design
+// review M-2).
+// TestDeclaredHashesForPath_TheFallbackUsesThePartialIndex pins the plan.
+func declaredBySuffixSQL(n int) string {
+	return `
+SELECT DISTINCT p.declared_sha256, p.snapshot_id, p.package_name, sf.suite_path, p.flat_filename
+  FROM package_hash p
+  JOIN suite_snapshot ss  ON ss.snapshot_id = p.snapshot_id
+  JOIN suite_freshness sf ON sf.canonical_scheme    = ss.canonical_scheme
+                         AND sf.canonical_host      = ss.canonical_host
+                         AND sf.suite_path          = ss.suite_path
+                         AND sf.current_snapshot_id = p.snapshot_id
+ WHERE p.canonical_scheme = ?
+   AND p.canonical_host   = ?
+   AND p.flat_filename   <> ''
+   AND p.flat_filename IN (` + strings.TrimSuffix(strings.Repeat("?, ", n), ", ") + `)
+   AND ss.anchor_form    <> 'unsigned'`
+}
+
+// declaredHashesBySuffix is spec C6's suffix fallback (step 2): for every
+// split B + "/" + F of the dot-cleaned path (flatSplits), the current
+// signed snapshots' rows whose flat_filename is F, kept iff B is an
+// ancestor-or-self of the row's suite's FlatBase; of the kept rows, those
+// with the longest B — the most specific base — are returned. A path
+// flatSplits refuses has no fallback.
+func (c *Cache) declaredHashesBySuffix(ctx context.Context, scheme, host, path string) ([]DeclaredHash, error) {
+	bases, names := flatSplits(path)
+	if len(names) == 0 {
+		return nil, nil
 	}
-	return &SnapshotMemberLookup{SnapshotID: snapID, BlobHash: blobHash}, nil
+	baseOf := make(map[string]string, len(names))
+	args := make([]any, 0, len(names)+2)
+	args = append(args, scheme, host)
+	for i, n := range names {
+		baseOf[n] = bases[i]
+		args = append(args, n)
+	}
+	rows, err := c.db.QueryContext(ctx, declaredBySuffixSQL(len(names)), args...)
+	if err != nil {
+		return nil, fmt.Errorf("DeclaredHashesForPath fallback: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var (
+		out  []DeclaredHash
+		best = -1
+	)
+	for rows.Next() {
+		var (
+			d    DeclaredHash
+			name string
+		)
+		if err := rows.Scan(&d.DeclaredSHA256, &d.SnapshotID, &d.PackageName, &d.SuitePath, &name); err != nil {
+			return nil, fmt.Errorf("DeclaredHashesForPath fallback scan: %w", err)
+		}
+		b, ok := baseOf[name]
+		if !ok || !strings.HasPrefix(aptpath.FlatBase(d.SuitePath)+"/", b+"/") {
+			continue
+		}
+		switch {
+		case len(b) > best:
+			best, out = len(b), []DeclaredHash{d}
+		case len(b) == best:
+			out = append(out, d)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("DeclaredHashesForPath fallback iter: %w", err)
+	}
+	return out, nil
 }
 
 // IntegrityCandidate is a single (blob_hash, declared_sha256, snapshot_id,

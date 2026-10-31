@@ -1,5 +1,7 @@
 package cache
 
+import "errors"
+
 // URLPath mirrors the url_path table (SPEC §4.3). Pointer fields hold
 // SQL NULLs; non-nullable columns are plain values.
 type URLPath struct {
@@ -14,6 +16,22 @@ type URLPath struct {
 	LastFetchedAt   *int64
 	UpstreamETag    *string // validator captured for resumable If-Range
 	UpstreamLastMod *string // validator fallback when ETag absent
+}
+
+// LastUse is the row's last use: the newer of its last_requested_at and
+// last_fetched_at (0 when neither is set) — the stamp a signed-seen marker
+// from the row carries (the handler's markers and backstop, the adopter's
+// re-mark; ListTrackedSuiteAnchors computes the same in SQL for the
+// startup marker pass). The orphan-marker sweep reads it back.
+func (u *URLPath) LastUse() int64 {
+	var seen int64
+	if u.LastRequestedAt != nil {
+		seen = *u.LastRequestedAt
+	}
+	if u.LastFetchedAt != nil && *u.LastFetchedAt > seen {
+		seen = *u.LastFetchedAt
+	}
+	return seen
 }
 
 // Blob mirrors the blob table.
@@ -39,7 +57,45 @@ type SuiteFreshness struct {
 	InReleaseLastMod      *string
 	InReleaseChangeSeenAt *int64 // diagnostic; non-nil = upstream is ahead
 	CurrentSnapshotID     *int64 // SPEC2 §4.3.1: NULL until first adoption
+
+	// v7 columns (spec §6). LastRequestedAt is the suite's client-interest
+	// stamp; only phase D's TouchSuite and the row-creating writers set it.
+	LastRequestedAt *int64
+	// CheckFailCount is the streak of consecutive freshness checks that
+	// ended unknown (spec C4). UpdateSuiteFreshness writes it; the scheduler
+	// reads it to order and back off suites.
+	CheckFailCount int64
+	// Adoption failure record (spec C7): the content key and reason of the
+	// latest failed or refused adoption, the streak since the last success,
+	// the next retry time, and the failing content's validators.
+	//
+	// AIDEV-NOTE: only RecordAdoptionFailure, ClearAdoptionFailure,
+	// SetAdoptionNextRetry, RescheduleFailingAdoptions and CommitAdoption's
+	// flip write these columns. UpdateSuiteFreshness never does.
+	AdoptionFailHash    *string
+	AdoptionFailReason  *string
+	AdoptionFailCount   int64
+	AdoptionFailFirstAt *int64
+	AdoptionFailLastAt  *int64
+	AdoptionNextRetryAt *int64
+	AdoptionFailETag    *string
+	AdoptionFailLastMod *string
 }
+
+// AnchorForm is how a snapshot's Release metadata was anchored (spec C5).
+// It is stored in suite_snapshot.anchor_form and never empty.
+type AnchorForm string
+
+const (
+	FormInline   AnchorForm = "inline"   // InRelease, verified clearsigned
+	FormDetached AnchorForm = "detached" // Release + Release.gpg, verified
+	FormUnsigned AnchorForm = "unsigned" // Release only, unverified (phase E)
+)
+
+// ErrInvalidAnchorForm is returned by InsertCandidateSnapshot when a
+// candidate's Form does not match its hash shape (or cannot be derived
+// from it). It is raised before any SQL runs.
+var ErrInvalidAnchorForm = errors.New("cache: invalid anchor form for snapshot candidate")
 
 // SnapshotCandidate is the input to InsertCandidateSnapshot — a fresh
 // suite_snapshot row with adopted_at = NULL. Exactly one of (InReleaseHash)
@@ -60,6 +116,14 @@ type SnapshotCandidate struct {
 	ReleaseHash             *string // sha256 hex of detached Release bytes
 	ReleaseGPGHash          *string // sha256 hex of Release.gpg
 	PackageCoverageComplete bool
+	// Form of the candidate. Empty is accepted only for the unambiguous
+	// inline and detached hash shapes and is derived from them;
+	// FormUnsigned is never derived and must be set explicitly.
+	Form AnchorForm
+	// ReleaseDate is the verified Release Date in Unix seconds (spec C5;
+	// 0 = missing or unparseable). nil leaves release_date NULL, which the
+	// Date rules treat as "no rule" (snapshots adopted before v7).
+	ReleaseDate *int64
 }
 
 // SnapshotMember mirrors the snapshot_member table — one (snapshot_id, path)
@@ -115,29 +179,76 @@ type PackageHash struct {
 	// (PackageName, Architecture). Empty for source/pdiff/Contents rows and
 	// for pre-v6 rows; the mirror rule only applies to non-empty versions.
 	Version string
+	// FlatFilename is package_hash.flat_filename (spec C6): for a flat
+	// suite's row, its stanza's Filename with every "." segment removed
+	// (aptpath.DotClean), the key DeclaredHashesForPath's suffix fallback
+	// looks a request up by; "" for a dists row, which the fallback never
+	// reads (the partial index idx_package_hash_flat_filename leaves it
+	// out).
+	FlatFilename string
 }
 
 // SuiteSnapshot mirrors the suite_snapshot table. Read-only model used
 // by request-path lookups and adoption diagnostics. SPEC2 §4.3.1,
 // SPEC3 §4.3.1 (PackageCoverageComplete).
 type SuiteSnapshot struct {
-	SnapshotID       int64
-	CanonicalScheme  string
-	CanonicalHost    string
-	SuitePath        string
-	InReleaseHash    *string
+	SnapshotID      int64
+	CanonicalScheme string
+	CanonicalHost   string
+	SuitePath       string
+	// SingleAnchorHash is the suite_snapshot.inrelease_hash column: the
+	// single anchor blob for the inline form (InRelease) AND the unsigned
+	// form (Release). Read Form to know which file it is.
+	//
+	// AIDEV-NOTE: renamed from InReleaseHash so the compiler lists every
+	// reader when forms change (spec C5). Never assume "set ⇒ inline".
+	SingleAnchorHash *string
 	InReleaseETag    *string
 	InReleaseLastMod *string
 	ReleaseHash      *string
 	ReleaseGPGHash   *string
 	CreatedAt        int64
 	AdoptedAt        *int64 // NULL while candidate; set on flip
+	Form             AnchorForm
+	ReleaseDate      *int64 // parsed Release Date (phase B); NULL until then
+	// RetiredAt is set when the snapshot is retired (phase F): with every
+	// snapshot of its suite not yet retired when the suite's row is deleted
+	// — reaped, evicted at the cap, or forgotten (deleteSuiteTx,
+	// retireSuiteSnapshotsTx) — or alone when the legacy trust audit
+	// quarantines it (quarantineSnapshotTx). Sub-job C deletes it.
+	RetiredAt *int64
 
 	// PackageCoverageComplete is the SPEC3 §7.5.4 per-snapshot proof
 	// that strict mode (§6.1) keys on. True iff every Release-listed
 	// directory containing a Packages* member contributed at least one
 	// parseable variant to package_hash. Pre-v3 rows default to false.
 	PackageCoverageComplete bool
+}
+
+// AnchorHash returns the hash of the snapshot's anchor file name
+// ("InRelease", "Release" or "Release.gpg"), or nil when the snapshot's
+// form has no such anchor (aptpath.AnchorPaths).
+func (s *SuiteSnapshot) AnchorHash(name string) *string {
+	return anchorHash(s.Form, name, s.SingleAnchorHash, s.ReleaseHash, s.ReleaseGPGHash)
+}
+
+// anchorHash maps an anchor file of a snapshot of form to the hash column
+// that holds it (spec C5): the single-anchor slot holds InRelease for the
+// inline form and Release for the unsigned one.
+//
+// AIDEV-NOTE: the one place the column-to-file mapping lives; never read
+// inrelease_hash as "the InRelease" (an unsigned snapshot keeps its
+// Release there).
+func anchorHash(form AnchorForm, name string, single, release, releaseGPG *string) *string {
+	switch {
+	case name == "InRelease" && form == FormInline, name == "Release" && form == FormUnsigned:
+		return single
+	case name == "Release" && form == FormDetached:
+		return release
+	case name == "Release.gpg" && form == FormDetached:
+		return releaseGPG
+	}
+	return nil
 }
 
 // SnapshotCoverage is a compact lookup result for the SPEC3 §6.1
@@ -266,10 +377,14 @@ type HotURLPath struct {
 // CurrentAdoptedAt is non-nil exactly when the LEFT JOIN found a
 // matching suite_snapshot row whose adopted_at is non-NULL — i.e.
 // the suite has a live current adoption. Returned by
-// ListSuitesWithAdoption (SPEC5 §9.7.8) for the status-page render.
+// ListSuitesWithAdoption (SPEC5 §9.7.8) for the status-page render, the
+// scheduler's tick and the suite reaper (deferred minor E-40).
 type SuiteWithAdoption struct {
 	SuiteFreshness
 	CurrentAdoptedAt *int64 // unix seconds; nil when current_snapshot_id is NULL or no matching suite_snapshot row exists
+	// CurrentAnchorForm is the current snapshot's anchor_form ("" when the
+	// suite has no current snapshot).
+	CurrentAnchorForm string
 }
 
 // HotSetEntry is one (.deb path, declared sha256) tuple that the SPEC3

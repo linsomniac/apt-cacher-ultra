@@ -48,6 +48,13 @@ const MaxSourceStanzas = 1_000_000
 // the input alongside the per-Sources-file row count.
 type SourcesParseStats struct {
 	StanzaCount int
+	// PathsSkipped counts the file paths (<Directory>/<filename>) left
+	// out because the Directory or the path failed validateMemberPath
+	// (deferred minor GD-2: kept narrower than validateFilename, ruling
+	// PG-21), and FirstSkipped is the first of them, so the caller can
+	// say so (source_paths_skipped) instead of dropping them silently.
+	PathsSkipped int
+	FirstSkipped string
 }
 
 // ParseSources parses an apt Sources file (uncompressed) and returns
@@ -57,7 +64,7 @@ type SourcesParseStats struct {
 // Phase 2's trust-SHA256-only posture refuses MD5/SHA1 fallback even
 // for source artifacts.
 //
-// A stanza is silently skipped when:
+// A stanza, or one of its files, is skipped when:
 //
 //   - it lacks `Package:` or `Directory:`,
 //   - it has no `Checksums-Sha256:` block (per SPEC6_5 §11 H4: source
@@ -66,17 +73,29 @@ type SourcesParseStats struct {
 //     against `..` segments per SPEC6_5 §11 H11 — even though signed
 //     input means the upstream has already vouched for the bytes,
 //     we refuse to materialize a `package_hash` row for an unsafe
-//     suite-relative path).
+//     suite-relative path). Such paths — every file of a stanza whose
+//     Directory fails, and each file whose own path fails — are
+//     counted in SourcesParseStats.PathsSkipped (deferred minor GD-2).
 //
 // Per-entry filename validation also rejects `/`, backslash, and NUL
 // — a Sources `Checksums-Sha256` filename is a basename within the
 // stanza's `Directory:`, so any path-separator-bearing filename is
 // either malformed input or an attempt to escape the directory.
 //
+// Only the validateMemberPath case is counted (SourcesParseStats.
+// PathsSkipped); the other skips above, and a malformed entry, are
+// dropped uncounted.
+//
 // Whole-file fatal errors (malformed header line, scanner buffer
-// exhausted, or stanza-cap exceeded) return non-nil err. The caller
-// emits SPEC6_5 §10.2 `source_parse_failed` Warn at the Sources-file
-// granularity.
+// exhausted, or stanza-cap exceeded) return non-nil err, and so does a
+// non-empty file that yields no row: "every path refused by
+// validateMemberPath" when paths reached that check and all failed it
+// (a dpkg-scansources ./pool repository, whose Directory fields start
+// "./"), otherwise "no stanza with Package, Directory and a well-formed
+// Checksums-Sha256 entry" (missing fields, or every entry malformed:
+// parked item 15 of the H1 final review). Every error return carries the
+// stats counted so far. The caller emits SPEC6_5 §10.2
+// `source_parse_failed` Warn at the Sources-file granularity.
 //
 // AIDEV-NOTE: callers pass already-decompressed bytes — decompression
 // of Sources.gz / Sources.xz is the fetch layer's job, not parsing.
@@ -113,9 +132,7 @@ func ParseSources(text []byte) ([]SourceRef, SourcesParseStats, error) {
 		if packageName == "" || directory == "" || len(sha256Entries) == 0 {
 			return nil
 		}
-		if err := validateMemberPath(directory); err != nil {
-			return nil
-		}
+		dirOK := validateMemberPath(directory) == nil
 		for _, e := range sha256Entries {
 			if !validHexSHA256(e.sha256) {
 				continue
@@ -128,7 +145,11 @@ func ParseSources(text []byte) ([]SourceRef, SourcesParseStats, error) {
 				continue
 			}
 			full := directory + "/" + e.filename
-			if err := validateMemberPath(full); err != nil {
+			if !dirOK || validateMemberPath(full) != nil {
+				stats.PathsSkipped++
+				if stats.FirstSkipped == "" {
+					stats.FirstSkipped = full
+				}
 				continue
 			}
 			if len(out) >= MaxSourceStanzas {
@@ -187,8 +208,12 @@ func ParseSources(text []byte) ([]SourceRef, SourcesParseStats, error) {
 	if err := flush(); err != nil {
 		return nil, stats, fmt.Errorf("sources: tail: %w", err)
 	}
+	if len(out) == 0 && stats.PathsSkipped > 0 {
+		// Task 10 review I-1: name the cause, not missing fields.
+		return nil, stats, fmt.Errorf("sources: every path refused by validateMemberPath (%d skipped)", stats.PathsSkipped)
+	}
 	if len(out) == 0 && len(bytes.TrimSpace(text)) > 0 {
-		return nil, stats, errors.New("sources: no stanzas with Package + Directory + Checksums-Sha256")
+		return nil, stats, errors.New("sources: no stanza with Package, Directory and a well-formed Checksums-Sha256 entry")
 	}
 	return out, stats, nil
 }

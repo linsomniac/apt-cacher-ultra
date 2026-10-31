@@ -21,6 +21,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
 )
 
 // chaos3DebSpec describes one .deb in a Phase 3 chaos fixture: archive-
@@ -85,7 +86,7 @@ func makeChaos3Snapshot(label string, specs []chaos3DebSpec) chaos3Snapshot {
 	})
 	return chaos3Snapshot{
 		label:      label,
-		inRelease:  rel,
+		inRelease:  simtest.ClearsignedFixture(string(rel)), // passes the spec C3 sniff
 		packagesGz: pkgsGz,
 		debBodies:  bodies,
 		debSpecs:   sorted,

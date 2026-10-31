@@ -2,6 +2,7 @@ package freshness
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -275,10 +276,12 @@ func TestParseRelease_LargeRealistic(t *testing.T) {
 	b.WriteString("Origin: Ubuntu\nSuite: noble\nSHA256:\n")
 	h := sha(7)
 	for i := 0; i < n; i++ {
+		// Distinct paths: since phase E an identical entry repeated in one
+		// block is one member (ParseRelease merges per path).
 		b.WriteString(" ")
 		b.WriteString(h)
 		b.WriteString(" 4533 main/binary-amd64/by-hash/SHA256/")
-		b.WriteString(h)
+		b.WriteString(strconv.Itoa(i))
 		b.WriteString("\n")
 	}
 	got, err := ParseRelease([]byte(b.String()))
