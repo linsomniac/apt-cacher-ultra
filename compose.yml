@@ -8,7 +8,6 @@ services:
     restart: unless-stopped
     ports:
       - "${APT_CACHER_ULTRA_BIND:-127.0.0.1}:3142:3142"
-      - "127.0.0.1:6789:6789"
     volumes:
       - apt-cache:/var/cache/apt-cacher-ultra
       - ./docker/config.toml:/etc/apt-cacher-ultra/config.toml:ro

@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
+ENV GOTOOLCHAIN=local
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -20,7 +21,7 @@ RUN apk add --no-cache ca-certificates \
 COPY --from=build /out/apt-cacher-ultra /usr/local/bin/apt-cacher-ultra
 COPY docker/config.toml /etc/apt-cacher-ultra/config.toml
 USER 10001:10001
-EXPOSE 3142 6789
+EXPOSE 3142
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD wget -q -O /dev/null http://127.0.0.1:6789/healthz || exit 1
 ENTRYPOINT ["/usr/local/bin/apt-cacher-ultra"]

@@ -5,16 +5,38 @@ Build and start HTTP caching from the repository root:
 ```sh
 docker compose up -d --build
 docker compose logs -f
-curl -fsS http://127.0.0.1:6789/healthz
+docker compose exec -T apt-cacher-ultra wget -qO- http://127.0.0.1:6789/healthz
 ```
 
 The image runs as UID/GID 10001, includes upstream TLS roots, and persists cache
 and generated MITM CA in the `apt-cache` named volume. Bind mounts used instead
-of that volume must be writable by UID 10001. The admin port binds to host
-loopback; the proxy also defaults to loopback. For LAN clients, set
+of that volume must be writable by UID 10001. Admin binds to loopback **inside
+the container** and is not published. The proxy defaults to host loopback. For LAN clients, set
 `APT_CACHER_ULTRA_BIND` to the server's LAN IP in `.env` before starting.
 Edit `cache.advertise_host` to its client-facing hostname and port.
 Only expose the proxy to your trusted LAN. The admin API has mutating endpoints.
+
+The Docker config blocks loopback, private, link-local and shared address ranges
+as upstream destinations, including names that resolve to those ranges. This
+also prevents proxy clients from reading the internal admin API. HTTPS upstream
+redirects to HTTP are refused. Public repositories are allowed; narrow
+`upstream.allowed_host_regex` to your repository hosts where practical.
+For a private mirror, narrow that hostname list and remove only the mirror's
+range from `deny_target_ranges`; retain loopback and link-local protection.
+An explicit upstream proxy must enforce destination restrictions itself (the
+daemon requires an empty deny list when `upstream.proxy` is configured).
+
+Use `docker compose exec` for maintenance and metrics, for example:
+
+```sh
+docker compose exec -T apt-cacher-ultra wget -qO- http://127.0.0.1:6789/metrics
+```
+
+To expose admin outside the container, configure `admin.htpasswd_file`, mount
+the password file read-only, and use an authenticated health check before
+changing its listen address and adding a host port. Publishing a port on host
+loopback does not restrict neighboring containers' direct access. See
+[admin authentication](../docs/configuration.md#admin-status-metrics-and-maintenance).
 
 HTTP-only clients use:
 
@@ -32,8 +54,8 @@ need their signing keys mounted under `/etc/apt/keyrings` or a configured
 ## HTTPS MITM
 
 Use the same `compose.yml` and `docker/config.toml`. In `[tls_mitm]`, change
-`enabled` to `true` and uncomment `allowed_host_regex` and
-`allow_unconstrained_ca`. Adapt the literal host allowlist to your repositories
+`enabled` to `true`. A constrained CA policy is already configured, including
+`allow_unconstrained_ca = false`. Adapt the literal host allowlist to your repositories
 (include regional Ubuntu mirror names if used), and set `cache.advertise_host`.
 Start the service, or restart it if it is already running:
 
@@ -84,13 +106,16 @@ Restart the service after editing TOML configuration.
 ## GHCR images
 
 The [CI workflow](../.github/workflows/ci.yaml) runs tests and checks once, then
-builds Linux amd64/arm64 images after the test, lint, end-to-end, Debian package,
-and apt-repository jobs pass. The Docker job also validates Compose and smoke
-tests the production image before publishing. Pull requests build without publishing.
+builds and smoke tests Linux amd64/arm64 images on native runners after the test,
+lint, end-to-end (including flat repositories), Debian package, and apt-repository
+jobs pass. Smoke tests check network isolation, proxy destination restrictions,
+HTTP caching, and MITM CA persistence across container replacement. Pull requests
+build without publishing. Only the separate publishing job has registry write access.
 Pushes to the default branch publish `edge`, a branch tag and `sha-...`;
 version tags publish the full version and major.minor. Stable version tags also
 publish `latest`; prereleases do not overwrite `latest` or stable major.minor.
-The registry name follows the fork automatically (lowercase `github.repository`).
+Manual runs publish only from the default branch. The registry name follows the
+fork automatically (lowercase `github.repository`).
 
 Enable Actions in the fork. The workflow uses `GITHUB_TOKEN` with
 `packages: write`; no separate registry password is needed. After the first

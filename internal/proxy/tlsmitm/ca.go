@@ -266,7 +266,7 @@ func keysMatch(certPub crypto.PublicKey, key crypto.PrivateKey) error {
 		if !ok {
 			return fmt.Errorf("cert public key is ECDSA, private key is %T", keyPub)
 		}
-		if ck.Curve != kk.Curve || ck.X.Cmp(kk.X) != 0 || ck.Y.Cmp(kk.Y) != 0 {
+		if !ck.Equal(kk) {
 			return errors.New("ECDSA public key parameters disagree")
 		}
 		return nil
