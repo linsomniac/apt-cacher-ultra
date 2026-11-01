@@ -455,7 +455,7 @@ func (s *subpacketCounts) walk(area []byte, hashed bool, n int) error {
 		case critical && !sigCriticalOK(typ, data):
 			return refuse("P4", "packet %d: a critical subpacket %d in its %s area, which gpgv 2.2 does not handle", n, typ, where)
 		case typ == 4 && hashed && len(data) == 0:
-			return refuse("P4", "packet %d: an exportable certification (subpacket 4) without its value octet in its hashed area, which go-crypto v1.4.1 reads past", n)
+			return refuse("P4", "packet %d: an exportable certification (subpacket 4) without its value octet in its hashed area, which go-crypto before v1.5.0 reads past", n)
 		}
 		if s.sqvFault == "" {
 			if why := sqvSubpacketFault(typ, data, s.hashAlgo); why != "" {
@@ -517,7 +517,7 @@ func (s *subpacketCounts) finish(p *sigPacket) error {
 // readBack is P5: go-crypto's own parse of p's bytes, as framed, is a
 // version 4 *packet.Signature naming p's issuer; any disagreement refuses.
 //
-// AIDEV-NOTE: go-crypto (v1.4.1, packet/signature.go) refuses a critical
+// AIDEV-NOTE: go-crypto (v1.4.1 to v1.5.2, packet/signature.go) refuses a critical
 // hashed subpacket of a type it does not parse — any but 2 to 6, 9, 11, 16,
 // 20 to 30, 32, 33, 35 and 39. Where gpgv 2.2's can_handle_critical refuses
 // the type too, P4 has refused it first, and the two agree (gpgv's BADSIG).
@@ -534,7 +534,8 @@ func (s *subpacketCounts) finish(p *sigPacket) error {
 // AIDEV-NOTE: the re-review's A-RC3. go-crypto v1.4.1's
 // parseSignatureSubpacket read a hashed exportable certification (4) as
 // subpacket[0] after a guard that counted the type octet, so one without
-// its value octet made packet.Read panic (fixed in v1.5.0) — key-free: a
+// its value octet made packet.Read panic (fixed in v1.5.0; go.mod pins
+// v1.5.2 since Task 9b's fix round 2) — key-free: a
 // packet beside the good one carried it — and the adoption goroutine's
 // recover then failed every attempt on the suite alike. Audited type by
 // type (v1.4.1 and v1.5.2), every other subpacket go-crypto reads checks

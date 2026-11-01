@@ -490,6 +490,16 @@ func inReleasePlaintext(blob []byte) (text []byte, err error) {
 	if block == nil {
 		return nil, errors.New("legacy audit: stored InRelease is not a valid clearsigned message")
 	}
+	// AIDEV-NOTE: go-crypto v1.4.1's Decode panicked on a message without
+	// signed text (I-1), which the recover above made this error; v1.5.0
+	// returns an empty plaintext instead. The audit keeps its verdict
+	// (malformed_envelope) whatever the version. (A signed text of one
+	// empty line, which v1.4.1 decoded to "" and the audit called
+	// unparseable, is malformed_envelope now too: both quarantine, and no
+	// verifier ever adopted either.)
+	if len(block.Plaintext) == 0 {
+		return nil, errors.New("legacy audit: stored InRelease has no signed text")
+	}
 	return block.Plaintext, nil
 }
 

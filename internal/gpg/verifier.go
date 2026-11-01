@@ -278,7 +278,7 @@ var (
 //
 // AIDEV-NOTE: I-1 (the 2026-09 security review): go-crypto v1.4.1's
 // clearsign.Decode panics (slice bounds [:-1]) on a signed text with no
-// lines. The verifier no longer calls it (nor armor.Decode, nor
+// lines (fixed in v1.5.0). The verifier no longer calls it (nor armor.Decode, nor
 // packet.Reader): go-crypto reads one packet at a time, only after layer P
 // has validated its bytes. The freshness goroutines still recover, as
 // defence in depth (TestVerifyInline_ZeroPlaintextIsAnErrorNotAPanic pins
@@ -570,8 +570,8 @@ func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (suiteTrust, error)
 // history. openpgp.VerifyDetachedSignature returns a non-nil signature
 // exactly when the cryptographic check passed, then reports expiry,
 // revocation or an unknown critical notation as its error (go-crypto
-// v1.4.1 openpgp/read.go, verifyDetachedSignature and
-// checkMessageSignatureDetails). It reads the packet's bytes as layer P
+// v1.5.2 openpgp/read.go, verifyDetachedSignature and
+// checkMessageSignatureDetails, unchanged since v1.4.1). It reads the packet's bytes as layer P
 // framed them, never a re-serialization (go-crypto's Serialize re-framed
 // lengths in the shortest form, which failed a packet gpgv verifies:
 // strict, gone with it). Each candidate entity is tried alone: the
