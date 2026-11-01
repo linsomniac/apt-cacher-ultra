@@ -28,7 +28,7 @@ func TestFetch_NoContentIsEmptySuccess(t *testing.T) {
 			_, _ = dst.Write([]byte(initial))
 			client := newTestClient(t, []string{`^127\.0\.0\.1$`})
 			res, err := client.Fetch(context.Background(), &Target{
-				CanonicalHost: "127.0.0.1", URL: srv.URL, MaxBytes: 1,
+				CanonicalHost: "127.0.0.1", URL: srv.URL,
 			}, dst)
 			if err != nil {
 				t.Fatal(err)

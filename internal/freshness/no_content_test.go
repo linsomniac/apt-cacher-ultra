@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 )
 
 // Exercise actual HTTP 204 handling through adoption, including the required
@@ -55,7 +57,13 @@ func TestAdopter_NoContentHTTP(t *testing.T) {
 						w.WriteHeader(http.StatusNoContent)
 					}))
 					defer srv.Close()
-					ad, c := newRealClientAdopter(t, srv)
+					env := newAdoptionTestEnv(t)
+					ad, c := env.adopter, env.cache
+					client, err := fetch.New(fetch.Options{Proxy: srv.URL, AllowedHostRegex: []string{`^archive\.example\.com$`}})
+					if err != nil {
+						t.Fatal(err)
+					}
+					ad.fetcher = client
 					suite := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.example.com", SuitePath: layout.suite}
 					trackSuite(t, c, suite)
 					release := "Origin: test\n"
@@ -70,7 +78,7 @@ func TestAdopter_NoContentHTTP(t *testing.T) {
 					}
 					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 					defer cancel()
-					err := ad.Run(ctx, suite, []byte(release), "etag", "")
+					err = ad.Run(ctx, suite, []byte(release), "etag", "")
 					if !errors.Is(err, tc.wantErr) {
 						t.Fatalf("Run: %v, want %v", err, tc.wantErr)
 					}
