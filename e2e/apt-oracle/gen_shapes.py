@@ -47,8 +47,13 @@ and ``keys.gpg`` is checked to hold public packets only.
   ``n_i_sha3_256``, ``n_i_nginx_crlf``). A key of its own, so that the
   batch can be made again alone (``--own-key``) once the other keys'
   secrets are gone, as they are after every run.
+- K, RSA-3072, signs, with two RSA-3072 signing subkeys: the key of batch
+  fx19 (``e7_*``), signatures by its primary and by each subkey. No
+  client's keys.gpg holds it: each fx19 shape has K's public key as its
+  own signed-by (``<name>.keys.asc``), as the second re-review measured
+  them, and ``--subkeys-key`` makes the batch again alone.
 
-730 shapes, in 17 batches. The first 135 are the planning measurement's
+823 shapes, in 19 batches. The first 135 are the planning measurement's
 (2026-10-28; DN-2 and Appendix A of
 docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md), by the
 same names and built as its throwaway generators built them (the plan's
@@ -106,6 +111,13 @@ two-block keys.asc of their own); fx17, 12 (sq_), Sequoia's subpacket
 rules the re-review did not measure, appended to A's good packet's
 unhashed area.
 
+Batches fx18 and fx19 are Task 9b's second fix round's, the second
+re-review's adversarial lens's shapes, by its names: fx18, 76, its key-free
+batches rr6, rr8, rr9 and rr10 (``q6_``, ``e8_``, ``q9_``, ``q10_``), cut
+without a key from committed fixtures as its tools/gen_a.py cut them (the
+``e8_`` shapes from fx13's ``n_i_sha224`` and ``n_i_sha3_256`` too); fx19,
+17 (``e7_``), its own-key batch rr7, made with key K.
+
 AIDEV-NOTE: the fixtures, verdicts.txt and classes.txt are one
 measurement. Each run makes new keys, new signatures and new random bytes
 (the v3 garbage packets), so a regenerated corpus must be re-measured
@@ -116,14 +128,18 @@ files together. Never edit a fixture by hand. Two modes write some of the
 corpus and leave every other file's bytes as they are, so that --record
 must leave every other row as it was: ``--from-controls`` makes no key and
 writes only the batches cut from OUT's committed fixtures (FROM_CONTROLS:
-fx8 to fx12 and fx14 to fx17, from CONTROL_FILES, with the key files of
-KEYRINGS_FROM_CONTROLS); ``--own-key`` makes key O alone
-and writes only batch fx13 and O's public key in keys.gpg (the other keys'
-packets keep their bytes).
+fx8 to fx12 and fx14 to fx18, from CONTROL_FILES, with the key files of
+KEYRINGS_FROM_CONTROLS); ``--own-key`` makes key O alone and writes batch
+fx13 and O's public key in keys.gpg (the other keys' packets keep their
+bytes), then cuts the FROM_CONTROLS batches again (fx18's ``e8_`` shapes
+are cut from fx13's SHA-224 and SHA3-256 anchors; every other one comes
+out byte for byte as it was); ``--subkeys-key`` makes key K alone and
+writes only batch fx19 and its key files.
 
 Usage: python3 -I e2e/apt-oracle/gen_shapes.py OUT
        python3 -I e2e/apt-oracle/gen_shapes.py --from-controls OUT
        python3 -I e2e/apt-oracle/gen_shapes.py --own-key OUT
+       python3 -I e2e/apt-oracle/gen_shapes.py --subkeys-key OUT
 """
 
 from __future__ import annotations
@@ -178,6 +194,8 @@ E_MADE = "20200101T000000!"
 E_SIGNS = "20200601T000000!"
 # Key O's user ID: --own-key finds O's packets in keys.gpg by it.
 OWN_KEY_UID = "Apt-shape O <o@example.invalid>"
+# Key K's user ID (batch fx19's key, in no client's keys.gpg).
+SUBKEYS_KEY_UID = "Apt-shape K <k@example.invalid>"
 
 BEGIN = b"-----BEGIN PGP SIGNATURE-----"
 END = b"-----END PGP SIGNATURE-----"
@@ -822,7 +840,9 @@ class GnuPG:
             inp=text,
         )
 
-    def detach_sign(self, key: str, text: bytes, textmode: bool = False) -> bytes:
+    def detach_sign(
+        self, key: str, text: bytes, textmode: bool = False, digest: str = "SHA256"
+    ) -> bytes:
         """key's binary detached signature of text: type 0x00, or with
         textmode 0x01 (a text signature, over text's canonical form)."""
         mode = ["--textmode"] if textmode else []
@@ -830,7 +850,7 @@ class GnuPG:
             "--local-user",
             key,
             "--digest-algo",
-            "SHA256",
+            digest,
             *mode,
             "--detach-sign",
             inp=text,
@@ -1406,7 +1426,16 @@ CONTROL_FILES = (
     "xi_good_plus_unknownhash_A.InRelease",  # A's good packet, then an unknown hash's
     "x3i_sha1_plus_good.InRelease",  # A's SHA-1 packet, then A's good one
     "i_expired_bad_plus_good.InRelease",  # E's bad packet, then A's good one
+    "n_i_sha224.InRelease",  # O's SHA-224 packet (fx13's; fx18's e8_* cut it)
+    "n_i_sha3_256.InRelease",  # O's SHA3-256 packet (likewise)
 )
+# The controls batch fx13 makes, with the hash their header names in place
+# of the other inline controls' "Hash: SHA256" (controls_from); --own-key
+# writes them.
+FX13_CONTROLS = {
+    "n_i_sha224.InRelease": b"SHA224",
+    "n_i_sha3_256.InRelease": b"SHA3-256",
+}
 
 
 @dataclass(frozen=True)
@@ -1483,7 +1512,8 @@ def subkeyed_primary(keyring: bytes) -> bytes:
 
 def controls_from(files: dict[str, bytes]) -> Controls:
     """The Controls in files (every name of CONTROL_FILES), checked: every
-    inline control carries the signed text of x7i_control_good."""
+    inline control carries the signed text of x7i_control_good (fx13's under
+    a header naming their hash: FX13_CONTROLS)."""
     missing = [f for f in CONTROL_FILES if f not in files]
     if missing:
         raise SystemExit(
@@ -1493,7 +1523,15 @@ def controls_from(files: dict[str, bytes]) -> Controls:
     for name in CONTROL_FILES:
         if name.endswith(".InRelease"):
             text = c.read(name)
-            if text[: text.index(BEGIN)] != c.head:
+            want = c.head
+            if name in FX13_CONTROLS:
+                want = replace(
+                    c.head,
+                    b"Hash: SHA256\n",
+                    b"Hash: " + FX13_CONTROLS[name] + b"\n",
+                    1,
+                )
+            if text[: text.index(BEGIN)] != want:
                 raise ValueError(f"{name}: its signed text is not the controls'")
     if c.read("Release") != RELEASE:
         raise ValueError("Release: not the generator's RELEASE")
@@ -3018,6 +3056,186 @@ def batch_fx17_from(c: Controls) -> Batch:
     return inline, {}, {}
 
 
+def fx18_rr6(c: Controls) -> Batch:
+    """The second re-review's round 6 (its batch rr6): the boundaries of
+    sqvSubpacketFault (Sequoia 2.0.0's Subpacket::parse), each type on both
+    sides, in A's good packet's unhashed area; critical-bit variants; two
+    faults; a fault in an unknown key's packet's hashed area beside the
+    good one."""
+    k = fx15_packets(c)
+    head, p, pd, qb = k.head, k.p, k.pd, k.qb
+
+    def note(flags: bytes, name: bytes, value: bytes) -> bytes:
+        return flags + struct.pack(">HH", len(name), len(value)) + name + value
+
+    fpr20 = bytes(range(1, 21))
+    cases = {
+        "t2_len4": subpacket(2, b"\x6a\x00\x00\x01"),
+        "t2_len0": subpacket(2, b""),
+        "t3_len4": subpacket(3, b"\x00\x00\x00\x10"),
+        "t9_len4": subpacket(9, b"\x00\x00\x00\x10"),
+        "t9_len3": subpacket(9, b"\x00\x00\x10"),
+        "t4_v0": subpacket(4, b"\x00"),
+        "t4_v1": subpacket(4, b"\x01"),
+        "t4_v2": subpacket(4, b"\x02"),
+        "t4_len0": subpacket(4, b""),
+        "t7_v2": subpacket(7, b"\x02"),
+        "t7_v0": subpacket(7, b"\x00"),
+        "t25_v2": subpacket(25, b"\x02"),
+        "t25_v1": subpacket(25, b"\x01"),
+        "t5_len2": subpacket(5, b"\x01\x3c"),
+        "t5_len3": subpacket(5, b"\x01\x3c\x00"),
+        "t6_nul_only": subpacket(6, b"\x00"),
+        "t6_empty": subpacket(6, b""),
+        "t6_mid_nul": subpacket(6, b"a\x00b\x00"),
+        "t12_22_c80": subpacket(12, b"\x80\x01" + fpr20),
+        "t12_22_c00": subpacket(12, b"\x00\x01" + fpr20),
+        "t12_21_c80": subpacket(12, b"\x80\x01" + fpr20[:19]),
+        "t12_23_c80": subpacket(12, b"\x80\x01" + fpr20 + b"\x01"),
+        "t12_34_c80": subpacket(12, b"\x80\x01" + bytes(32)),
+        "t12_22_cff": subpacket(12, b"\xff\x01" + fpr20),
+        "t20_ok": subpacket(20, note(b"\x80\x00\x00\x00", b"a@b", b"v")),
+        "t20_name_badutf8": subpacket(20, note(b"\x80\x00\x00\x00", b"a\xff@b", b"v")),
+        "t20_value_badutf8_hr": subpacket(
+            20, note(b"\x80\x00\x00\x00", b"a@b", b"\xff\xfe")
+        ),
+        "t20_name_empty": subpacket(20, note(b"\x00\x00\x00\x00", b"", b"v")),
+        "t20_len7": subpacket(20, b"\x00\x00\x00\x00\x00\x00\x00"),
+        "t29_len1": subpacket(29, b"\x00"),
+        "t31_len2": subpacket(31, b"\x01\x08"),
+        "t31_len7": subpacket(31, b"\x01\x08abcde"),
+        "t35_v4_21": subpacket(35, b"\x04" + fpr20),
+        "t35_v6_33": subpacket(35, b"\x06" + bytes(32)),
+        "t35_v6_21": subpacket(35, b"\x06" + fpr20),
+        "t35_v4_33": subpacket(35, b"\x04" + bytes(32)),
+        "t35_v5_5": subpacket(35, b"\x05\x01\x02\x03\x04"),
+        "t35_len1": subpacket(35, b"\x05"),
+        "t35_len0": subpacket(35, b""),
+        "t37_len0": subpacket(37, b""),
+        "t37_len32": subpacket(37, bytes(32)),
+        "t37_len64": subpacket(37, bytes(64)),
+        "t37_len20": subpacket(37, bytes(20)),
+        "t39_len0": subpacket(39, b""),
+        "t39_len2": subpacket(39, b"\x09\x02"),
+        "t39_len3": subpacket(39, b"\x09\x02\x01"),
+        "crit_t2_len3": subpacket(2, b"\x01\x02\x03", critical=True),
+        "crit_t2_len4": subpacket(2, b"\x6a\x00\x00\x01", critical=True),
+        "crit_t4_v2": subpacket(4, b"\x02", critical=True),
+        "two_faults": subpacket(2, b"\x01\x02\x03") + subpacket(5, b"\x01"),
+    }
+    inl: Shapes = {}
+    det: Shapes = {}
+    for tag, sp in cases.items():
+        inl[f"q6_unh_{tag}"] = head + armor_parts(with_unhashed(p, sp))
+    for tag in (
+        "t4_v2",
+        "t12_22_c00",
+        "t20_name_badutf8",
+        "t35_v6_21",
+        "t37_len20",
+        "t6_empty",
+    ):
+        det[f"q6_d_unh_{tag}"] = armor_parts(with_unhashed(pd, cases[tag]))
+    # A fault in an unknown key's packet's hashed area (types go-crypto does
+    # not parse there), beside the good one.
+    _, bh, _, _ = v4_parts(one_signature(qb))
+    for tag, sp in {
+        "t37_len3": subpacket(37, b"\x01\x02\x03"),
+        "t12_22_c00": subpacket(12, b"\x00\x01" + fpr20),
+    }.items():
+        inl[f"q6_good_plus_unknownB_hashed_{tag}"] = head + armor_parts(
+            p + with_hashed(qb, bh + sp)
+        )
+        inl[f"q6_unknownB_hashed_{tag}_plus_good"] = head + armor_parts(
+            with_hashed(qb, bh + sp) + p
+        )
+    # A fault in the good packet beside another good packet sqv reads.
+    inl["q6_faulty_good_plus_good"] = head + armor_parts(
+        with_unhashed(p, cases["t4_v2"]) + p
+    )
+    return inl, det, {}
+
+
+def fx18_rr8(c: Controls) -> Batch:
+    """The second re-review's round 8 (rr8): the erasure with digest ids
+    layer P does not read (SHA-224 and SHA3-256: key O's packets of batch
+    fx13's n_i_sha224 and n_i_sha3_256, signing the controls' Release, which
+    the re-review calls A's) beside A's good packet, either order, and with
+    an erasing packet that is bad (A's, its hash octet SHA3-256 or SHA-224)
+    or an unknown key's (B's, its hash octet SHA-1)."""
+    k = fx15_packets(c)
+    head, p, qb, bad = k.head, k.p, k.qb, k.bad
+    sha224_o = sig_packets(c.read("n_i_sha224.InRelease"))
+    sha3_o = sig_packets(c.read("n_i_sha3_256.InRelease"))
+    inl = {
+        "e8_good_then_sha224A": head + armor_parts(p + sha224_o),
+        "e8_sha224A_then_good": head + armor_parts(sha224_o + p),
+        "e8_good_then_sha3A": head + armor_parts(p + sha3_o),
+        "e8_sha3A_then_good": head + armor_parts(sha3_o + p),
+        "e8_good_plus_badA_sha3": head + armor_parts(p + body_edit(bad, 3, 12)),
+        "e8_good_plus_badA_sha224": head + armor_parts(p + body_edit(bad, 3, 11)),
+        "e8_good_then_unknownB_sha1": head + armor_parts(p + body_edit(qb, 3, 2)),
+    }
+    return inl, {}, {}
+
+
+def fx18_rr9(c: Controls) -> Batch:
+    """The second re-review's round 9 (rr9): an issuer fingerprint (33) of
+    v6 form added to A's good packet's unhashed area (beside its hashed v4
+    one), of the right length and the wrong one, and of v5 form."""
+    head, p = c.head, c.sig_a
+    inl = {
+        "q9_unh_33_v6form_33": head
+        + armor_parts(with_unhashed(p, subpacket(33, b"\x06" + bytes(32)))),
+        "q9_unh_33_v6form_21": head
+        + armor_parts(with_unhashed(p, subpacket(33, b"\x06" + bytes(20)))),
+        "q9_unh_33_v5form_5": head
+        + armor_parts(with_unhashed(p, subpacket(33, b"\x05\x01\x02\x03\x04"))),
+    }
+    return inl, {}, {}
+
+
+def fx18_rr10(c: Controls) -> Batch:
+    """The second re-review's round 10 (rr10): an exportable certification
+    (4) without its value octet in an unknown key's packet's hashed area
+    (its A-RC3: go-crypto v1.4.1's parse read past it and panicked, P4 now
+    refuses it), beside A's good packet, critical, and alone."""
+    k = fx15_packets(c)
+    head, p, pd, qb = k.head, k.p, k.pd, k.qb
+    _, bh, _, _ = v4_parts(one_signature(qb))
+    e4 = subpacket(4, b"")
+    c4 = subpacket(4, b"", critical=True)
+    inl = {
+        "q10_good_plus_unknownB_hashed_t4_empty": head
+        + armor_parts(p + with_hashed(qb, bh + e4)),
+        "q10_unknownB_hashed_t4_empty_plus_good": head
+        + armor_parts(with_hashed(qb, bh + e4) + p),
+        "q10_good_plus_unknownB_hashed_crit_t4_empty": head
+        + armor_parts(p + with_hashed(qb, bh + c4)),
+        "q10_unknownB_hashed_t4_empty_only": head
+        + armor_parts(with_hashed(qb, bh + e4)),
+    }
+    det = {
+        "q10_d_good_plus_unknownB_hashed_t4_empty": armor_parts(
+            pd + with_hashed(qb, bh + e4)
+        ),
+    }
+    return inl, det, {}
+
+
+def batch_fx18_from(c: Controls) -> Batch:
+    """Task 9b's second re-review, its adversarial lens
+    (PE/final-review/A-report.txt, "Re-review 2 (a47437e)"): 76 shapes in
+    its key-free batches rr6, rr8, rr9 and rr10, by its names, cut without a
+    key from committed fixtures exactly as its generator (tools/gen_a.py,
+    batch_rr6 and batch_rr8 to batch_rr10) cut them: q6_* (61), sqv's
+    subpacket rules at their boundaries; e8_* (7), the erasure with hashes
+    layer P does not read; q9_* (3), issuer fingerprints of other versions'
+    forms; q10_* (5), the empty hashed exportable certification of its
+    A-RC3."""
+    return merge(fx18_rr6(c), fx18_rr8(c), fx18_rr9(c), fx18_rr10(c))
+
+
 @dataclass(frozen=True)
 class OwnMaterial:
     """What batch fx13 is cut from: key O's signatures (see the module
@@ -3145,6 +3363,118 @@ def batch_fx13(om: OwnMaterial) -> Batch:
     return inline, detached, releases
 
 
+@dataclass(frozen=True)
+class SubkeysMaterial:
+    """What batch fx19 is cut from: key K's public key and its signatures of
+    RELEASE (the second re-review's ownkey3.sh, its sigs/): clearsigned by
+    the primary key and by each signing subkey (gpg's "!": that key itself)
+    with SHA-256 and SHA-1, gpg's whole output, and subkey 1's binary-mode
+    (0x00) detached SHA-1 signature."""
+
+    public: bytes  # K's binary export: the primary key and both subkeys
+    prim256: bytes
+    prim1: bytes
+    sub1_256: bytes
+    sub1_1: bytes
+    sub2_256: bytes
+    sub2_1: bytes
+    sub1_1_det: bytes  # the packet, as gpg wrote it
+
+
+def make_subkeys_key(g: GnuPG) -> tuple[str, str, str]:
+    """Key K, batch fx19's: an RSA-3072 primary that signs and two RSA-3072
+    signing subkeys; their fingerprints, the primary's first."""
+    k = g.gen_key(SUBKEYS_KEY_UID, "sign", "never")
+    return k, g.add_subkey(k, "sign"), g.add_subkey(k, "sign")
+
+
+def issuer_fingerprint(sig: bytes) -> str:
+    """The issuer fingerprint (a hashed v4 subpacket 33) of sig, one
+    signature packet."""
+    _, hashed, _, _ = v4_parts(one_signature(sig))
+    fprs = [d[1:] for t, _, d in subpackets(hashed) if t == 33 and d[:1] == b"\x04"]
+    if len(fprs) != 1:
+        raise ValueError(f"want one hashed v4 issuer fingerprint, got {len(fprs)}")
+    return fprs[0].hex().upper()
+
+
+def make_subkeys_material(g: GnuPG, keys: tuple[str, str, str]) -> SubkeysMaterial:
+    """Signs what batch fx19 needs with key K, each signature checked to
+    name the key it was asked of."""
+    k, sub1, sub2 = keys
+
+    def signed(fpr: str, digest: str) -> bytes:
+        out = g.clearsign(fpr + "!", RELEASE, digest=digest)
+        if issuer_fingerprint(sig_packets(out)) != fpr:
+            raise RuntimeError(f"gpg signed with another key than {fpr}")
+        return out
+
+    det = g.detach_sign(sub1 + "!", RELEASE, digest="SHA1")
+    if issuer_fingerprint(det) != sub1 or one_signature(det)[1] != 0x00:
+        raise RuntimeError("subkey 1's detached SHA-1 signature: another key or type")
+    public = g.export(k)
+    check_keyring(public, {k, sub1, sub2})
+    return SubkeysMaterial(
+        public=public,
+        prim256=signed(k, "SHA256"),
+        prim1=signed(k, "SHA1"),
+        sub1_256=signed(sub1, "SHA256"),
+        sub1_1=signed(sub1, "SHA1"),
+        sub2_256=signed(sub2, "SHA256"),
+        sub2_1=signed(sub2, "SHA1"),
+        sub1_1_det=det,
+    )
+
+
+def batch_fx19(km: SubkeysMaterial) -> Batch:
+    """Task 9b's second re-review, its adversarial lens's own-key batch rr7,
+    by its names, built as its tools/ownkey3.sh and gen_a.py's batch_rr7
+    built them, with key K for its K3: apt's erasure compares the signing
+    (sub)key (IsTheSameKey), so a SHA-1 good signature by another subkey or
+    by the primary erases nothing, and one by the same (sub)key after its
+    good one does; key-free reorders of the signer-made packets, a binary
+    detached packet of the same subkey in an InRelease, and three detached
+    shapes of text-mode packets. Each shape's signed-by is K's public key
+    alone (keyrings_fx19), as the re-review measured it."""
+    head = km.prim256[: km.prim256.index(BEGIN)]
+    p256, p1 = sig_packets(km.prim256), sig_packets(km.prim1)
+    a256, a1 = sig_packets(km.sub1_256), sig_packets(km.sub1_1)
+    b256, b1 = sig_packets(km.sub2_256), sig_packets(km.sub2_1)
+    a1d = km.sub1_1_det
+    inline = {
+        "e7_prim256_alone": head + armor_parts(p256),
+        "e7_sub1_256_alone": head + armor_parts(a256),
+        "e7_sub1_256_then_sub1_sha1": head + armor_parts(a256 + a1),
+        "e7_sub1_256_then_sub2_sha1": head + armor_parts(a256 + b1),
+        "e7_sub1_256_then_prim_sha1": head + armor_parts(a256 + p1),
+        "e7_prim256_then_sub1_sha1": head + armor_parts(p256 + a1),
+        "e7_prim256_then_prim_sha1": head + armor_parts(p256 + p1),
+        "e7_sub1_sha1_then_sub1_256": head + armor_parts(a1 + a256),
+        "e7_sub1_256_sub2_256_then_sub1_sha1": head + armor_parts(a256 + b256 + a1),
+        "e7_sub1_256_then_sub1_sha1_then_sub2_256": head
+        + armor_parts(a256 + a1 + b256),
+        "e7_sub1_256_then_sub2_sha1_then_sub1_sha1": head + armor_parts(a256 + b1 + a1),
+        "e7_prim256_sub1_256_then_prim_sha1": head + armor_parts(p256 + a256 + p1),
+        "e7_mixed_sub1_256t01_then_sub1_sha1t00": head + armor_parts(a256 + a1d),
+        "e7_sub2_sha1_then_sub1_256_then_sub2_256": head
+        + armor_parts(b1 + a256 + b256),
+    }
+    detached = {
+        "e7_d_text_sub1_256_then_sub1_sha1": armor_parts(a256 + a1),
+        "e7_d_text_sub1_256_then_sub2_sha1": armor_parts(a256 + b1),
+        "e7_d_text_prim256_then_sub1_sha1": armor_parts(p256 + a1),
+    }
+    return inline, detached, {}
+
+
+def keyrings_fx19(km: SubkeysMaterial) -> Shapes:
+    """The own signed-by (<name>.keys.asc) of every batch fx19 shape: key
+    K's public key, alone, in one armor block."""
+    asc = armored_keys(km.public, SUBKEYS_KEY_UID.encode())
+    inline, detached, _ = batch_fx19(km)
+    return {name: asc for name in (*inline, *detached)}
+
+
 # The batches cut from Material, in a run that makes keys.
 BATCHES: list[Callable[[Material], tuple[Shapes, Shapes]]] = [
     batch_fx,
@@ -3169,6 +3499,7 @@ FROM_CONTROLS: list[Callable[[Controls], Batch]] = [
     batch_fx15_from,
     batch_fx16_from,
     batch_fx17_from,
+    batch_fx18_from,
 ]
 
 # The own signed-by key files (<name>.keys.asc) of shapes the batches above
@@ -3226,19 +3557,23 @@ class Corpus:
         return out
 
 
-def build_shapes(m: Material, om: OwnMaterial, keyring: bytes) -> Corpus:
-    """Every batch's shapes: those cut from Material, those cut from the
-    control files among them (as --from-controls cuts them from committed
-    ones), and batch fx13; names are unique."""
+def build_shapes(
+    m: Material, om: OwnMaterial, km: SubkeysMaterial, keyring: bytes
+) -> Corpus:
+    """Every batch's shapes: those cut from Material, batch fx13, those cut
+    from the control files among them (as --from-controls cuts them from
+    committed ones), and batch fx19 with its key files; names are unique."""
     corpus = Corpus()
     for batch in BATCHES:
         corpus.add(*batch(m))
+    corpus.add(*batch_fx13(om))
     controls = controls_from(corpus.files() | {"keys.gpg": keyring, "Release": RELEASE})
     for batch_from in FROM_CONTROLS:
         corpus.add(*batch_from(controls))
     for keyrings_from in KEYRINGS_FROM_CONTROLS:
         corpus.add_keyrings(keyrings_from(controls))
-    corpus.add(*batch_fx13(om))
+    corpus.add(*batch_fx19(km))
+    corpus.add_keyrings(keyrings_fx19(km))
     return corpus
 
 
@@ -3275,10 +3610,13 @@ def write_corpus(out: Path, corpus: Corpus, keyring: bytes) -> None:
         (out / file).write_bytes(data)
 
 
-def write_files(out: Path, files: dict[str, bytes]) -> None:
-    """Writes files into OUT, none of them a control file."""
+def write_files(
+    out: Path, files: dict[str, bytes], owned: tuple[str, ...] = ()
+) -> None:
+    """Writes files into OUT, none of them a control file but those owned
+    (the controls the writing batch makes itself)."""
     for file in files:
-        if file in CONTROL_FILES:
+        if file in CONTROL_FILES and file not in owned:
             raise ValueError(f"{file} would overwrite a control")
     for file, data in files.items():
         (out / file).write_bytes(data)
@@ -3301,8 +3639,10 @@ def write_from_controls(out: Path) -> Corpus:
 def write_own_key(out: Path) -> Corpus:
     """Makes key O in a temporary GnuPG home, writes batch fx13 into OUT and
     replaces O's public key in OUT's keys.gpg (adding it if it has none),
-    every other key's packets byte for byte; writes nothing else. Returns
-    what it wrote."""
+    every other key's packets byte for byte, then cuts the FROM_CONTROLS
+    batches again (write_from_controls: fx18's e8_* shapes are cut from
+    fx13's SHA-224 and SHA3-256 anchors, every other shape comes out as it
+    was); writes nothing else. Returns batch fx13."""
     if not (out / "keys.gpg").is_file():
         raise SystemExit(f"{out}: no keys.gpg: generate the corpus first")
     corpus_entries(out)  # refuse a wrong OUT before making a key
@@ -3317,8 +3657,28 @@ def write_own_key(out: Path) -> Corpus:
     keyring = with_own_key(old, own_export, o)
     corpus = Corpus()
     corpus.add(*batch_fx13(om))
-    write_files(out, corpus.files())
+    write_files(out, corpus.files(), owned=tuple(FX13_CONTROLS))
     (out / "keys.gpg").write_bytes(keyring)
+    write_from_controls(out)
+    return corpus
+
+
+def write_subkeys_key(out: Path) -> Corpus:
+    """Makes key K in a temporary GnuPG home and writes batch fx19 and its
+    key files into OUT; writes nothing else (keys.gpg holds no K). Returns
+    what it wrote."""
+    if not (out / "keys.gpg").is_file():
+        raise SystemExit(f"{out}: no keys.gpg: generate the corpus first")
+    corpus_entries(out)  # refuse a wrong OUT before making a key
+    g = GnuPG()
+    try:
+        km = make_subkeys_material(g, make_subkeys_key(g))
+    finally:
+        g.close()
+    corpus = Corpus()
+    corpus.add(*batch_fx19(km))
+    corpus.add_keyrings(keyrings_fx19(km))
+    write_files(out, corpus.files())
     return corpus
 
 
@@ -3339,28 +3699,31 @@ def main(argv: list[str]) -> int:
     for s in EXIT_SIGNALS:
         signal.signal(s, exit_on_signal)
     args = argv[1:]
-    mode = args[0] if args and args[0] in ("--from-controls", "--own-key") else ""
+    modes = ("--from-controls", "--own-key", "--subkeys-key")
+    mode = args[0] if args and args[0] in modes else ""
     if mode:
         args = args[1:]
     if len(args) != 1:
         print(
             "usage: python3 -I e2e/apt-oracle/gen_shapes.py"
-            " [--from-controls | --own-key] OUT",
+            " [--from-controls | --own-key | --subkeys-key] OUT",
             file=sys.stderr,
         )
         return 2
     out = Path(args[0])
     if mode:
-        corpus = (
-            write_from_controls(out)
-            if mode == "--from-controls"
-            else write_own_key(out)
-        )
-        what = (
-            f"cut from {out}'s committed fixtures"
-            if mode == "--from-controls"
-            else f"signed by a new key O, whose public key replaces O's in {out}/keys.gpg"
-        )
+        if mode == "--from-controls":
+            corpus = write_from_controls(out)
+            what = f"cut from {out}'s committed fixtures"
+        elif mode == "--own-key":
+            corpus = write_own_key(out)
+            what = (
+                f"signed by a new key O, whose public key replaces O's in"
+                f" {out}/keys.gpg, and the batches cut from the controls again"
+            )
+        else:
+            corpus = write_subkeys_key(out)
+            what = "signed by a new key K, each with K's public key as its keys.asc"
         n_inline, n_detached = len(corpus.inline), len(corpus.detached)
         print(
             f"wrote {n_inline + n_detached} shapes ({n_inline} inline, "
@@ -3374,11 +3737,12 @@ def main(argv: list[str]) -> int:
         keys = make_keys(g)
         material = make_material(g, keys)
         own = make_own_material(g, keys.o)
+        subkeys = make_subkeys_material(g, make_subkeys_key(g))
         keyring = g.export(keys.a, keys.e, keys.s, keys.o)
     finally:
         g.close()
     check_keyring(keyring, {keys.a, keys.e, keys.s, keys.s_sub, keys.o})
-    corpus = build_shapes(material, own, keyring)
+    corpus = build_shapes(material, own, subkeys, keyring)
     write_corpus(out, corpus, keyring)
     total = len(corpus.inline) + len(corpus.detached)
     print(

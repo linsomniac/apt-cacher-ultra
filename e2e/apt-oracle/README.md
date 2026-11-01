@@ -57,7 +57,7 @@ The repository's `.gitattributes` marks every file here `-text`, so no
 checkout or commit converts their line ends, whatever `core.autocrlf`
 says: several shapes differ from their controls only in CRs.
 
-There are 730 shapes, in seventeen batches. The first 135 are those the
+There are 823 shapes, in nineteen batches. The first 135 are those the
 hardening plan measured on 2026-10-28
 (`docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md`: DN-2
 sorts them into classes, Appendix A gives each one's verdicts), rebuilt by
@@ -74,7 +74,8 @@ fx8, `t7c_` and `t7g` batch fx9, `a_` to `s_` batch fx10, `sx_` to `vm3_`
 batch fx11, `n_` batches fx12 to fx14, `o_` and `o2_` batch fx13,
 `c_text_`, `e_`, `e2_`, `g5_`, `h_`, `k_`, `l_`, `m_`, `u_`, `v_`,
 `w_d_`, `x_`, `y_`, `z_` and `n_clearhdr_` batch fx15, `rd_`, `c_` and
-`ka_` batch fx16, `sq_` batch fx17;
+`ka_` batch fx16, `sq_` batch fx17, `q6_`, `e8_`, `q9_` and `q10_`
+batch fx18, `e7_` batch fx19;
 `i_trail_lf` is a blank line after the END line, `xd_good_plus_literal` a
 literal-data packet beside a good detached signature, a `*_control*` its
 batch's unmodified control.
@@ -223,11 +224,36 @@ committed fixtures (`FROM_CONTROLS`):
   a regular expression that is its NUL alone. Every verdict is the one
   the table predicts (`debian:13` refuses exactly the faults).
 
+Batches fx18 and fx19 (93 shapes) are the plan's Task 9b's second fix
+round: its second re-review's adversarial lens's shapes
+(PE/final-review/A-report.txt, "Re-review 2"), by its names, every one
+with the verdicts it measured:
+
+- **fx18**, 76, cut without a key from committed fixtures exactly as
+  its generator cut them (byte for byte the bytes it measured): sqv's
+  subpacket rules at their boundaries, each type on both sides, in A's
+  good packet's unhashed area (`q6_`; `debian:13` refuses exactly the
+  faults); apt's erasure with hashes layer P does not read, key O's
+  SHA-224 and SHA3-256 packets of fx13's `n_i_sha224` and
+  `n_i_sha3_256` beside A's good one, and with a bad or unknown key's
+  erasing packet (`e8_`); issuer fingerprints of v6 and v5 form in an
+  unhashed area (`q9_`); and an exportable certification without its
+  value octet in an unknown key's hashed area (`q10_`, finding A-RC3:
+  go-crypto v1.4.1's parse panicked on it).
+- **fx19**, 17 (`e7_`): its own-key batch rr7, made with key K: apt's
+  erasure compares the signing (sub)key, so a SHA-1 signature by
+  another subkey or by the primary after a good one erases nothing,
+  one by the same (sub)key does (the five gpgv-based apt refuse).
+  Each shape's `signed-by` is K's public key alone, its own
+  `<name>.keys.asc`, as the re-review measured it.
+
 The keys are made in a temporary GnuPG home that the generator deletes
 when the run ends, by an error, Ctrl-C, SIGTERM or SIGHUP too (only
 SIGKILL leaves it, and a home it cannot delete is named on stderr); no
 secret key is written anywhere else, and the generator checks that
-`keys.gpg` holds public packets only, of exactly A, E, S and O.
+`keys.gpg` holds public packets only, of exactly A, E, S and O, and
+K's public key, fx19's `keys.asc`, public packets only, of K and its
+two subkeys.
 
 | Key | What it is | Why |
 |---|---|---|
@@ -236,6 +262,7 @@ secret key is written anywhere else, and the generator checks that
 | E | RSA-3072, signs; made at 2020-01-01, valid one year (it expired at 2020-12-31); its signatures made at 2020-06-01 | a key in `signed-by` that has expired: its good or bad signature beside a good one, and its good one alone (`i_expired_*`, `i_good_plus_expired_good`) |
 | S | an RSA-3072 primary that only certifies, with an RSA-3072 signing subkey | a signature by a subkey (`x3i_subkey_*`), and a forged packet naming the primary (`t7g5_s_primary`) |
 | O | RSA-3072, signs | batch fx13's key: the shapes that need a signer but no other key, so that they can be made again alone (`--own-key`), the other keys' secrets being gone after every run |
+| K | RSA-3072, signs, with two RSA-3072 signing subkeys; not in `keys.gpg` | batch fx19's key: signatures by its primary and by each subkey (`e7_`), each shape with K's public key as its own `keys.asc`, made again alone with `--subkeys-key` |
 
 ### Adding a shape
 
@@ -247,30 +274,38 @@ secret key is written anywhere else, and the generator checks that
      `CONTROL_FILES` names — the fx7 controls, A's and S's subkey's bad
      signatures, B's, E's and S's subkey's packets beside A's, the v3 and
      unknown-hash packets, S's fingerprint from `keys.gpg`, the shared
-     `Release`): a `FROM_CONTROLS` batch, as fx8 to fx12 and fx14 to
-     fx17 are; a shape that needs a `signed-by` of its own gets its
-     `<name>.keys.asc` from a `KEYRINGS_FROM_CONTROLS` function, as
-     fx16's `ka_` rows do.
+     `Release`, fx13's SHA-224 and SHA3-256 anchors): a `FROM_CONTROLS`
+     batch, as fx8 to fx12 and fx14 to fx18 are; a shape that needs a
+     `signed-by` of its own gets its `<name>.keys.asc` from a
+     `KEYRINGS_FROM_CONTROLS` function, as fx16's `ka_` rows do.
      `python3 -I e2e/apt-oracle/gen_shapes.py --from-controls
      internal/gpg/testdata/aptshapes` writes those batches alone, from the
      committed fixtures, and every other file keeps its bytes.
    - **A signer, no other key**: batch fx13 (`batch_fx13`, from key O's
      `OwnMaterial`). `python3 -I e2e/apt-oracle/gen_shapes.py --own-key
      internal/gpg/testdata/aptshapes` makes a new key O in a temporary
-     home, writes fx13 alone and replaces O's public key in `keys.gpg` (the
-     key whose user ID is O's), every other key's packets byte for byte;
-     every other file keeps its bytes. The table test's keyring is
+     home, writes fx13 and replaces O's public key in `keys.gpg` (the
+     key whose user ID is O's), every other key's packets byte for byte,
+     then cuts the `FROM_CONTROLS` batches again: fx18's `e8_` shapes,
+     cut from fx13's SHA-224 and SHA3-256 anchors, change with it, every
+     other file keeps its bytes. The table test's keyring is
      `keys.gpg`, so it trusts the new O at once.
+   - **A signer with subkeys, in no client's `keys.gpg`**: batch fx19
+     (`batch_fx19`, from key K's `SubkeysMaterial`), each shape with K's
+     public key as its `<name>.keys.asc`. `python3 -I
+     e2e/apt-oracle/gen_shapes.py --subkeys-key
+     internal/gpg/testdata/aptshapes` makes a new key K and writes fx19
+     and its key files alone; every other file keeps its bytes.
    - **The keys A, B, E and S** (`Material`): a batch in `BATCHES`, made
      only by a full regeneration.
    A detached shape that signs another text than the shared `Release`
    gives that text in its batch's third dict; the generator writes it as
    `<name>.Release`.
-2. Regenerate. With `--from-controls` or `--own-key`, only that part
-   changes, so in step 4 every other row must come out unchanged. A full
-   regeneration,
+2. Regenerate. With `--from-controls`, `--own-key` or `--subkeys-key`,
+   only that part changes, so in step 4 every other row must come out
+   unchanged. A full regeneration,
    `python3 -I e2e/apt-oracle/gen_shapes.py internal/gpg/testdata/aptshapes`,
-   makes new keys A, B, E, S and O and new signatures, so every fixture
+   makes new keys A, B, E, S, O and K and new signatures, so every fixture
    changes (the key-free batches are cut from the new controls, byte
    surgery the same); `verdicts.txt` and `classes.txt` are left in place,
    and are now stale.
@@ -435,3 +470,4 @@ together (*Adding a shape*).
 | 2026-10-29, 15:30 UTC (the plan's Task 9a) | the commit that adds batches fx10 to fx13 and `classes.txt`, on 78175bb | `--from-controls` wrote fx10 to fx12's 307 shapes (fx8's and fx9's 33 again, byte for byte), `--own-key` fx13's 15 and key O; `--record`: 490 shapes in 6 images, the 168 earlier rows unchanged, the 309 the final review measured as it measured them, and the error classes of every refusal; then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 51 s and 50 s, images cached |
 | 2026-10-29, 16:23 UTC (the plan's Task 9b) | the commit that adds batch fx14, on 9efa08d | `--from-controls` wrote fx14's 8 shapes (fx8 to fx12's 340 again, byte for byte); `--record`: 498 shapes in 6 images, the 490 earlier rows and their error classes unchanged; then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 51 s and 54 s, images cached |
 | 2026-11-01, 21:23 UTC (the plan's Task 9b, its fix round) | the commit that adds batches fx15 to fx17 | `--from-controls` wrote fx15 to fx17's 232 shapes and fx16's 6 key files (fx8 to fx12's and fx14's 348 again, byte for byte), the re-review's 226 files byte for byte as its generators wrote them; `--record`: 730 shapes in 6 images, the 498 earlier rows and their error classes unchanged, the 220 rows the re-review measured as it measured them, the 12 `sq_` rows as the table predicts; then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 68 s and 68 s, images cached |
+| 2026-11-01, 23:41 UTC (the plan's Task 9b, its second fix round) | the commit that adds batches fx18 and fx19 | `--from-controls` wrote fx18's 76 shapes (fx8 to fx12's and fx14 to fx17's 580 again, byte for byte), the second re-review's 76 files byte for byte as its generator wrote them; `--subkeys-key` fx19's 17 shapes and their 17 key files, signed by a new key K; `--record`: 823 shapes in 6 images, the 730 earlier rows and their error classes unchanged, the 93 new rows as the second re-review measured them (fx19's with K for its K3); then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 84 s and 77 s, images cached |

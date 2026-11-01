@@ -119,7 +119,7 @@ var aptShapeDeviations = map[string]string{
 	"x5i_hdr_space_in_key":     aptShapeNonCanonicalArmor,
 	"xd_blank_after_crc":       aptShapeNonCanonicalArmor,
 	"xi_blank_after_crc":       aptShapeNonCanonicalArmor,
-	// aptShapeNonCanonicalPacket (37)
+	// aptShapeNonCanonicalPacket (43)
 	"gd_p1_inner_marker":                          aptShapeNonCanonicalPacket,
 	"gd_p2_inner_unknowntag":                      aptShapeNonCanonicalPacket,
 	"gd_p3_inner_zero_bytes":                      aptShapeNonCanonicalPacket,
@@ -138,6 +138,12 @@ var aptShapeDeviations = map[string]string{
 	"p_good_unh_fpr_v0form":                       aptShapeNonCanonicalPacket,
 	"p_good_unh_fpr_v3form":                       aptShapeNonCanonicalPacket,
 	"p_good_unh_fpr_v4_dup":                       aptShapeNonCanonicalPacket,
+	"q10_d_good_plus_unknownB_hashed_t4_empty":    aptShapeNonCanonicalPacket,
+	"q10_good_plus_unknownB_hashed_crit_t4_empty": aptShapeNonCanonicalPacket,
+	"q10_good_plus_unknownB_hashed_t4_empty":      aptShapeNonCanonicalPacket,
+	"q10_unknownB_hashed_t4_empty_plus_good":      aptShapeNonCanonicalPacket,
+	"q9_unh_33_v5form_5":                          aptShapeNonCanonicalPacket,
+	"q9_unh_33_v6form_33":                         aptShapeNonCanonicalPacket,
 	"q_good_plus_bigunh_dup":                      aptShapeNonCanonicalPacket,
 	"q_good_plus_unknownB_critunh":                aptShapeNonCanonicalPacket,
 	"q_good_unh_16A_16B":                          aptShapeNonCanonicalPacket,
@@ -157,7 +163,11 @@ var aptShapeDeviations = map[string]string{
 	"v_good_plus_unknownB_hashed_regexp_nonul_go": aptShapeNonCanonicalPacket,
 	"x3i_goodsig_unhashed_fpr_added":              aptShapeNonCanonicalPacket,
 	"z_good_unh_embedded_sig":                     aptShapeNonCanonicalPacket,
-	// aptShapeUnverifiableAlgorithm (3)
+	// aptShapeUnverifiableAlgorithm (7)
+	"e8_good_plus_badA_sha3":        aptShapeUnverifiableAlgorithm,
+	"e8_good_then_sha224A":          aptShapeUnverifiableAlgorithm,
+	"e8_good_then_sha3A":            aptShapeUnverifiableAlgorithm,
+	"e8_sha224A_then_good":          aptShapeUnverifiableAlgorithm,
 	"k_good_plus_unknownB_sha224":   aptShapeUnverifiableAlgorithm,
 	"k_good_plus_unknownB_sha3_256": aptShapeUnverifiableAlgorithm,
 	"xi_good_plus_unknownpk_A":      aptShapeUnverifiableAlgorithm,
@@ -168,7 +178,7 @@ var aptShapeDeviations = map[string]string{
 const (
 	aptShapeOneArmorBlock         = "one armor block: the cache reads one block (layer T), apt reads every one; no surveyed vendor publishes two (2026-10-28)"
 	aptShapeNonCanonicalArmor     = "non-canonical armor layout: outside layer A's whitelist (armor_canon.go), or a NUL byte in the envelope's headers (layer T's T5: a_hdr_nul_value, n_clearhdr_nul), which gpgv and sqv both accept and every surveyed signer writes; the edit no signer makes, the cache refuses even where every apt reads it"
-	aptShapeNonCanonicalPacket    = "non-canonical packet layout: outside layer P's v4 grammar (sigpacket.go: exact consumption, one issuer, minimal MPIs, bounded areas), which every surveyed signer writes; the cache refuses even where every apt reads it"
+	aptShapeNonCanonicalPacket    = "non-canonical packet layout: outside layer P's v4 grammar (sigpacket.go: exact consumption, one issuer, minimal MPIs, bounded areas, subpackets go-crypto can parse), which every surveyed signer writes; the cache refuses even where every apt reads it"
 	aptShapeUnverifiableAlgorithm = "unverifiable algorithm: a public-key or hash algorithm layer P does not read, so the packet cannot be told from garbage; a vendor adding one is refused until the corpus measures it and the cache reads it"
 )
 
