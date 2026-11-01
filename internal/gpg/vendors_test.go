@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/apttext"
 )
 
 // vendorDir holds real repositories' signed anchors, fetched for the
@@ -79,18 +81,18 @@ func TestVerifier_AcceptsTheVendorAnchors(t *testing.T) {
 		)
 		if va.inline {
 			body := read(va.dir, "InRelease")
-			cs, err := inlineTextLayer(body)
+			cs, err := apttext.Inline(body)
 			if err != nil {
 				t.Errorf("%s: layer T: %v", name, err)
 				continue
 			}
-			lines, first = cs.armor, cs.armorLine
-			if got, err = v.VerifyInline(context.Background(), newSuite(), body); err != nil || !bytes.Equal(got, cs.message) {
+			lines, first = cs.Armor, cs.ArmorLine
+			if got, err = v.VerifyInline(context.Background(), newSuite(), body); err != nil || !bytes.Equal(got, cs.Message) {
 				t.Errorf("%s (%s): VerifyInline: %v; want it verified, to M", name, va.layout, err)
 			}
 		} else {
 			release, sig := read(va.dir, "Release"), read(va.dir, "Release.gpg")
-			if lines, err = detachedTextLayer(sig); err != nil {
+			if lines, err = apttext.Detached(sig); err != nil {
 				t.Errorf("%s: layer T: %v", name, err)
 				continue
 			}
@@ -193,7 +195,7 @@ func TestVerifier_RefusesSublimesSecondSignatureFlipped(t *testing.T) {
 	}
 	second := append([]byte{}, pkts[1].raw...)
 	second[len(second)-1] ^= 0x01
-	head := body[:bytes.Index(body, []byte(sigArmorBegin))]
+	head := body[:bytes.Index(body, []byte(apttext.SigArmorBegin))]
 	flipped := joined(head, armorSignature(t, joined(pkts[0].raw, second)))
 	if _, err := v.VerifyInline(context.Background(), newSuite(), flipped); !errors.Is(err, ErrBadSignature) {
 		t.Fatalf("sublime's InRelease, its second signature flipped: %v; want ErrBadSignature (gpgv's BADSIG 7FE2FA12CF6E38F2)", err)

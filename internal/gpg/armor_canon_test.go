@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/apttext"
 )
 
 // TestParseArmor_Rules pins A1–A6 on armors the corpus lacks, the edges of
@@ -24,7 +26,7 @@ func TestParseArmor_Rules(t *testing.T) {
 	}
 	// armorOf joins lines between the BEGIN and END lines.
 	armorOf := func(lines ...string) string {
-		return sigArmorBegin + "\n" + strings.Join(lines, "\n") + "\n" + sigArmorEnd + "\n"
+		return apttext.SigArmorBegin + "\n" + strings.Join(lines, "\n") + "\n" + apttext.SigArmorEnd + "\n"
 	}
 	big := bytes.Repeat([]byte{0xa5}, armorMaxPacketBytes+1)
 	var bigLines []string
@@ -65,7 +67,7 @@ func TestParseArmor_Rules(t *testing.T) {
 		{"a space in the key", armorOf("Com ment: x", "", b64, good), "A2"},
 		{"a control byte in the value", armorOf("Comment: a\x01b", "", b64, good), "A2"},
 		{"DEL in the value", armorOf("Comment: a\x7fb", "", b64, good), "A2"},
-		{"the END line before an empty line", sigArmorBegin + "\n" + sigArmorEnd + "\n", "A3"},
+		{"the END line before an empty line", apttext.SigArmorBegin + "\n" + apttext.SigArmorEnd + "\n", "A3"},
 		{"a header, then the END line", armorOf("Comment: x"), "A3"},
 		{"no base64 line", armorOf(""), "A4"},
 		{"a CRC line and no base64 line", armorOf("", good), "A4"},
@@ -81,7 +83,7 @@ func TestParseArmor_Rules(t *testing.T) {
 		{"two CRC lines", armorOf("", b64, good, good), "A5"},
 		{"a CRC line holding padding", armorOf("", b64, "=AB=C"), "A4"},
 	} {
-		lines := aptLines([]byte(tc.armor))
+		lines := apttext.AptLines([]byte(tc.armor))
 		got, err := parseArmor(lines, 1)
 		if ruleOf(err) != tc.rule {
 			t.Errorf("%s: %v (rule %q); want rule %q", tc.name, err, ruleOf(err), tc.rule)
@@ -93,7 +95,7 @@ func TestParseArmor_Rules(t *testing.T) {
 	}
 	// A1 and A6 hold of every block layer T hands over (its BEGIN line
 	// first, its END line last); parseArmor checks them anyway.
-	lines := aptLines([]byte(armorOf("", b64, good)))
+	lines := apttext.AptLines([]byte(armorOf("", b64, good)))
 	if _, err := parseArmor(lines[1:], 2); ruleOf(err) != "A1" {
 		t.Errorf("no BEGIN line first: %v; want A1", err)
 	}

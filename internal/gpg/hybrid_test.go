@@ -1,7 +1,7 @@
 package gpg
 
 // Tests of the hybrid verifier's layers (the hardening plan's DN-11, Task
-// 9b): T (textsplit.go), A (armor_canon.go), P (sigpacket.go) and S
+// 9b): T (internal/apttext), A (armor_canon.go), P (sigpacket.go) and S
 // (verifier.go), on the corpus and on shapes it does not hold.
 
 import (
@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/apttext"
 )
 
 // ruleOf names the rule that refused err: a structural rule of layers T, A
@@ -23,7 +25,7 @@ func ruleOf(err error) string {
 	case err == nil:
 		return ""
 	case errors.As(err, &se):
-		return se.rule
+		return se.Rule
 	case errors.Is(err, ErrBadSignature):
 		return "S1"
 	}
@@ -32,8 +34,8 @@ func ruleOf(err error) string {
 
 // TestAptTextLayer_RefusesExactlyTheSplitRows is layer T's differential
 // test (the hardening plan's DN-11; PE/approach-decision.md §6, its first
-// residual risk: a port bug): the port alone — splitClearsigned and
-// splitDetached, without the cache's rules on top (T5, F0, one block) —
+// residual risk: a port bug): the port alone — apttext.SplitClearsigned and
+// apttext.SplitDetached, without the cache's rules on top (T5, F0, one block) —
 // refuses a corpus row exactly when apt's own text layer refused it in
 // every image (classes.txt's "split": apt refused the file before its
 // verifier ran). That holds the port to apt's splitter row by row, not only
@@ -49,9 +51,9 @@ func TestAptTextLayer_RefusesExactlyTheSplitRows(t *testing.T) {
 		split := len(row) > 0 && row[0] == "split" // a split row is split in every column (TestAptShapeClasses_AgreeWithTheVerdicts)
 		var err error
 		if s.inline {
-			_, err = splitClearsigned(s.body)
+			_, err = apttext.SplitClearsigned(s.body)
 		} else {
-			_, _, err = splitDetached(s.body)
+			_, _, err = apttext.SplitDetached(s.body)
 		}
 		if split {
 			splits++
@@ -274,13 +276,13 @@ func TestVerifyInline_ReturnsAptsMessage(t *testing.T) {
 // built: M and the signature packets.
 func inlineParts(t *testing.T, body []byte) ([]byte, []sigPacket) {
 	t.Helper()
-	cs, err := inlineTextLayer(body)
+	cs, err := apttext.Inline(body)
 	if err != nil {
 		t.Fatalf("test premise: layer T refuses the InRelease: %v", err)
 	}
-	pkts, err := armorPackets(cs.armor, cs.armorLine)
+	pkts, err := armorPackets(cs.Armor, cs.ArmorLine)
 	if err != nil {
 		t.Fatalf("test premise: layers A and P refuse the InRelease: %v", err)
 	}
-	return cs.message, pkts
+	return cs.Message, pkts
 }

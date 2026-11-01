@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
+
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
@@ -445,6 +447,50 @@ func classifyLegacyInline(blob []byte) legacyVerdict {
 		}
 	}
 	return legacyVerdict{outcome: cache.LegacyAuditKeep}
+}
+
+// inReleasePlaintext returns the signed plaintext of a stored InRelease as
+// go-crypto's clearsign decoder reads it, without re-verifying the
+// signature: the legacy audit's reading (classifyLegacyInline).
+//
+// AIDEV-NOTE: R-1. Never ParseRelease the raw envelope: lines placed
+// after a forged "=CRC" line inside the signature armor, or as
+// colon-bearing armor headers, are part of the stored bytes but were never
+// signed (both verify with go-crypto v1.4.1). A body without a clearsign
+// marker is an error since phase D (the plain-text fallback served only
+// test fixtures; VerifyInline never adopts plain text, and the startup
+// audit quarantines legacy plain-text snapshots). The marker test is
+// bytes.Contains, never HasPrefix: snapshots adopted before phase D may
+// hold whitespace before the marker (ruling R-D2 now refuses that at
+// adoption). A decode failure is an error, never a raw parse; the decode
+// sees aptpath.DecodableClearsign(blob) (R-D2) and runs under recover(): a
+// stored blob cannot trigger I-1, but the audit must never crash the
+// daemon.
+//
+// AIDEV-NOTE: moved here from reconcile.go by Task 9b's fix round (the
+// re-review's V-RI1): reconcile reads a stored InRelease with apt's own
+// splitter now (inReleaseMessage, internal/apttext), as adoption does
+// since Task 9b. The audit keeps go-crypto's reading, which is safe: it
+// judges snapshots adopted before Task 9b, by a verifier that verified
+// and parsed exactly this plaintext, so it asks whether declarations lie
+// outside the text their adoption read; it keeps ruling R-D2's tolerance
+// of whitespace before the marker, which TestClassifyLegacyInline pins;
+// and it only keeps or quarantines a snapshot, never derives members for
+// one.
+func inReleasePlaintext(blob []byte) (text []byte, err error) {
+	if !bytes.Contains(blob, []byte("-----BEGIN PGP SIGNED MESSAGE-----")) {
+		return nil, errors.New("legacy audit: stored InRelease is not clearsigned")
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			text, err = nil, fmt.Errorf("legacy audit: clearsign decode panicked: %v", r)
+		}
+	}()
+	block, _ := clearsign.Decode(aptpath.DecodableClearsign(blob))
+	if block == nil {
+		return nil, errors.New("legacy audit: stored InRelease is not a valid clearsigned message")
+	}
+	return block.Plaintext, nil
 }
 
 // clearsignCanonical returns b with every line canonicalised exactly as

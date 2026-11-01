@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
+	"github.com/linsomniac/apt-cacher-ultra/internal/apttext"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
@@ -153,7 +154,7 @@ func TestVerifyInline_FollowsAptsFirstLineRule(t *testing.T) {
 			t.Errorf("%s: the handler's sniff accepts a body adoption refuses", name)
 		}
 	}
-	trailing := bytes.Replace(good, []byte(clearsignBeginMarker+"\n"), []byte(clearsignBeginMarker+" \t\r\n"), 1)
+	trailing := bytes.Replace(good, []byte(apttext.ClearsignBeginMarker+"\n"), []byte(apttext.ClearsignBeginMarker+" \t\r\n"), 1)
 	if bytes.Equal(trailing, good) {
 		t.Fatal("test premise: the marker line was not rewritten")
 	}
@@ -164,8 +165,9 @@ func TestVerifyInline_FollowsAptsFirstLineRule(t *testing.T) {
 
 // Deferred minor D-6: the accept leg end to end for an envelope whose
 // every line ends in CRLF and whose marker line carries trailing blanks —
-// DecodableClearsign then hands go-crypto an LF marker line before CRLF
-// lines: it verifies, and the handler's sniff accepts it too.
+// apt's splitter (internal/apttext, AptLine) strips both from every line,
+// as it did DecodableClearsign's LF marker line before go-crypto's decoder
+// until Task 9b: it verifies, and the handler's sniff accepts it too.
 func TestVerifyInline_AcceptsACRLFEnvelopeWithABlankPaddedMarker(t *testing.T) {
 	signer := newTestEntity(t, "Signer", "signer@example.com")
 	v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t, signer), RequireSignature: true, Logger: silentLogger()})
@@ -173,7 +175,7 @@ func TestVerifyInline_AcceptsACRLFEnvelopeWithABlankPaddedMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	crlf := bytes.ReplaceAll(clearsignWith(t, signer, []byte(fakeReleasePlaintext)), []byte("\n"), []byte("\r\n"))
-	body := bytes.Replace(crlf, []byte(clearsignBeginMarker+"\r\n"), []byte(clearsignBeginMarker+" \t\r\n"), 1)
+	body := bytes.Replace(crlf, []byte(apttext.ClearsignBeginMarker+"\r\n"), []byte(apttext.ClearsignBeginMarker+" \t\r\n"), 1)
 	if bytes.Equal(body, crlf) {
 		t.Fatal("test premise: the marker line was not rewritten")
 	}

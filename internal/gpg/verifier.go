@@ -12,6 +12,7 @@ import (
 	pgperrors "github.com/ProtonMail/go-crypto/openpgp/errors"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/apttext"
 	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
 )
 
@@ -185,7 +186,7 @@ var (
 	// ErrMalformedClearsign means the body carries the clearsign marker
 	// but is not a clearsigned message in the shape the cache accepts
 	// (the hardening plan's DN-11): apt's own text layer refuses it (T1–T4,
-	// textsplit.go: the marker not on line 1, a line after the END line,
+	// internal/apttext: the marker not on line 1, a line after the END line,
 	// an undashed "-" line), or the cache's text rules do (T5, F0, one
 	// armor block), or its armor or packets fall outside the canonical
 	// grammar (A1–A6, armor_canon.go: a forged checksum, a damaged armor;
@@ -240,7 +241,7 @@ var (
 // client's apt hands its verifier and then its Release parser.
 //
 // Order of checks (each fails closed), the hardening plan's DN-11:
-//  1. T (textsplit.go): apt's SplitClearSignedFile, ported, and the
+//  1. T (internal/apttext): apt's SplitClearSignedFile, ported, and the
 //     cache's text rules: M and the one armor block. A body no line of
 //     which is the clearsign marker is ErrMissingSignature; any other
 //     refusal is ErrMalformedClearsign, in every mode (the "verified
@@ -287,15 +288,15 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 	// undecodable "InRelease" become a trust-bearing inline snapshot.
 	// Never reintroduce a text fallback: unsigned repositories go through
 	// the explicit unsigned form, which never vouches.
-	cs, err := inlineTextLayer(inRelease)
-	if errors.Is(err, errNotClearsigned) {
+	cs, err := apttext.Inline(inRelease)
+	if errors.Is(err, apttext.ErrNotClearsigned) {
 		// apt reads such a body as not clearsigned. One that holds the
 		// marker elsewhere — after a leading blank, space, tab or BOM
 		// (ruling R-D2) — is reported as a damaged envelope, as before
 		// the port: what the operator should hear about it.
-		if bytes.Contains(inRelease, []byte(clearsignBeginMarker)) {
+		if bytes.Contains(inRelease, []byte(apttext.ClearsignBeginMarker)) {
 			return nil, fmt.Errorf("%w: %w", ErrMalformedClearsign,
-				refuse("T1", "line 1 is not %q, which the body holds elsewhere (apt reads it as not clearsigned)", clearsignBeginMarker))
+				refuse("T1", "line 1 is not %q, which the body holds elsewhere (apt reads it as not clearsigned)", apttext.ClearsignBeginMarker))
 		}
 		return nil, ErrMissingSignature
 	}
@@ -304,16 +305,16 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 	}
 
 	// Step 2: layers A and P.
-	pkts, err := armorPackets(cs.armor, cs.armorLine)
+	pkts, err := armorPackets(cs.Armor, cs.ArmorLine)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrMalformedClearsign, err)
 	}
 
 	// Steps 3-5.
-	if err := v.checkSignatures(suite, cs.message, pkts); err != nil {
+	if err := v.checkSignatures(suite, cs.Message, pkts); err != nil {
 		return nil, err
 	}
-	return cs.message, nil
+	return cs.Message, nil
 }
 
 // VerifyDetached verifies a detached signature (Release.gpg bytes)
@@ -343,7 +344,7 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 // function (the freshness checker only switches to detached mode
 // after fetching both bodies).
 //
-// AIDEV-NOTE: the detached form's "bare armor" guard (textsplit.go's
+// AIDEV-NOTE: the detached form's "bare armor" guard (internal/apttext's
 // history note): until the 2026-10-28 hardening plan it enforced none, and
 // so adopted what apt refuses (VC-2, C-4) while every client of the suite
 // then failed `apt update`. Enforced now by apt's own grammar, ported (T),
@@ -360,7 +361,7 @@ func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef,
 	if len(sigBytes) == 0 {
 		return nil, errors.New("empty Release.gpg body")
 	}
-	lines, err := detachedTextLayer(sigBytes)
+	lines, err := apttext.Detached(sigBytes)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrMalformedSignature, err)
 	}

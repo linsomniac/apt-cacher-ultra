@@ -1,4 +1,4 @@
-package gpg
+package apttext
 
 import (
 	"bytes"
@@ -7,10 +7,22 @@ import (
 	"testing"
 )
 
+// ruleOf names the rule that refused err (a ShapeError's), "" for none.
+func ruleOf(err error) string {
+	var se *ShapeError
+	if errors.As(err, &se) {
+		return se.Rule
+	}
+	if err != nil {
+		return "?" + err.Error()
+	}
+	return ""
+}
+
 // textRule names what layer T made of a body: "" accepted, "not" not
-// clearsigned (errNotClearsigned), else the refusing rule.
+// clearsigned (ErrNotClearsigned), else the refusing rule.
 func textRule(err error) string {
-	if errors.Is(err, errNotClearsigned) {
+	if errors.Is(err, ErrNotClearsigned) {
 		return "not"
 	}
 	return ruleOf(err)
@@ -25,7 +37,7 @@ const textTestArmor = "-----BEGIN PGP SIGNATURE-----\n\nAAAA\n-----END PGP SIGNA
 // holds it to apt on the corpus): each body, and the rule apt's split
 // refuses it by, or the M and the number of armor blocks it makes of it.
 func TestSplitClearsigned_PortsApt(t *testing.T) {
-	const begin = clearsignBeginMarker
+	const begin = ClearsignBeginMarker
 	crlf := func(s string) string { return strings.ReplaceAll(s, "\n", "\r\n") }
 	for _, tc := range []struct {
 		name, body string
@@ -58,7 +70,7 @@ func TestSplitClearsigned_PortsApt(t *testing.T) {
 		{"two armor blocks", begin + "\n\nx\n" + textTestArmor + textTestArmor, "", "x", 2},
 		{"the END line with blanks, no final LF", begin + "\n\nx\n-----BEGIN PGP SIGNATURE-----\n\nAAAA\n-----END PGP SIGNATURE----- \t\r", "", "x", 1},
 	} {
-		cs, err := splitClearsigned([]byte(tc.body))
+		cs, err := SplitClearsigned([]byte(tc.body))
 		if got := textRule(err); got != tc.rule {
 			t.Errorf("%s: %v (rule %q); want rule %q", tc.name, err, got, tc.rule)
 			continue
@@ -66,11 +78,11 @@ func TestSplitClearsigned_PortsApt(t *testing.T) {
 		if err != nil {
 			continue
 		}
-		if string(cs.message) != tc.m || cs.message == nil || cs.blocks != tc.blocks {
-			t.Errorf("%s: M %q (nil %v), %d blocks; want %q, %d", tc.name, cs.message, cs.message == nil, cs.blocks, tc.m, tc.blocks)
+		if string(cs.Message) != tc.m || cs.Message == nil || cs.Blocks != tc.blocks {
+			t.Errorf("%s: M %q (nil %v), %d blocks; want %q, %d", tc.name, cs.Message, cs.Message == nil, cs.Blocks, tc.m, tc.blocks)
 		}
-		if !bytes.Equal(cs.armor[0], []byte(sigArmorBegin)) || !bytes.Equal(cs.armor[len(cs.armor)-1], []byte(sigArmorEnd)) {
-			t.Errorf("%s: the armor runs from %q to %q; want the BEGIN line to the END line", tc.name, cs.armor[0], cs.armor[len(cs.armor)-1])
+		if !bytes.Equal(cs.Armor[0], []byte(SigArmorBegin)) || !bytes.Equal(cs.Armor[len(cs.Armor)-1], []byte(SigArmorEnd)) {
+			t.Errorf("%s: the armor runs from %q to %q; want the BEGIN line to the END line", tc.name, cs.Armor[0], cs.Armor[len(cs.Armor)-1])
 		}
 	}
 }
@@ -98,12 +110,12 @@ func TestSplitDetached_PortsApt(t *testing.T) {
 		{"one block, no final LF", strings.TrimSuffix(textTestArmor, "\n"), "", 1},
 		{"two blocks", textTestArmor + textTestArmor, "", 2},
 	} {
-		lines, blocks, err := splitDetached([]byte(tc.body))
+		lines, blocks, err := SplitDetached([]byte(tc.body))
 		if got := ruleOf(err); got != tc.rule {
 			t.Errorf("%s: %v (rule %q); want rule %q", tc.name, err, got, tc.rule)
 			continue
 		}
-		if err == nil && (blocks != tc.blocks || !bytes.Equal(lines[0], []byte(sigArmorBegin))) {
+		if err == nil && (blocks != tc.blocks || !bytes.Equal(lines[0], []byte(SigArmorBegin))) {
 			t.Errorf("%s: %d blocks, first line %q; want %d and the BEGIN line", tc.name, blocks, lines[0], tc.blocks)
 		}
 	}
@@ -112,7 +124,7 @@ func TestSplitDetached_PortsApt(t *testing.T) {
 // TestAptLine_StripsAsApt: apt's LineBuffer strips trailing LFs and CRs,
 // then trailing spaces and tabs (gpgv.cc:94-98 at apt 2.2.4), and a body
 // splits on LF with a last line without one (the final review's A-C1); a
-// final LF starts no empty line (aptLines' AIDEV-NOTE).
+// final LF starts no empty line (AptLines' AIDEV-NOTE).
 func TestAptLine_StripsAsApt(t *testing.T) {
 	for in, want := range map[string]string{
 		"x":         "x",
@@ -127,8 +139,8 @@ func TestAptLine_StripsAsApt(t *testing.T) {
 		"x\v":       "x\v",
 		"x\u00a0":   "x\u00a0",
 	} {
-		if got := string(aptLine([]byte(in))); got != want {
-			t.Errorf("aptLine(%q) = %q, want %q", in, got, want)
+		if got := string(AptLine([]byte(in))); got != want {
+			t.Errorf("AptLine(%q) = %q, want %q", in, got, want)
 		}
 	}
 	for in, want := range map[string][]string{
@@ -140,38 +152,38 @@ func TestAptLine_StripsAsApt(t *testing.T) {
 		"\n":      {""},
 		"a\nb \n": {"a", "b"},
 	} {
-		got := aptLines([]byte(in))
+		got := AptLines([]byte(in))
 		var gs []string
 		for _, l := range got {
 			gs = append(gs, string(l))
 		}
 		if strings.Join(gs, "|") != strings.Join(want, "|") || len(gs) != len(want) {
-			t.Errorf("aptLines(%q) = %q, want %q", in, gs, want)
+			t.Errorf("AptLines(%q) = %q, want %q", in, gs, want)
 		}
 	}
 }
 
-// TestInlineTextLayer_TheCachesRules pins what layer T adds to apt's split:
+// TestInline_TheCachesRules pins what layer T adds to apt's split:
 // no NUL (T5), no END marker in M (F0, which reads M only: an END marker in
 // an armor header's value is the armor layer's), one armor block; apt's own
 // refusals come first.
-func TestInlineTextLayer_TheCachesRules(t *testing.T) {
-	const begin = clearsignBeginMarker
+func TestInline_TheCachesRules(t *testing.T) {
+	const begin = ClearsignBeginMarker
 	for _, tc := range []struct{ name, body, rule string }{
 		{"a NUL in the text", begin + "\n\nx\x00y\n" + textTestArmor, "T5"},
 		{"a NUL in a cleartext header", begin + "\nHash: SHA\x00256\n\nx\n" + textTestArmor, "T5"},
-		{"a dash-escaped END line", begin + "\n\n- " + sigArmorEnd + "\n" + textTestArmor, "F0"},
-		{"the END marker inside a text line", begin + "\n\nDescription: x " + sigArmorEnd + " y\n" + textTestArmor, "F0"},
-		{"the END marker in an armor header", begin + "\n\nx\n-----BEGIN PGP SIGNATURE-----\nComment: " + sigArmorEnd + "\n\nAAAA\n-----END PGP SIGNATURE-----\n", ""},
+		{"a dash-escaped END line", begin + "\n\n- " + SigArmorEnd + "\n" + textTestArmor, "F0"},
+		{"the END marker inside a text line", begin + "\n\nDescription: x " + SigArmorEnd + " y\n" + textTestArmor, "F0"},
+		{"the END marker in an armor header", begin + "\n\nx\n-----BEGIN PGP SIGNATURE-----\nComment: " + SigArmorEnd + "\n\nAAAA\n-----END PGP SIGNATURE-----\n", ""},
 		{"two armor blocks", begin + "\n\nx\n" + textTestArmor + textTestArmor, "T4/one-block"},
 		{"apt's refusal first", "\x00\n" + begin + "\n\nx\n" + textTestArmor, "T1"},
 		{"accepted", begin + "\n\nx\n" + textTestArmor, ""},
 	} {
-		if _, err := inlineTextLayer([]byte(tc.body)); ruleOf(err) != tc.rule {
+		if _, err := Inline([]byte(tc.body)); ruleOf(err) != tc.rule {
 			t.Errorf("%s: %v (rule %q); want rule %q", tc.name, err, ruleOf(err), tc.rule)
 		}
 	}
-	if _, err := detachedTextLayer([]byte(textTestArmor + textTestArmor)); ruleOf(err) != "T4/one-block" {
+	if _, err := Detached([]byte(textTestArmor + textTestArmor)); ruleOf(err) != "T4/one-block" {
 		t.Errorf("a Release.gpg of two blocks: %v; want T4/one-block", err)
 	}
 }

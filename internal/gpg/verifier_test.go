@@ -18,6 +18,7 @@ import (
 	pgperrors "github.com/ProtonMail/go-crypto/openpgp/errors"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/apttext"
 	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
 )
 
@@ -1416,7 +1417,7 @@ func TestVerifyInline_AcceptAnySigner_EmptyArmorStillRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("assembleClearsignedBlock: %v", err)
 	}
-	if _, err := inlineTextLayer(body); err != nil {
+	if _, err := apttext.Inline(body); err != nil {
 		t.Fatalf("test premise: layer T refuses the empty armor: %v", err)
 	}
 	for _, anySigner := range []bool{false, true} {

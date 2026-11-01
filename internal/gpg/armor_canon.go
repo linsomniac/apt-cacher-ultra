@@ -9,7 +9,7 @@ package gpg
 // accepts it (a deviation of the family "non-canonical armor layout";
 // widening the grammar is a code change with a measured corpus row, ruling
 // HD-17). Both forms, on lines as apt's LineBuffer leaves them
-// (textsplit.go's aptLine: what an InRelease's S holds; a Release.gpg's raw
+// (internal/apttext's AptLine: what an InRelease's S holds; a Release.gpg's raw
 // lines reach gpgv and sqv, which both tolerate the trailing blanks and CRs
 // aptLine strips, measured). The cache's base64 decode is the decode: no
 // other parser reads the armor.
@@ -37,6 +37,8 @@ package gpg
 import (
 	"bytes"
 	"encoding/base64"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/apttext"
 )
 
 // Layer A's limits: RFC 4880 §6.3 and RFC 9580 §6.2.3 cap a base64 line
@@ -75,12 +77,12 @@ const (
 // are set and gpgv drops them (n_i/n_d_b64_pad_bits, Task 9b's batch fx14),
 // so the lenient decode would adopt a key-free edit some apt refuses.
 func parseArmor(lines [][]byte, first int) ([]byte, error) {
-	if len(lines) < 2 || !bytes.Equal(lines[0], []byte(sigArmorBegin)) {
-		return nil, refuse("A1", "line %d is not %q", first, sigArmorBegin)
+	if len(lines) < 2 || !bytes.Equal(lines[0], []byte(apttext.SigArmorBegin)) {
+		return nil, refuse("A1", "line %d is not %q", first, apttext.SigArmorBegin)
 	}
 	end := len(lines) - 1
-	if !bytes.Equal(lines[end], []byte(sigArmorEnd)) {
-		return nil, refuse("A6", "line %d, the armor's last, is not %q", first+end, sigArmorEnd)
+	if !bytes.Equal(lines[end], []byte(apttext.SigArmorEnd)) {
+		return nil, refuse("A6", "line %d, the armor's last, is not %q", first+end, apttext.SigArmorEnd)
 	}
 	i := 1
 	for headers := 0; ; headers++ {

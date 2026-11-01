@@ -329,12 +329,13 @@ func (f SuiteFile) Sniff(path string, head []byte) bool {
 // neither does the signed text.
 //
 // AIDEV-NOTE: ruling R-D2 (phase D): adoption accepts exactly apt's first
-// line. Every go-crypto decode of an InRelease envelope (reconcile's
-// inReleasePlaintext; the verifier's until the hardening plan's Task 9b,
-// which reads the envelope with its own port of apt's splitter,
-// internal/gpg/textsplit.go, and no go-crypto decoder) goes through this,
+// line. Every go-crypto decode of an InRelease envelope goes through this,
 // so a body apt accepts is never refused, nor later found undecodable, for
-// its marker line alone.
+// its marker line alone. One is left: the startup audit's
+// (freshness/legacy_audit.go, inReleasePlaintext). The verifier reads the
+// envelope with its own port of apt's splitter since the hardening plan's
+// Task 9b (internal/apttext), and reconcile with the same port since its
+// fix round (the re-review's V-RI1): neither decodes with go-crypto.
 func DecodableClearsign(b []byte) []byte {
 	if !SniffInRelease(b) {
 		return b
