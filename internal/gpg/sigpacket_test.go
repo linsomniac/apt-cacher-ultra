@@ -3,6 +3,8 @@ package gpg
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 
@@ -513,5 +515,77 @@ func TestParseSigPackets_RecordsWhatSqvDoesNotRead(t *testing.T) {
 		case tc.want != "" && !strings.Contains(pkts[0].sqvFault, tc.want):
 			t.Errorf("%s: sqvFault %q; want it to name %q", tc.name, pkts[0].sqvFault, tc.want)
 		}
+	}
+}
+
+// TestParseSigPackets_RefusesAnEmptyHashedExportableCertification: the
+// re-review's A-RC3. go-crypto v1.4.1's parseSignatureSubpacket reads a
+// hashed exportable certification (4) as subpacket[0] after a guard that
+// counted the type octet, so one with no value octet made packet.Read
+// panic (fixed in v1.5.0). It is the one type the parser indexes without
+// a length guard of its own (readBack's note). P4 refuses it in the hashed
+// area, critical or not, before go-crypto reads the packet; in the
+// unhashed area go-crypto never parses a type 4, and P passes it (sqv's
+// fault, recorded: sqvSubpacketFault).
+func TestParseSigPackets_RefusesAnEmptyHashedExportableCertification(t *testing.T) {
+	a16 := tsub(16, tkeyID(testIDA)...)
+	crit := func(s []byte) []byte { s[1] |= 0x80; return s }
+	for _, tc := range []struct {
+		name             string
+		hashed, unhashed []byte
+		rule             string
+	}{
+		{"hashed, no value octet", joined(tcreated, a16, tsub(4)), nil, "P4"},
+		{"hashed, critical, no value octet", joined(tcreated, a16, crit(tsub(4))), nil, "P4"},
+		{"hashed, a five-octet length, no value octet", joined(tcreated, a16, tsub5(4)), nil, "P4"},
+		{"hashed, value 1", joined(tcreated, a16, tsub(4, 1)), nil, ""},
+		{"unhashed, no value octet", joined(tcreated, a16), tsub(4), ""},
+	} {
+		var err error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("panic: %v", r)
+				}
+			}()
+			_, err = parseSigPackets(trsa(tc.hashed, tc.unhashed))
+		}()
+		if ruleOf(err) != tc.rule {
+			t.Errorf("%s: %v (rule %q); want rule %q", tc.name, err, ruleOf(err), tc.rule)
+		}
+	}
+}
+
+// TestReadBack_TurnsAPanicIntoARefusal: P5 runs go-crypto's packet.Read
+// under recover(), so a parse panic in go-crypto — v1.4.1's on an empty
+// hashed exportable certification (A-RC3), or any later one — is a P5
+// refusal (malformed_*), never a panic in the adoption goroutine, which
+// would make every attempt on the suite fail the same way. Shown twice:
+// with the packet.Read test seam swapped for one that panics, and with
+// that shape handed to readBack directly, past P4.
+func TestReadBack_TurnsAPanicIntoARefusal(t *testing.T) {
+	good := trsa(joined(tcreated, tsub(16, tkeyID(testIDA)...)), nil)
+	orig := readPacket
+	readPacket = func(io.Reader) (packet.Packet, error) { panic("an injected go-crypto parse panic") }
+	_, err := parseSigPackets(good)
+	readPacket = orig
+	if ruleOf(err) != "P5" || !strings.Contains(err.Error(), "panicked") {
+		t.Errorf("with packet.Read panicking: %v (rule %q); want a P5 refusal naming the panic", err, ruleOf(err))
+	}
+	if _, err := parseSigPackets(good); err != nil {
+		t.Fatalf("test premise: the seam restored, the packet: %v; want it read", err)
+	}
+	empty4 := trsa(joined(tcreated, tsub(16, tkeyID(testIDA)...), tsub(4)), nil)
+	var rerr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				rerr = fmt.Errorf("readBack panicked: %v", r)
+			}
+		}()
+		rerr = readBack(sigPacket{n: 1, raw: empty4, issuer: testIDA})
+	}()
+	if ruleOf(rerr) != "P5" {
+		t.Errorf("readBack on an empty hashed type 4: %v (rule %q); want P5", rerr, ruleOf(rerr))
 	}
 }

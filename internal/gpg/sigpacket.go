@@ -454,6 +454,8 @@ func (s *subpacketCounts) walk(area []byte, hashed bool, n int) error {
 			return refuse("P4", "packet %d: an embedded signature (subpacket 32) in its %s area", n, where)
 		case critical && !sigCriticalOK(typ, data):
 			return refuse("P4", "packet %d: a critical subpacket %d in its %s area, which gpgv 2.2 does not handle", n, typ, where)
+		case typ == 4 && hashed && len(data) == 0:
+			return refuse("P4", "packet %d: an exportable certification (subpacket 4) without its value octet in its hashed area, which go-crypto v1.4.1 reads past", n)
 		}
 		if s.sqvFault == "" {
 			if why := sqvSubpacketFault(typ, data, s.hashAlgo); why != "" {
@@ -528,8 +530,33 @@ func (s *subpacketCounts) finish(p *sigPacket) error {
 // octets, a trust signature of one, an odd AEAD list, a regular expression
 // without its NUL) and a hashed exportable certification of 0: strict too
 // where gpgv and sqv read the packet (k_*, v_*_hashed_regexp_nonul_go).
-func readBack(p sigPacket) error {
-	pkt, err := packet.Read(bytes.NewReader(p.raw))
+//
+// AIDEV-NOTE: the re-review's A-RC3. go-crypto v1.4.1's
+// parseSignatureSubpacket read a hashed exportable certification (4) as
+// subpacket[0] after a guard that counted the type octet, so one without
+// its value octet made packet.Read panic (fixed in v1.5.0) — key-free: a
+// packet beside the good one carried it — and the adoption goroutine's
+// recover then failed every attempt on the suite alike. Audited type by
+// type (v1.4.1 and v1.5.2), every other subpacket go-crypto reads checks
+// its length before it indexes (2, 3, 5, 9, 16, 25: exact sizes; 6, 20,
+// 29, 33, 35: minimums; 23, 27, 30: an empty body skipped; 39: even; the
+// rest are copied whole), the subpacket length parse included; P4
+// refuses the empty hashed 4 first (in the unhashed area go-crypto parses
+// no 4) and 32 anywhere, whose nested parse lacked a recursion guard until
+// v1.5.0. And the parse runs under recover(): any go-crypto parse panic,
+// this one or a later one, is a P5 refusal (TestReadBack_TurnsAPanicIntoARefusal).
+
+// readPacket is go-crypto's packet reader, a test seam: tests swap it for
+// one that panics.
+var readPacket = packet.Read
+
+func readBack(p sigPacket) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = refuse("P5", "packet %d: go-crypto's parse of it panicked: %v", p.n, r)
+		}
+	}()
+	pkt, err := readPacket(bytes.NewReader(p.raw))
 	if err != nil {
 		return refuse("P5", "packet %d: go-crypto does not parse it: %v", p.n, err)
 	}
