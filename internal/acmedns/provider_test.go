@@ -14,11 +14,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-acme/lego/v5/challenge"
 	"github.com/linsomniac/apt-cacher-ultra/internal/testutil/dnsfixture"
 )
 
 func TestMain(m *testing.M) {
 	if len(os.Args) == 2 && os.Args[1] == WorkerArgument {
+		if os.Getenv("ACU_TEST_STUBBORN_MARKER") != "" {
+			os.Exit(runWorker(func(string) (challenge.Provider, error) { return &stubbornProvider{}, nil }))
+		}
 		os.Exit(RunWorker())
 	}
 	os.Exit(m.Run())
@@ -89,7 +93,7 @@ func TestProviderErrorsAreRedacted(t *testing.T) {
 	}
 }
 
-func TestStalledProviderCancelledAndReaped(t *testing.T) {
+func TestCooperativeProviderCancelledAndReaped(t *testing.T) {
 	if !Supported("httpreq") {
 		t.Skip("provider not compiled")
 	}
@@ -130,6 +134,7 @@ func TestStalledProviderCancelledAndReaped(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("worker did not stop")
 	}
+	p.Close()
 	if p.cmd.ProcessState == nil {
 		t.Fatal("worker not reaped")
 	}

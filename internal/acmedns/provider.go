@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -25,6 +26,7 @@ const WorkerArgument = "--internal-acme-dns-worker"
 const operationTimeout = 5 * time.Minute
 const cleanupTimeout = operationTimeout
 const initializationTimeout = 30 * time.Second
+const cancellationGrace = time.Second
 
 type Failure string
 
@@ -32,6 +34,7 @@ func (e Failure) Error() string          { return "acme: " + string(e) }
 func (e Failure) DNSFailureCode() string { return string(e) }
 
 type request struct {
+	ID        uint64    `json:"id"`
 	Operation string    `json:"operation"`
 	Provider  string    `json:"provider,omitempty"`
 	Resolvers []string  `json:"resolvers,omitempty"`
@@ -51,6 +54,8 @@ type response struct {
 type Session struct {
 	cmd               *exec.Cmd
 	input             io.WriteCloser
+	interrupt         *os.File
+	sequence          uint64
 	output            *os.File
 	reader            *bufio.Reader
 	closeOnce         sync.Once
@@ -60,6 +65,9 @@ type Session struct {
 }
 
 func New(ctx context.Context, provider string, resolvers []string) (*Session, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if !Supported(provider) {
 		return nil, Failure("dns_provider_unsupported")
 	}
@@ -88,29 +96,33 @@ func startWorker(executable string, env []string) (*Session, error) {
 	if err != nil {
 		return nil, Failure("dns_worker_failed")
 	}
-	cmd := exec.Command(executable, WorkerArgument)
-	cmd.Env = env
-	// A dedicated response descriptor prevents provider/SDK stdout or stderr
-	// (including debug dumps) from becoming protocol messages or daemon logs.
-	cmd.ExtraFiles = []*os.File{write}
-	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
-	cmd.WaitDelay = time.Second
-	input, err := cmd.StdinPipe()
+	defer func() { _ = write.Close() }()
+	cancelRead, cancelWrite, err := os.Pipe()
 	if err != nil {
 		_ = read.Close()
-		_ = write.Close()
 		return nil, Failure("dns_worker_failed")
 	}
-	if err := cmd.Start(); err != nil {
-		_ = input.Close()
+	defer func() { _ = cancelRead.Close() }()
+	cmd := exec.Command(executable, WorkerArgument)
+	cmd.Env = env
+	// FD 3 carries only replies; FD 4 interrupts SDK calls without losing their
+	// state. Nil stdout/stderr go directly to /dev/null, without copy goroutines
+	// or pipes which a credential helper could keep open.
+	cmd.ExtraFiles = []*os.File{write, cancelRead}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
+	input, err := cmd.StdinPipe()
+	if err == nil {
+		err = cmd.Start()
+	}
+	if err != nil {
+		if input != nil {
+			_ = input.Close()
+		}
 		_ = read.Close()
-		_ = write.Close()
+		_ = cancelWrite.Close()
 		return nil, Failure("dns_worker_failed")
 	}
-	_ = write.Close()
-	s := &Session{cmd: cmd, input: input, output: read, reader: bufio.NewReaderSize(read, 4096)}
-	return s, nil
+	return &Session{cmd: cmd, input: input, interrupt: cancelWrite, output: read, reader: bufio.NewReaderSize(read, 4096)}, nil
 }
 
 func (s *Session) Close() {
@@ -120,6 +132,7 @@ func (s *Session) Close() {
 		_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
 		_ = s.cmd.Process.Kill()
 		_ = s.input.Close()
+		_ = s.interrupt.Close()
 		_ = s.output.Close()
 		// Reap only after signalling the group, so its PID cannot be reused by an
 		// unrelated process between Wait and Kill.
@@ -135,6 +148,8 @@ func (s *Session) call(ctx context.Context, req request, limit time.Duration) (r
 	if err := ctx.Err(); err != nil {
 		return response{}, err
 	}
+	s.sequence++
+	req.ID = s.sequence
 	req.Deadline, _ = ctx.Deadline()
 	type result struct {
 		response response
@@ -169,6 +184,25 @@ func (s *Session) call(ctx context.Context, req request, limit time.Duration) (r
 			return response{}, Failure("dns_worker_failed")
 		}
 	case <-ctx.Done():
+		// Cancel the worker's operation first, then give a cooperative SDK time to
+		// return. Keep that instance for cleanup (including any record IDs). Only a
+		// stuck operation loses its worker/state after the bounded grace period.
+		if req.Operation != "init" {
+			_ = s.interrupt.SetWriteDeadline(time.Now().Add(cancellationGrace))
+			_, sendErr := io.WriteString(s.interrupt, strconv.FormatUint(req.ID, 10)+"\n")
+			if sendErr == nil {
+				timer := time.NewTimer(cancellationGrace)
+				defer timer.Stop()
+				select {
+				case result := <-done:
+					if result.err != nil {
+						s.Close()
+					}
+					return response{}, ctx.Err()
+				case <-timer.C:
+				}
+			}
+		}
 		s.Close()
 		<-done
 		return response{}, ctx.Err()
@@ -179,8 +213,8 @@ func (s *Session) Present(ctx context.Context, domain, token, keyAuth string) er
 	_, err := s.call(ctx, request{Operation: "present", Domain: domain, Token: token, KeyAuth: keyAuth}, operationTimeout)
 	return err
 }
-func (s *Session) CleanUp(ctx context.Context, domain, token, keyAuth string) error {
-	_, err := s.call(ctx, request{Operation: "cleanup", Domain: domain, Token: token, KeyAuth: keyAuth}, cleanupTimeout)
+func (s *Session) CleanUp(ctx context.Context, _, _, _ string) error {
+	_, err := s.call(ctx, request{Operation: "cleanup"}, cleanupTimeout)
 	return err
 }
 

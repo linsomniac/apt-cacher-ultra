@@ -2,7 +2,6 @@ package acmedns
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -39,9 +38,12 @@ func canonical(name string) string {
 func Supported(name string) bool { return slices.Contains(Providers(), canonical(name)) }
 
 // RunWorker is entered only by the executable's private worker argument. The
-// parent passes descriptor 3; nothing private is accepted on the command line.
-func RunWorker() int {
+// parent passes reply/cancellation descriptors 3 and 4; no private command-line data.
+func RunWorker() int { return runWorker(dns.NewDNSChallengeProviderByName) }
+
+func runWorker(create func(string) (challenge.Provider, error)) int {
 	syscall.CloseOnExec(3)
+	syscall.CloseOnExec(4)
 	output := os.NewFile(3, "acme-dns-response")
 	if output == nil {
 		return 1
@@ -50,27 +52,42 @@ func RunWorker() int {
 	legolog.SetDefault(slog.New(slog.DiscardHandler))
 	slog.SetDefault(slog.New(slog.DiscardHandler))
 	log.SetOutput(io.Discard)
-	return serveWorker(os.Stdin, output, dns.NewDNSChallengeProviderByName)
+	// Register the inherited control pipe with Go's poller so Close unblocks
+	// the reader when malformed input or EOF ends the worker.
+	if err := syscall.SetNonblock(4, true); err != nil {
+		return 1
+	}
+	input := os.NewFile(4, "acme-dns-cancellation")
+	if input == nil {
+		return 1
+	}
+	control := &workerControl{}
+	done := make(chan struct{})
+	go func() { defer close(done); control.read(input) }()
+	defer func() { _ = input.Close(); <-done }()
+	return serveWorker(os.Stdin, output, create, control)
 }
 
 var dnsDomain = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$`)
 var authorization = regexp.MustCompile(`^[A-Za-z0-9_-]{16,256}\.[A-Za-z0-9_-]{43}$`)
 
-func serveWorker(input io.Reader, output io.Writer, create func(string) (challenge.Provider, error)) int {
+func serveWorker(input io.Reader, output io.Writer, create func(string) (challenge.Provider, error), control *workerControl) int {
 	scanner := bufio.NewScanner(input)
 	scanner.Buffer(make([]byte, 4096), 16<<10)
 	encoder := json.NewEncoder(output)
 	var provider challenge.Provider
 	var presented *request
+	var lastID uint64
 	for scanner.Scan() {
 		var req request
 		if json.Unmarshal(scanner.Bytes(), &req) != nil {
 			return 1
 		}
-		if req.Deadline.IsZero() || time.Until(req.Deadline) > operationTimeout+time.Second {
+		if req.ID <= lastID || req.Deadline.IsZero() || time.Until(req.Deadline) > operationTimeout+time.Second {
 			return 1
 		}
-		ctx, cancel := context.WithDeadline(context.Background(), req.Deadline)
+		lastID = req.ID
+		ctx, cancel := control.begin(req.ID, req.Deadline)
 		reply := response{}
 		switch req.Operation {
 		case "init":
@@ -97,6 +114,10 @@ func serveWorker(input io.Reader, output io.Writer, create func(string) (challen
 				reply.Error = "dns_worker_failed"
 				break
 			}
+			if ctx.Err() != nil {
+				reply.Error = "dns_present_failed"
+				break
+			}
 			// Retain the attempt even after a provider error: the write may have
 			// succeeded remotely before its response was lost.
 			copy := req
@@ -105,8 +126,12 @@ func serveWorker(input io.Reader, output io.Writer, create func(string) (challen
 				reply.Error = "dns_present_failed"
 			}
 		case "cleanup":
-			if provider == nil || presented == nil {
+			if provider == nil {
 				reply.Error = "dns_cleanup_failed"
+				break
+			}
+			if presented == nil {
+				// Cancelled before Present began: nothing to remove.
 				break
 			}
 			if err := provider.CleanUp(ctx, presented.Domain, presented.Token, presented.KeyAuth); err != nil {

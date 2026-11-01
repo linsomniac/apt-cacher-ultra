@@ -49,6 +49,18 @@ func (t authorityTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 			return nil, err
 		}
 	}
+	// x/crypto/acme parses integer Retry-After values with time.Duration
+	// arithmetic in both error retries and authorization/order polling. Give
+	// those paths a date so an oversized value cannot wrap into a short retry.
+	// The observer above must first persist the original authority cooldown.
+	now := time.Now()
+	if next := retryAfter(resp.Header.Get("Retry-After"), now); next.After(now) {
+		// HTTP dates have second precision. Round upward to avoid shortening it.
+		if next.Nanosecond() != 0 {
+			next = next.Truncate(time.Second).Add(time.Second)
+		}
+		resp.Header.Set("Retry-After", next.UTC().Format(http.TimeFormat))
+	}
 	resp.Body = &boundedBody{ReadCloser: resp.Body, left: 2 << 20}
 	return resp, nil
 }

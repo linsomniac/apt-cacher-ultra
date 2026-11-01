@@ -211,12 +211,17 @@ func (r *serverTLS) Start() {
 	}()
 }
 
+// Stop initiates certificate/provider shutdown without delaying listener drain.
+func (r *serverTLS) Stop() {
+	r.cancel()
+	if r.challenge != nil {
+		r.challenge.Close()
+	}
+}
+
 func (r *serverTLS) Close() {
 	r.closeOnce.Do(func() {
-		r.cancel()
-		if r.challenge != nil {
-			r.challenge.Close()
-		}
+		r.Stop()
 		r.wg.Wait()
 		if r.manager != nil {
 			r.manager.Close()

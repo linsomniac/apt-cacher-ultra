@@ -849,7 +849,9 @@ func serveListeners(
 		}
 	}
 
-	serverCerts.Close()
+	// DNS cleanup can take minutes. Stop accepting application traffic first;
+	// Close joins certificate workers after the listeners drain.
+	serverCerts.Stop()
 
 	// Spec C8 (phase C plan, design note 18): close the flip barrier
 	// before anything drains. An adoption waiting in it abandons its commit
@@ -992,7 +994,7 @@ func serveListeners(
 	// their upstream work, and an adoption that has not reached its
 	// commit skips it; a commit already running is not cancelled (spec C4)
 	// and can hold this Wait for up to the 5-minute commit timeout
-	// (the packaged unit's TimeoutStopSec=35 may SIGKILL first; SQLite
+	// (a supervisor stop timeout may SIGKILL first; SQLite
 	// rolls the transaction back). This Wait makes the shutdown
 	// deterministic before the cache is closed by the deferred
 	// c.Close(); past adoptionDrainNotice it is explained in the journal.
@@ -1001,6 +1003,7 @@ func serveListeners(
 	waitAdoptionDrain(freshChecker.WaitForAdoptions, adoptionDrainNotice, logger)
 
 	wg.Wait()
+	serverCerts.Close()
 	logger.Info("apt-cacher-ultra stopped")
 	return listenerErr
 }

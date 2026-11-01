@@ -181,11 +181,17 @@ asynchronous DNS API changes inside these operations. Cleanup gets a fresh
 budget after cancellation or a partially failed creation. DNS issuance has a
 70-minute budget for provider operations, propagation and ACME work, plus any
 cleanup still needed. The packaged systemd service and DNS Compose example allow
-six minutes for shutdown so cleanup can finish; configure the same grace period
-in other supervisors. Provider SDKs run in a short-lived process of the same executable so a
-stuck SDK can be terminated and its raw output kept out of daemon logs. This is
-**not a security sandbox**: providers inherit the daemon's environment and
-permissions. Their networking and proxy behavior follow their own SDK settings,
+six minutes for shutdown so cleanup can finish. Application listeners stop
+accepting traffic while cleanup runs. The systemd unit uses `KillMode=mixed` to
+send SIGTERM to the daemon first, preserving the provider worker for cleanup;
+other supervisors should allow the same grace period and signal the daemon first.
+
+Provider SDKs run in a short-lived process of the same executable so a stuck SDK
+can be terminated and its raw output kept out of daemon logs. Cancellation first
+interrupts the SDK operation through its context. A responsive worker retains
+its provider state for cleanup; an unresponsive worker is killed after a short,
+bounded grace period. This is **not a security sandbox**: providers inherit the
+daemon's environment and permissions. Their networking and proxy behavior follow their own SDK settings,
 independently of the ACME client's origin restrictions and `upstream.proxy`.
 
 Cleanup is best effort. A crash, hard timeout, or remote API failure can leave a

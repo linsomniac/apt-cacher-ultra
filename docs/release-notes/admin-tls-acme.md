@@ -50,6 +50,17 @@ Provider selection:
 
 The assistant produced the security review and implementation plan in
 `docs/superpowers/plans/2026-11-01-admin-tls-acme-{review,plan}.md` before coding.
-No subagents were used.
+The initial implementation used no subagents. The final review used a default
+review subagent after the requested Fable model was unavailable.
+
+Final review:
+
+> Please do a final review of this change looking for security, reliability,
+> robustness, and code complexity enhancement opportunities and fix them.
+> Use a fable sub agent for review.
+
+That review fixed ACME retry overflow, cancellation losing DNS cleanup state,
+listener shutdown waiting on DNS cleanup, and systemd terminating the provider
+worker too early. See the [final review record](../superpowers/plans/2026-11-01-server-tls-final-review.md).
 
 </details>
