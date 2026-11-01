@@ -522,11 +522,11 @@ func TestParseSigPackets_RecordsWhatSqvDoesNotRead(t *testing.T) {
 // re-review's A-RC3. go-crypto v1.4.1's parseSignatureSubpacket reads a
 // hashed exportable certification (4) as subpacket[0] after a guard that
 // counted the type octet, so one with no value octet made packet.Read
-// panic (fixed in v1.5.0). It is the one type the parser indexes without
-// a length guard of its own (readBack's note). P4 refuses it in the hashed
-// area, critical or not, before go-crypto reads the packet; in the
-// unhashed area go-crypto never parses a type 4, and P passes it (sqv's
-// fault, recorded: sqvSubpacketFault).
+// panic (fixed in v1.5.0). It was the one type v1.4.1's parser indexed
+// without a length guard of its own (readBack's note). P4 refuses it in
+// the hashed area, critical or not, before go-crypto reads the packet; in
+// the unhashed area go-crypto never parses a type 4, and P passes it
+// (sqv's fault, recorded: sqvSubpacketFault).
 func TestParseSigPackets_RefusesAnEmptyHashedExportableCertification(t *testing.T) {
 	a16 := tsub(16, tkeyID(testIDA)...)
 	crit := func(s []byte) []byte { s[1] |= 0x80; return s }
@@ -560,12 +560,15 @@ func TestParseSigPackets_RefusesAnEmptyHashedExportableCertification(t *testing.
 // under recover(), so a parse panic in go-crypto — v1.4.1's on an empty
 // hashed exportable certification (A-RC3), or any later one — is a P5
 // refusal (malformed_*), never a panic in the adoption goroutine, which
-// would make every attempt on the suite fail the same way. Shown twice:
-// with the packet.Read test seam swapped for one that panics, and with
-// that shape handed to readBack directly, past P4.
+// would make every attempt on the suite fail the same way. The panic is
+// injected: the packet.Read test seam swapped for one that panics, which
+// holds whatever go-crypto's version. And that shape handed to readBack
+// directly, past P4, is a P5 refusal too: go-crypto v1.4.1 panicked on it,
+// v1.5.0 and later return a parse error.
 func TestReadBack_TurnsAPanicIntoARefusal(t *testing.T) {
 	good := trsa(joined(tcreated, tsub(16, tkeyID(testIDA)...)), nil)
 	orig := readPacket
+	t.Cleanup(func() { readPacket = orig })
 	readPacket = func(io.Reader) (packet.Packet, error) { panic("an injected go-crypto parse panic") }
 	_, err := parseSigPackets(good)
 	readPacket = orig
