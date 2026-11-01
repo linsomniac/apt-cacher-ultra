@@ -377,3 +377,141 @@ func TestGpgvChecks(t *testing.T) {
 		}
 	}
 }
+
+// TestSqvSubpacketFault_FollowsSequoia pins sqvSubpacketFault, type by type,
+// to Sequoia's subpacket parser as debian:13's sqv 1.3.0 is built with it
+// (sequoia-openpgp 2.0.0, src/parse.rs, Subpacket::parse; the re-review's
+// A-RC1): each rule's boundary on both sides, and types it reads whatever
+// their size. Rows marked measured are the re-review's shapes (batches
+// rr1-rr3: a good packet with the subpacket appended to its unhashed area,
+// refused by debian:13 alone, or accepted by every apt).
+func TestSqvSubpacketFault_FollowsSequoia(t *testing.T) {
+	notation := func(nameLen, valueLen int, name, value []byte) []byte {
+		d := binary.BigEndian.AppendUint16(binary.BigEndian.AppendUint16([]byte{0x80, 0, 0, 0}, uint16(nameLen)), uint16(valueLen))
+		return append(append(d, name...), value...)
+	}
+	fpr20 := bytes.Repeat([]byte{0xab}, 20)
+	fpr32 := bytes.Repeat([]byte{0xcd}, 32)
+	for _, tc := range []struct {
+		name  string
+		typ   byte
+		data  []byte
+		hash  byte
+		fault bool
+	}{
+		{"creation time, 4 octets (measured: created_ok)", 2, []byte{1, 2, 3, 4}, 8, false},
+		{"creation time, 3 octets (measured: created_3)", 2, []byte{1, 2, 3}, 8, true},
+		{"creation time, 5 octets (measured: created_5)", 2, []byte{1, 2, 3, 4, 5}, 8, true},
+		{"signature expiration, 4 octets", 3, []byte{0, 0, 0, 1}, 8, false},
+		{"signature expiration, 2 octets (measured: sigexp_2)", 3, []byte{0, 1}, 8, true},
+		{"key expiration, 4 octets", 9, []byte{0, 0, 0, 1}, 8, false},
+		{"key expiration, 2 octets (measured: keyexp_2)", 9, []byte{0, 1}, 8, true},
+		{"exportable, 0 (measured: exportable0)", 4, []byte{0}, 8, false},
+		{"exportable, 1", 4, []byte{1}, 8, false},
+		{"exportable, 2", 4, []byte{2}, 8, true},
+		{"exportable, 2 octets (measured: exportable_2)", 4, []byte{1, 1}, 8, true},
+		{"exportable, no octet", 4, nil, 8, true},
+		{"revocable, 1", 7, []byte{1}, 8, false},
+		{"revocable, 0xff", 7, []byte{0xff}, 8, true},
+		{"revocable, 2 octets (measured: revocable_2)", 7, []byte{1, 1}, 8, true},
+		{"primary user ID, 0", 25, []byte{0}, 8, false},
+		{"primary user ID, 2", 25, []byte{2}, 8, true},
+		{"primary user ID, 2 octets (measured: primaryuid_2)", 25, []byte{1, 1}, 8, true},
+		{"trust signature, 2 octets", 5, []byte{1, 120}, 8, false},
+		{"trust signature, 1 octet (measured: trust_1)", 5, []byte{1}, 8, true},
+		{"trust signature, 3 octets", 5, []byte{1, 120, 0}, 8, true},
+		{"regular expression, NUL-terminated", 6, []byte("a.*\x00"), 8, false},
+		{"regular expression, the NUL alone", 6, []byte{0}, 8, false},
+		{"regular expression, unterminated (measured: regexp_nonul)", 6, []byte("a.*"), 8, true},
+		{"regular expression, empty", 6, nil, 8, true},
+		{"revocation key, 22 octets, class 0x80 (measured: revkey_ok_crit)", 12, append([]byte{0x80, 1}, fpr20...), 8, false},
+		{"revocation key, 34 octets: a v6 fingerprint", 12, append([]byte{0x80, 27}, fpr32...), 8, false},
+		{"revocation key, 23 octets: an unknown fingerprint form", 12, append([]byte{0xc0, 1}, append(fpr20, 0)...), 8, false},
+		{"revocation key, 21 octets", 12, append([]byte{0x80, 1}, fpr20[:19]...), 8, true},
+		{"revocation key, 5 octets (measured: revkey_5)", 12, []byte{0x80, 1, 2, 3, 4}, 8, true},
+		{"revocation key, class 0x40 (bit 0x80 clear)", 12, append([]byte{0x40, 1}, fpr20...), 8, true},
+		{"notation, its lengths its size", 20, notation(1, 2, []byte("n"), []byte("vv")), 8, false},
+		{"notation, empty name and value", 20, notation(0, 0, nil, nil), 8, false},
+		{"notation, a UTF-8 name", 20, notation(3, 0, []byte("é@"), nil), 8, false},
+		{"notation, lengths past its size (measured: notation_badlen)", 20, notation(16, 16, []byte("n"), []byte("v")), 8, true},
+		{"notation, lengths short of its size", 20, notation(1, 0, []byte("n"), []byte("v")), 8, true},
+		{"notation, 7 octets", 20, []byte{0x80, 0, 0, 0, 0, 0, 0}, 8, true},
+		{"notation, a name that is not UTF-8", 20, notation(2, 0, []byte{0xc3, 0x28}, nil), 8, true},
+		{"notation, a name holding a UTF-16 surrogate", 20, notation(3, 0, []byte{0xed, 0xa0, 0x80}, nil), 8, true},
+		{"reason for revocation, a code (measured: revreason_ok)", 29, []byte{0}, 8, false},
+		{"reason for revocation, empty (measured: revreason_empty)", 29, nil, 8, true},
+		{"signature target, algorithms and a digest", 31, append([]byte{1, 8}, fpr32...), 8, false},
+		{"signature target, algorithms only", 31, []byte{1, 8}, 8, false},
+		{"signature target, a digest shorter than its hash's", 31, []byte{1, 8, 1, 2, 3}, 8, false},
+		{"signature target, 1 octet (measured: sigtarget_1)", 31, []byte{1}, 8, true},
+		{"issuer fingerprint, v4, 21 octets", 33, append([]byte{4}, fpr20...), 8, false},
+		{"issuer fingerprint, v6, 33 octets", 33, append([]byte{6}, fpr32...), 8, false},
+		{"issuer fingerprint, v5, 3 octets: an unknown form", 33, []byte{5, 1, 2}, 8, false},
+		{"issuer fingerprint, v4, 20 octets", 33, append([]byte{4}, fpr20[:19]...), 8, true},
+		{"issuer fingerprint, v6, 21 octets", 33, append([]byte{6}, fpr20...), 8, true},
+		{"issuer fingerprint, empty", 33, nil, 8, true},
+		{"intended recipient, v4, 21 octets", 35, append([]byte{4}, fpr20...), 8, false},
+		{"intended recipient, v6, 33 octets", 35, append([]byte{6}, fpr32...), 8, false},
+		{"intended recipient, v3, 1 octet: an unknown form", 35, []byte{3}, 8, false},
+		{"intended recipient, v4, 5 octets (measured: recipient_5)", 35, []byte{4, 1, 2, 3, 4}, 8, true},
+		{"intended recipient, v6, 21 octets", 35, append([]byte{6}, fpr20...), 8, true},
+		{"intended recipient, empty", 35, nil, 8, true},
+		{"approved certifications, two SHA-256 digests (measured: attested_ok)", 37, append(fpr32, fpr32...), 8, false},
+		{"approved certifications, none", 37, nil, 8, false},
+		{"approved certifications, 3 octets (measured: attested_odd)", 37, []byte{1, 2, 3}, 8, true},
+		{"approved certifications, 48 octets in a SHA-256 packet", 37, bytes.Repeat([]byte{1}, 48), 8, true},
+		{"approved certifications, 96 octets in a SHA-512 packet", 37, bytes.Repeat([]byte{1}, 96), 10, true},
+		{"approved certifications, a SHA-1 digest in a SHA-1 packet", 37, fpr20, 2, false},
+		{"approved certifications, a SHA-256 digest in a SHA-1 packet", 37, fpr32, 2, true},
+		{"approved certifications, a SHA-384 digest in a SHA-384 packet", 37, bytes.Repeat([]byte{1}, 48), 9, false},
+		{"approved certifications, a SHA-256 digest in a SHA-384 packet", 37, fpr32, 9, true},
+		{"approved certifications, a SHA-512 digest in a SHA-512 packet", 37, bytes.Repeat([]byte{1}, 64), 10, false},
+		{"approved certifications, a SHA-384 digest in a SHA-512 packet", 37, bytes.Repeat([]byte{1}, 48), 10, true},
+		{"preferred AEAD ciphersuites, a pair (measured: pref_aead34_ok)", 39, []byte{9, 2}, 8, false},
+		{"preferred AEAD ciphersuites, odd (measured: aead_odd)", 39, []byte{9}, 8, true},
+		{"issuer key ID, 7 octets: Sequoia reads it (P4 refuses it)", 16, []byte{1, 2, 3, 4, 5, 6, 7}, 8, false},
+	} {
+		if got := sqvSubpacketFault(tc.typ, tc.data, tc.hash); (got != "") != tc.fault {
+			t.Errorf("%s: sqvSubpacketFault = %q; want a fault %v", tc.name, got, tc.fault)
+		}
+	}
+	// Types Sequoia reads whatever their size (measured: x_good_unh_*):
+	// preferences, flags, URIs, user IDs, features, and the reserved,
+	// private and unknown types.
+	for _, typ := range []byte{0, 1, 8, 10, 11, 13, 14, 15, 17, 18, 19, 21, 22, 23, 24, 26, 27, 28, 30, 34, 36, 38, 40, 99, 100, 110, 127} {
+		for _, n := range []int{0, 1, 3, 31} {
+			if got := sqvSubpacketFault(typ, bytes.Repeat([]byte{0xff}, n), 8); got != "" {
+				t.Errorf("type %d, %d octets: sqvSubpacketFault = %q; want none", typ, n, got)
+			}
+		}
+	}
+}
+
+// TestParseSigPackets_RecordsWhatSqvDoesNotRead: layer P records, without
+// refusing, the first subpacket Sequoia's parser refuses, in either area
+// (sigPacket.sqvFault, which S2 reads: discount); a packet without one
+// records none.
+func TestParseSigPackets_RecordsWhatSqvDoesNotRead(t *testing.T) {
+	a16 := tsub(16, tkeyID(testIDA)...)
+	for _, tc := range []struct {
+		name             string
+		hashed, unhashed []byte
+		want             string // a substring of sqvFault; "" for none
+	}{
+		{"well formed", joined(tcreated, a16), tcreated, ""},
+		{"an unhashed creation time of 3 octets", joined(tcreated, a16), tsub(2, 1, 2, 3), "unhashed subpacket 2 "},
+		{"a hashed revocation key of 5 octets", joined(tcreated, a16, tsub(12, 0x80, 1, 2, 3, 4)), nil, "hashed subpacket 12 "},
+		{"the first of two", joined(tcreated, a16, tsub(37, 1, 2, 3)), tsub(2, 1, 2, 3), "hashed subpacket 37 "},
+		{"after a well-formed one", joined(tcreated, a16), joined(tsub(39, 9, 2), tsub(37, 1, 2, 3)), "unhashed subpacket 37 "},
+	} {
+		pkts, err := parseSigPackets(trsa(tc.hashed, tc.unhashed))
+		switch {
+		case err != nil:
+			t.Errorf("%s: %v; want layer P to accept it", tc.name, err)
+		case tc.want == "" && pkts[0].sqvFault != "":
+			t.Errorf("%s: sqvFault %q; want none", tc.name, pkts[0].sqvFault)
+		case tc.want != "" && !strings.Contains(pkts[0].sqvFault, tc.want):
+			t.Errorf("%s: sqvFault %q; want it to name %q", tc.name, pkts[0].sqvFault, tc.want)
+		}
+	}
+}

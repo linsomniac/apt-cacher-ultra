@@ -47,7 +47,9 @@ package gpg
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math/bits"
+	"unicode/utf8"
 
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 )
@@ -74,6 +76,14 @@ type sigPacket struct {
 	hashAlgo byte   // the hash algorithm
 	issuer   uint64 // its one issuer key ID (subpacket 16)
 	fpr      []byte // its issuer fingerprint (subpacket 33's 20 octets), nil when it has none
+
+	// sqvFault names the packet's first subpacket, in either area, that
+	// Sequoia's parser refuses (sqvSubpacketFault), "" when it has none.
+	// Layer P does not refuse such a packet: debian:13's sqv reads it as
+	// an unknown packet and ignores it, as it ignores an unknown key's, and
+	// gpgv reads it (the unhashed subpackets but 16 and 33 not at all), so
+	// it only keeps S2 from counting it (discount; the re-review's A-RC1).
+	sqvFault string
 }
 
 // The algorithms P2 accepts (RFC 9580 §9.1, §9.5), each public-key
@@ -228,7 +238,7 @@ func parseSigBody(body []byte, n int) (sigPacket, error) {
 		return p, refuse("P2", "packet %d: hash algorithm %d, which the cache does not read", n, p.hashAlgo)
 	}
 	rest := body[4:]
-	var subs subpacketCounts
+	subs := subpacketCounts{hashAlgo: p.hashAlgo}
 	for _, hashed := range []bool{true, false} {
 		area := "unhashed"
 		if hashed {
@@ -303,6 +313,107 @@ type subpacketCounts struct {
 	fprs      int    // 33s, both areas
 	fpr       []byte // the last 33's data
 	badLength error  // the first hashed 2, or 16 or 33, of a wrong length
+	hashAlgo  byte   // the packet's hash (sqvSubpacketFault's type 37)
+	sqvFault  string // the first subpacket Sequoia's parser refuses (sigPacket.sqvFault)
+}
+
+// sqvDigestSizes are the digest sizes, in octets, of the hashes P2 reads:
+// an approved certifications subpacket (37) holds whole digests of its
+// packet's hash.
+var sqvDigestSizes = map[byte]int{2: 20, 8: 32, 9: 48, 10: 64}
+
+// sqvSubpacketFault says why Sequoia's subpacket parser refuses a
+// subpacket of type typ whose data (its octets after the type octet) are
+// data, in a packet whose hash is hashAlgo, or "" when it reads it: the
+// parser debian:13's sqv 1.3.0 is built with (sequoia-openpgp 2.0.0,
+// src/parse.rs, Subpacket::parse), rule by rule.
+//
+// AIDEV-NOTE: the re-review's A-RC1. Sequoia parses every subpacket of a
+// signature packet, in both areas, by type, and a type it knows must hold
+// exactly its fields (it fails a subpacket whose body its fields do not
+// consume exactly: "body length is N bytes, but read M"); any failure
+// makes the whole packet unknown to sqv, which then ignores it. The table
+// below is the parser's, type by type: a fixed-size field (2, 3, 9: four
+// octets; 5: two), a boolean (4, 7, 25: one octet, 0 or 1), a
+// NUL-terminated regular expression (6), a revocation key of 22 octets or
+// more whose class has bit 0x80 (12: RevocationKey::from_bits), a notation
+// whose two lengths are its size and whose name is UTF-8 (20), a reason
+// code (29), two algorithm octets (31; the digest's length is not
+// checked), a fingerprint of a version octet and, for v4, 20 octets, for
+// v6, 32 (33, 35; another version any length), whole digests of the
+// packet's hash (37), octet pairs (39). Every other type it reads whatever
+// its size: preferences, flags, URIs, user IDs, features, an issuer key ID
+// of any length (KeyID::Invalid: P4 asks 8), and the reserved, private and
+// unknown types. An embedded signature (32) it parses as a signature: P4
+// refuses 32 first. TestSqvSubpacketFault_FollowsSequoia pins each rule
+// both sides of its boundary, and the corpus' batch fx15 measures the
+// re-review's shapes (u_good_unh_*, z_good_unh_*, x_good_unh_*) on sqv:
+// re-derive the table when debian's sqv moves to another sequoia-openpgp.
+func sqvSubpacketFault(typ byte, data []byte, hashAlgo byte) string {
+	n := len(data)
+	switch typ {
+	case 2, 3, 9: // signature creation, signature expiration, key expiration time
+		if n != 4 {
+			return fmt.Sprintf("of %d octets, not 4", n)
+		}
+	case 4, 7, 25: // exportable certification, revocable, primary user ID
+		switch {
+		case n != 1:
+			return fmt.Sprintf("of %d octets, not a one-octet boolean", n)
+		case data[0] > 1:
+			return fmt.Sprintf("a boolean of value %d, not 0 or 1", data[0])
+		}
+	case 5: // trust signature: a level and an amount
+		if n != 2 {
+			return fmt.Sprintf("of %d octets, not 2", n)
+		}
+	case 6: // regular expression
+		if n == 0 || data[n-1] != 0 {
+			return "not NUL-terminated"
+		}
+	case 12: // revocation key: a class, an algorithm, a fingerprint
+		switch {
+		case n < 22:
+			return fmt.Sprintf("of %d octets, under 22", n)
+		case data[0]&0x80 == 0:
+			return fmt.Sprintf("its class 0x%02x without bit 0x80", data[0])
+		}
+	case 20: // notation: four flag octets, the name's and the value's lengths, the name, the value
+		if n < 8 {
+			return fmt.Sprintf("of %d octets, under 8", n)
+		}
+		name := int(binary.BigEndian.Uint16(data[4:6]))
+		if n != 8+name+int(binary.BigEndian.Uint16(data[6:8])) {
+			return fmt.Sprintf("of %d octets, which its name's and value's lengths do not make", n)
+		}
+		if !utf8.Valid(data[8 : 8+name]) {
+			return "its name not UTF-8"
+		}
+	case 29: // reason for revocation: a code, then text
+		if n == 0 {
+			return "empty, without a code"
+		}
+	case 31: // signature target: two algorithms, then a digest
+		if n < 2 {
+			return fmt.Sprintf("of %d octets, under 2", n)
+		}
+	case 33, 35: // issuer fingerprint, intended recipient: a version, a fingerprint
+		switch {
+		case n == 0:
+			return "empty, without a version"
+		case data[0] == 4 && n != 21, data[0] == 6 && n != 33:
+			return fmt.Sprintf("of version %d and %d octets", data[0], n)
+		}
+	case 37: // approved certifications: digests of the packet's hash
+		if d := sqvDigestSizes[hashAlgo]; d > 0 && n%d != 0 {
+			return fmt.Sprintf("of %d octets, not whole %d-octet digests", n, d)
+		}
+	case 39: // preferred AEAD ciphersuites: pairs
+		if n%2 != 0 {
+			return fmt.Sprintf("of %d octets, not pairs", n)
+		}
+	}
+	return ""
 }
 
 // walk applies P3's framing and P4's per-subpacket rules to one area of the
@@ -344,6 +455,11 @@ func (s *subpacketCounts) walk(area []byte, hashed bool, n int) error {
 		case critical && !sigCriticalOK(typ, data):
 			return refuse("P4", "packet %d: a critical subpacket %d in its %s area, which gpgv 2.2 does not handle", n, typ, where)
 		}
+		if s.sqvFault == "" {
+			if why := sqvSubpacketFault(typ, data, s.hashAlgo); why != "" {
+				s.sqvFault = fmt.Sprintf("its %s subpacket %d %s", where, typ, why)
+			}
+		}
 		switch typ {
 		case 2:
 			if hashed {
@@ -383,6 +499,7 @@ func (s *subpacketCounts) finish(p *sigPacket) error {
 		return refuse("P4", "packet %d: %d issuer fingerprints (subpacket 33), not one at most", p.n, s.fprs)
 	}
 	p.issuer = binary.BigEndian.Uint64(s.issuer)
+	p.sqvFault = s.sqvFault
 	if s.fprs == 1 {
 		switch {
 		case s.fpr[0] != 4:

@@ -7,7 +7,12 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
+	"math/bits"
 	"strings"
 	"testing"
 	"time"
@@ -237,5 +242,96 @@ func TestVerifyInline_ASHA1SignatureWithoutAFingerprintIsNeverCounted(t *testing
 	_, err = v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, inlineSHA1WithoutFingerprint(t, a)))
 	if err == nil || !strings.Contains(err.Error(), "never counted") || errors.Is(err, ErrBadSignature) {
 		t.Fatalf("A's SHA-1 signature without 33: err %v; want S2's refusal, never counted", err)
+	}
+}
+
+// signedWithHashed is e's v4 binary-mode SHA-256 signature packet of
+// message (e's key RSA), made by hand so that its hashed area can hold any
+// subpacket: a creation time, e's fingerprint (33), then extra (whole
+// subpackets, tsub); its unhashed area e's key ID (16). go-crypto writes
+// only the subpackets it knows.
+func signedWithHashed(t *testing.T, e *openpgp.Entity, message, extra []byte) []byte {
+	t.Helper()
+	priv, ok := e.PrivateKey.PrivateKey.(*rsa.PrivateKey)
+	if !ok {
+		t.Fatalf("test premise: %T is no RSA key", e.PrivateKey.PrivateKey)
+	}
+	created := binary.BigEndian.AppendUint32(nil, uint32(time.Now().Unix()))
+	hashed := joined(tsub(2, created...), tsub(33, append([]byte{4}, e.PrimaryKey.Fingerprint...)...), extra)
+	unhashed := tsub(16, tkeyID(e.PrimaryKey.KeyId)...)
+	head := binary.BigEndian.AppendUint16([]byte{4, 0x00, byte(packet.PubKeyAlgoRSA), 8}, uint16(len(hashed)))
+	h := sha256.New()
+	h.Write(message)
+	h.Write(head)
+	h.Write(hashed)
+	h.Write(binary.BigEndian.AppendUint32([]byte{4, 0xff}, uint32(len(head)+len(hashed))))
+	digest := h.Sum(nil)
+	s, err := rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, digest)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	s = bytes.TrimLeft(s, "\x00")
+	mpi := binary.BigEndian.AppendUint16(nil, uint16(8*(len(s)-1)+bits.Len8(s[0])))
+	body := joined(head, hashed, binary.BigEndian.AppendUint16(nil, uint16(len(unhashed))), unhashed, digest[:2], mpi, s)
+	return tpacket(body)
+}
+
+// TestVerifyInline_AGoodPacketSqvDoesNotReadIsNotCounted: the re-review's
+// A-RC1. debian:13's sqv parses every subpacket of a signature packet, in
+// both areas, and reads a packet holding one its parser refuses as an
+// unknown packet, which it ignores: so a good packet with a malformed
+// subpacket appended to its unhashed area (no key needed: the area is not
+// signed) is refused by debian:13 when it is the only good one
+// (u_good_unh_created_3), and accepted by every apt beside another good one
+// (y_goodmalformed_plus_good); gpgv and go-crypto never read the unhashed
+// subpackets but 16, 32 and 33. S2 does not count such a packet, and the
+// refusal names it; a well-formed unhashed subpacket changes nothing
+// (u_good_unh_created_ok). The hashed area's twin needs the key (a
+// malformed subpacket the key holder signed): sqv refuses it alike, and so
+// does S2.
+func TestVerifyInline_AGoodPacketSqvDoesNotReadIsNotCounted(t *testing.T) {
+	a := newTestEntity(t, "A", "a@example.com")
+	v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t, a), RequireSignature: true, Logger: silentLogger()})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	good := signaturePacketsOf(t, clearsignWith(t, a, []byte(fakeReleasePlaintext)))
+	malformed := withUnhashedSubpacket(t, good, tsub(2, 1, 2, 3))
+	wellFormed := withUnhashedSubpacket(t, good, tsub(2, 0x65, 0, 0, 0))
+	hashedBad := signedWithHashed(t, a, []byte(fakeReleasePlaintext), tsub(12, 0x80, 1, 2, 3, 4))
+	hashedGood := signedWithHashed(t, a, []byte(fakeReleasePlaintext), tsub(12, append([]byte{0x80, 1}, bytes.Repeat([]byte{0x77}, 20)...)...))
+	// A's good signature that has expired since: S2's verification refuses
+	// it after the malformed one, whose reason must still be the one named.
+	aExpiredSig := signedAt(t, a, []byte(fakeReleasePlaintext), packet.SigTypeText, crypto.SHA256, true,
+		time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), 1)
+	for _, tc := range []struct {
+		name    string
+		packets [][]byte
+		refused bool
+	}{
+		{"the good packet with a 3-octet unhashed creation time, alone", [][]byte{malformed}, true},
+		{"that packet, then A's expired signature", [][]byte{malformed, aExpiredSig}, true},
+		{"that packet, then a good one", [][]byte{malformed, good}, false},
+		{"a good packet, then that one", [][]byte{good, malformed}, false},
+		{"a well-formed unhashed creation time", [][]byte{wellFormed}, false},
+		{"a hashed revocation key of 5 octets, signed", [][]byte{hashedBad}, true},
+		{"a hashed revocation key of 22 octets, signed", [][]byte{hashedGood}, false},
+	} {
+		got, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, tc.packets...))
+		switch {
+		case tc.refused && (err == nil || !strings.Contains(err.Error(), "sqv does not read it") || ClassifyVerifyErr(err) != "crypto_verify_failed"):
+			t.Errorf("%s: got %q, err %v (reason %q); want refused, crypto_verify_failed, naming sqv", tc.name, got, err, ClassifyVerifyErr(err))
+		case !tc.refused && err != nil:
+			t.Errorf("%s: err %v; want it adopted", tc.name, err)
+		}
+	}
+	// Detached (u_d_good_unh_created_3).
+	release := []byte(fakeReleasePlaintext)
+	det := detachSignWith(t, a, release, false)
+	if _, err := v.VerifyDetached(context.Background(), newSuite(), release, armorSignature(t, withUnhashedSubpacket(t, det, tsub(2, 1, 2, 3)))); err == nil || !strings.Contains(err.Error(), "sqv does not read it") {
+		t.Errorf("detached, the good packet with a 3-octet unhashed creation time: err %v; want refused, naming sqv", err)
+	}
+	if _, err := v.VerifyDetached(context.Background(), newSuite(), release, armorSignature(t, det)); err != nil {
+		t.Errorf("test premise: the detached good packet: %v; want it adopted", err)
 	}
 }

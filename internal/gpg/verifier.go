@@ -739,9 +739,17 @@ func uncountable(p sigPacket) error {
 // checks; S2 trusts pkts[i]), or nil when it counts it:
 //
 //   - its hash is not one of s2Hashes (SHA-1: ruling HD-18): uncountable;
+//   - debian:13's sqv does not read it (the re-review's A-RC1): Sequoia's
+//     parser refuses one of its subpackets (sigPacket.sqvFault), so sqv
+//     reads the packet as unknown and does not count it;
 //   - apt erases it (the re-review's A-RC2): a later packet of pkts, by
-//     the same key, has a hash apt distrusts (erasedBy). This reason
-//     outranks a verification error at the refusal.
+//     the same key, has a hash apt distrusts (erasedBy).
+//
+// The last two outrank a verification error at the refusal: each names why
+// an otherwise good signature did not count. Not counting a packet sqv
+// does not read, rather than refusing the anchor, is what every apt does
+// beside another good packet (y_goodmalformed_plus_good, accepted by all
+// six: sqv counts the other one, gpgv reads both).
 //
 // AIDEV-NOTE: the erasure is apt's, not gpgv's: methods/gpgv.cc (2.2.4
 // :245-250, 3.2.0 :293-302) erases every Signers.Good entry of a key at
@@ -761,6 +769,9 @@ func discount(pkts []sigPacket, i int) (outranks bool, err error) {
 	p := pkts[i]
 	if !s2Hashes[p.hashAlgo] {
 		return false, uncountable(p)
+	}
+	if p.sqvFault != "" {
+		return true, fmt.Errorf("S2: packet %d: sqv does not read it: %s, which Sequoia's parser refuses, so debian:13's sqv reads the packet as unknown and does not count it", p.n, p.sqvFault)
 	}
 	if q, ok := erasedBy(pkts, i); ok {
 		return true, fmt.Errorf("S2: packet %d: apt erases it: packet %d, by the same key %016X, has hash algorithm %d (SHA-1), "+
