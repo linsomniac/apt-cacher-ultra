@@ -1,0 +1,27 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://github.com/linsomniac/apt-cacher-ultra/blob/main/security/openpgp.vex.json",
+  "author": "https://github.com/linsomniac/apt-cacher-ultra",
+  "timestamp": "2026-11-01T16:15:02Z",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": {
+        "@id": "https://pkg.go.dev/vuln/GO-2026-5932",
+        "name": "GO-2026-5932"
+      },
+      "products": [
+        {
+          "@id": "pkg:golang/github.com/linsomniac/apt-cacher-ultra",
+          "subcomponents": [
+            { "@id": "pkg:golang/golang.org/x/crypto@v0.58.0" }
+          ]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "impact_statement": "Production Linux AMD64 and ARM64 builds do not import golang.org/x/crypto/openpgp or any of its subpackages, directly or transitively. OpenPGP verification uses github.com/ProtonMail/go-crypto/openpgp. The x/crypto module remains necessary for bcrypt and other cryptographic primitives. This assessment applies to production builds checked by scripts/check-no-legacy-openpgp.sh; CI and release workflows enforce that guard. Reassess before changing the module version, supported platforms, build tags, or dependency policy.",
+      "status_notes": "Dependency guard: https://github.com/linsomniac/apt-cacher-ultra/blob/main/scripts/check-no-legacy-openpgp.sh. The independent govulncheck CI gate remains enabled without suppressions. Scanner usage: https://github.com/linsomniac/apt-cacher-ultra/blob/main/docker/README.md#vulnerability-scanning."
+    }
+  ]
+}

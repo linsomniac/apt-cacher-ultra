@@ -142,3 +142,35 @@ Pin a release version or digest for deployments. To use the published image:
 APT_CACHER_ULTRA_IMAGE=ghcr.io/linsomniac/apt-cacher-ultra:edge docker compose pull
 APT_CACHER_ULTRA_IMAGE=ghcr.io/linsomniac/apt-cacher-ultra:edge docker compose up -d --no-build
 ```
+
+## Vulnerability scanning
+
+The [OpenVEX assessment](../security/openpgp.vex.json) marks
+[GO-2026-5932](https://pkg.go.dev/vuln/GO-2026-5932) as `not_affected` for this
+application's `golang.org/x/crypto@v0.58.0` dependency. Its vulnerable legacy
+OpenPGP packages are absent from the production dependency graph on Linux
+AMD64 and ARM64. OpenPGP verification uses the maintained ProtonMail library;
+`x/crypto` is still needed for bcrypt and other cryptographic primitives.
+
+CI and the release workflow run `make check-deps`, rejecting direct or
+transitive legacy OpenPGP imports on either architecture. A failed dependency
+lookup also fails the guard. CI separately runs `govulncheck` without any
+exceptions. The guard's offline regression tests run with `make check-deps-test`.
+
+To scan a production image built from the current checkout with Trivy's
+[local OpenVEX support](https://trivy.dev/docs/latest/supply-chain/vex/file/):
+
+```sh
+make check-deps
+docker build -t apt-cacher-ultra:scan .
+trivy image --scanners vuln --exit-code 1 --show-suppressed \
+  --vex security/openpgp.vex.json apt-cacher-ultra:scan
+```
+
+The assessment matches this application's Go module and the exact `x/crypto`
+version; it does not apply to other applications or other advisories. Inspect
+the suppressed finding to retain its justification. When updating `x/crypto`,
+rerun the guard and scan, then reassess the VEX statement and update its module
+version, timestamp and document version. Also reassess when adding production
+architectures or build tags. Custom builds that import legacy OpenPGP must not
+use this assessment.

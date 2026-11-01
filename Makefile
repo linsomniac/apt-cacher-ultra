@@ -1,4 +1,4 @@
-.PHONY: build test test-race lint shellcheck fmt deb e2e e2e-flat e2e-live deb-test apt-repo-test clean
+.PHONY: build test test-race lint shellcheck check-deps check-deps-test fmt deb e2e e2e-flat e2e-live deb-test apt-repo-test clean
 
 GO        ?= go
 BIN       := apt-cacher-ultra
@@ -28,6 +28,14 @@ test:
 test-race:
 	$(GO) test -race -timeout 10m ./...
 
+# Package-level guard backing security/openpgp.vex.json. Check both production
+# architectures even when the host only builds one of them.
+check-deps:
+	GO="$(GO)" bash scripts/check-no-legacy-openpgp.sh
+
+check-deps-test:
+	GO="$(GO)" bash scripts/test-check-no-legacy-openpgp.sh
+
 # CI's lint job: golangci-lint, also over the e2ehooks build (e2e/flat's
 # test seam, cmd/apt-cacher-ultra/e2ehooks.go, compiles only with that tag),
 # and ShellCheck.
@@ -40,7 +48,7 @@ lint: shellcheck
 # they flag (0.9.0, GitHub's ubuntu-latest, reports an SC2015 that 0.11.0
 # does not), so CI's lint job and every checkout run this one version.
 SHELLCHECK_IMAGE := koalaman/shellcheck:v0.11.0
-SHELL_SCRIPTS    := e2e/flat/*.sh e2e/live/*.sh e2e/deb/*.sh packaging/scripts/*.sh scripts/smoke-test-docker.sh
+SHELL_SCRIPTS    := e2e/flat/*.sh e2e/live/*.sh e2e/deb/*.sh packaging/scripts/*.sh scripts/smoke-test-docker.sh scripts/check-no-legacy-openpgp.sh scripts/test-check-no-legacy-openpgp.sh
 
 shellcheck:
 	docker run --rm -v "$(CURDIR):/mnt:ro" -w /mnt $(SHELLCHECK_IMAGE) -x $(SHELL_SCRIPTS)

@@ -28,6 +28,8 @@ jobs:
         with:
           go-version: '1.27'
           cache: true
+      - name: Reject legacy OpenPGP dependencies
+        run: make check-deps-test check-deps
       - run: go vet ./...
       - run: go test -race -timeout 10m ./...
       - name: Check reachable dependency vulnerabilities
