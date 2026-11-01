@@ -260,8 +260,9 @@ var (
 //     ErrBadSignature. Not on the bypass path (the hardening plan's DN-8).
 //  5. S2 (verifyAnyTrusted): one packet gpgv checks passes BOTH the
 //     long-form-fingerprint trust check AND verifies cryptographically
-//     against the trust set, and is countable (SHA-256, -384 or -512:
-//     ruling HD-18). Without the coupling, a multi-sig block could satisfy
+//     against the trust set, and S2 counts it (discount: SHA-256, -384 or
+//     -512, ruling HD-18; not erased by apt at a later SHA-1 packet by its
+//     key). Without the coupling, a multi-sig block could satisfy
 //     the policy with one packet (decoy) and verify a different packet
 //     (the actual cryptographic anchor).
 //
@@ -587,13 +588,16 @@ var s2Hashes = map[byte]bool{8: true, 9: true, 10: true}
 // long-form IssuerFingerprint in trustFPs, or (when AllowShortKeyID
 // is enabled) the legacy 8-byte issuer keyid maps to a single entity
 // in trustSet — AND (b) cryptographic verification against the
-// matched entity, and that is countable (s2Hashes). Coupling these
-// checks to the same packet is the SPEC2 §7.6.3 invariant: a
-// multi-signature block must not satisfy the policy with one packet
-// while the library's verifier accepts a different packet. Each packet is
-// verified as layer P framed it (p.raw), alone.
+// matched entity, and that S2 counts (discount: its hash, apt's erasure
+// of it). Coupling these checks to the same packet is the SPEC2 §7.6.3
+// invariant: a multi-signature block must not satisfy the policy with one
+// packet while the library's verifier accepts a different packet. Each
+// packet is verified as layer P framed it (p.raw), alone.
 //
 // Error precedence when no packet is accepted:
+//   - If a trusted packet was discounted for a reason that outranks the
+//     rest (discount: apt erases it), return the first such reason: it
+//     names why an otherwise good signature did not count.
 //   - If at least one packet's IssuerFingerprint was trusted but
 //     none verified (or none was countable), return the last
 //     underlying verification error.
@@ -618,10 +622,25 @@ func (v *Verifier) verifyAnyTrusted(
 		anyUntrusted    bool
 		sawSignature    bool
 		lastVerifyErr   error
+		discounted      error // the first reason that outranks lastVerifyErr (discount)
 		anyTrustedSeen  bool
 		rejectedSigners []string
 	)
-	for _, p := range pkts {
+	// skip records why S2 does not count pkts[i], a packet it trusts, and
+	// says whether it does not (discount).
+	skip := func(i int) bool {
+		outranks, err := discount(pkts, i)
+		switch {
+		case err == nil:
+			return false
+		case !outranks:
+			lastVerifyErr = err
+		case discounted == nil:
+			discounted = err
+		}
+		return true
+	}
+	for i, p := range pkts {
 		sawSignature = true
 
 		// Short-keyid fallback (SPEC2 §7.6.3): a real-world signer
@@ -655,8 +674,7 @@ func (v *Verifier) verifyAnyTrusted(
 				continue
 			}
 			anyTrustedSeen = true
-			if !s2Hashes[p.hashAlgo] {
-				lastVerifyErr = uncountable(p)
+			if skip(i) {
 				continue
 			}
 			// The entity whose keyid resolved the trust check is the
@@ -677,8 +695,7 @@ func (v *Verifier) verifyAnyTrusted(
 			continue
 		}
 		anyTrustedSeen = true
-		if !s2Hashes[p.hashAlgo] {
-			lastVerifyErr = uncountable(p)
+		if skip(i) {
 			continue
 		}
 		// Verify this one packet in isolation, as framed: the packet
@@ -698,6 +715,8 @@ func (v *Verifier) verifyAnyTrusted(
 	switch {
 	case !sawSignature:
 		return ErrNoUsableSignature
+	case anyTrustedSeen && discounted != nil:
+		return fmt.Errorf("signature verification failed: %w", discounted)
 	case anyTrustedSeen && lastVerifyErr != nil:
 		return fmt.Errorf("signature verification failed: %w", lastVerifyErr)
 	case anyUntrusted:
@@ -715,6 +734,61 @@ func (v *Verifier) verifyAnyTrusted(
 func uncountable(p sigPacket) error {
 	return fmt.Errorf("S2: packet %d: hash algorithm %d is never counted (SHA-1: ruling HD-18)", p.n, p.hashAlgo)
 }
+
+// discount says why S2 does not count pkts[i] (pkts are the packets gpgv
+// checks; S2 trusts pkts[i]), or nil when it counts it:
+//
+//   - its hash is not one of s2Hashes (SHA-1: ruling HD-18): uncountable;
+//   - apt erases it (the re-review's A-RC2): a later packet of pkts, by
+//     the same key, has a hash apt distrusts (erasedBy). This reason
+//     outranks a verification error at the refusal.
+//
+// AIDEV-NOTE: the erasure is apt's, not gpgv's: methods/gpgv.cc (2.2.4
+// :245-250, 3.2.0 :293-302) erases every Signers.Good entry of a key at
+// that key's VALIDSIG with an untrusted digest, and gpgv writes each
+// packet's GOODSIG before its VALIDSIG, packet by packet, so only good
+// signatures BEFORE the SHA-1 packet are erased (x3i_sha1_plus_good, SHA-1
+// first, is accepted by every apt; e_good_then_sha1A is refused by the five
+// gpgv-based apt; debian:13's sqv ignores the SHA-1 packet and accepts
+// both). The key is the signing (sub)key: apt's IsTheSameKey compares the
+// VALIDSIG fingerprint's long key ID with the GOODSIG's, and P4 makes a
+// packet's one issuer key ID the key every reader takes, so the issuers
+// are compared. The later packet need not be trusted for the suite: gpgv
+// writes a VALIDSIG for every good packet of a key in its keyring, and a
+// key whose good signature S2 trusts is one; S1 has verified the later
+// packet (it is gpgv-checked and its key is known), so it is a good one.
+func discount(pkts []sigPacket, i int) (outranks bool, err error) {
+	p := pkts[i]
+	if !s2Hashes[p.hashAlgo] {
+		return false, uncountable(p)
+	}
+	if q, ok := erasedBy(pkts, i); ok {
+		return true, fmt.Errorf("S2: packet %d: apt erases it: packet %d, by the same key %016X, has hash algorithm %d (SHA-1), "+
+			"and apt drops every good signature of a key it has read when that key's VALIDSIG has a hash it distrusts", p.n, q.n, p.issuer, q.hashAlgo)
+	}
+	return false, nil
+}
+
+// erasedBy returns the first packet after pkts[i] in pkts (the packets
+// gpgv checks) by the same key whose hash apt distrusts
+// (aptUntrustedDigest), and whether there is one: the packet at whose
+// VALIDSIG apt erases pkts[i]'s good signature (discount).
+func erasedBy(pkts []sigPacket, i int) (sigPacket, bool) {
+	for _, q := range pkts[i+1:] {
+		if q.issuer == pkts[i].issuer && aptUntrustedDigest(q.hashAlgo) {
+			return q, true
+		}
+	}
+	return sigPacket{}, false
+}
+
+// aptUntrustedDigest reports whether apt's methods/gpgv.cc distrusts a
+// VALIDSIG whose hash algorithm is h, by default: its Digests table, the
+// same in apt 2.2.4 to 3.2.0, trusts ids 4 to 11 (four reserved ids,
+// SHA-256, SHA-384, SHA-512 and SHA-224) and distrusts every other id — 0,
+// MD5, SHA-1, RIPE-MD/160, and any id past the table (FindDigest's
+// fallback, "Invalid digest"). Of the hashes layer P reads, SHA-1 alone.
+func aptUntrustedDigest(h byte) bool { return h < 4 || h > 11 }
 
 // findUniqueEntityByKeyID looks up a short 8-byte issuer keyid against
 // the given EntityList — checking each entity's primary key and every
