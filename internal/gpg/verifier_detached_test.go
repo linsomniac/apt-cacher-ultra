@@ -295,8 +295,8 @@ func TestVerifyDetached_GarbageSignatureBytes(t *testing.T) {
 		context.Background(), newSuite(),
 		[]byte(fakeReleasePlaintext),
 		[]byte("not a valid pgp signature, just ASCII text"),
-	); err == nil {
-		t.Fatal("expected error on garbage signature input")
+	); !errors.Is(err, ErrMalformedSignature) || ruleOf(err) != "T1" {
+		t.Fatalf("garbage signature input: %v (rule %q); want ErrMalformedSignature, refused by T1 (no BEGIN line)", err, ruleOf(err))
 	}
 }
 
@@ -325,8 +325,8 @@ Q0gIKKkPxQv/RJUL/BQEbZE76q+vKyEfnRzwZ8BWBqoIHGYjcdaRXz5cVOmu0Nd9
 		context.Background(), newSuite(),
 		[]byte(fakeReleasePlaintext), armoredOther,
 	)
-	if err == nil {
-		t.Fatal("expected error on wrong-armor-type input")
+	if !errors.Is(err, ErrMalformedSignature) || ruleOf(err) != "T1" {
+		t.Fatalf("wrong-armor-type input: %v (rule %q); want ErrMalformedSignature, refused by T1 (no signature BEGIN line)", err, ruleOf(err))
 	}
 }
 

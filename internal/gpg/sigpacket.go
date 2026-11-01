@@ -514,8 +514,20 @@ func (s *subpacketCounts) finish(p *sigPacket) error {
 
 // readBack is P5: go-crypto's own parse of p's bytes, as framed, is a
 // version 4 *packet.Signature naming p's issuer; any disagreement refuses.
-// (go-crypto refuses a critical hashed subpacket it does not know: that
-// agrees with gpgv's BADSIG for it.)
+//
+// AIDEV-NOTE: go-crypto (v1.4.1, packet/signature.go) refuses a critical
+// hashed subpacket of a type it does not parse — any but 2 to 6, 9, 11, 16,
+// 20 to 30, 32, 33, 35 and 39. Where gpgv 2.2's can_handle_critical refuses
+// the type too, P4 has refused it first, and the two agree (gpgv's BADSIG).
+// Not for 7, 12 and 38 (version 0): gpgv 2.2 handles them and P4 lets them
+// through, so P5's refusal is strict (the re-review's V-RM4; batch fx15's
+// k_good_plus_unknownB_hashed_crit7 and _crit12, an unknown key's packet,
+// every apt accepts, the cache refuses: the deviation family "non-canonical
+// packet layout"). go-crypto also refuses, critical or not, a hashed
+// subpacket it parses and finds malformed (a primary user ID of two
+// octets, a trust signature of one, an odd AEAD list, a regular expression
+// without its NUL) and a hashed exportable certification of 0: strict too
+// where gpgv and sqv read the packet (k_*, v_*_hashed_regexp_nonul_go).
 func readBack(p sigPacket) error {
 	pkt, err := packet.Read(bytes.NewReader(p.raw))
 	if err != nil {

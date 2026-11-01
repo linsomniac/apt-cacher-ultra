@@ -334,9 +334,9 @@ func TestParseSigPackets_RefusesAnEmbeddedSignatureBeforeGoCrypto(t *testing.T) 
 // TestParseSigPackets_GoCryptoMustAgree pins P5: a packet P1–P4 pass but
 // go-crypto does not parse, or reads otherwise, is refused. A critical
 // revocation key subpacket (12) is one gpgv 2.2 handles and go-crypto does
-// not know (it refuses an unknown critical hashed subpacket, which agrees
-// with gpgv's BADSIG for one gpgv lacks); a primary user ID subpacket (25)
-// of two octets, one go-crypto finds malformed.
+// not know (it refuses an unknown critical hashed subpacket: strict here,
+// as gpgv reads it; readBack's note); a primary user ID subpacket (25) of
+// two octets, one go-crypto finds malformed.
 func TestParseSigPackets_GoCryptoMustAgree(t *testing.T) {
 	a16 := tsub(16, tkeyID(testIDA)...)
 	revoker := tsub(12, append([]byte{0x80, 1}, bytes.Repeat([]byte{0x77}, 20)...)...)

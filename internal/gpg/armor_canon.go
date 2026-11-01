@@ -9,10 +9,16 @@ package gpg
 // accepts it (a deviation of the family "non-canonical armor layout";
 // widening the grammar is a code change with a measured corpus row, ruling
 // HD-17). Both forms, on lines as apt's LineBuffer leaves them
-// (internal/apttext's AptLine: what an InRelease's S holds; a Release.gpg's raw
-// lines reach gpgv and sqv, which both tolerate the trailing blanks and CRs
-// aptLine strips, measured). The cache's base64 decode is the decode: no
-// other parser reads the armor.
+// (internal/apttext's AptLine: what an InRelease's S holds; a Release.gpg's
+// raw lines reach gpgv and sqv, which both tolerate the trailing blanks and
+// CRs AptLine strips). Measured for a Release.gpg: CR line ends (d_crlf_all)
+// and trailing blanks and CRs on the marker lines (the corpus' a_d_begin_*,
+// a_d_end_*), and, since Task 9b's fix round (the re-review's V-RM4 and
+// V-RM5: batch fx16's rd_* rows), trailing spaces, tabs and CRs on the
+// base64, CRC and header lines and on the header-ending empty line; a line
+// ending in a CR then a blank ("\r ": AptLine keeps the CR) is refused by A4
+// where every apt accepts it, a strict deviation (w_d_*_cr_sp). The cache's
+// base64 decode is the decode: no other parser reads the armor.
 //
 // AIDEV-NOTE: history moved here from the deleted armor_shape.go (F0, F2–F5;
 // rulings HD-8, HD-13). go-crypto's armor reader trims every line with

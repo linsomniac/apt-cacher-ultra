@@ -313,6 +313,18 @@ func SplitDetached(b []byte) ([][]byte, int, error) {
 // armor parser has no such cut, so F0 now reads M only (Task 9b's ruling):
 // an END marker in an armor header's value (vm3_i/vm3_d_end_marker_in_header,
 // accepted by every apt) is A2's business, not F0's.
+//
+// AIDEV-NOTE: M is what S1 and S2 check the signatures against, with
+// go-crypto's canonical-text hashing for a text-mode signature. That equals
+// gpgv's text filter on M but for a line of M ending in two CRs or more,
+// which only a file line ending in CRs then a blank leaves ("x\r\r " is
+// "x\r\r" to AptLine, which strips the blank and stops at the CR): gpgv
+// strips the CRs, go-crypto keeps all but one, so the cache refuses such a
+// signature (bad_signature) where the five gpgv-based apt accept it, and
+// debian:13's sqv refuses it too (the corpus' c_text_crcr_sp and
+// c_text_crcrcr_sp; the re-review's V-RM4), so ruling HD-2 holds. A line
+// ending in one CR then a blank (c_text_cr_sp) hashes alike and is
+// accepted by every apt and the cache.
 func Inline(b []byte) (Clearsigned, error) {
 	cs, err := SplitClearsigned(b)
 	if err != nil {

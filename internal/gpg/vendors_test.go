@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
+
+	pgperrors "github.com/ProtonMail/go-crypto/openpgp/errors"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/apttext"
 )
@@ -141,9 +144,17 @@ func TestVerifier_AcceptsTheVendorAnchors(t *testing.T) {
 	}
 }
 
+// vendorCheckTime is the time the vendor anchors are checked at: after
+// every fixture was fetched (2026-10-28) and every anchor signed, and
+// before any of their keys expires, so that a key's expiry cannot fail
+// the tests later (the re-review's V-RM3: mongodb's signing key expires
+// 2028-01-17, yarn's subkey 2030-01-27, Debian 12's key 2031-01-19).
+var vendorCheckTime = time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+
 // vendorVerifier is the verifier of a vendor fixture directory: its key
 // files (every file but InRelease, Release and Release.gpg) as the host
-// keyring, under the defaults (no pin, allow_short_keyid).
+// keyring, under the defaults (no pin, allow_short_keyid), checking
+// signatures at vendorCheckTime.
 func vendorVerifier(t *testing.T, dir string) *Verifier {
 	t.Helper()
 	entries, err := os.ReadDir(filepath.Join(vendorDir, dir))
@@ -168,7 +179,32 @@ func vendorVerifier(t *testing.T, dir string) *Verifier {
 	if err != nil {
 		t.Fatal(err)
 	}
+	v.now = func() time.Time { return vendorCheckTime }
 	return v
+}
+
+// TestVerifier_ChecksTheVendorAnchorsAtAFixedTime: the vendor fixtures are
+// checked at vendorCheckTime, not the wall clock (the re-review's V-RM3):
+// at a time after mongodb's signing key expires, its anchor is refused
+// (ErrKeyExpired), so it is the fixed time that keeps
+// TestVerifier_AcceptsTheVendorAnchors passing after 2028-01-17.
+func TestVerifier_ChecksTheVendorAnchorsAtAFixedTime(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join(vendorDir, "mongodb", "InRelease"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := vendorVerifier(t, "mongodb")
+	if v.now == nil || !v.now().Equal(vendorCheckTime) {
+		t.Fatalf("vendorVerifier's clock is not vendorCheckTime")
+	}
+	if _, err := v.VerifyInline(context.Background(), newSuite(), body); err != nil {
+		t.Fatalf("mongodb at %v: %v; want it verified", vendorCheckTime, err)
+	}
+	later := time.Date(2028, 2, 1, 0, 0, 0, 0, time.UTC)
+	v.now = func() time.Time { return later }
+	if _, err := v.VerifyInline(context.Background(), newSuite(), body); !errors.Is(err, pgperrors.ErrKeyExpired) {
+		t.Fatalf("mongodb at %v: %v; want ErrKeyExpired (its key expires 2028-01-17)", later, err)
+	}
 }
 
 // TestVerifier_RefusesSublimesSecondSignatureFlipped: the re-review's

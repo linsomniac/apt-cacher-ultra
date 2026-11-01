@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	pgperrors "github.com/ProtonMail/go-crypto/openpgp/errors"
@@ -103,6 +104,12 @@ type Verifier struct {
 	// accept_any_signer when the bypass branch runs. Same dedupe shape as
 	// the other once-loggers.
 	unverifiedSignerLogged onceSet
+
+	// now, when set, is the time S2 checks signatures at (go-crypto's
+	// expiry and revocation checks: sigConfig); nil, as NewVerifier leaves
+	// it, is the wall clock. A test's clock: real vendors' keys expire
+	// (vendors_test.go, the re-review's V-RM3).
+	now func() time.Time
 }
 
 // Compile-time interface check: Verifier satisfies freshness.Verifier.
@@ -241,6 +248,9 @@ var (
 // client's apt hands its verifier and then its Release parser.
 //
 // Order of checks (each fails closed), the hardening plan's DN-11:
+//  0. Resolve the per-suite trust set (resolveTrustSet); if RequirePinned
+//     and no pin matches, abort (ErrUnpinnedSuite), whatever the anchor's
+//     shape (the re-review's V-RM1).
 //  1. T (internal/apttext): apt's SplitClearSignedFile, ported, and the
 //     cache's text rules: M and the one armor block. A body no line of
 //     which is the clearsign marker is ErrMissingSignature; any other
@@ -251,10 +261,9 @@ var (
 //  2. A (armor_canon.go) and P (sigpacket.go): the armor, as a
 //     canonical whitelist, and its signature packets, by the cache's own
 //     v4 parser: ErrMalformedClearsign.
-//  3. Resolve the per-suite trust set; if RequirePinned and no match,
-//     abort (ErrUnpinnedSuite). Under accept_any_signer with no pin
-//     matched, accept here (SPEC2 §7.6.2's bypass: T, A and P passed,
-//     so at least one signature packet).
+//  3. Under accept_any_signer with no pin matched (step 0), accept here
+//     (SPEC2 §7.6.2's bypass: T, A and P passed, so at least one
+//     signature packet).
 //  4. S1 (requireKnownSignaturesVerify): every signature packet gpgv
 //     checks whose issuer names a key in the host keyring verifies, as
 //     apt's BADSIG refuses the anchor even beside a good signature:
@@ -279,6 +288,13 @@ var (
 // no I/O — verification is CPU-bound and short.
 func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, inRelease []byte) ([]byte, error) {
 	_ = ctx
+
+	// Step 0: the suite's trust set; an unpinned suite under
+	// require_pinned_signer is refused here, whatever the anchor.
+	trust, err := v.resolveTrustSet(suite)
+	if err != nil {
+		return nil, err
+	}
 
 	// Step 1: layer T. Only a clearsigned envelope is inline metadata,
 	// whatever require_signature says (spec C5 rev 4).
@@ -311,7 +327,7 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 	}
 
 	// Steps 3-5.
-	if err := v.checkSignatures(suite, cs.Message, pkts); err != nil {
+	if err := v.checkSignatures(suite, trust, cs.Message, pkts); err != nil {
 		return nil, err
 	}
 	return cs.Message, nil
@@ -334,9 +350,10 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 //  1. Empty inputs are a programming error in the caller (the
 //     freshness checker only routes here when both Release and
 //     Release.gpg fetched non-empty bodies).
-//  2. Layers T, A and P on sigBytes, on the bypass path too.
-//  3. Resolve the per-suite trust set; if RequirePinned and no match,
-//     abort. Under accept_any_signer with no pin matched, accept here.
+//  2. Resolve the per-suite trust set; if RequirePinned and no match,
+//     abort, whatever the signature's shape (VerifyInline's step 0).
+//  3. Layers T, A and P on sigBytes, on the bypass path too. Under
+//     accept_any_signer with no pin matched, accept here.
 //  4. S1 and S2 over the Release bytes, as VerifyInline's steps 4 and 5.
 //
 // As in VerifyInline, a missing signature never passes through: a
@@ -361,6 +378,10 @@ func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef,
 	if len(sigBytes) == 0 {
 		return nil, errors.New("empty Release.gpg body")
 	}
+	trust, err := v.resolveTrustSet(suite)
+	if err != nil {
+		return nil, err
+	}
 	lines, err := apttext.Detached(sigBytes)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrMalformedSignature, err)
@@ -369,7 +390,7 @@ func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef,
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrMalformedSignature, err)
 	}
-	if err := v.checkSignatures(suite, releaseBytes, pkts); err != nil {
+	if err := v.checkSignatures(suite, trust, releaseBytes, pkts); err != nil {
 		return nil, err
 	}
 	return releaseBytes, nil
@@ -386,14 +407,10 @@ func armorPackets(lines [][]byte, first int) ([]sigPacket, error) {
 }
 
 // checkSignatures is layer S over the packets layer P read, signed being
-// what they sign (M inline, the Release detached): the trust set, then
-// the bypass or S1 and S2.
-func (v *Verifier) checkSignatures(suite freshness.SuiteRef, signed []byte, pkts []sigPacket) error {
-	trustSet, trustFPs, pinned, bypass, err := v.resolveTrustSet(suite)
-	if err != nil {
-		return err
-	}
-	if bypass {
+// what they sign (M inline, the Release detached), under the suite's
+// trust set (resolveTrustSet): the bypass, or S1 and S2.
+func (v *Verifier) checkSignatures(suite freshness.SuiteRef, trust suiteTrust, signed []byte, pkts []sigPacket) error {
+	if trust.bypass {
 		// SPEC2 §7.6.2 bypass: the anchor parsed structurally (T, A and
 		// P, so at least one signature packet: parseSigPackets refuses
 		// none); trust + crypto check skipped. The original signed bytes
@@ -410,13 +427,13 @@ func (v *Verifier) checkSignatures(suite freshness.SuiteRef, signed []byte, pkts
 		v.logUnverifiedSignerOnce(suite, pkts[0])
 		return nil
 	}
-	if len(trustSet) == 0 {
+	if len(trust.entities) == 0 {
 		// No key can verify the signed metadata — fail closed. Unpinned:
 		// the host keyring is empty (require_signature = false admits
 		// that at startup). Pinned: the keyring holds none of the
 		// pinned fingerprints (we already passed the RequirePinned
 		// gate, so this is "configured but un-loadable").
-		if !pinned {
+		if !trust.pinned {
 			return fmt.Errorf("%w: the host keyring is empty — signed suites cannot adopt until keys are installed or adoption.accept_any_signer is set", ErrNoUsableSignature)
 		}
 		return fmt.Errorf("%w: pin matched but no key in host keyring satisfies it", ErrNoUsableSignature)
@@ -425,7 +442,7 @@ func (v *Verifier) checkSignatures(suite freshness.SuiteRef, signed []byte, pkts
 	if err := v.requireKnownSignaturesVerify(signed, checked); err != nil {
 		return err
 	}
-	return v.verifyAnyTrusted(suite, trustSet, trustFPs, signed, checked)
+	return v.verifyAnyTrusted(suite, trust.entities, trust.fps, signed, checked)
 }
 
 // gpgvChecks returns the packets gpgv checks: every one when they share
@@ -455,9 +472,17 @@ func gpgvChecks(pkts []sigPacket) []sigPacket {
 	return pkts
 }
 
+// suiteTrust is a suite's trust set (resolveTrustSet).
+type suiteTrust struct {
+	entities openpgp.EntityList  // to verify against (nil under bypass)
+	fps      map[string]struct{} // their uppercase fingerprints (nil under bypass)
+	pinned   bool                // at least one [[trusted_signer]] block matched
+	bypass   bool                // accept_any_signer and no pin matched
+}
+
 // resolveTrustSet implements SPEC2 §7.6.2. Returns:
-//   - trustSet: the openpgp.EntityList to verify against (nil under bypass)
-//   - trustFPs: the uppercase-fingerprint set (for IssuerFingerprint check;
+//   - entities: the openpgp.EntityList to verify against (nil under bypass)
+//   - fps:      the uppercase-fingerprint set (for IssuerFingerprint check;
 //     nil under bypass)
 //   - pinned:   true iff at least one [[trusted_signer]] block matched
 //   - bypass:   true iff acceptAnySigner is on AND no pin matched — the
@@ -468,7 +493,15 @@ func gpgvChecks(pkts []sigPacket) []sigPacket {
 //     hard requirement; the relaxation only governs verification within
 //     the broad-trust branch).
 //   - err:      ErrUnpinnedSuite when RequirePinned and no pin matched
-func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (openpgp.EntityList, map[string]struct{}, bool, bool, error) {
+//
+// AIDEV-NOTE: the verifier resolves it before layers T, A and P (the
+// re-review's V-RM1): an unpinned suite under require_pinned_signer is a
+// configuration fault, which the operator hears about (unpinned_suite,
+// the rollout signal for integrity.require_pinned_signer, and the WARN
+// below) whatever the anchor's shape; when Task 9b moved the layers
+// first, a malformed anchor hid it. It decides nothing about the anchor:
+// a pinned or unrequired suite's malformed anchor keeps its reason.
+func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (suiteTrust, error) {
 	var matched []SignerPin
 	for _, p := range v.pins {
 		if p.HostRegex.MatchString(suite.CanonicalHost) {
@@ -488,7 +521,7 @@ func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (openpgp.EntityList
 			// errors.Is(err, gpg.ErrUnpinnedSuite) still matches
 			// for any caller that prefers the gpg-package
 			// sentinel.
-			return nil, nil, false, false, fmt.Errorf("%w: %w: no [[trusted_signer]] block matches %q",
+			return suiteTrust{}, fmt.Errorf("%w: %w: no [[trusted_signer]] block matches %q",
 				ErrUnpinnedSuite, freshness.ErrAdoptionUnpinnedSuite, suite.CanonicalHost)
 		}
 		if v.acceptAnySigner {
@@ -496,7 +529,7 @@ func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (openpgp.EntityList
 			// trust + crypto check; only the structural decode
 			// remains. trustSet / trustFPs are nil because they have
 			// no consumer on this path.
-			return nil, nil, false, true, nil
+			return suiteTrust{bypass: true}, nil
 		}
 		// Broad trust: the entire host keyring. Build a copy of the
 		// host fingerprint set so the IssuerFingerprint check has
@@ -505,7 +538,7 @@ func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (openpgp.EntityList
 		for fp := range v.keyring.fingerprints {
 			fps[fp] = struct{}{}
 		}
-		return v.keyring.EntityList(), fps, false, false, nil
+		return suiteTrust{entities: v.keyring.EntityList(), fps: fps}, nil
 	}
 	union := make(map[string]struct{})
 	for _, m := range matched {
@@ -513,8 +546,7 @@ func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (openpgp.EntityList
 			union[fp] = struct{}{}
 		}
 	}
-	subset := v.keyring.Subset(union)
-	return subset, union, true, false, nil
+	return suiteTrust{entities: v.keyring.Subset(union), fps: union, pinned: true}, nil
 }
 
 // requireKnownSignaturesVerify is S1, apt's rule that a bad signature from
@@ -681,7 +713,7 @@ func (v *Verifier) verifyAnyTrusted(
 			// The entity whose keyid resolved the trust check is the
 			// one whose key is used for the cryptographic check.
 			if _, _, verr := openpgp.VerifyDetachedSignature(openpgp.EntityList{matched},
-				bytes.NewReader(signed), bytes.NewReader(p.raw), nil); verr != nil {
+				bytes.NewReader(signed), bytes.NewReader(p.raw), v.sigConfig()); verr != nil {
 				lastVerifyErr = verr
 				continue
 			}
@@ -706,7 +738,7 @@ func (v *Verifier) verifyAnyTrusted(
 			trustSet,
 			bytes.NewReader(signed),
 			bytes.NewReader(p.raw),
-			nil,
+			v.sigConfig(),
 		)
 		if verr == nil {
 			return nil
@@ -728,6 +760,19 @@ func (v *Verifier) verifyAnyTrusted(
 	default:
 		return ErrNoUsableSignature
 	}
+}
+
+// sigConfig is the go-crypto configuration S2 verifies a packet with: nil
+// (the defaults, the wall clock) unless a test set the verifier's clock
+// (now). go-crypto's detached verification reads only its time and its
+// known notations (none either way). S1 needs none: it passes an expired
+// or revoked key's good signature whatever the time, as gpgv's EXPKEYSIG
+// and REVKEYSIG.
+func (v *Verifier) sigConfig() *packet.Config {
+	if v.now == nil {
+		return nil
+	}
+	return &packet.Config{Time: v.now}
 }
 
 // uncountable is S2's refusal of a trusted packet whose hash it does not
