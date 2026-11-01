@@ -308,6 +308,29 @@ func TestParseSigPackets_OneIssuer(t *testing.T) {
 	}
 }
 
+// TestParseSigPackets_RefusesAnEmbeddedSignatureBeforeGoCrypto: the final
+// review's V-C2, its second vector, on an otherwise well-formed packet (a
+// creation time, one issuer key ID): an unhashed embedded signature
+// (subpacket 32) holding a v6 header that claims a hashed area of
+// 0x40000000 octets, which go-crypto allocates before reading it. P4
+// refuses the subpacket before go-crypto parses a byte, so the parse
+// allocates under a mebibyte. The corpus' vc2_*_v4_embedded_v6_1g carry no
+// issuer key ID, so P4's issuer rule refuses them too; this pins the
+// subpacket-32 rule alone.
+func TestParseSigPackets_RefusesAnEmbeddedSignatureBeforeGoCrypto(t *testing.T) {
+	// Version 6, a primary-key binding, Ed25519, SHA-256, then the hashed
+	// area's four-octet length: 0x40000000.
+	v6 := []byte{6, 0x19, 27, 8, 0x40, 0x00, 0x00, 0x00}
+	pkt := trsa(joined(tcreated, tsub(16, tkeyID(testIDA)...)), tsub(32, v6...))
+	var err error
+	if n := allocatedBy(func() { _, err = parseSigPackets(pkt) }); n >= aptShapeAllocationMax {
+		t.Errorf("the parse allocated %d bytes; the bound is %d", n, aptShapeAllocationMax)
+	}
+	if ruleOf(err) != "P4" {
+		t.Errorf("%v (rule %q); want P4", err, ruleOf(err))
+	}
+}
+
 // TestParseSigPackets_GoCryptoMustAgree pins P5: a packet P1–P4 pass but
 // go-crypto does not parse, or reads otherwise, is refused. A critical
 // revocation key subpacket (12) is one gpgv 2.2 handles and go-crypto does
