@@ -52,6 +52,7 @@ const MaxArchitecturesEntries = 32
 
 // Config is the top-level structure of config.toml.
 type Config struct {
+	ACME           ACMEConfig         `toml:"acme"`
 	Cache          CacheConfig        `toml:"cache"`
 	Upstream       UpstreamConfig     `toml:"upstream"`
 	Freshness      FreshnessConfig    `toml:"freshness"`
@@ -71,6 +72,7 @@ type Config struct {
 }
 
 type CacheConfig struct {
+	UseACME   bool   `toml:"use_acme"`
 	Dir       string `toml:"dir"`
 	Listen    string `toml:"listen"`
 	ListenTLS string `toml:"listen_tls"`
@@ -478,6 +480,9 @@ type GCConfig struct {
 // admin listener: /metrics, /, /healthz endpoints; htpasswd Basic
 // auth; refresher goroutine; per-metric series cap.
 type AdminConfig struct {
+	TLSCert string `toml:"tls_cert"`
+	TLSKey  string `toml:"tls_key"`
+	UseACME bool   `toml:"use_acme"`
 	// Enabled is the master switch. When false, the admin listener
 	// is not bound; /metrics, /, and /healthz are unreachable. The
 	// cache continues to serve proxy traffic normally — the
@@ -807,6 +812,10 @@ func Load(path string) (*Config, error) {
 	// ints/durations need IsDefined-gated defaults so an operator's
 	// explicit value (or explicit zero — though zero is invalid for
 	// most of these) survives Defaults().
+	if !md.IsDefined("acme", "listen") {
+		cfg.ACME.Listen = "127.0.0.1:8080"
+	}
+	cfg.ACME.DNSName = strings.ToLower(cfg.ACME.DNSName)
 	if !md.IsDefined("admin", "listen") {
 		cfg.Admin.Listen = "127.0.0.1:6789"
 	}
@@ -951,20 +960,8 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("cache.listen: %w", err))
 	}
 
-	tlsAnySet := c.Cache.ListenTLS != "" || c.Cache.TLSCert != "" || c.Cache.TLSKey != ""
-	tlsAllSet := c.Cache.ListenTLS != "" && c.Cache.TLSCert != "" && c.Cache.TLSKey != ""
-	if tlsAnySet && !tlsAllSet {
-		errs = append(errs, errors.New("cache.listen_tls / tls_cert / tls_key must all be set or all empty"))
-	} else if tlsAllSet {
-		if err := validateListenAddr(c.Cache.ListenTLS); err != nil {
-			errs = append(errs, fmt.Errorf("cache.listen_tls: %w", err))
-		}
-		if err := checkReadableFile(c.Cache.TLSCert); err != nil {
-			errs = append(errs, fmt.Errorf("cache.tls_cert %q: %w", c.Cache.TLSCert, err))
-		}
-		if err := checkReadableFile(c.Cache.TLSKey); err != nil {
-			errs = append(errs, fmt.Errorf("cache.tls_key %q: %w", c.Cache.TLSKey, err))
-		}
+	if err := c.ValidateServerTLS(); err != nil {
+		errs = append(errs, err)
 	}
 
 	// SPEC6 §14.2 cache.advertise_host: empty default; otherwise must

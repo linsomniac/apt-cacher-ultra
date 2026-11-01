@@ -14,11 +14,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/acme"
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/gc"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
+	"github.com/linsomniac/apt-cacher-ultra/internal/servertls"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
@@ -31,18 +33,20 @@ import (
 // `"gc": {"last_run_unixtime": null}` with the rest of the gc.*
 // block omitted (a custom MarshalJSON on gcInfo handles this).
 type statusModel struct {
-	Process         processInfo      `json:"process"`
-	Cache           cacheInfo        `json:"cache"`
-	CacheSummary    cacheSummary     `json:"cache_summary"`
-	RepoCoverage    repoCoverageInfo `json:"repo_coverage"`
-	Listeners       []listenerInfo   `json:"listeners"`
-	TLSMITM         *tlsMITMInfo     `json:"tls_mitm"`
-	Suites          []suiteEntry     `json:"suites"`
-	GC              *gcInfo          `json:"gc"`
-	HotURLPaths     []hotURLEntry    `json:"hot_url_paths"`
-	RecentAdoptions []adoptionEntry  `json:"recent_adoptions"`
-	ActiveHosts     []activeHostInfo `json:"active_hosts"`
-	Keyring         []keyringEntry   `json:"keyring"`
+	ServerTLS       map[string]servertls.Snapshot `json:"server_tls,omitempty"`
+	ACME            *acme.Status                  `json:"acme,omitempty"`
+	Process         processInfo                   `json:"process"`
+	Cache           cacheInfo                     `json:"cache"`
+	CacheSummary    cacheSummary                  `json:"cache_summary"`
+	RepoCoverage    repoCoverageInfo              `json:"repo_coverage"`
+	Listeners       []listenerInfo                `json:"listeners"`
+	TLSMITM         *tlsMITMInfo                  `json:"tls_mitm"`
+	Suites          []suiteEntry                  `json:"suites"`
+	GC              *gcInfo                       `json:"gc"`
+	HotURLPaths     []hotURLEntry                 `json:"hot_url_paths"`
+	RecentAdoptions []adoptionEntry               `json:"recent_adoptions"`
+	ActiveHosts     []activeHostInfo              `json:"active_hosts"`
+	Keyring         []keyringEntry                `json:"keyring"`
 }
 
 // htmlRenderModel is the additive presentation wrapper used by the
@@ -237,8 +241,9 @@ type cacheInfo struct {
 }
 
 type listenerInfo struct {
-	Role string `json:"role"`
-	Addr string `json:"addr"`
+	Scheme string `json:"scheme,omitempty"`
+	Role   string `json:"role"`
+	Addr   string `json:"addr"`
 }
 
 type suiteEntry struct {
@@ -475,6 +480,12 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 		ActiveHosts:     buildActiveHostEntries(s.cfg.HostLimiter.Snapshot()),
 		Keyring:         buildKeyringEntries(s.cfg.Keyring),
 	}
+	if s.cfg.ServerTLS != nil {
+		model.ServerTLS = s.cfg.ServerTLS()
+	}
+	if s.cfg.ACME != nil {
+		model.ACME = s.cfg.ACME()
+	}
 	annotateSuiteEntries(model.Suites, s.adoptionEnabled(), s.cfg.CheckBackoff, wallclock.Now().Unix())
 
 	// SPEC5 §10.5: gc is always present at the top level. When no GC
@@ -618,12 +629,16 @@ func buildRepoCoverageInfo(rc cache.RepoCoverage, filter []string) repoCoverageI
 
 func buildListenerInfo(cfg Config) []listenerInfo {
 	out := []listenerInfo{
-		{Role: "proxy", Addr: cfg.ProxyAddr},
+		{Role: "proxy", Addr: cfg.ProxyAddr, Scheme: "http"},
 	}
 	if cfg.TLSAddr != "" {
-		out = append(out, listenerInfo{Role: "tls", Addr: cfg.TLSAddr})
+		out = append(out, listenerInfo{Role: "tls", Addr: cfg.TLSAddr, Scheme: "https"})
 	}
-	out = append(out, listenerInfo{Role: "admin", Addr: cfg.AdminAddr})
+	scheme := "http"
+	if cfg.TLS != nil {
+		scheme = "https"
+	}
+	out = append(out, listenerInfo{Role: "admin", Addr: cfg.AdminAddr, Scheme: scheme})
 	return out
 }
 

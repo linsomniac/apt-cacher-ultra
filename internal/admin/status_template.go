@@ -674,8 +674,27 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
 
         <div class="kv" style="margin-bottom:24px">
           <div class="kv__group-head"><span>Listeners</span></div>
-          {{range .Listeners}}<div class="k">{{.Role}}</div><div class="v"><code>{{.Addr}}</code></div>{{end}}
+          {{range .Listeners}}<div class="k">{{.Role}}</div><div class="v"><code>{{.Addr}}</code> {{.Scheme}}</div>{{end}}
         </div>
+
+        {{range $listener, $cert := .ServerTLS}}
+        <div class="kv" style="margin-bottom:24px">
+          <div class="kv__group-head"><span>Server TLS — {{$listener}}</span></div>
+          <div class="k">Source / state</div><div class="v">{{$cert.Source}} / {{$cert.State}}</div>
+          <div class="k">Fingerprint</div><div class="v"><span class="fp">{{$cert.Fingerprint}}</span></div>
+          <div class="k">Expires</div><div class="v">{{unixTime $cert.NotAfter}}</div>
+          {{if $cert.Error}}<div class="k">Error</div><div class="v">{{$cert.Error}}</div>{{end}}
+        </div>
+        {{end}}
+        {{if .ACME}}
+        <div class="kv" style="margin-bottom:24px">
+          <div class="kv__group-head"><span>ACME</span></div>
+          <div class="k">DNS name</div><div class="v">{{.ACME.DNSName}}</div>
+          <div class="k">Authority</div><div class="v">{{.ACME.DirectoryURL}}</div>
+          <div class="k">Next eligible attempt</div><div class="v">{{unixTime .ACME.NextAttempt}}</div>
+          <div class="k">Last success</div><div class="v">{{unixTime .ACME.LastSuccess}}</div>
+        </div>
+        {{end}}
 
         {{if .TLSMITM.Enabled}}
         <div class="kv" style="margin-bottom:24px">

@@ -19,6 +19,7 @@ package admin
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"log/slog"
 	"math/rand/v2"
@@ -30,12 +31,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/acme"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/gc"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
+	"github.com/linsomniac/apt-cacher-ultra/internal/servertls"
 )
 
 // BuildInfo carries the version information that cmd reads from
@@ -52,6 +55,9 @@ type BuildInfo struct {
 // Config wires the admin listener to its dependencies. All fields
 // are required; New returns an error on any nil dependency.
 type Config struct {
+	TLS         *tls.Config
+	ServerTLS   func() map[string]servertls.Snapshot
+	ACME        func() *acme.Status
 	Cache       *cache.Cache
 	GC          *gc.GC
 	HostLimiter *hostsem.Sem
@@ -319,6 +325,16 @@ func New(cfg Config) (*Server, error) {
 		return nil, errors.New("admin: AdminAddr is required")
 	}
 
+	if (cfg.Admin.TLSCert == "") != (cfg.Admin.TLSKey == "") {
+		return nil, errors.New("admin: incomplete TLS pair")
+	}
+	if cfg.Admin.UseACME && (cfg.Admin.TLSCert != "" || cfg.Admin.TLSKey != "") {
+		return nil, errors.New("admin: conflicting TLS sources")
+	}
+	if cfg.Admin.TLSEnabled() != (cfg.TLS != nil) {
+		return nil, errors.New("admin: TLS configuration requires a prepared certificate source")
+	}
+
 	s := &Server{
 		cfg:    cfg,
 		logger: logger,
@@ -355,6 +371,7 @@ func New(cfg Config) (*Server, error) {
 	// structured record (the final fix wave's re-review, logging minor 1).
 	s.server = &http.Server{
 		Addr:              cfg.AdminAddr,
+		TLSConfig:         cfg.TLS,
 		Handler:           s.buildHandler(),
 		ReadHeaderTimeout: cfg.Admin.ReadTimeout.Duration,
 		IdleTimeout:       cfg.Admin.IdleTimeout.Duration,
@@ -473,7 +490,13 @@ func (s *Server) buildHandler() http.Handler {
 func (s *Server) Serve(ln net.Listener) error {
 	s.runRefreshOnce(context.Background())
 	s.startRefresher()
-	if err := s.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	var err error
+	if s.cfg.TLS != nil {
+		err = s.server.ServeTLS(ln, "", "")
+	} else {
+		err = s.server.Serve(ln)
+	}
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
