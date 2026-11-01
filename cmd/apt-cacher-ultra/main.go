@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/acmedns"
 	"github.com/linsomniac/apt-cacher-ultra/internal/admin"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
@@ -148,6 +149,20 @@ var (
 )
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == acmedns.WorkerArgument {
+		os.Exit(acmedns.RunWorker())
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "acme" {
+		if len(os.Args) != 3 || os.Args[2] != "dns-providers" {
+			fmt.Fprintln(os.Stderr, "usage: apt-cacher-ultra acme dns-providers")
+			os.Exit(1)
+		}
+		for _, provider := range acmedns.Providers() {
+			fmt.Println(provider)
+		}
+		return
+	}
+
 	// SPEC6 §14.3 subcommand routing. `ca print` is a positional
 	// pre-flag form (matches the established `program subcommand
 	// args` shell idiom and avoids polluting the daemon's flag set).
@@ -310,6 +325,7 @@ func serveListeners(
 	tlsLn net.Listener,
 	adminLn net.Listener,
 	preloadedCA *tlsmitm.CA,
+	preparedTLS ...*serverTLS,
 ) (retErr error) {
 	defer func() {
 		// Defensive: if we error out before the goroutines start serving,
@@ -340,6 +356,18 @@ func serveListeners(
 		}
 		htpasswdUsers = n
 	}
+
+	var serverCerts *serverTLS
+	if len(preparedTLS) != 0 {
+		serverCerts = preparedTLS[0]
+	} else {
+		var err error
+		serverCerts, err = prepareServerTLS(ctx, cfg, logger, nil)
+		if err != nil {
+			return fmt.Errorf("server TLS: %w", err)
+		}
+	}
+	defer serverCerts.Close()
 
 	// SPEC §10 / SPEC2 §10.3: startup config dump. Capture every
 	// operationally-relevant tunable so a single boot log line tells
@@ -392,6 +420,8 @@ func serveListeners(
 		"gc_heartbeat_stale_grace_effective", cfg.HeartbeatStaleGraceEffective(),
 		"gc_url_path_ttl", cfg.GC.URLPathTTL.Duration,
 		"gc_suite_idle_ttl", cfg.GC.SuiteIdleTTL.Duration,
+		"admin_tls_enabled", cfg.Admin.TLSEnabled(),
+		"acme_enabled", cfg.ACME.Enabled,
 		"admin_enabled", cfg.Admin.Enabled,
 		"admin_listen", cfg.Admin.Listen,
 		"admin_htpasswd_file", cfg.Admin.HtpasswdFile,
@@ -721,6 +751,9 @@ func serveListeners(
 			Logger:                  logger,
 			BuildInfo:               buildInfo(),
 			Admin:                   cfg.Admin,
+			TLS:                     serverCerts.Config("admin"),
+			ServerTLS:               serverCerts.Snapshots,
+			ACME:                    serverCerts.ACMEStatus,
 			StartTime:               time.Now(),
 			ProxyAddr:               plainLn.Addr().String(),
 			TLSAddr:                 tlsAddrString(tlsLn),
@@ -750,11 +783,13 @@ func serveListeners(
 	var tlsSrv *http.Server
 	if tlsLn != nil {
 		tlsSrv = newHTTPServer(h, logger)
+		tlsSrv.TLSConfig = serverCerts.Config("cache")
 	}
 
 	// AIDEV-NOTE: errCh is buffered to (number of servers) so a goroutine
 	// can always deliver its terminal error without blocking even if the
 	// main goroutine has already moved on to shutdown.
+	serverCerts.Start()
 	errCh := make(chan error, 3)
 	var wg sync.WaitGroup
 
@@ -775,7 +810,7 @@ func serveListeners(
 		go func() {
 			defer wg.Done()
 			logger.Info("https listener accepting", "addr", tlsLn.Addr().String())
-			err := tlsSrv.ServeTLS(tlsLn, cfg.Cache.TLSCert, cfg.Cache.TLSKey)
+			err := tlsSrv.ServeTLS(tlsLn, "", "")
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- fmt.Errorf("https: %w", err)
 				return
@@ -805,12 +840,18 @@ func serveListeners(
 	select {
 	case <-ctx.Done():
 		logger.Info("shutdown signal received")
+	case err := <-serverCerts.err:
+		listenerErr = err
 	case err := <-errCh:
 		if err != nil {
 			listenerErr = err
 			logger.Error("listener exited unexpectedly", "err", err)
 		}
 	}
+
+	// DNS cleanup can take minutes. Stop accepting application traffic first;
+	// Close joins certificate workers after the listeners drain.
+	serverCerts.Stop()
 
 	// Spec C8 (phase C plan, design note 18): close the flip barrier
 	// before anything drains. An adoption waiting in it abandons its commit
@@ -953,7 +994,7 @@ func serveListeners(
 	// their upstream work, and an adoption that has not reached its
 	// commit skips it; a commit already running is not cancelled (spec C4)
 	// and can hold this Wait for up to the 5-minute commit timeout
-	// (the packaged unit's TimeoutStopSec=35 may SIGKILL first; SQLite
+	// (a supervisor stop timeout may SIGKILL first; SQLite
 	// rolls the transaction back). This Wait makes the shutdown
 	// deterministic before the cache is closed by the deferred
 	// c.Close(); past adoptionDrainNotice it is explained in the journal.
@@ -962,6 +1003,7 @@ func serveListeners(
 	waitAdoptionDrain(freshChecker.WaitForAdoptions, adoptionDrainNotice, logger)
 
 	wg.Wait()
+	serverCerts.Close()
 	logger.Info("apt-cacher-ultra stopped")
 	return listenerErr
 }

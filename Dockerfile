@@ -9,7 +9,7 @@ COPY . .
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -p 2 \
     -trimpath -ldflags "-s -w -X main.Version=${VERSION}" \
     -o /out/apt-cacher-ultra ./cmd/apt-cacher-ultra
 

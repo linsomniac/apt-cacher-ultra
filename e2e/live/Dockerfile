@@ -22,7 +22,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath \
+RUN CGO_ENABLED=0 go build -p 2 -trimpath \
     -ldflags "-s -w -X main.Version=0.0.0-e2e-live" \
     -o /out/apt-cacher-ultra ./cmd/apt-cacher-ultra
 

@@ -279,7 +279,10 @@ func inReleasePlaintext(blob []byte) (text []byte, err error) {
 		}
 	}()
 	block, _ := clearsign.Decode(aptpath.DecodableClearsign(blob))
-	if block == nil {
+	// An empty cleartext cannot be an InRelease. go-crypto v1.5.2 returns
+	// an empty block where older versions panicked; keep the audit's existing
+	// malformed-envelope verdict, without marking the suite as seen signed.
+	if block == nil || len(block.Plaintext) == 0 {
 		return nil, errors.New("reconcile: stored InRelease is not a valid clearsigned message")
 	}
 	return block.Plaintext, nil

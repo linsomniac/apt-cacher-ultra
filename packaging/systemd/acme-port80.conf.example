@@ -1,0 +1,5 @@
+# Optional /etc/systemd/system/apt-cacher-ultra.service.d/acme-port80.conf
+# Only needed for direct acme.listen = ":80". Prefer forwarding to port 8080.
+[Service]
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE

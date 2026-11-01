@@ -1,0 +1,38 @@
+# Standalone example: edit docker/config.acme.toml and create the secret files
+# described in docs/server-tls.md, then docker compose -f compose.acme.yml up -d.
+services:
+  apt-cacher-ultra:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.acme
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3142:3142"
+      - "127.0.0.1:3143:3143"
+      - "127.0.0.1:6789:6789"
+      - "80:8080"
+    volumes:
+      - apt-cache:/var/cache/apt-cacher-ultra
+      - ./docker/config.acme.toml:/etc/apt-cacher-ultra/config.toml:ro
+    secrets:
+      - admin.htpasswd
+      - healthcheck.conf
+      - authority-root.pem
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--max-time", "4", "--config", "/run/secrets/healthcheck.conf"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5m
+      retries: 3
+secrets:
+  admin.htpasswd:
+    file: ./docker/secrets/admin.htpasswd
+  healthcheck.conf:
+    file: ./docker/secrets/healthcheck.conf
+  authority-root.pem:
+    file: ./docker/secrets/authority-root.pem
+volumes:
+  apt-cache:

@@ -1,0 +1,6 @@
+# Optional image for the verified, authenticated HTTPS healthcheck example.
+ARG ACU_BASE_IMAGE=ghcr.io/linsomniac/apt-cacher-ultra:edge
+FROM ${ACU_BASE_IMAGE}
+USER root
+RUN apk add --no-cache curl
+USER 10001:10001

@@ -16,6 +16,7 @@ listen      = "0.0.0.0:3142"               # proxy host:port; ports 1-65535
 listen_tls  = ""
 tls_cert    = ""
 tls_key     = ""
+use_acme    = false # requires [acme]; conflicts with manual tls_cert/tls_key
 # Host or host:port for --print-apt-conf (no scheme/path). Required when
 # generating snippets from a wildcard listen address; no effect on binding.
 advertise_host = ""
@@ -191,6 +192,11 @@ suite_idle_ttl      = "720h"
 # htpasswd_file an IP address, localhost or listen's host as the Host).
 enabled           = true
 listen            = "127.0.0.1:6789" # host:port; protect access if widened
+# Optional HTTPS. Files reload every minute; partial rotations keep the last
+# valid certificate. TLS does not replace authentication or access restrictions.
+tls_cert          = ""
+tls_key           = ""
+use_acme          = false # requires [acme]; conflicts with the manual pair
 # Optional bcrypt-only Apache htpasswd file ($2a$/$2b$/$2y$). Empty = no auth.
 # Reloaded on requests when mtime/size changes. HTTP Basic auth is not
 # encrypted: use a trusted network, SSH tunnel, or TLS reverse proxy.
@@ -263,3 +269,25 @@ allow_unconstrained_ca = true
 # prefix = "/corretto"
 # upstream = "https://apt.corretto.aws/"
 # END OPTIONAL TABLE EXAMPLES
+
+[acme]
+# Opt-in server certificates, independent of the MITM CA. Select use_acme on
+# [cache] (requires listen_tls) and/or [admin]. No ACME traffic when disabled.
+enabled = false
+# Explicit HTTPS CA directory; use staging for initial setup:
+# https://acme-staging-v02.api.letsencrypt.org/directory
+directory_url = ""
+dns_name = "" # one DNS name shared by all selecting listeners
+# HTTP-01 is the default. DNS-01 uses Lego providers and needs no inbound port.
+challenge_type = "http-01" # "http-01" or "dns-01"
+dns_provider = "" # e.g. "cloudflare"; see: apt-cacher-ultra acme dns-providers
+# Provider credentials follow Lego environment / supported _FILE settings.
+# Explicit recursive resolvers prevent split-DNS surprises; empty uses system DNS.
+dns_resolvers = [] # e.g. ["1.1.1.1:53", "8.8.8.8:53"]
+# HTTP-01 only: forward public TCP port 80 to this challenge-only listener.
+# Containers may bind 0.0.0.0:8080 and publish host port 80 explicitly.
+listen = "127.0.0.1:8080"
+# Operator acceptance of the configured CA's subscriber terms.
+accept_terms = false
+# Account/certificate/retry state lives in <cache.dir>/acme; preserve it.
+# Renewal follows certificate lifetime; failed attempts back off across restarts.
