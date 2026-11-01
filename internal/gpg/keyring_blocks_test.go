@@ -241,42 +241,54 @@ func TestParseKeyring_RefusesWhatAptReadsOtherwise(t *testing.T) {
 	}
 }
 
-// rawKeyBlocks splits a binary keyring into its keys' packets, each from a
-// public key packet (tag 6) to the next, byte for byte (the re-review's
-// mkasc.py).
-func rawKeyBlocks(t *testing.T, keyring []byte) [][]byte {
+// rawPacketList splits binary OpenPGP data into its packets, byte for byte,
+// and their tags.
+func rawPacketList(t *testing.T, b []byte) (tags []byte, packets [][]byte) {
 	t.Helper()
-	var out [][]byte
-	for off := 0; off < len(keyring); {
-		h := keyring[off]
+	for off := 0; off < len(b); {
+		h := b[off]
 		var tag byte
 		var hl, n int
 		switch {
 		case h&0xc0 == 0xc0: // new format
 			tag = h & 0x3f
-			switch l0 := int(keyring[off+1]); {
+			switch l0 := int(b[off+1]); {
 			case l0 < 192:
 				hl, n = 2, l0
 			case l0 < 224:
-				hl, n = 3, (l0-192)<<8+int(keyring[off+2])+192
+				hl, n = 3, (l0-192)<<8+int(b[off+2])+192
 			default:
-				hl, n = 6, int(binary.BigEndian.Uint32(keyring[off+2:off+6]))
+				hl, n = 6, int(binary.BigEndian.Uint32(b[off+2:off+6]))
 			}
 		case h&0x80 != 0: // old format
 			tag = (h >> 2) & 0x0f
 			octets := []int{1, 2, 4}[h&3]
-			for _, c := range keyring[off+1 : off+1+octets] {
+			for _, c := range b[off+1 : off+1+octets] {
 				n = n<<8 | int(c)
 			}
 			hl = 1 + octets
 		default:
 			t.Fatalf("test premise: offset %d starts no packet", off)
 		}
-		if tag == 6 {
+		tags = append(tags, tag)
+		packets = append(packets, b[off:off+hl+n])
+		off += hl + n
+	}
+	return tags, packets
+}
+
+// rawKeyBlocks splits a binary keyring into its keys' packets, each from a
+// public key packet (tag 6) to the next, byte for byte (the re-review's
+// mkasc.py).
+func rawKeyBlocks(t *testing.T, keyring []byte) [][]byte {
+	t.Helper()
+	tags, packets := rawPacketList(t, keyring)
+	var out [][]byte
+	for i, pkt := range packets {
+		if tags[i] == 6 {
 			out = append(out, nil)
 		}
-		out[len(out)-1] = append(out[len(out)-1], keyring[off:off+hl+n]...)
-		off += hl + n
+		out[len(out)-1] = append(out[len(out)-1], pkt...)
 	}
 	return out
 }

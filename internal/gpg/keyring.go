@@ -18,10 +18,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
 )
 
 // Standard apt keyring directories. Modern apt installs split trust
@@ -51,7 +53,9 @@ const (
 // KeyringEntry is one loaded entity with its source attribution.
 // SourcePath is either an absolute file path on disk, or the
 // pseudo-path "embedded:<name>" for keys baked into the binary via
-// EmbeddedSource. Exposed for the admin status page.
+// EmbeddedSource: the first source the key was read from, when it was
+// read more than once (its copies are merged: LoadKeyringWithEmbedded).
+// Exposed for the admin status page.
 type KeyringEntry struct {
 	Entity             *openpgp.Entity
 	PrimaryFingerprint string   // uppercase 40-char hex
@@ -174,26 +178,43 @@ func LoadKeyring(dirs []string, logger *slog.Logger) (*Keyring, error) {
 
 // LoadKeyringWithEmbedded extends LoadKeyring by also merging in
 // keys baked into the binary as EmbeddedSource entries. On-disk dirs
-// load first (in slice order); embedded sources load last. Dedup is
-// by primary-key fingerprint, first-seen wins — so a key present on
-// disk takes precedence over the bundled copy of the same key, and
-// its SourcePath in the resulting Entries reflects the disk path the
-// operator actually staged.
+// load first (in slice order); embedded sources load last. A key read
+// more than once (two files, two copies in one file, a disk copy and
+// the bundled one) is one entity, each later copy merged into the
+// first (mergeEntity); its entry's SourcePath is the first copy's, so
+// a key present on disk shows the disk path the operator staged.
 func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *slog.Logger) (*Keyring, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	// AIDEV-NOTE: dedupe by primary-key fingerprint. apt's keyring
-	// directories overlap (operators sometimes symlink keys into
-	// multiple paths) and the embedded set can overlap with disk
-	// copies; the same key bytes parsed twice as distinct *Entity
-	// values would be picked twice by openpgp's signature
-	// verification — wasted work, not a correctness bug, but we
-	// filter at load time anyway.
-	seen := make(map[string]struct{})
+	// AIDEV-NOTE: one entity per primary-key fingerprint, each later copy
+	// of a key merged into the first (the re-review's V-R2C2). apt's
+	// keyring directories overlap (a key symlinked into two paths, a
+	// vendor's file beside an older copy, the bundled set beside a disk
+	// copy), and one file can hold a key twice (a concatenated export).
+	// The loader kept the first copy and dropped the rest, which is
+	// harmless only for identical copies: vendors add signing subkeys
+	// (google's key held eight in the survey, about one a year), and an
+	// older copy read first hid the new one — the cache refused an anchor
+	// every apt accepts (untrusted_signer: gpgv finds the keyblock holding
+	// the subkey, sqv reads every certificate it is given), and S1 did not
+	// see a bad signature by the subkey beside a good one, which the five
+	// gpgv-based apt refuse. Merged rather than kept as separate entities:
+	// a key stays one entity for the short-keyid fallback (which refuses a
+	// key ID two entities claim), Subset and the admin listing; and a
+	// revocation in any copy counts, as after gpg's import (which merges a
+	// keyblock's signatures so) and in sqv (which merges the certificates
+	// it is given) — kept apart, a copy without it read first would still
+	// verify. A subkey's binding and an identity's self-signature are the
+	// newest of the copies' (go-crypto's rule within one copy, gpg's after
+	// a merge). The residual gap: gpgv reads only the first keyblock that
+	// holds the key ID, so where an older copy read first has an expired
+	// binding and a later copy renews it, gpgv refuses what the cache
+	// accepts (sqv agrees with the cache); a client that cannot use the key
+	// fails with or without the cache, as with V-R2M3's gaps.
+	seen := make(map[string]int) // primary fingerprint -> its index in entries
 	var entries []KeyringEntry
-	fingerprints := make(map[string]struct{})
 
 	addEntities := func(parsed openpgp.EntityList, source string) {
 		for _, e := range parsed {
@@ -201,27 +222,16 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 				continue
 			}
 			fp := upperFP(e.PrimaryKey.Fingerprint)
-			if _, dup := seen[fp]; dup {
+			if i, dup := seen[fp]; dup {
+				mergeEntity(entries[i].Entity, e)
 				continue
 			}
-			seen[fp] = struct{}{}
-
-			subFPs := make([]string, 0, len(e.Subkeys))
-			fingerprints[fp] = struct{}{}
-			for _, sub := range e.Subkeys {
-				if sub.PublicKey != nil {
-					subFP := upperFP(sub.PublicKey.Fingerprint)
-					fingerprints[subFP] = struct{}{}
-					subFPs = append(subFPs, subFP)
-				}
-			}
-
+			seen[fp] = len(entries)
 			entries = append(entries, KeyringEntry{
 				Entity:             e,
 				PrimaryFingerprint: fp,
 				PrimaryUID:         firstUID(e),
 				SourcePath:         source,
-				SubkeyFingerprints: subFPs,
 			})
 		}
 	}
@@ -282,9 +292,23 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 		addEntities(parsed, "embedded:"+es.Name)
 	}
 
+	// The fingerprints last: a merge adds subkeys to an entry already
+	// listed.
+	fingerprints := make(map[string]struct{})
 	entities := make(openpgp.EntityList, 0, len(entries))
-	for _, e := range entries {
-		entities = append(entities, e.Entity)
+	for i := range entries {
+		e := entries[i].Entity
+		fingerprints[entries[i].PrimaryFingerprint] = struct{}{}
+		subFPs := make([]string, 0, len(e.Subkeys))
+		for _, sub := range e.Subkeys {
+			if sub.PublicKey != nil {
+				subFP := upperFP(sub.PublicKey.Fingerprint)
+				fingerprints[subFP] = struct{}{}
+				subFPs = append(subFPs, subFP)
+			}
+		}
+		entries[i].SubkeyFingerprints = subFPs
+		entities = append(entities, e)
 	}
 
 	return &Keyring{
@@ -292,6 +316,59 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 		entities:     entities,
 		fingerprints: fingerprints,
 	}, nil
+}
+
+// mergeEntity folds dup, a later copy of e's key (the same primary
+// fingerprint, so the same key packet), into e, as gpg's import merges
+// keyblocks: the union of the copies' subkeys (by fingerprint) and
+// identities (by name), and of every revocation and signature, a subkey's
+// binding, an identity's self-signature and the key's direct-key
+// self-signature each the newest of the copies' (go-crypto's rule within
+// one copy: a later one only if strictly newer). go-crypto verified every
+// self-signature of both copies against the one primary key as it read
+// them, so the union holds no signature it did not. e and dup are the
+// loader's own, freshly parsed; dup is not used after.
+func mergeEntity(e, dup *openpgp.Entity) {
+	newer := func(have, cand *packet.Signature) *packet.Signature {
+		if cand != nil && (have == nil || cand.CreationTime.After(have.CreationTime)) {
+			return cand
+		}
+		return have
+	}
+	e.Revocations = append(e.Revocations, dup.Revocations...)
+	e.Signatures = append(e.Signatures, dup.Signatures...)
+	e.SelfSignature = newer(e.SelfSignature, dup.SelfSignature)
+	if e.Identities == nil {
+		e.Identities = make(map[string]*openpgp.Identity, len(dup.Identities))
+	}
+	for name, id := range dup.Identities {
+		have, ok := e.Identities[name]
+		if !ok || have == nil {
+			e.Identities[name] = id
+			continue
+		}
+		if id == nil {
+			continue
+		}
+		have.Revocations = append(have.Revocations, id.Revocations...)
+		have.Signatures = append(have.Signatures, id.Signatures...)
+		have.SelfSignature = newer(have.SelfSignature, id.SelfSignature)
+	}
+	for _, sub := range dup.Subkeys {
+		if sub.PublicKey == nil {
+			continue
+		}
+		i := slices.IndexFunc(e.Subkeys, func(s openpgp.Subkey) bool {
+			return s.PublicKey != nil && bytes.Equal(s.PublicKey.Fingerprint, sub.PublicKey.Fingerprint)
+		})
+		if i < 0 {
+			e.Subkeys = append(e.Subkeys, sub)
+			continue
+		}
+		have := &e.Subkeys[i]
+		have.Revocations = append(have.Revocations, sub.Revocations...)
+		have.Sig = newer(have.Sig, sub.Sig)
+	}
 }
 
 // firstUID returns the entity's first user-id identity string
