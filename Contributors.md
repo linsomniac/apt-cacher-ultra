@@ -6,4 +6,4 @@ Sam Parkes (@Sam-Parkes)
 @sdh91
 @skibbipl
 Venkat (@venkatamutyala) -- flat repository support is based on their PR #8
-Laurent Corbes (@lcaflc) -- empty repository index handling is based on their PR #22
+Laurent Corbes (@lcaflc) -- admin TLS and ACME support is based on their PRs #20/#21; empty repository index handling is based on their PR #22

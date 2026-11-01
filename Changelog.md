@@ -11,6 +11,12 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Added
 
+- Optional admin HTTPS and a shared server-certificate lifecycle for the cache
+  and admin listeners, including automatic reload of PEM certificates.
+- Automatic ACME issuance and renewal with HTTP-01 or DNS-01, using Lego's full
+  automated DNS provider catalogue, private persistent state, durable retry
+  deadlines, and certificate health reporting. Based on Laurent Corbes's
+  (@lcaflc) PRs #20 and #21; see [server HTTPS setup](docs/server-tls.md).
 - Flat repositories (`deb <uri>/ /`, `deb <uri> ./`, `deb <uri> binary/`)
   are tracked, refreshed and adopted like `dists/` suites, and vouch their
   packages for strict mode. Based on Venkat's (@venkatamutyala) PR #8.
@@ -37,6 +43,8 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Changed
 
+- The systemd service allows six minutes for shutdown and signals the daemon
+  before its DNS worker, allowing bounded record cleanup after listeners stop.
 - The package upgrade restarts a running daemon.
 - The database migrates one way (schema 6 to 7), and a trust audit checks
   the snapshots 1.0.x adopted at the first start.
