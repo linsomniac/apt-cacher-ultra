@@ -2275,7 +2275,9 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 			fmt.Sprintf("served %d vs declared %d", res.ContentLength, m.Size))
 	}
 
-	hashHex, err := verifyMember(w, m, res.ContentLength, a.rehashPooledBlob(suite, m))
+	// Use the Release's size: an empty 204 or an unknown response length
+	// must not disable verification of a declared nonzero member size.
+	hashHex, err := verifyMember(w, m, m.Size, a.rehashPooledBlob(suite, m))
 	var mm *memberHashMismatch
 	switch {
 	case errors.Is(err, ErrAdoptionDBFailed):
