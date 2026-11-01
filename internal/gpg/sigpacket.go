@@ -517,8 +517,8 @@ func (s *subpacketCounts) finish(p *sigPacket) error {
 // readBack is P5: go-crypto's own parse of p's bytes, as framed, is a
 // version 4 *packet.Signature naming p's issuer; any disagreement refuses.
 //
-// AIDEV-NOTE: go-crypto (v1.4.1 to v1.5.2, packet/signature.go) refuses a critical
-// hashed subpacket of a type it does not parse — any but 2 to 6, 9, 11, 16,
+// AIDEV-NOTE: go-crypto (v1.4.1 to v1.5.2, packet/signature.go) refuses a
+// critical hashed subpacket of a type it does not parse — any but 2 to 6, 9, 11, 16,
 // 20 to 30, 32, 33, 35 and 39. Where gpgv 2.2's can_handle_critical refuses
 // the type too, P4 has refused it first, and the two agree (gpgv's BADSIG).
 // Not for 7, 12 and 38 (version 0): gpgv 2.2 handles them and P4 lets them
@@ -545,7 +545,8 @@ func (s *subpacketCounts) finish(p *sigPacket) error {
 // refuses the empty hashed 4 first (in the unhashed area go-crypto parses
 // no 4) and 32 anywhere, whose nested parse lacked a recursion guard until
 // v1.5.0. And the parse runs under recover(): any go-crypto parse panic,
-// this one or a later one, is a P5 refusal (TestReadBack_TurnsAPanicIntoARefusal).
+// this one or a later one, is a P5 refusal
+// (TestReadBack_TurnsAPanicIntoARefusal).
 
 // readPacket is go-crypto's packet reader, a test seam: tests swap it for
 // one that panics.

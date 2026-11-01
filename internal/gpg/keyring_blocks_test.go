@@ -1,8 +1,9 @@
 package gpg
 
 // Tests of the keyring loader's reading of a key file as apt reads it: every
-// public key block of an armored file, a binary file to its end, and a
-// refusal where apt's readers part (the re-review's V-RC1).
+// public key block of an armored file, wherever it stands, and nothing
+// around them (the re-review's V-RC1, its second's V-R2C1), a binary file to
+// its end, and a refusal where some apt cannot use the file.
 
 import (
 	"bytes"
