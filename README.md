@@ -457,3 +457,5 @@ workflow refuse one.
 ## License
 
 Released into the public domain under [CC0 1.0 Universal](LICENSE).
+
+Server certificates: see [admin HTTPS, file reload and ACME setup](docs/server-tls.md).

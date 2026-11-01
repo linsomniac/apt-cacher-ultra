@@ -58,6 +58,23 @@ jobs:
           fi
           ./build/apt-cacher-ultra -version
 
+  acme-interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27'
+          cache: true
+      - name: Install pinned local test authority
+        run: |
+          mkdir -p "$RUNNER_TEMP/pebble-bin"
+          GOBIN="$RUNNER_TEMP/pebble-bin" go install github.com/letsencrypt/pebble/v2/cmd/pebble@v2.10.1
+          GOBIN="$RUNNER_TEMP/pebble-bin" go install github.com/letsencrypt/pebble/v2/cmd/pebble-challtestsrv@v2.10.1
+      - name: Issuance, renewal and offline restart
+        run: ACU_PEBBLE_BIN_DIR="$RUNNER_TEMP/pebble-bin" go test -race -timeout 3m ./internal/acme -run TestPebbleInteroperability -count=1
+
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -181,7 +198,7 @@ jobs:
 
   # Test both architectures without giving PR code a registry write token.
   docker:
-    needs: [test, lint, e2e, deb-test, e2e-flat, apt-repo]
+    needs: [test, lint, acme-interop, e2e, deb-test, e2e-flat, apt-repo]
     strategy:
       fail-fast: false
       matrix:
@@ -212,6 +229,15 @@ jobs:
         run: docker compose -f compose.yml config --quiet
       - name: Smoke test production image
         run: bash scripts/smoke-test-docker.sh apt-cacher-ultra:smoke
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27'
+          cache: true
+      - name: Verified HTTPS healthcheck in optional image
+        run: |
+          docker compose -f compose.acme.yml config --quiet
+          docker build -f docker/Dockerfile.acme --build-arg ACU_BASE_IMAGE=apt-cacher-ultra:smoke -t apt-cacher-ultra:tls-healthcheck .
+          ACU_TLS_SMOKE_IMAGE=apt-cacher-ultra:tls-healthcheck go test -timeout 3m ./internal/servertls -run TestContainerHTTPSHealthcheck -count=1
 
   docker-publish:
     needs: [docker]

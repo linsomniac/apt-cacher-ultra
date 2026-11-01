@@ -12,9 +12,9 @@ sudo systemctl restart apt-cacher-ultra
 sudo journalctl -u apt-cacher-ultra -n 50 --no-pager
 ```
 
-There is no configuration reload or `SIGHUP` reload handler. Certificate and
-keyring changes also require a restart. The admin password file is an exception:
-its contents are checked for changes on admin requests, as described below.
+There is no configuration reload or `SIGHUP` reload handler. Keyring and MITM CA
+changes require a restart. Server certificate files reload every minute. The
+admin password file is checked for changes on requests, as described below.
 
 ## Syntax and defaults
 
@@ -48,12 +48,14 @@ only the admin listener.
 | --- | --- | --- | --- |
 | `dir` | string | **Required** | Existing writable cache root. The package example uses `/var/cache/apt-cacher-ultra`. Stores the database, blobs, temporary files, and, by default, the MITM CA. |
 | `listen` | string | `"0.0.0.0:3142"` | HTTP proxy bind address. Empty string also selects the default. |
-| `listen_tls` | string | `""` | Additional TLS proxy listener; empty disables it. Set together with `tls_cert` and `tls_key`. |
+| `listen_tls` | string | `""` | Additional TLS proxy listener; empty disables it. Select either `tls_cert` and `tls_key`, or `use_acme = true`. |
 | `tls_cert` | string | `""` | Readable PEM server certificate for `listen_tls`; validated with its key when the daemon starts. |
 | `tls_key` | string | `""` | Readable PEM private key matching `tls_cert`. |
+| `use_acme` | boolean | `false` | Use the shared managed certificate for `listen_tls`. Requires `[acme]` enabled and empty file options. |
 | `advertise_host` | string | `""` | Client-facing hostname or `host:port` for `--print-apt-conf`, without a scheme or path. A missing port uses the port from `listen`. Does not change listener binding or request routing. |
 
-`listen_tls`, `tls_cert`, and `tls_key` must be either all set or all empty.
+For file mode, `listen_tls`, `tls_cert`, and `tls_key` must be either all set or all empty.
+Both file and managed certificates require TLS 1.2 or newer and reload without restart.
 These settings secure the client-to-proxy connection; `[tls_mitm]` separately
 controls interception of upstream HTTPS repositories.
 
@@ -1126,12 +1128,33 @@ up to the step early; and a daemon restarted at least once a day
 turns suite reaping off; the reaper then only deletes the year-old
 records of signed paths no suite tracks.
 
+## `[acme]`: automatic server certificates
+
+| Key | Type | Default | Behavior and constraints |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Enable ACME; at least one listener must select `use_acme`. |
+| `directory_url` | string | `""` | Explicit HTTPS authority directory; no credentials, query or fragment. Resource URLs must stay on that origin. |
+| `dns_name` | string | `""` | One ASCII DNS name; normalized to lowercase by the loader. No IP, wildcard or trailing dot. |
+| `listen` | string | `"127.0.0.1:8080"` | Dedicated HTTP-01 challenge listener. Public port 80 must forward here. No overlap with application listeners. |
+| `accept_terms` | boolean | `false` | Explicit acceptance of the configured authority's terms; must be true when enabled. |
+
+State is private under `cache.dir/acme/`, separated by authority. A valid saved
+certificate allows offline startup. Otherwise issuance must complete before
+application service starts. Renewal follows actual certificate lifetime and
+persists retry deadlines across restarts. A failed renewal retains the previous
+certificate until expiry, then new TLS handshakes fail. Certificate expiry and
+renewal status appear in admin HTML/JSON and metrics.
+
+See [server HTTPS and ACME](server-tls.md) for Certbot migration, staging,
+forwarding, systemd privileges, authenticated HTTPS healthchecks, Docker,
+backup and recovery. These certificates do not replace the MITM CA.
+
 ## `[admin]`: status, metrics, and maintenance
 
-The separate **HTTP** admin listener serves the status page, `/metrics`, and
+The separate **HTTP or HTTPS** admin listener serves the status page, `/metrics`, and
 `/healthz`, plus the mutating `POST /reconcile` and `POST /forget` maintenance
 endpoints. It is not a read-only interface. Keep access restricted to trusted
-operators; if exposed beyond loopback, protect the network path or place it behind a TLS reverse proxy.
+operators; if exposed beyond loopback, enable HTTPS below or protect the network path with a TLS reverse proxy.
 HTTP Basic authentication does not encrypt credentials in transit.
 
 Both mutating endpoints refuse a request with 403, the body naming the
@@ -1163,6 +1186,9 @@ them.
 | --- | --- | --- | --- |
 | `enabled` | boolean | `true` | Bind the admin listener and run its background refresh work. `false` leaves proxy service running and logs a warning. |
 | `listen` | string | `"127.0.0.1:6789"` | Admin bind address. A non-loopback address without authentication emits a startup warning. Explicit empty string is invalid when enabled. |
+| `tls_cert` | string | `""` | PEM server chain; set with `tls_key` to serve HTTPS on `listen`. Reloaded every minute. |
+| `tls_key` | string | `""` | Matching PEM private key. Partial pairs are rejected. |
+| `use_acme` | boolean | `false` | Serve HTTPS with the shared ACME certificate. Requires enabled admin and ACME, with empty file options. |
 | `htpasswd_file` | string | `""` | Optional readable Apache htpasswd file with at least one user; only bcrypt (`$2a$`, `$2b$`, `$2y$`) entries are accepted. Empty disables authentication. Applies to every admin endpoint. |
 | `pprof_enabled` | boolean | `false` | Enable `GET /debug/pprof/profile`, `/debug/pprof/heap`, and `/debug/pprof/goroutine` on the admin listener, with the same authentication. CPU capture defaults to 30 seconds; `?seconds=N` accepts integers from 1 through 300. Profiles expose process details; enable only for trusted operators. |
 | `gauge_refresh` | duration | `"30s"` | Delay after a completed refresh before recomputing gauges. Values can lag by this delay plus refresh work time. Positive and at most `"1h"`. |
