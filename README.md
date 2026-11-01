@@ -26,6 +26,9 @@ of "apt update/upgrade" and "apt installs".
 - Drop-in apt-cacher-ng replacement — same :3142 port, proxy mode, and http://HTTPS/// URL convention, so existing
 client configs work unchanged.
 - TLS MITM (optional) — local CA signs per-host leaf certs so HTTPS repos (e.g. download.docker.com) can be cached,
+- Server HTTPS (optional) — admin and cache listeners support certificate file reload and automatic
+  ACME HTTP-01 or DNS-01 issuance and renewal, using Lego's full automated DNS provider catalogue.
+  See [server HTTPS setup](docs/server-tls.md).
 - Availability-first caching — cache hits never block on upstream; snapshot is served when upstream is down/slow
   rather than failing.
 - Atomic snapshot adoption — per-suite InRelease + all referenced Packages/by-hash blobs are staged, GPG-verified
@@ -98,8 +101,8 @@ cp packaging/config/config.toml.default config.toml
 
 ## Docker
 
-See [Docker and Compose](docker/README.md) for HTTP-only and HTTPS MITM examples,
-persistent storage, and multi-platform GHCR builds.
+See [Docker and Compose](docker/README.md) for HTTP-only, server HTTPS/ACME, and
+HTTPS MITM examples, persistent storage, and multi-platform GHCR builds.
 
 ## Configuration
 
@@ -108,6 +111,10 @@ then restart the daemon. The [configuration reference](docs/configuration.md)
 documents every option, its defaults, valid values, and interactions. The
 [packaged example](packaging/config/config.toml.default) includes every option
 with concise comments and optional signer, remap, and mirror examples.
+
+For HTTPS on the admin or cache listener, see [server certificates and ACME](docs/server-tls.md).
+The guide covers existing certificates and Certbot, built-in HTTP-01 and DNS-01,
+provider credentials, renewal, recovery, and verified healthchecks.
 
 The packaged configuration listens on `0.0.0.0:3142`, allows all upstreams,
 and enables HTTPS MITM;
@@ -457,5 +464,3 @@ workflow refuse one.
 ## License
 
 Released into the public domain under [CC0 1.0 Universal](LICENSE).
-
-Server certificates: see [admin HTTPS, file reload and HTTP-01/DNS-01 ACME setup](docs/server-tls.md).

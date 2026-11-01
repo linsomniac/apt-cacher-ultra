@@ -51,6 +51,21 @@ for verified snapshots. Debian/Ubuntu keys are bundled. Third-party repositories
 need their signing keys mounted under `/etc/apt/keyrings` or a configured
 `adoption.keyring_dirs` directory before enabling adoption.
 
+## Server HTTPS and ACME
+
+The cache and admin listeners can serve HTTPS using existing PEM certificates or
+built-in ACME. Follow [server HTTPS setup](../docs/server-tls.md) for certificate
+reload, provider credentials, persistent state, and authenticated healthchecks
+that verify the certificate and hostname.
+
+For managed certificates, use the standalone [HTTP-01 example](../compose.acme.yml)
+or [DNS-01 example](../compose.acme-dns.yml). Configure your domain, credentials
+and explicit authority terms acceptance before starting. HTTP-01 publishes port
+80 for validation; DNS-01 requires no inbound challenge port. The examples keep
+application ports on host loopback.
+
+Server certificates and the repository MITM CA are configured independently.
+
 ## HTTPS MITM
 
 Use the same `compose.yml` and `docker/config.toml`. In `[tls_mitm]`, change
