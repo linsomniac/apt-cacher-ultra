@@ -329,32 +329,53 @@ func parseKeyringBytes(b []byte) (openpgp.EntityList, error) {
 const keyringMaxFile = 16 << 20
 
 // parseKeyringReader reads one key file as apt reads it (the re-review's
-// V-RC1): an armored file (its first 64 octets hold "-----BEGIN PGP") is
-// every public key block in it, dearmored and joined in file order into one
-// binary keyring (dearmorKeyring); any other file is a binary keyring,
+// V-RC1 and V-R2C1): an armored file (its first octet is text, where an
+// OpenPGP packet's first octet has its top bit set) is every public key
+// block in it, wherever it stands, dearmored and joined in file order into
+// one binary keyring (dearmorKeyring); any other file is a binary keyring,
 // which must be whole OpenPGP packets to its end (wholePackets). The
 // keyring's keys are then go-crypto's ReadKeyRing, which skips a key it
 // does not support (an unknown algorithm), as gpgv cannot use one either.
 // An empty file holds no key and is no error, as apt reads it.
 //
-// AIDEV-NOTE: apt reads every block of an armored file: apt 2.2 to 2.8's
-// apt-key (dearmor_keyring: an awk script over every BEGIN..END block,
-// "to support multiple keys in one file", then base64 -d), apt 3.x's
-// dearmorKeyOrCheckFormat (apt-pkg/contrib/gpgv.cc, 3.2.0 :316-346: every
-// public key block's base64 joined, then decoded), and debian:13's sqv,
-// which reads the file itself. The loader read the first block only
-// (openpgp.ReadArmoredKeyRing), so a key in a later block was unknown to
-// S1 and untrusted by S2: yarn's signing subkey (block 2 of its published
-// file) and sublime's second signer (block 3) among the surveyed vendors.
-// Where apt's readers part — text outside the blocks (apt-key and apt 3
-// skip it), a block of another type (apt-key reads any BEGIN block, apt 3
-// public key blocks only), a block without its END line (apt 3 ignores
-// the file, apt-key decodes what it has), a line after a block's checksum
-// line, bytes after a binary keyring's packets (gpgv reads a keyring to
-// its first bad packet; a .asc holding binary then armor is armor alone to
-// apt 3) — the file is refused, and LoadKeyring logs that at WARN and
-// skips it: no surveyed vendor's file is so (all 70 are clean binary or
-// clean armor), and a skipped file is said where a misread one is not.
+// AIDEV-NOTE: apt reads every public key block of an armored file and
+// nothing around them: apt 2.2 to 2.8's apt-key (dearmor_keyring: an awk
+// script that prints the base64 lines of every BEGIN..END block, "to skip
+// surrounding garbage and to support multiple keys in one file", then
+// base64 -d), apt 3.x's dearmorKeyOrCheckFormat (apt-pkg/contrib/gpgv.cc,
+// 3.2.0 :316-346: a state machine over stripped lines, every public key
+// block's base64 joined, then decoded) and debian:13's sqv, which reads the
+// file itself. Text, binary bytes or a block of another type before,
+// between or after the public key blocks are read past by every one of
+// them (measured in all six images: the re-review's V-R2C1). The loader
+// read the first block only (main, openpgp.ReadArmoredKeyRing: yarn's
+// signing subkey in block 2 and sublime's second signer in block 3 were
+// unknown), then (fix round 1) refused a file with anything around its
+// blocks; a skipped file is not only an outage (its keys untrusted) but an
+// S1 hole (its keys unknown to S1, so a bad signature by one of them beside
+// a good one, which gpgv refuses, was adopted). The loader now refuses only
+// what some apt cannot use: a line after a block's checksum line, bytes
+// after a binary keyring's packets (every apt fails both: measured), a
+// public key block without its END line (apt 3 ignores the file), and a
+// file holding no public key block (key packets in a private key or
+// signature block alone: apt 3.2's gpgv path reads no key from them, u26
+// measured; apt-key and sqv read them) — and a block body go-crypto's
+// armor decoder refuses (dearmorKeyring's note). LoadKeyring logs the
+// refusal at WARN and skips the file. All 70 surveyed vendor files load.
+//
+// AIDEV-NOTE: the re-review's V-R2M3, a known gap, left as it is: the
+// loader tells armor from binary by content, apt by the file's name. apt
+// dearmors a ".asc" and needs any other keyring to start with a public key
+// packet's first octet, 0x98, 0x99 or 0xc6 (apt-key's is_supported_keyring,
+// apt 3's dearmorKeyOrCheckFormat; sqv, handed a signed-by file, reads
+// either), so an armored file named .gpg, a binary one named .asc, and a
+// binary keyring whose first packet is framed otherwise (0x9a, an
+// old-format four-octet length) load here and not in apt's trusted.gpg.d;
+// and a CRLF .asc loads here and in apt 2.7 and 3, while apt 2.2, 2.4 and
+// 2.6 read no key from it (apt-key's awk wants an empty line, and "\r" is
+// not one; measured). The cache's keyring is then larger than those
+// clients', never smaller: a client that cannot read the file fails with or
+// without the cache, and S1 is only stricter.
 func parseKeyringReader(r io.Reader) (openpgp.EntityList, error) {
 	b, err := io.ReadAll(io.LimitReader(r, keyringMaxFile+1))
 	if err != nil {
@@ -364,7 +385,7 @@ func parseKeyringReader(r io.Reader) (openpgp.EntityList, error) {
 		return nil, fmt.Errorf("larger than %d octets", keyringMaxFile)
 	}
 	kind := "binary"
-	if bytes.Contains(b[:min(len(b), 64)], []byte("-----BEGIN PGP")) {
+	if len(b) > 0 && b[0]&0x80 == 0 {
 		kind = "armored"
 		if b, err = dearmorKeyring(b); err != nil {
 			return nil, fmt.Errorf("armored: %w", err)
@@ -379,27 +400,41 @@ func parseKeyringReader(r io.Reader) (openpgp.EntityList, error) {
 	return entities, nil
 }
 
-// The public key block's armor lines (RFC 9580 §6.2).
+// The armor lines that open and close a public key block, as apt 3
+// matches them (a stripped line starting with each).
 var (
 	keyBlockBegin = []byte("-----BEGIN PGP PUBLIC KEY BLOCK-----")
-	keyBlockEnd   = []byte("-----END PGP PUBLIC KEY BLOCK-----")
+	armorEndLine  = []byte("-----END")
 )
 
-// dearmorKeyring is apt's dearmoring of an armored key file
-// (parseKeyringReader): every public key block's packets, in file order,
-// as one binary keyring. Lines are compared without their surrounding
-// blanks (a CR included), as apt 3 strips them; outside a block only blank
-// lines are read; inside one, any line starting with "-----" but its END
-// line, or any line after its checksum line ("=" first), is refused; each
-// block is go-crypto's armor decoding of its lines (headers, the empty
-// line, base64; the checksum is not checked, by apt either), and must
-// decode to whole packets.
+// dearmorKeyring is apt 3's dearmoring of an armored key file
+// (parseKeyringReader): every public key block's packets, in file order, as
+// one binary keyring. Lines are read without their surrounding blanks (a CR
+// included), as apt 3 strips them. A public key block opens at a line
+// starting "-----BEGIN PGP PUBLIC KEY BLOCK-----" and closes at the next
+// line starting "-----END"; every line outside one is read past (text,
+// binary bytes, a signature or private key block), as apt 3 reads none and
+// apt-key's awk prints none but another block's base64 (a signature packet
+// then rides along in its keyring, harmless as measured; keys in such a
+// block apt 3.2 reads not, nor does the loader). Inside a block, a line
+// starting "-----" but its END line, or a line after its checksum line ("="
+// first), is refused: apt 3 and apt-key fold it into the block's base64 or
+// restart the block keeping what they read of it, which every apt fails
+// (measured for the latter) or no two read alike. Each block is go-crypto's
+// armor decoding of its lines (headers, the empty line, base64; the
+// checksum is not checked, by apt either) and must decode to whole packets.
+// A file whose last public key block has no END line (apt 3 ignores the
+// file), or that holds no public key block, is refused.
 //
-// The caller's sniff found "-----BEGIN PGP" in b's first 64 octets, so b
-// holds a line: a public key block's BEGIN line, which opens a block, or
-// one refused (another BEGIN line, or text).
+// AIDEV-NOTE: go-crypto's armor decoder (openpgp/armor, the same in v1.4.1
+// and v1.5.2) refuses a few block bodies apt 3 reads: a line over 96
+// octets (a BEGIN line over 100), a header line without a colon, a
+// checksum line other than five characters, a body line starting "-" but
+// not "-----". Pre-existing (main read a file's first block with it), not
+// measured, and no surveyed vendor's file has one.
 func dearmorKeyring(b []byte) ([]byte, error) {
 	var out []byte
+	blocks := 0
 	start := -1 // the open block's first octet in b, -1 outside a block
 	crc := false
 	for off, n := 0, 1; off < len(b); n++ {
@@ -409,19 +444,17 @@ func dearmorKeyring(b []byte) ([]byte, error) {
 		}
 		l := bytes.TrimSpace(b[off:next])
 		switch {
-		case start < 0 && len(l) == 0:
-		case start < 0 && bytes.Equal(l, keyBlockBegin):
+		case start < 0 && bytes.HasPrefix(l, keyBlockBegin):
 			start, crc = off, false
-		case start < 0 && bytes.HasPrefix(l, []byte("-----BEGIN ")):
-			return nil, fmt.Errorf("line %d: an armor block that is no public key block", n)
 		case start < 0:
-			return nil, fmt.Errorf("line %d: text outside the public key blocks", n)
-		case bytes.Equal(l, keyBlockEnd):
+			// Outside a public key block: read past, as apt does.
+		case bytes.HasPrefix(l, armorEndLine):
 			data, err := decodeKeyBlock(b[start:next])
 			if err != nil {
 				return nil, fmt.Errorf("the block ending on line %d: %w", n, err)
 			}
 			out = append(out, data...)
+			blocks++
 			start = -1
 		case bytes.HasPrefix(l, []byte("-----")):
 			return nil, fmt.Errorf("line %d: a line starting with \"-----\" inside a public key block", n)
@@ -434,6 +467,9 @@ func dearmorKeyring(b []byte) ([]byte, error) {
 	}
 	if start >= 0 {
 		return nil, errors.New("a public key block without its END line")
+	}
+	if blocks == 0 {
+		return nil, errors.New("no public key block, from which apt 3 reads no key")
 	}
 	return out, nil
 }
