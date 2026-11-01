@@ -96,6 +96,11 @@ cp packaging/config/config.toml.default config.toml
 ./build/apt-cacher-ultra -config config.toml
 ```
 
+## Docker
+
+See [Docker and Compose](docker/README.md) for HTTP-only and HTTPS MITM examples,
+persistent storage, and multi-platform GHCR builds.
+
 ## Configuration
 
 Edit `/etc/apt-cacher-ultra/config.toml` (or the file passed to `-config`),

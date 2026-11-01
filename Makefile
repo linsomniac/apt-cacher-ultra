@@ -40,7 +40,7 @@ lint: shellcheck
 # they flag (0.9.0, GitHub's ubuntu-latest, reports an SC2015 that 0.11.0
 # does not), so CI's lint job and every checkout run this one version.
 SHELLCHECK_IMAGE := koalaman/shellcheck:v0.11.0
-SHELL_SCRIPTS    := e2e/flat/*.sh e2e/live/*.sh e2e/deb/*.sh packaging/scripts/*.sh
+SHELL_SCRIPTS    := e2e/flat/*.sh e2e/live/*.sh e2e/deb/*.sh packaging/scripts/*.sh scripts/smoke-test-docker.sh
 
 shellcheck:
 	docker run --rm -v "$(CURDIR):/mnt:ro" -w /mnt $(SHELLCHECK_IMAGE) -x $(SHELL_SCRIPTS)
