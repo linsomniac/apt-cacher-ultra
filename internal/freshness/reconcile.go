@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/apttext"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
@@ -43,22 +44,39 @@ func (a *Adopter) ReconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 	return a.reconcileSnapshot(ctx, suite, snapshotID, nil, force)
 }
 
-// sweepReconcileMemo drops every reconciledSnapshots entry whose snapshot
-// is not in current — the suites' current snapshots, as the reaper's run
-// listed them (spec C9) — and reports how many it dropped. A displaced
-// snapshot never becomes current again, so its entry is dead; one adopted
-// after the listing may lose a fresh entry, which costs it one extra parse
-// of its Release on its next unchanged check.
+// sweepReconcileMemo drops every reconciledSnapshots and
+// reconcileFailedSnapshots entry whose snapshot is not in current — the
+// suites' current snapshots, as the reaper's run listed them (spec C9) —
+// and reports how many it dropped. A displaced snapshot never becomes
+// current again, so its entry is dead; one adopted after the listing may
+// lose a fresh entry, which costs it one extra parse of its Release on its
+// next unchanged check (or one more WARN of a failing decision).
 func (a *Adopter) sweepReconcileMemo(current map[int64]bool) int {
 	n := 0
-	a.reconciledSnapshots.Range(func(k, _ any) bool {
-		if id, ok := k.(int64); !ok || !current[id] {
-			a.reconciledSnapshots.Delete(k)
-			n++
-		}
-		return true
-	})
+	for _, memo := range []*sync.Map{&a.reconciledSnapshots, &a.reconcileFailedSnapshots} {
+		memo.Range(func(k, _ any) bool {
+			if id, ok := k.(int64); !ok || !current[id] {
+				memo.Delete(k)
+				n++
+			}
+			return true
+		})
+	}
 	return n
+}
+
+// firstReconcileFailure records that snapshotID's reconcile decision failed
+// and reports whether it is the first failure since the process started or
+// since a decision on it last succeeded (the one logged at WARN).
+func (a *Adopter) firstReconcileFailure(snapshotID int64) bool {
+	_, seen := a.reconcileFailedSnapshots.LoadOrStore(snapshotID, struct{}{})
+	return !seen
+}
+
+// clearReconcileFailure forgets snapshotID's failed decision: a decision on
+// it succeeded, so a failure that recurs is said again.
+func (a *Adopter) clearReconcileFailure(snapshotID int64) {
+	a.reconcileFailedSnapshots.Delete(snapshotID)
 }
 
 // reconcileSnapshot is ReconcileSnapshot; a non-nil declared must be

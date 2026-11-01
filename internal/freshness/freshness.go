@@ -725,10 +725,10 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
 	declared, needReconcile, err := c.adopter.reconcilePending(ctx, rp.suite, rp.snapshotID)
 	if err != nil {
 		// A fail-closed anchor (R-1 decode error) must be visible, not a
-		// silent non-heal.
-		c.logger.Warn("adoption_reconcile_failed",
-			"canonical_host", rp.suite.CanonicalHost, "suite_path", rp.suite.SuitePath,
-			"snapshot_id", rp.snapshotID, "stage", "decision", "err", err)
+		// silent non-heal: WARN once per snapshot, every failure counted.
+		c.logReconcileFailure(ctx, "decision", rp.suite, rp.snapshotID, err)
+	} else {
+		c.adopter.clearReconcileFailure(rp.snapshotID)
 	}
 	out.needReconcile, out.declared = needReconcile, declared
 	if !out.needRepair && !out.needReconcile {
@@ -794,12 +794,35 @@ func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
 			// on-demand path (Reconcile) so a fail-closed anchor (R-1
 			// decode error) is visible, not a silent non-heal.
 			if _, err := c.adopter.reconcileSnapshot(rctx, rp.suite, rp.snapshotID, declared, false); err != nil {
-				c.logger.Warn("adoption_reconcile_failed",
-					"canonical_host", rp.suite.CanonicalHost, "suite_path", rp.suite.SuitePath,
-					"snapshot_id", rp.snapshotID, "stage", "heal", "err", err)
+				c.logReconcileFailure(rctx, "heal", rp.suite, rp.snapshotID, err)
 			}
 		}
 	}()
+}
+
+// logReconcileFailure logs and counts a failed reconcile of snapshotID at
+// stage: "decision" (planRepair: an unchanged check's reconcilePending),
+// "heal" (spawnRepair) or "on_demand" (Reconcile). Every failure is counted
+// (acu_adoption_reconcile_failed_total{stage}); a heal's or an on-demand
+// one is logged at WARN each time, a decision's at WARN once per snapshot
+// and at DEBUG after, until a decision on it succeeds.
+//
+// AIDEV-NOTE: the re-review's V-R2M1: a snapshot whose reconcile can never
+// succeed (a stored anchor apt's split refuses, which the legacy audit
+// keeps under ruling R-D2) fails its decision on every confirmed-unchanged
+// check, and the WARN fired each time, forever on a frozen suite. The memo
+// (Adopter.reconcileFailedSnapshots) is keyed by snapshot ID, so a suite's
+// next adoption warns afresh; a decision that succeeds clears its entry,
+// and each reaper run drops the entries of snapshots no longer current.
+func (c *Checker) logReconcileFailure(ctx context.Context, stage string, suite SuiteRef, snapshotID int64, err error) {
+	adoptionReconcileFailedTotal.Inc(stage)
+	level := slog.LevelWarn
+	if stage == "decision" && !c.adopter.firstReconcileFailure(snapshotID) {
+		level = slog.LevelDebug
+	}
+	c.logger.Log(ctx, level, "adoption_reconcile_failed",
+		"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath,
+		"snapshot_id", snapshotID, "stage", stage, "err", err)
 }
 
 // WaitForAdoptions blocks until every in-flight adoption goroutine
@@ -1325,9 +1348,7 @@ func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string)
 		rctx, cancel := context.WithTimeout(c.lifetimeCtx, c.maxAdoptionDuration)
 		defer cancel()
 		if _, err := c.adopter.ReconcileSnapshot(rctx, suite, snapID, true); err != nil {
-			c.logger.Warn("adoption_reconcile_failed",
-				"canonical_host", host, "suite_path", suitePath,
-				"snapshot_id", snapID, "stage", "on_demand", "err", err)
+			c.logReconcileFailure(rctx, "on_demand", suite, snapID, err)
 		}
 	}()
 	return true

@@ -38,7 +38,9 @@ import (
 // counter by reason: idle, non_canonical, junk);
 // acu_anchorless_sniff_rejected_total (spec C4 Dispatch 4, counter by
 // host); acu_suite_reaper_last_run_unixtime (spec C9, deferred minor
-// F-13, unlabelled gauge). The flip barrier's
+// F-13, unlabelled gauge); acu_adoption_reconcile_failed_total (Task 9b's
+// fix round 2, the re-review's V-R2M1, counter by stage: decision, heal,
+// on_demand). The flip barrier's
 // acu_flip_hold_skipped_total, acu_flip_hold_expired_total,
 // acu_flip_quiet_cut_short_total, acu_flip_waiters_over_cap_total,
 // acu_flip_slow_anchor_reads_total and
@@ -279,6 +281,18 @@ var (
 		"Requestable IndexTargets healed into an existing snapshot by in-place reconcile, by architecture (SPEC6_8).",
 		metrics.DefaultMaxSeries,
 		"architecture",
+	)
+
+	// adoptionReconcileFailedTotal counts every adoption_reconcile_failed
+	// line, whatever its level, by stage: decision, heal or on_demand (a
+	// closed enum; Checker.logReconcileFailure). A failing decision is
+	// logged at WARN once per snapshot (the re-review's V-R2M1), so the
+	// count is what shows it recurring.
+	adoptionReconcileFailedTotal = metrics.NewCounterWithCap(
+		"acu_adoption_reconcile_failed_total",
+		"Failed in-place reconciles, by stage: decision (an unchanged check's re-parse of the snapshot's anchor), heal or on_demand (SPEC6_8).",
+		metrics.DefaultMaxSeries,
+		"stage",
 	)
 
 	adoptionSourcesParsedTotal = metrics.NewCounterWithCap(

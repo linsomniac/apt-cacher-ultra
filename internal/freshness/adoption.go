@@ -685,6 +685,14 @@ type Adopter struct {
 	// by the suite table rather than by every snapshot id the process saw.
 	reconciledSnapshots sync.Map // map[int64]struct{}
 
+	// reconcileFailedSnapshots memoizes the snapshot IDs whose reconcile
+	// decision failed and was logged at WARN (Checker.logReconcileFailure),
+	// so a snapshot that can never reconcile warns once per process rather
+	// than on every unchanged check (the re-review's V-R2M1). A decision
+	// that succeeds clears its entry; each reaper run drops the entries of
+	// snapshots that are no suite's current one (sweepReconcileMemo).
+	reconcileFailedSnapshots sync.Map // map[int64]struct{}
+
 	logger *slog.Logger
 	now    func() time.Time
 }
