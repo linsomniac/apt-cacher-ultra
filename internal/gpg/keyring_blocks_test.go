@@ -13,9 +13,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
 )
 
 // armoredKey is e's public key in one armor block, as gpg --export --armor
@@ -226,9 +228,13 @@ func TestParseKeyring_RefusesWhatAptReadsOtherwise(t *testing.T) {
 			t.Errorf("%s: %d keys, %v; want the file refused, %q", tc.name, len(ents), err, tc.why)
 		}
 	}
-	big := make([]byte, keyringMaxFile+1)
-	if _, err := parseKeyringBytes(big); err == nil || !strings.Contains(err.Error(), "larger than") {
-		t.Errorf("a file of %d octets: %v; want it refused as larger than the cap", len(big), err)
+	// The cap, at a small limit (TestParseKeyring_ReadsADebianKeyringSizedFile
+	// reads a file the size of the largest real one at the real cap).
+	if _, err := parseKeyringReaderMax(bytes.NewReader(make([]byte, 1025)), 1024); err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Errorf("a file of 1025 octets at a cap of 1024: %v; want it refused as larger than the cap", err)
+	}
+	if _, err := parseKeyringReaderMax(bytes.NewReader(make([]byte, 1024)), 1024); err == nil || strings.Contains(err.Error(), "larger than") {
+		t.Errorf("a file of 1024 octets at a cap of 1024: %v; want it read (and refused as no keyring)", err)
 	}
 	// LoadKeyring skips the refused file and loads the rest.
 	dir := makeTestDir(t)
@@ -381,5 +387,51 @@ func TestVerifier_AKeyFromAFileWithTextAroundItsBlockIsKnown(t *testing.T) {
 	}
 	if _, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, cGood)); err != nil {
 		t.Errorf("C's good signature alone: %v; want it adopted", err)
+	}
+}
+
+// TestParseKeyring_ReadsADebianKeyringSizedFile: the re-review's V-R2M2. The
+// loader's 16 MiB cap skipped debian-keyring.gpg (31.3 MB in
+// debian-keyring 2025.07.26, in /usr/share/keyrings, a default directory)
+// with a WARN at every start; apt has no limit. A generated keyring past
+// that size, built as the real one is (a key whose user ID carries many
+// certifications by other keys, which go-crypto keeps unverified), loads at
+// the real cap, binary as the real one is and armored; and the cap stands
+// far above it.
+func TestParseKeyring_ReadsADebianKeyringSizedFile(t *testing.T) {
+	const debianKeyring = 31_300_000 // octets, debian-keyring.gpg 2025.07.26
+	if keyringMaxFile < 8*debianKeyring {
+		t.Errorf("keyringMaxFile is %d octets, want at least eight times debian-keyring.gpg's %d", keyringMaxFile, debianKeyring)
+	}
+	a := newTestEntity(t, "A", "a@example.com")
+	b := newTestEntity(t, "B", "b@example.com")
+	if err := a.SignIdentity(firstUID(a), b, &packet.Config{Time: func() time.Time { return time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC) }}); err != nil {
+		t.Fatalf("SignIdentity: %v", err)
+	}
+	tags, packets := rawPacketList(t, binaryKey(t, a))
+	// A's packets: its key, its user ID, the self-signature and B's
+	// certification (identity.Signatures, in order), then its subkey.
+	if len(tags) < 4 || tags[0] != 6 || tags[1] != 13 || tags[2] != 2 || tags[3] != 2 {
+		t.Fatalf("test premise: A's packets have tags %v, want a key, a user ID and two signatures first", tags)
+	}
+	var big bytes.Buffer
+	big.Write(joined(packets[0], packets[1], packets[2]))
+	for big.Len() < 32<<20 {
+		big.Write(packets[3])
+	}
+	for _, pkt := range packets[4:] {
+		big.Write(pkt)
+	}
+	if big.Len() <= debianKeyring {
+		t.Fatalf("test premise: %d octets, want more than debian-keyring.gpg's", big.Len())
+	}
+	dir := makeTestDir(t)
+	writeFile(t, filepath.Join(dir, "debian-keyring.gpg"), big.Bytes())
+	writeFile(t, filepath.Join(dir, "debian-keyring.asc"), armorOf(t, openpgp.PublicKeyType, big.Bytes()))
+	for _, name := range []string{"debian-keyring.gpg", "debian-keyring.asc"} {
+		ents, err := parseKeyringFile(filepath.Join(dir, name))
+		if err != nil || len(ents) != 1 || !fingerprintsOf(ents)[upperFP(a.PrimaryKey.Fingerprint)] {
+			t.Errorf("%s: %d keys, %v; want A's key read", name, len(ents), err)
+		}
 	}
 }

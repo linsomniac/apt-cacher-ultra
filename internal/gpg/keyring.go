@@ -400,10 +400,21 @@ func parseKeyringBytes(b []byte) (openpgp.EntityList, error) {
 	return parseKeyringReader(bytes.NewReader(b))
 }
 
-// keyringMaxFile caps one keyring file, which is read whole: the largest
-// real keyrings are well under a mebibyte (debian-archive-keyring.gpg, 56
-// KiB; the vendor survey's largest armored file, 15 KiB).
-const keyringMaxFile = 16 << 20
+// keyringMaxFile caps one keyring file, which is read whole: 256 MiB, eight
+// times the largest keyring a distribution ships (debian-keyring.gpg, 31.3
+// MB in debian-keyring 2025.07.26: every Debian developer's key with its
+// certifications, in /usr/share/keyrings, a default directory), where the
+// archive keyrings are well under a mebibyte (debian-archive-keyring.gpg,
+// 56 KiB; the vendor survey's largest file, 15 KiB). apt has no limit, and
+// keyring files are the operator's trusted input; the cap only keeps a
+// file that is no keyring (a disk image named .gpg) from being read whole
+// at startup, and room for decades of debian-keyring's growth.
+//
+// AIDEV-NOTE: the re-review's V-R2M2: round 1's 16 MiB cap skipped
+// debian-keyring.gpg with a WARN at every start
+// (TestParseKeyring_ReadsADebianKeyringSizedFile loads a generated file
+// past its size).
+const keyringMaxFile = 256 << 20
 
 // parseKeyringReader reads one key file as apt reads it (the re-review's
 // V-RC1 and V-R2C1): an armored file (its first octet is text, where an
@@ -454,12 +465,18 @@ const keyringMaxFile = 16 << 20
 // clients', never smaller: a client that cannot read the file fails with or
 // without the cache, and S1 is only stricter.
 func parseKeyringReader(r io.Reader) (openpgp.EntityList, error) {
-	b, err := io.ReadAll(io.LimitReader(r, keyringMaxFile+1))
+	return parseKeyringReaderMax(r, keyringMaxFile)
+}
+
+// parseKeyringReaderMax is parseKeyringReader with the cap given (tests
+// read past a small one).
+func parseKeyringReaderMax(r io.Reader, maxFile int) (openpgp.EntityList, error) {
+	b, err := io.ReadAll(io.LimitReader(r, int64(maxFile)+1))
 	if err != nil {
 		return nil, fmt.Errorf("read: %w", err)
 	}
-	if len(b) > keyringMaxFile {
-		return nil, fmt.Errorf("larger than %d octets", keyringMaxFile)
+	if len(b) > maxFile {
+		return nil, fmt.Errorf("larger than %d octets", maxFile)
 	}
 	kind := "binary"
 	if len(b) > 0 && b[0]&0x80 == 0 {
