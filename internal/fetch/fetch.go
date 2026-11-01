@@ -163,8 +163,8 @@ type Target struct {
 
 // FetchDst is the destination for the response body. Truncate must reset
 // the destination to its zero state — used when a resume retry returns
-// 200 (validator changed) instead of 206, or when no validator was ever
-// captured and a retry can't safely resume.
+// 200 (validator changed) or 204 instead of 206, or when no validator was
+// ever captured and a retry can't safely resume.
 type FetchDst interface {
 	io.Writer
 	Written() int64
@@ -176,8 +176,10 @@ type FetchDst interface {
 //
 // Status is always 200 on success — the internal resume mechanics (a
 // 206 partial response or a validator-induced restart) are hidden from
-// the caller. ContentLength is the *full* object size; it equals
-// Written on the FetchDst at success.
+// the caller. An upstream 204 is normalized to an empty 200 response,
+// discarding any partial download. ContentLength is the declared full
+// object size, or -1 when the initial response length was unknown; a
+// normalized 204 always has ContentLength 0.
 type FetchResult struct {
 	Status        int
 	ContentType   string
@@ -300,6 +302,8 @@ func New(opts Options) (*Client, error) {
 
 // Fetch streams target.URL into dst, applying SPEC §6.6 hardening (host
 // allowlist + deny-CIDR check) and SPEC §6.3 resumable retries.
+// A 204 No Content is a successful empty fetch; callers remain responsible
+// for checking the body against any declared size and hash.
 //
 // Errors are classified for callers via errors.Is:
 //
@@ -388,13 +392,13 @@ func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (resul
 			}
 			if validator == "" {
 				// No validator captured — can't safely resume per SPEC
-				// §6.3. Truncate and start over.
+				// §6.3. Truncate and start over without spending another
+				// retry: the failed attempt was already counted below.
 				if terr := dst.Truncate(); terr != nil {
-					return nil, fmt.Errorf("fetch: truncate (no validator): %w", terr)
+					return nil, fmt.Errorf("%w: truncate (no validator): %v", ErrCacheWriteFailed, terr)
 				}
 				haveInitial = false
 				initial = nil
-				attempts++
 				continue
 			}
 		}
@@ -406,9 +410,9 @@ func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (resul
 		out, err := c.doAttempt(ctx, target, dst, sendRange, dst.Written(), validator, expectedTotal)
 
 		// Capture (or refresh) initial when this attempt produced fresh
-		// 200 headers — the first 200, or a validator-induced restart's
-		// new 200. doAttempt has already truncated dst in the restart
-		// case, so this assignment never trails stale Written bytes.
+		// 200 headers (including a normalized 204) — the first response,
+		// or a restart's new response. doAttempt has already truncated dst
+		// in the restart case, so this assignment never trails stale bytes.
 		if out != nil && out.Status == http.StatusOK {
 			initial = out
 			haveInitial = true
@@ -502,6 +506,20 @@ func (c *Client) doAttempt(
 	}
 
 	switch resp.StatusCode {
+	case http.StatusNoContent:
+		// Some repositories serve empty index files as 204. Treat this
+		// as a complete empty object, even after a partial download: a
+		// 204 cannot supply the remainder of a Range request. Reset the
+		// bytes and hash state before reporting success. A local reset
+		// failure must not be retried as an upstream failure.
+		if dst.Written() > 0 {
+			if err := dst.Truncate(); err != nil {
+				return out, fmt.Errorf("%w: truncate dst on 204: %v", ErrCacheWriteFailed, err)
+			}
+		}
+		out.Status = http.StatusOK
+		out.ContentLength = 0
+		return out, nil
 	case http.StatusOK:
 		if target.MaxBytes > 0 && resp.ContentLength > target.MaxBytes {
 			return out, fmt.Errorf("%w: declared %d bytes, at most %d expected",
@@ -512,7 +530,7 @@ func (c *Client) doAttempt(
 			// ignored the Range header). SPEC §6.3: "the partial file is
 			// discarded and the fetch restarts from byte 0".
 			if err := dst.Truncate(); err != nil {
-				return out, fmt.Errorf("fetch: truncate dst on restart: %w", err)
+				return out, fmt.Errorf("%w: truncate dst on restart: %v", ErrCacheWriteFailed, err)
 			}
 		}
 		if err := streamBody(resp, dst, target.MaxBytes); err != nil {

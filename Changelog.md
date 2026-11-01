@@ -58,6 +58,13 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Fixed
 
+- Empty repository indexes served as HTTP 204 now adopt successfully.
+  A 204 during a resumed download discards the partial bytes before caching;
+  declared member sizes and hashes are still checked. Based on Laurent Corbes's
+  (@lcaflc) PR #22.
+- Restarting a partial download without a validator no longer consumes an
+  extra retry. Failed destination resets stop as cache write errors instead
+  of retrying with stale partial bytes.
 - An `InRelease` the signature library cannot decode no longer crashes the
   daemon.
 - A backward clock step no longer freezes freshness checks.
