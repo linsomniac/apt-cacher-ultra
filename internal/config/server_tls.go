@@ -14,11 +14,14 @@ import (
 )
 
 type ACMEConfig struct {
-	Enabled      bool   `toml:"enabled"`
-	DirectoryURL string `toml:"directory_url"`
-	DNSName      string `toml:"dns_name"`
-	Listen       string `toml:"listen"`
-	AcceptTerms  bool   `toml:"accept_terms"`
+	Enabled       bool     `toml:"enabled"`
+	DirectoryURL  string   `toml:"directory_url"`
+	DNSName       string   `toml:"dns_name"`
+	Listen        string   `toml:"listen"`
+	AcceptTerms   bool     `toml:"accept_terms"`
+	ChallengeType string   `toml:"challenge_type"`
+	DNSProvider   string   `toml:"dns_provider"`
+	DNSResolvers  []string `toml:"dns_resolvers"`
 }
 
 func (a AdminConfig) TLSEnabled() bool { return a.TLSCert != "" || a.TLSKey != "" || a.UseACME }
@@ -89,6 +92,32 @@ func (c *Config) ValidateServerTLS() error {
 	if err := ValidateACMEName(c.ACME.DNSName); err != nil {
 		errs = append(errs, err)
 	}
+	switch c.ACME.ChallengeMethod() {
+	case "http-01":
+		if c.ACME.DNSProvider != "" || len(c.ACME.DNSResolvers) != 0 {
+			errs = append(errs, errors.New("acme.dns_provider / dns_resolvers require challenge_type = dns-01"))
+		}
+	case "dns-01":
+		if !acmeProvider.MatchString(c.ACME.DNSProvider) || c.ACME.DNSProvider == "manual" || c.ACME.DNSProvider == "exec" {
+			errs = append(errs, errors.New("acme.dns_provider must name an automated DNS provider"))
+		}
+		if len(c.ACME.DNSResolvers) > 8 {
+			errs = append(errs, errors.New("acme.dns_resolvers allows at most eight resolvers"))
+		}
+		for _, resolver := range c.ACME.DNSResolvers {
+			if address, err := netip.ParseAddrPort(resolver); err != nil {
+				errs = append(errs, errors.New("acme.dns_resolvers must contain IP:port addresses"))
+			} else {
+				if address.Port() == 0 {
+					errs = append(errs, errors.New("acme.dns_resolvers requires nonzero ports"))
+				}
+			}
+		}
+		return errors.Join(errs...)
+	default:
+		errs = append(errs, errors.New("acme.challenge_type must be http-01 or dns-01"))
+		return errors.Join(errs...)
+	}
 	if err := validateListenAddr(c.ACME.Listen); err != nil {
 		errs = append(errs, fmt.Errorf("acme.listen: %w", err))
 	}
@@ -121,6 +150,8 @@ func ValidateACMEDirectory(raw string) error {
 	return nil
 }
 
+var acmeProvider = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+
 var acmeLabel = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 
 func ValidateACMEName(name string) error {
@@ -147,4 +178,11 @@ func ListenOverlap(a, b string) bool {
 	}
 	wild := func(h string) bool { return h == "" || h == "0.0.0.0" || h == "::" }
 	return strings.EqualFold(ah, bh) || wild(ah) || wild(bh)
+}
+
+func (a ACMEConfig) ChallengeMethod() string {
+	if a.ChallengeType == "" {
+		return "http-01"
+	}
+	return a.ChallengeType
 }

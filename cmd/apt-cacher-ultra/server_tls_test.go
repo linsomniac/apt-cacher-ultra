@@ -94,11 +94,16 @@ func TestManagedTLSBothListenersAndShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for runtime.manager.Current().Leaf.Equal(old) && time.Now().Before(deadline) {
+	// The certificate is installed before the retry-state commit/status publish.
+	// Wait for both serving material and renewal completion, not a scheduling race.
+	renewalReady := func() bool {
+		return !runtime.manager.Current().Leaf.Equal(old) && runtime.manager.Snapshot().State == "usable"
+	}
+	for !renewalReady() && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if runtime.manager.Current().Leaf.Equal(old) {
-		t.Fatal("renewal not published")
+	if !renewalReady() {
+		t.Fatal("renewal not committed and published")
 	}
 	roots := x509.NewCertPool()
 	roots.AppendCertsFromPEM(srv.CACertPEM())

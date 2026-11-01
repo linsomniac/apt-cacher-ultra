@@ -1135,7 +1135,10 @@ records of signed paths no suite tracks.
 | `enabled` | boolean | `false` | Enable ACME; at least one listener must select `use_acme`. |
 | `directory_url` | string | `""` | Explicit HTTPS authority directory; no credentials, query or fragment. Resource URLs must stay on that origin. |
 | `dns_name` | string | `""` | One ASCII DNS name; normalized to lowercase by the loader. No IP, wildcard or trailing dot. |
-| `listen` | string | `"127.0.0.1:8080"` | Dedicated HTTP-01 challenge listener. Public port 80 must forward here. No overlap with application listeners. |
+| `challenge_type` | string | `"http-01"` | `http-01` or `dns-01`. DNS-01 requires no inbound challenge listener. |
+| `dns_provider` | string | `""` | Lego provider code, required for DNS-01. List supported codes with `apt-cacher-ultra acme dns-providers`. Credentials use native Lego environment variables/files. `manual` and `exec` are excluded. |
+| `dns_resolvers` | string array | `[]` | DNS-01 recursive resolvers as IP:port, at most eight, nonzero ports. Empty uses system resolvers. Every configured resolver must see the expected TXT value. |
+| `listen` | string | `"127.0.0.1:8080"` | HTTP-01 challenge listener; ignored for DNS-01. Public port 80 must forward here for HTTP-01. No overlap with application listeners. |
 | `accept_terms` | boolean | `false` | Explicit acceptance of the configured authority's terms; must be true when enabled. |
 
 State is private under `cache.dir/acme/`, separated by authority. A valid saved
@@ -1146,7 +1149,7 @@ certificate until expiry, then new TLS handshakes fail. Certificate expiry and
 renewal status appear in admin HTML/JSON and metrics.
 
 See [server HTTPS and ACME](server-tls.md) for Certbot migration, staging,
-forwarding, systemd privileges, authenticated HTTPS healthchecks, Docker,
+forwarding, DNS-provider credentials and delegation, systemd privileges, authenticated HTTPS healthchecks, Docker,
 backup and recovery. These certificates do not replace the MITM CA.
 
 ## `[admin]`: status, metrics, and maintenance

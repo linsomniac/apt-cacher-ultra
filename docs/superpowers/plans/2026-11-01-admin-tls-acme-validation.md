@@ -1,5 +1,8 @@
 # Unified server TLS / ACME implementation validation
 
+This records the initial HTTP-01 implementation. Subsequent DNS-01 support and
+its dependency changes are recorded in [the Lego validation](2026-11-01-acme-dns-lego-validation.md).
+
 Implemented in `review/admin-tls-acme`, based on `40d40b8`, in
 `~/projects/worktrees/apt-cacher-ultra-admin-tls-acme`. The original checkout's
 tracked files and existing untracked work were left untouched.

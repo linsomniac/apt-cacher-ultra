@@ -163,41 +163,55 @@ func TestInvalidIssuedKeyNeverReplacesGoodCertificate(t *testing.T) {
 }
 
 func TestRetryAfterSurvivesTimeoutAndRestart(t *testing.T) {
-	srv := fakeacme.New(t)
-	m, cfg := testManager(t, srv)
-	var orders atomic.Int64
-	base := cfg.Transport
-	transport := roundTrip(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/order" {
-			orders.Add(1)
-			return &http.Response{StatusCode: 429, Header: http.Header{"Retry-After": []string{"7200"}, "Content-Type": []string{"application/problem+json"}},
-				Body: io.NopCloser(strings.NewReader(`{"type":"urn:ietf:params:acme:error:rateLimited","detail":"https://ca.example/recover?token=SENSITIVE-MARKER"}`)), Request: r}, nil
-		}
-		return base.RoundTrip(r)
-	})
-	m.cfg.Transport, cfg.Transport = transport, transport
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-	if err := m.EnsureCertificate(ctx); err == nil {
-		t.Fatal("rate limit ignored")
-	}
-	if m.retry.Next.Before(time.Now().Add(119 * time.Minute)) {
-		t.Fatal("CA cooldown shortened")
-	}
-	if strings.Contains(m.Snapshot().Error, "SENSITIVE") {
-		t.Fatal("raw problem leaked")
-	}
-	before := orders.Load()
-	next, err := NewManager(context.Background(), cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer next.Close()
-	if err := next.EnsureCertificate(context.Background()); err == nil {
-		t.Fatal("restart ignored cooldown")
-	}
-	if orders.Load() != before {
-		t.Fatal("restart contacted rate-limited authority")
+	for _, tt := range []struct {
+		name, header     string
+		minimum, maximum time.Duration
+	}{
+		{"shorter than reservation", "120", 119 * time.Second, 3 * time.Minute},
+		{"longer than reservation", "7200", 119 * time.Minute, 121 * time.Minute},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := fakeacme.New(t)
+			m, cfg := testManager(t, srv)
+			var orders atomic.Int64
+			base := cfg.Transport
+			transport := roundTrip(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/order" {
+					orders.Add(1)
+					return &http.Response{StatusCode: 429, Header: http.Header{"Retry-After": []string{tt.header}, "Content-Type": []string{"application/problem+json"}},
+						Body: io.NopCloser(strings.NewReader(`{"type":"urn:ietf:params:acme:error:rateLimited","detail":"https://ca.example/recover?token=SENSITIVE-MARKER"}`)), Request: r}, nil
+				}
+				return base.RoundTrip(r)
+			})
+			m.cfg.Transport, cfg.Transport = transport, transport
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+			if err := m.EnsureCertificate(ctx); err == nil {
+				t.Fatal("rate limit ignored")
+			}
+			if m.retry.Next.Before(time.Now().Add(tt.minimum)) {
+				t.Fatal("CA cooldown shortened")
+			}
+			if m.retry.Next.After(time.Now().Add(tt.maximum)) {
+				t.Fatal("completed attempt kept excess crash reservation")
+			}
+			if strings.Contains(m.Snapshot().Error, "SENSITIVE") {
+				t.Fatal("raw problem leaked")
+			}
+			before := orders.Load()
+			next, err := NewManager(context.Background(), cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer next.Close()
+			if err := next.EnsureCertificate(context.Background()); err == nil {
+				t.Fatal("restart ignored cooldown")
+			}
+			if orders.Load() != before {
+				t.Fatal("restart contacted rate-limited authority")
+			}
+
+		})
 	}
 }
 

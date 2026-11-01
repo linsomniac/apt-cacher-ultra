@@ -812,6 +812,9 @@ func Load(path string) (*Config, error) {
 	// ints/durations need IsDefined-gated defaults so an operator's
 	// explicit value (or explicit zero — though zero is invalid for
 	// most of these) survives Defaults().
+	if !md.IsDefined("acme", "challenge_type") {
+		cfg.ACME.ChallengeType = "http-01"
+	}
 	if !md.IsDefined("acme", "listen") {
 		cfg.ACME.Listen = "127.0.0.1:8080"
 	}

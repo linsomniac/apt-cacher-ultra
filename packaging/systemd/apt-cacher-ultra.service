@@ -11,7 +11,8 @@ Group=apt-cacher-ultra
 ExecStart=/usr/sbin/apt-cacher-ultra --config /etc/apt-cacher-ultra/config.toml
 Restart=always
 RestartSec=5
-TimeoutStopSec=35
+# Allow bounded DNS-provider cleanup after cancellation.
+TimeoutStopSec=6min
 
 PrivateTmp=true
 ProtectSystem=strict

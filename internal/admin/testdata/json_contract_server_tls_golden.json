@@ -26,6 +26,8 @@
     "error": "rate_limited",
     "dns_name": "cache.example.net",
     "directory_url": "https://ca.example/directory",
+    "challenge_type": "dns-01",
+    "dns_provider": "cloudflare",
     "next_attempt_unixtime": 1706000000,
     "last_success_unixtime": 1700000100,
     "attempts": 2,

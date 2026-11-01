@@ -18,12 +18,17 @@ import (
 )
 
 const attemptTimeout = 5 * time.Minute
+
+// Accommodate native Lego propagation defaults up to an hour, plus provider API and ACME work.
+const dnsAttemptTimeout = time.Hour + 2*attemptTimeout
 const minimumLifetime = time.Hour
 
 type Config struct {
 	DirectoryURL, DNSName, StateDir string
 	AcceptTerms                     bool
 	Challenge                       *Challenge
+	DNSFactory                      func(context.Context) (DNSProvider, error)
+	DNSProviderName                 string
 	// Transport and Now are injection seams. Production uses verified HTTPS
 	// with system roots and the wall clock; URL policy also wraps test transports.
 	Transport http.RoundTripper
@@ -43,6 +48,7 @@ type Manager struct {
 	closeOnce                     sync.Once
 	status                        atomic.Pointer[managerStatus]
 	retry                         retryRecord
+	authorityCooldown             time.Time
 	renewAt, obtainedAt           time.Time
 	storageFailed                 bool
 	attempts, successes, failures atomic.Uint64
@@ -55,8 +61,8 @@ func NewManager(ctx context.Context, cfg Config) (*Manager, error) {
 	if err := config.ValidateACMEName(cfg.DNSName); err != nil {
 		return nil, err
 	}
-	if !cfg.AcceptTerms || cfg.StateDir == "" || cfg.Challenge == nil {
-		return nil, errors.New("acme: terms acceptance, state directory and challenge listener are required")
+	if !cfg.AcceptTerms || cfg.StateDir == "" || (cfg.Challenge == nil) == (cfg.DNSFactory == nil) {
+		return nil, errors.New("acme: terms acceptance, state directory and exactly one challenge method are required")
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -136,19 +142,26 @@ func (m *Manager) Snapshot() servertls.Snapshot {
 
 type Status struct {
 	servertls.Snapshot
-	DNSName      string `json:"dns_name"`
-	DirectoryURL string `json:"directory_url"`
-	NextAttempt  int64  `json:"next_attempt_unixtime,omitempty"`
-	LastSuccess  int64  `json:"last_success_unixtime,omitempty"`
-	Attempts     uint64 `json:"attempts"`
-	Successes    uint64 `json:"successes"`
-	Failures     uint64 `json:"failures"`
+	DNSName       string `json:"dns_name"`
+	DirectoryURL  string `json:"directory_url"`
+	ChallengeType string `json:"challenge_type,omitempty"`
+	DNSProvider   string `json:"dns_provider,omitempty"`
+	NextAttempt   int64  `json:"next_attempt_unixtime,omitempty"`
+	LastSuccess   int64  `json:"last_success_unixtime,omitempty"`
+	Attempts      uint64 `json:"attempts"`
+	Successes     uint64 `json:"successes"`
+	Failures      uint64 `json:"failures"`
 }
 
 func (m *Manager) Status() Status {
 	s := m.status.Load()
 	out := Status{Snapshot: m.Snapshot(), DNSName: m.cfg.DNSName, DirectoryURL: m.cfg.DirectoryURL,
 		Attempts: m.attempts.Load(), Successes: m.successes.Load(), Failures: m.failures.Load()}
+	out.ChallengeType = "http-01"
+	if m.cfg.DNSFactory != nil {
+		out.ChallengeType = "dns-01"
+		out.DNSProvider = m.cfg.DNSProviderName
+	}
 	if !s.next.IsZero() {
 		out.NextAttempt = s.next.Unix()
 	}
@@ -190,53 +203,33 @@ func (m *Manager) ensure(ctx context.Context, renewal bool) error {
 	}
 	// Reserve a cooldown BEFORE the order: crashes/kills during an attempt
 	// cannot repeatedly place orders without recording their next retry.
+	budget := attemptTimeout
+	if m.cfg.DNSFactory != nil {
+		budget = dnsAttemptTimeout
+	}
+	m.authorityCooldown = time.Time{}
 	count := min(m.retry.Failures+1, 64)
-	m.retry = retryRecord{Version: 1, Failures: count, Next: now.Add(attemptTimeout + backoff(count)), Problem: "issuance_interrupted"}
+	m.retry = retryRecord{Version: 1, Failures: count, Next: now.Add(budget + backoff(count)), Problem: "issuance_interrupted"}
 	if err := m.store.write(m.store.retryName, m.retry); err != nil {
 		return m.stopOnStorageError()
 	}
 	m.publishStatus()
 	m.attempts.Add(1)
-	attemptCtx, stop := context.WithTimeout(ctx, attemptTimeout)
+	attemptCtx, stop := context.WithTimeout(ctx, budget)
 	defer stop()
 	cert, key, err := m.issue(attemptCtx)
 	if err != nil {
-		m.failures.Add(1)
-		if m.storageFailed {
-			return errors.New("acme: storage_failed")
-		}
-		m.retry.Problem = classify(err)
-		deadline := m.cfg.Now().Add(backoff(count))
-		if deadline.After(m.retry.Next) {
-			m.retry.Next = deadline
-		}
-		if err := m.store.write(m.store.retryName, m.retry); err != nil {
-			return m.stopOnStorageError()
-		}
-		m.publishStatus()
-		return errors.New("acme: " + m.retry.Problem)
+		return m.finishFailure(classify(err))
 	}
 	now = m.cfg.Now()
 	parsed, err := servertls.Parse(cert, key, m.cfg.DNSName, now)
 	before, after := servertls.Validity(parsed)
 	if err != nil || after.Sub(now) < minimumLifetime {
-		m.failures.Add(1)
-		m.retry.Problem = "certificate_invalid"
-		if err := m.store.write(m.store.retryName, m.retry); err != nil {
-			return m.stopOnStorageError()
-		}
-		m.publishStatus()
-		return errors.New("acme: certificate_invalid")
+		return m.finishFailure("certificate_invalid")
 	}
 	renewAt := renewalTime(parsed, jitter(after.Sub(before)/20))
 	if !renewAt.After(now) { // Do not accept a certificate already needing renewal.
-		m.failures.Add(1)
-		m.retry.Problem = "certificate_invalid"
-		if err := m.store.write(m.store.retryName, m.retry); err != nil {
-			return m.stopOnStorageError()
-		}
-		m.publishStatus()
-		return errors.New("acme: certificate_invalid")
+		return m.finishFailure("certificate_invalid")
 	}
 	record := certificateRecord{Version: 1, Directory: m.cfg.DirectoryURL, Name: m.cfg.DNSName, Certificate: cert, Key: key, RenewAt: renewAt, ObtainedAt: now}
 	if err := m.store.write(m.store.certName, record); err != nil {
@@ -251,6 +244,27 @@ func (m *Manager) ensure(ctx context.Context, renewal bool) error {
 	m.successes.Add(1)
 	m.publishStatus()
 	return nil
+}
+
+// finishFailure replaces the conservative crash reservation only once an
+// attempt has actually returned. Keep every observed authority cooldown, even
+// one shorter than that reservation. A crash before this write keeps the longer
+// reservation; a crash after it still has durable normal backoff.
+func (m *Manager) finishFailure(problem string) error {
+	m.failures.Add(1)
+	if m.storageFailed {
+		return errors.New("acme: storage_failed")
+	}
+	m.retry.Problem = problem
+	m.retry.Next = m.cfg.Now().Add(backoff(m.retry.Failures))
+	if m.authorityCooldown.After(m.retry.Next) {
+		m.retry.Next = m.authorityCooldown
+	}
+	if err := m.store.write(m.store.retryName, m.retry); err != nil {
+		return m.stopOnStorageError()
+	}
+	m.publishStatus()
+	return errors.New("acme: " + m.retry.Problem)
 }
 
 func (m *Manager) stopOnStorageError() error {

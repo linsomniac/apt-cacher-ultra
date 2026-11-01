@@ -278,7 +278,13 @@ enabled = false
 # https://acme-staging-v02.api.letsencrypt.org/directory
 directory_url = ""
 dns_name = "" # one DNS name shared by all selecting listeners
-# Forward public TCP port 80 to this dedicated challenge-only listener.
+# HTTP-01 is the default. DNS-01 uses Lego providers and needs no inbound port.
+challenge_type = "http-01" # "http-01" or "dns-01"
+dns_provider = "" # e.g. "cloudflare"; see: apt-cacher-ultra acme dns-providers
+# Provider credentials follow Lego environment / supported _FILE settings.
+# Explicit recursive resolvers prevent split-DNS surprises; empty uses system DNS.
+dns_resolvers = [] # e.g. ["1.1.1.1:53", "8.8.8.8:53"]
+# HTTP-01 only: forward public TCP port 80 to this challenge-only listener.
 # Containers may bind 0.0.0.0:8080 and publish host port 80 explicitly.
 listen = "127.0.0.1:8080"
 # Operator acceptance of the configured CA's subscriber terms.

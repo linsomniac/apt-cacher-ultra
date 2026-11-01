@@ -81,7 +81,7 @@ func serverTLSJSONFixture() statusModel {
 	m.Listeners = []listenerInfo{{Role: "proxy", Addr: "127.0.0.1:3142", Scheme: "http"}, {Role: "tls", Addr: "127.0.0.1:3143", Scheme: "https"}, {Role: "admin", Addr: "127.0.0.1:6789", Scheme: "https"}}
 	snap := servertls.Snapshot{Source: "acme", State: "degraded", Fingerprint: "0123456789abcdef", NotBefore: 1700000000, NotAfter: 1707776000, Error: "rate_limited"}
 	m.ServerTLS = map[string]servertls.Snapshot{"admin": snap, "cache": snap}
-	m.ACME = &acme.Status{Snapshot: snap, DNSName: "cache.example.net", DirectoryURL: "https://ca.example/directory", NextAttempt: 1706000000, LastSuccess: 1700000100, Attempts: 2, Successes: 1, Failures: 1}
+	m.ACME = &acme.Status{Snapshot: snap, DNSName: "cache.example.net", ChallengeType: "dns-01", DNSProvider: "cloudflare", DirectoryURL: "https://ca.example/directory", NextAttempt: 1706000000, LastSuccess: 1700000100, Attempts: 2, Successes: 1, Failures: 1}
 	return m
 }
 
@@ -89,7 +89,7 @@ func TestServerTLSStatusHTML(t *testing.T) {
 	m := newHealthyModel()
 	m.statusModel = serverTLSJSONFixture()
 	html := renderHTMLForGolden(t, m)
-	for _, want := range []string{"Server TLS", "rate_limited", "cache.example.net", "https://ca.example/directory", "0123456789abcdef"} {
+	for _, want := range []string{"Server TLS", "dns-01", "cloudflare", "rate_limited", "cache.example.net", "https://ca.example/directory", "0123456789abcdef"} {
 		if !strings.Contains(html, want) {
 			t.Errorf("missing %s", want)
 		}

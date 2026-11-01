@@ -17,6 +17,16 @@ import (
 
 // classify never returns authority-controlled text, URLs, headers or tokens.
 func classify(err error) string {
+	var dns interface{ DNSFailureCode() string }
+	if errors.As(err, &dns) {
+		code := dns.DNSFailureCode()
+		switch code {
+		case "dns_provider_configuration_failed", "dns_provider_unsupported", "dns_worker_failed", "dns_present_failed", "dns_cleanup_failed", "dns_propagation_timeout":
+			return code
+		}
+		return "issuance_failed"
+	}
+
 	if errors.Is(err, context.Canceled) {
 		return "cancelled"
 	}
@@ -45,7 +55,7 @@ func classify(err error) string {
 
 func safeProblem(s string) bool {
 	switch s {
-	case "", "issuance_interrupted", "certificate_invalid", "storage_failed", "cancelled", "timeout", "rate_limited", "action_required", "authorization_failed", "account_missing", "issuance_failed":
+	case "dns_provider_configuration_failed", "dns_provider_unsupported", "dns_worker_failed", "dns_present_failed", "dns_cleanup_failed", "dns_propagation_timeout", "", "issuance_interrupted", "certificate_invalid", "storage_failed", "cancelled", "timeout", "rate_limited", "action_required", "authorization_failed", "account_missing", "issuance_failed":
 		return true
 	}
 	return false
@@ -141,11 +151,27 @@ func (m *Manager) account(ctx context.Context, hc *http.Client) (*acme.Client, e
 }
 
 func (m *Manager) issue(ctx context.Context) ([]byte, []byte, error) {
+	var dns DNSProvider
+	if m.cfg.DNSFactory != nil {
+		var err error
+		dns, err = m.cfg.DNSFactory(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		if dns == nil {
+			return nil, nil, dnsFailure("dns_worker_failed")
+		}
+		defer dns.Close()
+	}
+
 	hc := newHTTPClient(m.cfg.DirectoryURL, m.cfg.Transport, func(resp *http.Response) error {
 		if resp.StatusCode < 400 {
 			return nil
 		}
 		next := retryAfter(resp.Header.Get("Retry-After"), m.cfg.Now())
+		if next.After(m.authorityCooldown) {
+			m.authorityCooldown = next
+		}
 		if next.After(m.retry.Next) {
 			m.retry.Next = next
 			if err := m.store.write(m.store.retryName, m.retry); err != nil {
@@ -167,7 +193,6 @@ func (m *Manager) issue(ctx context.Context) ([]byte, []byte, error) {
 	if len(order.AuthzURLs) != 1 {
 		return nil, nil, errors.New("unexpected authorization count")
 	}
-	defer m.cfg.Challenge.clear()
 	for _, authURL := range order.AuthzURLs {
 		auth, err := client.GetAuthorization(ctx, authURL)
 		if err != nil {
@@ -179,27 +204,7 @@ func (m *Manager) issue(ctx context.Context) ([]byte, []byte, error) {
 		if auth.Status == acme.StatusValid {
 			continue
 		}
-		var challenge *acme.Challenge
-		for _, c := range auth.Challenges {
-			if c.Type == "http-01" {
-				challenge = c
-				break
-			}
-		}
-		if challenge == nil {
-			return nil, nil, errors.New("HTTP-01 unavailable")
-		}
-		response, err := client.HTTP01ChallengeResponse(challenge.Token)
-		if err != nil {
-			return nil, nil, err
-		}
-		if err := m.cfg.Challenge.set(challenge.Token, response); err != nil {
-			return nil, nil, err
-		}
-		if _, err := client.Accept(ctx, challenge); err != nil {
-			return nil, nil, err
-		}
-		if _, err := client.WaitAuthorization(ctx, auth.URI); err != nil {
+		if err := m.solveAuthorization(ctx, client, auth, dns); err != nil {
 			return nil, nil, err
 		}
 	}

@@ -2,7 +2,8 @@
 
 Adds optional HTTPS to the admin listener and a shared server-certificate
 lifecycle for cache and admin. File certificates reload without restart. Optional
-ACME HTTP-01 issuance, persistent accounts, atomic certificate/key storage and
+ACME HTTP-01 or DNS-01 issuance (using Lego's full automated provider catalogue),
+persistent accounts, atomic certificate/key storage and
 durable retry deadlines support automatic renewal and offline startup with a
 valid saved certificate. HTTP defaults and the separate MITM CA are unchanged.
 
@@ -38,6 +39,14 @@ Drafted by OpenAI Codex (GPT-6), directed by linsomniac.
 Follow-up:
 
 > Please start the implementation
+
+DNS follow-up:
+
+> Let's go ahead with using the Lego provider packages.
+
+Provider selection:
+
+> Full Lego provider catalogue
 
 The assistant produced the security review and implementation plan in
 `docs/superpowers/plans/2026-11-01-admin-tls-acme-{review,plan}.md` before coding.

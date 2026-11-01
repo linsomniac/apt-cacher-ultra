@@ -63,3 +63,35 @@ func TestACMEIdentifiers(t *testing.T) {
 		}
 	}
 }
+
+func TestDNS01Configuration(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		change    func(*Config)
+		wantError bool
+	}{
+		{"no HTTP listener", func(c *Config) { c.ACME.Listen = "" }, false},
+		{"ignored HTTP overlap", func(c *Config) { c.ACME.Listen = c.Cache.Listen }, false},
+		{"recursive resolvers", func(c *Config) { c.ACME.DNSResolvers = []string{"1.1.1.1:53", "[2606:4700:4700::1111]:53"} }, false},
+		{"missing provider", func(c *Config) { c.ACME.DNSProvider = "" }, true},
+		{"interactive provider", func(c *Config) { c.ACME.DNSProvider = "manual" }, true},
+		{"command hook", func(c *Config) { c.ACME.DNSProvider = "exec" }, true},
+		{"invalid resolver", func(c *Config) { c.ACME.DNSResolvers = []string{"https://dns.example/"} }, true},
+		{"zero resolver port", func(c *Config) { c.ACME.DNSResolvers = []string{"127.0.0.1:0"} }, true},
+		{"wrong challenge", func(c *Config) { c.ACME.ChallengeType = "dns-02" }, true},
+		{"mixed HTTP settings", func(c *Config) { c.ACME.ChallengeType = "http-01" }, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Config{}
+			c.Defaults()
+			c.Admin.Enabled = true
+			enableTestACME(c)
+			c.ACME.ChallengeType = "dns-01"
+			c.ACME.DNSProvider = "cloudflare"
+			tt.change(c)
+			if err := c.ValidateServerTLS(); (err != nil) != tt.wantError {
+				t.Fatalf("unexpected result %v", err)
+			}
+		})
+	}
+}

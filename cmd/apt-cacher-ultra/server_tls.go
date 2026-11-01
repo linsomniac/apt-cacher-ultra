@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/acme"
+	"github.com/linsomniac/apt-cacher-ultra/internal/acmedns"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 	"github.com/linsomniac/apt-cacher-ultra/internal/servertls"
@@ -82,23 +83,36 @@ func prepareServerTLS(ctx context.Context, cfg *config.Config, logger *slog.Logg
 		if err := os.MkdirAll(cfg.Cache.Dir, 0750); err != nil {
 			return nil, errors.New("acme: cannot create cache directory")
 		}
-		ln, err := net.Listen("tcp", cfg.ACME.Listen)
-		if err != nil {
-			return nil, errors.New("acme: cannot reserve challenge listener; check listen address and permissions")
-		}
-		r.challenge = acme.StartChallenge(ln, cfg.ACME.DNSName)
-		r.wg.Add(1)
-		go func() {
-			defer r.wg.Done()
-			select {
-			case <-ctx.Done():
-			case err := <-r.challenge.Errors():
-				r.err <- err
-				cancel()
+		managerCfg := acme.Config{DirectoryURL: cfg.ACME.DirectoryURL, DNSName: cfg.ACME.DNSName,
+			StateDir: filepath.Join(cfg.Cache.Dir, "acme"), AcceptTerms: cfg.ACME.AcceptTerms, Transport: transport}
+		if cfg.ACME.ChallengeMethod() == "dns-01" {
+			if !acmedns.Supported(cfg.ACME.DNSProvider) {
+				return nil, errors.New("acme: DNS provider is not available; see acme dns-providers")
 			}
-		}()
-		r.manager, err = acme.NewManager(ctx, acme.Config{DirectoryURL: cfg.ACME.DirectoryURL, DNSName: cfg.ACME.DNSName,
-			StateDir: filepath.Join(cfg.Cache.Dir, "acme"), AcceptTerms: cfg.ACME.AcceptTerms, Challenge: r.challenge, Transport: transport})
+			managerCfg.DNSProviderName = cfg.ACME.DNSProvider
+			managerCfg.DNSFactory = func(ctx context.Context) (acme.DNSProvider, error) {
+				return acmedns.New(ctx, cfg.ACME.DNSProvider, cfg.ACME.DNSResolvers)
+			}
+		} else {
+			ln, err := net.Listen("tcp", cfg.ACME.Listen)
+			if err != nil {
+				return nil, errors.New("acme: cannot reserve challenge listener; check listen address and permissions")
+			}
+			r.challenge = acme.StartChallenge(ln, cfg.ACME.DNSName)
+			r.wg.Add(1)
+			go func() {
+				defer r.wg.Done()
+				select {
+				case <-ctx.Done():
+				case err := <-r.challenge.Errors():
+					r.err <- err
+					cancel()
+				}
+			}()
+			managerCfg.Challenge = r.challenge
+		}
+		var err error
+		r.manager, err = acme.NewManager(ctx, managerCfg)
 		if err != nil {
 			return nil, err
 		}

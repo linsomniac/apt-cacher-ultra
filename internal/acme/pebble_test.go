@@ -16,13 +16,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/acmedns"
 	"github.com/linsomniac/apt-cacher-ultra/internal/testutil/certfixture"
+	"github.com/linsomniac/apt-cacher-ultra/internal/testutil/dnsfixture"
 )
 
 // TestPebbleInteroperability runs only with explicitly installed test binaries.
 // CI pins both binaries to github.com/letsencrypt/pebble/v2 v2.10.1. No public
-// authority is contacted; Pebble validates our real HTTP-01 handler locally.
+// authority is contacted; Pebble validates HTTP-01 and Lego DNS-01 locally.
 func TestPebbleInteroperability(t *testing.T) {
+	t.Run("HTTP01", func(t *testing.T) { testPebble(t, false) })
+	t.Run("DNS01", func(t *testing.T) { testPebble(t, true) })
+}
+
+func testPebble(t *testing.T, useDNS bool) {
 	bin := os.Getenv("ACU_PEBBLE_BIN_DIR")
 	if bin == "" {
 		t.Skip("set ACU_PEBBLE_BIN_DIR to run independent ACME interoperability test")
@@ -39,14 +46,18 @@ func TestPebbleInteroperability(t *testing.T) {
 		return addr
 	}
 	apiAddr, managementAddr, dnsAddr, dnsManagement := address(), address(), address(), address()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	var ch *Challenge
+	httpPort := 0
+	if !useDNS {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch = StartChallenge(ln, testName)
+		defer ch.Close()
+		_, port, _ := net.SplitHostPort(ln.Addr().String())
+		httpPort, _ = strconv.Atoi(port)
 	}
-	ch := StartChallenge(ln, testName)
-	defer ch.Close()
-	_, port, _ := net.SplitHostPort(ln.Addr().String())
-	httpPort, _ := strconv.Atoi(port)
 	dir := t.TempDir()
 	pair := certfixture.New(t)
 	cert, key := pair.Write(t, dir)
@@ -78,7 +89,18 @@ func TestPebbleInteroperability(t *testing.T) {
 			}
 		})
 	}
-	start("pebble-challtestsrv", "-dnsserver", dnsAddr, "-defaultIPv6", "", "-management", dnsManagement, "-doh", "", "-http01", "", "-tlsalpn01", "", "-https01", "")
+	var dnsServer *dnsfixture.Server
+	if useDNS {
+		if !acmedns.Supported("dnsupdate") {
+			t.Skip("DNS test provider not compiled")
+		}
+		dnsServer = dnsfixture.New(t)
+		dnsServer.ConfigureLego(t)
+		dnsAddr = dnsServer.Address
+		dnsServer.Add("unrelated.example.net", "unrelated-record")
+	} else {
+		start("pebble-challtestsrv", "-dnsserver", dnsAddr, "-defaultIPv6", "", "-management", dnsManagement, "-doh", "", "-http01", "", "-tlsalpn01", "", "-https01", "")
+	}
 	start("pebble", "-config", cfgPath, "-dnsserver", dnsAddr, "-strict")
 	transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pair.Roots, MinVersion: tls.VersionTLS12}}
 	defer transport.CloseIdleConnections()
@@ -99,6 +121,13 @@ func TestPebbleInteroperability(t *testing.T) {
 		}
 	}
 	cfg := Config{DirectoryURL: directory, DNSName: testName, StateDir: filepath.Join(dir, "state"), AcceptTerms: true, Challenge: ch, Transport: transport}
+	if useDNS {
+		cfg.Challenge = nil
+		cfg.DNSProviderName = "dnsupdate"
+		cfg.DNSFactory = func(ctx context.Context) (DNSProvider, error) {
+			return acmedns.New(ctx, "dnsupdate", []string{dnsAddr})
+		}
+	}
 	m, err := NewManager(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -157,6 +186,12 @@ func TestPebbleInteroperability(t *testing.T) {
 	defer recovered.Close()
 	if err := recovered.EnsureCertificate(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if useDNS {
+		records := dnsServer.Records("_acme-challenge." + testName)
+		if len(records) != 0 || len(dnsServer.Records("unrelated.example.net")) != 1 || dnsServer.UpdateCount() != 4 {
+			t.Fatalf("DNS cleanup/renewal mismatch: records=%v updates=%d", records, dnsServer.UpdateCount())
+		}
 	}
 	if !recovered.Current().Leaf.Equal(m.Current().Leaf) {
 		t.Fatal("restart lost renewed certificate")

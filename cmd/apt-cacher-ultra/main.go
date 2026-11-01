@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/acmedns"
 	"github.com/linsomniac/apt-cacher-ultra/internal/admin"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
@@ -148,6 +149,20 @@ var (
 )
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == acmedns.WorkerArgument {
+		os.Exit(acmedns.RunWorker())
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "acme" {
+		if len(os.Args) != 3 || os.Args[2] != "dns-providers" {
+			fmt.Fprintln(os.Stderr, "usage: apt-cacher-ultra acme dns-providers")
+			os.Exit(1)
+		}
+		for _, provider := range acmedns.Providers() {
+			fmt.Println(provider)
+		}
+		return
+	}
+
 	// SPEC6 §14.3 subcommand routing. `ca print` is a positional
 	// pre-flag form (matches the established `program subcommand
 	// args` shell idiom and avoids polluting the daemon's flag set).

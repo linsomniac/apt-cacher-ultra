@@ -690,6 +690,8 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
         <div class="kv" style="margin-bottom:24px">
           <div class="kv__group-head"><span>ACME</span></div>
           <div class="k">DNS name</div><div class="v">{{.ACME.DNSName}}</div>
+          <div class="k">Challenge</div><div class="v">{{.ACME.ChallengeType}}</div>
+          {{if .ACME.DNSProvider}}<div class="k">DNS provider</div><div class="v">{{.ACME.DNSProvider}}</div>{{end}}
           <div class="k">Authority</div><div class="v">{{.ACME.DirectoryURL}}</div>
           <div class="k">Next eligible attempt</div><div class="v">{{unixTime .ACME.NextAttempt}}</div>
           <div class="k">Last success</div><div class="v">{{unixTime .ACME.LastSuccess}}</div>
