@@ -5,7 +5,9 @@
 # builds a flat file: repository in a temporary directory — the shape's
 # file as InRelease, or as Release.gpg beside /fx/<name>.Release (/fx/Release
 # when the shape has none of its own), and an empty Packages — and runs
-# apt-get update against that repository alone, signed-by=/fx/keys.gpg.
+# apt-get update against that repository alone, signed-by=/fx/keys.gpg, or
+# signed-by=/fx/<name>.keys.asc when the shape has a key file of its own
+# (an armored keyring: batch fx16's ka_* rows).
 #
 # Prints "# apt <version> <verifier> <version>" (gpgv, or debian:13's sqv:
 # whichever the image has installed), then one line per shape:
@@ -77,7 +79,11 @@ for shape in /fx/*.InRelease /fx/*.Release.gpg; do
         fi
         ;;
     esac
-    echo "deb [signed-by=/fx/keys.gpg] file:$repo/ ./" > "$list"
+    keys=/fx/keys.gpg
+    if [[ -f /fx/$name.keys.asc ]]; then
+        keys=/fx/$name.keys.asc
+    fi
+    echo "deb [signed-by=$keys] file:$repo/ ./" > "$list"
     if out=$(update); then
         rc=0
     else

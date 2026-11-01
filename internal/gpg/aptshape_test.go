@@ -44,7 +44,7 @@ var aptShapeDeviations = map[string]string{
 	"xd_twoblocks_goodgood":     aptShapeOneArmorBlock,
 	"xi_twoblocks_good_unknown": aptShapeOneArmorBlock,
 	"xi_twoblocks_goodgood":     aptShapeOneArmorBlock,
-	// aptShapeNonCanonicalArmor (65)
+	// aptShapeNonCanonicalArmor (74)
 	"a_aftercrc_cr_sp":         aptShapeNonCanonicalArmor,
 	"a_aftercrc_sp_tab_cr":     aptShapeNonCanonicalArmor,
 	"a_b64_cr_mid":             aptShapeNonCanonicalArmor,
@@ -85,8 +85,14 @@ var aptShapeDeviations = map[string]string{
 	"a_sighdrterm_cr_sp":       aptShapeNonCanonicalArmor,
 	"a_sighdrterm_ff":          aptShapeNonCanonicalArmor,
 	"d_blank_in_base64":        aptShapeNonCanonicalArmor,
+	"h_hdr_key_underscore":     aptShapeNonCanonicalArmor,
+	"h_hdr_val_del":            aptShapeNonCanonicalArmor,
 	"i_blank_in_base64":        aptShapeNonCanonicalArmor,
 	"i_crc_lowercase_eq_ws":    aptShapeNonCanonicalArmor,
+	"l_hdr_17":                 aptShapeNonCanonicalArmor,
+	"l_hdr_key_65":             aptShapeNonCanonicalArmor,
+	"l_hdr_val_1025":           aptShapeNonCanonicalArmor,
+	"n_clearhdr_nul":           aptShapeNonCanonicalArmor,
 	"q_b64_ff_mid":             aptShapeNonCanonicalArmor,
 	"q_d_b64_lead_ff":          aptShapeNonCanonicalArmor,
 	"q_sighdrterm_vt":          aptShapeNonCanonicalArmor,
@@ -101,6 +107,9 @@ var aptShapeDeviations = map[string]string{
 	"s_hdr_lead_tab":           aptShapeNonCanonicalArmor,
 	"s_hdr_nonascii_key":       aptShapeNonCanonicalArmor,
 	"s_hdr_value_trail_vt":     aptShapeNonCanonicalArmor,
+	"w_d_b64_cr_sp":            aptShapeNonCanonicalArmor,
+	"w_d_crc_cr_sp":            aptShapeNonCanonicalArmor,
+	"w_d_term_cr_sp":           aptShapeNonCanonicalArmor,
 	"x3d_armor_no_blank":       aptShapeNonCanonicalArmor,
 	"x3i_armor_no_blank":       aptShapeNonCanonicalArmor,
 	"x4i_b64_leading_space":    aptShapeNonCanonicalArmor,
@@ -110,45 +119,55 @@ var aptShapeDeviations = map[string]string{
 	"x5i_hdr_space_in_key":     aptShapeNonCanonicalArmor,
 	"xd_blank_after_crc":       aptShapeNonCanonicalArmor,
 	"xi_blank_after_crc":       aptShapeNonCanonicalArmor,
-	// aptShapeNonCanonicalPacket (29)
-	"gd_p1_inner_marker":             aptShapeNonCanonicalPacket,
-	"gd_p2_inner_unknowntag":         aptShapeNonCanonicalPacket,
-	"gd_p3_inner_zero_bytes":         aptShapeNonCanonicalPacket,
-	"gi_p1_inner_marker":             aptShapeNonCanonicalPacket,
-	"gi_p2_inner_unknowntag":         aptShapeNonCanonicalPacket,
-	"gi_p3_inner_zero_bytes":         aptShapeNonCanonicalPacket,
-	"p_good_unh_16_dup":              aptShapeNonCanonicalPacket,
-	"p_good_unh_16_fiveoctet_len":    aptShapeNonCanonicalPacket,
-	"p_good_unh_crit_issuer16":       aptShapeNonCanonicalPacket,
-	"p_good_unh_fpr_v0form":          aptShapeNonCanonicalPacket,
-	"p_good_unh_fpr_v3form":          aptShapeNonCanonicalPacket,
-	"p_good_unh_fpr_v4_dup":          aptShapeNonCanonicalPacket,
-	"q_good_plus_bigunh_dup":         aptShapeNonCanonicalPacket,
-	"q_good_plus_unknownB_critunh":   aptShapeNonCanonicalPacket,
-	"q_good_unh_16A_16B":             aptShapeNonCanonicalPacket,
-	"q_good_unh_16A_33A":             aptShapeNonCanonicalPacket,
-	"q_good_unh_33B_16A":             aptShapeNonCanonicalPacket,
-	"q_unknownB_critunh_plus_good":   aptShapeNonCanonicalPacket,
-	"r_dup_mpi_low_plus_good":        aptShapeNonCanonicalPacket,
-	"r_good_plus_dup_mpi_low":        aptShapeNonCanonicalPacket,
-	"sx_d_straddle_unknownB":         aptShapeNonCanonicalPacket,
-	"sx_i_straddle_unknownB":         aptShapeNonCanonicalPacket,
-	"t7g3b_hashed16B_16A":            aptShapeNonCanonicalPacket,
-	"t7g7b_33junk_33A":               aptShapeNonCanonicalPacket,
-	"v4_i_ed25519unknown_plus_good":  aptShapeNonCanonicalPacket,
-	"v4_i_ed448unknown_plus_good":    aptShapeNonCanonicalPacket,
-	"v6_d_good_plus_v6unknown":       aptShapeNonCanonicalPacket,
-	"v6_i_good_plus_v6unknown":       aptShapeNonCanonicalPacket,
-	"x3i_goodsig_unhashed_fpr_added": aptShapeNonCanonicalPacket,
-	// aptShapeUnverifiableAlgorithm (1)
-	"xi_good_plus_unknownpk_A": aptShapeUnverifiableAlgorithm,
+	// aptShapeNonCanonicalPacket (37)
+	"gd_p1_inner_marker":                          aptShapeNonCanonicalPacket,
+	"gd_p2_inner_unknowntag":                      aptShapeNonCanonicalPacket,
+	"gd_p3_inner_zero_bytes":                      aptShapeNonCanonicalPacket,
+	"gi_p1_inner_marker":                          aptShapeNonCanonicalPacket,
+	"gi_p2_inner_unknowntag":                      aptShapeNonCanonicalPacket,
+	"gi_p3_inner_zero_bytes":                      aptShapeNonCanonicalPacket,
+	"k_good_plus_unknownB_hashed_crit12":          aptShapeNonCanonicalPacket,
+	"k_good_plus_unknownB_hashed_crit7":           aptShapeNonCanonicalPacket,
+	"k_good_plus_unknownB_nocreated":              aptShapeNonCanonicalPacket,
+	"k_good_plus_unknownB_type13":                 aptShapeNonCanonicalPacket,
+	"k_unknownB_hashed_crit7_first":               aptShapeNonCanonicalPacket,
+	"l_pkts_9":                                    aptShapeNonCanonicalPacket,
+	"p_good_unh_16_dup":                           aptShapeNonCanonicalPacket,
+	"p_good_unh_16_fiveoctet_len":                 aptShapeNonCanonicalPacket,
+	"p_good_unh_crit_issuer16":                    aptShapeNonCanonicalPacket,
+	"p_good_unh_fpr_v0form":                       aptShapeNonCanonicalPacket,
+	"p_good_unh_fpr_v3form":                       aptShapeNonCanonicalPacket,
+	"p_good_unh_fpr_v4_dup":                       aptShapeNonCanonicalPacket,
+	"q_good_plus_bigunh_dup":                      aptShapeNonCanonicalPacket,
+	"q_good_plus_unknownB_critunh":                aptShapeNonCanonicalPacket,
+	"q_good_unh_16A_16B":                          aptShapeNonCanonicalPacket,
+	"q_good_unh_16A_33A":                          aptShapeNonCanonicalPacket,
+	"q_good_unh_33B_16A":                          aptShapeNonCanonicalPacket,
+	"q_unknownB_critunh_plus_good":                aptShapeNonCanonicalPacket,
+	"r_dup_mpi_low_plus_good":                     aptShapeNonCanonicalPacket,
+	"r_good_plus_dup_mpi_low":                     aptShapeNonCanonicalPacket,
+	"sx_d_straddle_unknownB":                      aptShapeNonCanonicalPacket,
+	"sx_i_straddle_unknownB":                      aptShapeNonCanonicalPacket,
+	"t7g3b_hashed16B_16A":                         aptShapeNonCanonicalPacket,
+	"t7g7b_33junk_33A":                            aptShapeNonCanonicalPacket,
+	"v4_i_ed25519unknown_plus_good":               aptShapeNonCanonicalPacket,
+	"v4_i_ed448unknown_plus_good":                 aptShapeNonCanonicalPacket,
+	"v6_d_good_plus_v6unknown":                    aptShapeNonCanonicalPacket,
+	"v6_i_good_plus_v6unknown":                    aptShapeNonCanonicalPacket,
+	"v_good_plus_unknownB_hashed_regexp_nonul_go": aptShapeNonCanonicalPacket,
+	"x3i_goodsig_unhashed_fpr_added":              aptShapeNonCanonicalPacket,
+	"z_good_unh_embedded_sig":                     aptShapeNonCanonicalPacket,
+	// aptShapeUnverifiableAlgorithm (3)
+	"k_good_plus_unknownB_sha224":   aptShapeUnverifiableAlgorithm,
+	"k_good_plus_unknownB_sha3_256": aptShapeUnverifiableAlgorithm,
+	"xi_good_plus_unknownpk_A":      aptShapeUnverifiableAlgorithm,
 }
 
 // The deviation families (DN-11). TestAptShapeDeviations_EveryFamilyHasARow
 // requires a row in each.
 const (
 	aptShapeOneArmorBlock         = "one armor block: the cache reads one block (layer T), apt reads every one; no surveyed vendor publishes two (2026-10-28)"
-	aptShapeNonCanonicalArmor     = "non-canonical armor layout: outside layer A's whitelist (armor_canon.go), which gpgv and sqv both accept and every surveyed signer writes; the edit no signer makes, the cache refuses even where every apt reads it"
+	aptShapeNonCanonicalArmor     = "non-canonical armor layout: outside layer A's whitelist (armor_canon.go), or a NUL byte in the envelope's headers (layer T's T5: a_hdr_nul_value, n_clearhdr_nul), which gpgv and sqv both accept and every surveyed signer writes; the edit no signer makes, the cache refuses even where every apt reads it"
 	aptShapeNonCanonicalPacket    = "non-canonical packet layout: outside layer P's v4 grammar (sigpacket.go: exact consumption, one issuer, minimal MPIs, bounded areas), which every surveyed signer writes; the cache refuses even where every apt reads it"
 	aptShapeUnverifiableAlgorithm = "unverifiable algorithm: a public-key or hash algorithm layer P does not read, so the packet cannot be told from garbage; a vendor adding one is refused until the corpus measures it and the cache reads it"
 )
@@ -180,6 +199,7 @@ type aptShape struct {
 	inline   bool
 	body     []byte // the InRelease, or the Release.gpg
 	release  []byte // detached: the shape's own <name>.Release, else the shared Release
+	keys     []byte // the shape's own signed-by, <name>.keys.asc (an armored keyring); nil: keys.gpg
 	rejected []bool // apt's verdicts, one per column: true is REJ
 }
 
@@ -230,8 +250,8 @@ func loadAptShapeVerdicts(t *testing.T) map[string][]bool {
 }
 
 // loadAptShapes reads the corpus: every <name>.InRelease and
-// <name>.Release.gpg (with <name>.Release when present), each with its row
-// of verdicts.txt. A shape without a row, a row without a shape, or a file
+// <name>.Release.gpg (with <name>.Release and <name>.keys.asc when
+// present), each with its row of verdicts.txt. A shape without a row, a row without a shape, or a file
 // the corpus does not define fails the test.
 func loadAptShapes(t *testing.T) []aptShape {
 	t.Helper()
@@ -251,6 +271,7 @@ func loadAptShapes(t *testing.T) []aptShape {
 	}
 	byName := make(map[string]*aptShape)
 	ownRelease := make(map[string][]byte)
+	ownKeys := make(map[string][]byte)
 	for _, e := range entries {
 		file := e.Name()
 		switch {
@@ -267,6 +288,8 @@ func loadAptShapes(t *testing.T) []aptShape {
 			byName[name] = &aptShape{name: name, inline: inline, body: read(file)}
 		case strings.HasSuffix(file, ".Release"):
 			ownRelease[strings.TrimSuffix(file, ".Release")] = read(file)
+		case strings.HasSuffix(file, ".keys.asc"):
+			ownKeys[strings.TrimSuffix(file, ".keys.asc")] = read(file)
 		default:
 			t.Fatalf("%s: a file the corpus does not define", file)
 		}
@@ -277,6 +300,13 @@ func loadAptShapes(t *testing.T) []aptShape {
 			t.Fatalf("%s.Release: no detached shape %s signs it", name, name)
 		}
 		s.release = rel
+	}
+	for name, keys := range ownKeys {
+		s, ok := byName[name]
+		if !ok {
+			t.Fatalf("%s.keys.asc: no shape %s", name, name)
+		}
+		s.keys = keys
 	}
 	var out []aptShape
 	for name, s := range byName {
@@ -353,8 +383,23 @@ func aptShapeVerifier(t *testing.T, acceptAnySigner ...bool) *Verifier {
 	return v
 }
 
-// verifyShape runs v on s, in its form, and returns the error.
+// verifyShape runs v on s, in its form, and returns the error. A shape
+// with its own keys.asc (its signed-by in the oracle) is run by a verifier
+// like v whose host keyring is that file, read as LoadKeyring reads an
+// armored key file (every block: the re-review's V-RC1).
 func verifyShape(v *Verifier, s aptShape) error {
+	if s.keys != nil {
+		keyring, err := LoadKeyringWithEmbedded(nil, []EmbeddedSource{{Name: s.name + ".keys.asc", Data: s.keys}}, silentLogger())
+		if err != nil {
+			return err
+		}
+		if v, err = NewVerifier(VerifierConfig{
+			Keyring: keyring, Pins: v.pins, RequireSignature: true, RequirePinned: v.requirePinned,
+			AllowShortKeyID: v.allowShortKeyID, AcceptAnySigner: v.acceptAnySigner, Logger: v.logger,
+		}); err != nil {
+			return err
+		}
+	}
 	if s.inline {
 		_, err := v.VerifyInline(context.Background(), newSuite(), s.body)
 		return err

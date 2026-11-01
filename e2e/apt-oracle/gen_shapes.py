@@ -11,7 +11,10 @@ Writes into OUT (internal/gpg/testdata/aptshapes in the tree):
   writes that file beside it);
 - ``keys.gpg``: the public keys A, E, S and O in binary, the clients'
   ``signed-by`` in the oracle and the host keyring of the verifier's table
-  test (Task 6 of the plan named below).
+  test (Task 6 of the plan named below);
+- ``<name>.keys.asc`` for a shape with a ``signed-by`` of its own (batch
+  fx16's ``ka_*``): an armored key file the oracle names in keys.gpg's
+  place and the table test loads as that shape's host keyring.
 
 ``verdicts.txt`` and ``classes.txt`` beside them are not written here: they
 are apt's measurement of these bytes (``bash e2e/apt-oracle/run.sh
@@ -45,7 +48,7 @@ and ``keys.gpg`` is checked to hold public packets only.
   batch can be made again alone (``--own-key``) once the other keys'
   secrets are gone, as they are after every run.
 
-498 shapes, in 14 batches. The first 135 are the planning measurement's
+730 shapes, in 17 batches. The first 135 are the planning measurement's
 (2026-10-28; DN-2 and Appendix A of
 docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md), by the
 same names and built as its throwaway generators built them (the plan's
@@ -95,6 +98,14 @@ binary-mode packets mixed in one anchor, which gpgv checks the first of
 only, and base64 whose last character has its unused bits set, which
 debian:13's sqv refuses.
 
+Batches fx15 to fx17 are Task 9b's fix round's, cut without a key from
+committed fixtures: fx15, 193, the re-review's adversarial lens's shapes
+(its batches rr1 to rr5, by its names, cut as its tools/gen_a.py cut
+them); fx16, 27, its verifier lens's (rd_, c_, and the ka_ rows with a
+two-block keys.asc of their own); fx17, 12 (sq_), Sequoia's subpacket
+rules the re-review did not measure, appended to A's good packet's
+unhashed area.
+
 AIDEV-NOTE: the fixtures, verdicts.txt and classes.txt are one
 measurement. Each run makes new keys, new signatures and new random bytes
 (the v3 garbage packets), so a regenerated corpus must be re-measured
@@ -105,7 +116,8 @@ files together. Never edit a fixture by hand. Two modes write some of the
 corpus and leave every other file's bytes as they are, so that --record
 must leave every other row as it was: ``--from-controls`` makes no key and
 writes only the batches cut from OUT's committed fixtures (FROM_CONTROLS:
-fx8 to fx12 and fx14, from CONTROL_FILES); ``--own-key`` makes key O alone
+fx8 to fx12 and fx14 to fx17, from CONTROL_FILES, with the key files of
+KEYRINGS_FROM_CONTROLS); ``--own-key`` makes key O alone
 and writes only batch fx13 and O's public key in keys.gpg (the other keys'
 packets keep their bytes).
 
@@ -180,7 +192,7 @@ NAME_RE = re.compile(r"[A-Za-z0-9_]+")
 CORPUS_FILES = ("keys.gpg", "Release", "verdicts.txt", "classes.txt")
 # What a regeneration leaves in place: apt's measurement of the old bytes.
 MEASUREMENT_FILES = ("verdicts.txt", "classes.txt")
-SHAPE_SUFFIXES = (".InRelease", ".Release.gpg", ".Release")
+SHAPE_SUFFIXES = (".InRelease", ".Release.gpg", ".Release", ".keys.asc")
 
 
 # --- OpenPGP packets and armor (PE/pgp.py, typed) ---------------------------
@@ -1392,6 +1404,8 @@ CONTROL_FILES = (
     "xi_good_plus_v3garbage_A.InRelease",  # A's good packet, then a v3 one naming A
     "xd_good_plus_v3garbage_A.Release.gpg",  # the same, detached
     "xi_good_plus_unknownhash_A.InRelease",  # A's good packet, then an unknown hash's
+    "x3i_sha1_plus_good.InRelease",  # A's SHA-1 packet, then A's good one
+    "i_expired_bad_plus_good.InRelease",  # E's bad packet, then A's good one
 )
 
 
@@ -2403,6 +2417,607 @@ def batch_fx14_from(c: Controls) -> Batch:
     return inline, detached, {}
 
 
+def body_edit(pkt: bytes, offset: int, value: int) -> bytes:
+    """pkt (one signature packet) with its body octet at offset set to value
+    (1: the signature type, 3: the hash algorithm), in gpg's old-format
+    two-octet framing."""
+    b = bytearray(one_signature(pkt))
+    b[offset] = value
+    return old_frame(bytes(b), 2)
+
+
+def with_hashed(pkt: bytes, hashed: bytes) -> bytes:
+    """pkt with its hashed subpacket area replaced (its signature covers
+    nothing then: for an unknown key's packet, or a bad one)."""
+    head, _, unhashed, rest = v4_parts(one_signature(pkt))
+    return old_frame(v4_build(head, hashed, unhashed, rest), 2)
+
+
+def split_subpackets(area: bytes) -> list[bytes]:
+    """The raw subpackets of an area, their length octets included."""
+    out = []
+    j = 0
+    while j < len(area):
+        l0 = area[j]
+        if l0 < 192:
+            n, hl = l0, 1
+        elif l0 < 255:
+            n, hl = ((l0 - 192) << 8) + area[j + 1] + 192, 2
+        else:
+            n, hl = int.from_bytes(area[j + 1 : j + 5], "big"), 5
+        out.append(area[j : j + hl + n])
+        j += hl + n
+    return out
+
+
+def armor_with_suffixes(
+    packets: bytes, suffix: dict[str, bytes], headers: list[bytes] | None = None
+) -> bytes:
+    """A detached armor whose lines carry the given suffixes before their
+    LF, by kind: begin, header (every header line), term (the empty line),
+    b64 (every base64 line), b64first, b64last, crc, end; all (every line)."""
+    lines: list[tuple[str, bytes]] = [("begin", BEGIN)]
+    for h in headers or []:
+        lines.append(("header", h))
+    lines.append(("term", b""))
+    b64 = armor_lines(packets)
+    for k, line in enumerate(b64):
+        kind = "b64"
+        if k == 0:
+            kind = "b64first"
+        if k == len(b64) - 1:
+            kind = "b64last"
+        lines.append((kind, line))
+    lines.append(("crc", crc_line(packets)))
+    lines.append(("end", END))
+    out = []
+    for kind, line in lines:
+        s = suffix.get(kind, b"")
+        if kind in ("b64first", "b64last") and "b64" in suffix and kind not in suffix:
+            s = suffix["b64"]
+        if "all" in suffix:
+            s = suffix["all"]
+        out.append(line + s)
+    return b"\n".join(out) + b"\n"
+
+
+@dataclass(frozen=True)
+class Fx15Packets:
+    """The packets batch fx15 cuts its shapes from (the re-review's
+    gen_a.py names them p, pd, qb, bad and sha1_a)."""
+
+    head: bytes  # the inline controls' signed text and header, up to the armor
+    p: bytes  # A's good text-mode (0x01) packet over the Release
+    pd: bytes  # A's good binary-mode (0x00) packet over the Release
+    qb: bytes  # B's text-mode packet (an unknown key's)
+    bad: bytes  # A's signature of OTHER_TEXT: a bad one here
+    sha1_a: bytes  # A's good SHA-1 text-mode packet
+
+
+def fx15_packets(c: Controls) -> Fx15Packets:
+    """Fx15Packets cut from the controls, checked."""
+    p, pd = c.sig_a, c.det_a
+    whole = sig_packets(c.read("i_unknown_unknownfirst.InRelease"))
+    sha1 = sig_packets(c.read("x3i_sha1_plus_good.InRelease"))
+    if whole[len(whole) - len(p) :] != p or sha1[len(sha1) - len(p) :] != p:
+        raise ValueError("the controls do not end in A's good inline packet")
+    return Fx15Packets(
+        head=c.head,
+        p=p,
+        pd=pd,
+        qb=whole[: len(whole) - len(p)],
+        bad=c.sig_a_other,
+        sha1_a=sha1[: len(sha1) - len(p)],
+    )
+
+
+def fx15_rr1(c: Controls) -> Batch:
+    """The re-review's round 1 (its batch rr1): the hybrid grammar's edges.
+    The detached form's trailing blanks and CRs (layer A runs on lines as
+    AptLine leaves them, gpgv and sqv read the raw file); malformed known
+    subpackets in the good packet's unhashed area (gpgv and go-crypto ignore
+    them, sqv parses them); apt's erasure of a key's good signatures at its
+    SHA-1 one; mixed signature types; M's trailing CRs; armor header values
+    sqv may trim; the grammar's limits; packet-level edges on an unknown
+    key's packet; a NUL in the cleartext header."""
+    k = fx15_packets(c)
+    head, p, pd, qb, bad, sha1_a = k.head, k.p, k.pd, k.qb, k.bad, k.sha1_a
+    ci = c.inline
+    inl: Shapes = {}
+    det: Shapes = {}
+
+    # 1. The detached form's trailing blanks and CRs, line by line.
+    sfx = {
+        "sp": b" ",
+        "tab": b"\t",
+        "sp_tab": b"  \t",
+        "sp_cr": b" \r",
+        "tab_crcr": b"\t\r\r",
+        "cr": b"\r",
+        "cr_sp": b"\r ",
+    }
+    for kind in ("begin", "header", "term", "b64", "b64first", "b64last", "crc", "end"):
+        for tag, s in sfx.items():
+            if tag == "cr_sp" and kind not in ("b64", "crc", "term"):
+                continue
+            hdr = [b"Comment: hello"] if kind == "header" else None
+            det[f"w_d_{kind}_{tag}"] = armor_with_suffixes(pd, {kind: s}, headers=hdr)
+    det["w_d_all_sp"] = armor_with_suffixes(
+        pd, {"all": b" "}, headers=[b"Comment: hello"]
+    )
+    det["w_d_all_tab_cr"] = armor_with_suffixes(
+        pd, {"all": b"\t\r"}, headers=[b"Comment: hello"]
+    )
+    det["w_d_term_sp_noheaders"] = armor_with_suffixes(pd, {"term": b"   "})
+    det["w_d_control_hdr"] = armor_with_suffixes(pd, {}, headers=[b"Comment: hello"])
+
+    # 2. Malformed known subpackets in the good packet's unhashed area.
+    bad_subs = {
+        "created_3": subpacket(2, b"\x01\x02\x03"),
+        "created_5": subpacket(2, b"\x01\x02\x03\x04\x05"),
+        "sigexp_2": subpacket(3, b"\x00\x01"),
+        "exportable_2": subpacket(4, b"\x01\x01"),
+        "trust_1": subpacket(5, b"\x01"),
+        "revocable_2": subpacket(7, b"\x01\x01"),
+        "keyexp_2": subpacket(9, b"\x00\x01"),
+        "revkey_5": subpacket(12, b"\x80\x01\x02\x03\x04"),
+        "notation_badlen": subpacket(20, b"\x80\x00\x00\x00\x00\x10\x00\x10ab"),
+        "primaryuid_2": subpacket(25, b"\x01\x01"),
+        "revreason_empty": subpacket(29, b""),
+        "sigtarget_1": subpacket(31, b"\x01"),
+        "recipient_5": subpacket(35, b"\x04\x01\x02\x03\x04"),
+        "aead_odd": subpacket(39, b"\x09"),
+        "regexp_nonul": subpacket(6, b"abc"),
+    }
+    for tag, sp in bad_subs.items():
+        inl[f"u_good_unh_{tag}"] = head + armor_parts(with_unhashed(p, sp))
+        if tag in ("created_3", "sigexp_2", "notation_badlen", "recipient_5"):
+            det[f"u_d_good_unh_{tag}"] = armor_parts(with_unhashed(pd, sp))
+    # Their well-formed twins (controls).
+    inl["u_good_unh_created_ok"] = head + armor_parts(
+        with_unhashed(p, subpacket(2, b"\x6a\xe2\xc1\x4c"))
+    )
+    inl["u_good_unh_revreason_ok"] = head + armor_parts(
+        with_unhashed(p, subpacket(29, b"\x00"))
+    )
+
+    # 3. apt's erasure: a SHA-1 GOODSIG from the same key after the SHA-256
+    # one erases both (methods/gpgv.cc).
+    inl["e_good_then_sha1A"] = head + armor_parts(p + sha1_a)
+    inl["e_sha1A_then_good_control"] = head + armor_parts(sha1_a + p)
+    det["e_d_text_good_then_sha1A"] = armor_parts(p + sha1_a)
+    det["e_d_text_sha1A_then_good"] = armor_parts(sha1_a + p)
+    inl["e_good00_then_sha1A01"] = head + armor_parts(pd + sha1_a)
+
+    # 4. Mixed signature types (gpgvChecks).
+    b00 = body_edit(qb, 1, 0x00)
+    bad00 = body_edit(bad, 1, 0x00)
+    inl["m_i_good00_lone"] = head + armor_parts(pd)
+    inl["m_i_t01good_t00good"] = head + armor_parts(p + pd)
+    inl["m_i_t00good_t01good"] = head + armor_parts(pd + p)
+    inl["m_i_t01good_t00unknownB_t01good"] = head + armor_parts(p + b00 + p)
+    inl["m_i_t01badA_t00good_t01good"] = head + armor_parts(bad + pd + p)
+    inl["m_i_t01unknownB_t00good"] = head + armor_parts(qb + pd)
+    inl["m_i_t00unknownB_t00good"] = head + armor_parts(b00 + pd)
+    inl["m_i_t01good_t01good_t00badA"] = head + armor_parts(p + p + bad00)
+    inl["m_i_t00good_t01badA"] = head + armor_parts(pd + bad)
+    inl["m_i_t01unknownB_t01good_t00good"] = head + armor_parts(qb + p + pd)
+    det["m_d_t01good_lone"] = armor_parts(p)
+    det["m_d_t00good_t01good"] = armor_parts(pd + p)
+    det["m_d_t01good_t00good"] = armor_parts(p + pd)
+    det["m_d_t01unknownB_t00good"] = armor_parts(qb + pd)
+    det["m_d_t00good_t01badA_t00good"] = armor_parts(pd + bad + pd)
+
+    # 5. M's trailing CRs (AptLine keeps a CR followed by a blank).
+    for tag, (old, new) in {
+        "origin_crcr_sp": (b"\nOrigin: oracle\n", b"\nOrigin: oracle\r\r \n"),
+        "origin_sp_cr_sp": (b"\nOrigin: oracle\n", b"\nOrigin: oracle \r \n"),
+        "hashline_cr_sp": (b" 0 Packages\n", b" 0 Packages\r \n"),
+        "date_cr_sp": (b" GMT\n", b" GMT\r \n"),
+        "arch_cr_sp": (b"\nArchitectures: amd64\n", b"\nArchitectures: amd64\r \n"),
+        "sha256hdr_cr_sp": (b"\nSHA256:\n", b"\nSHA256:\r \n"),
+    }.items():
+        inl[f"c_text_{tag}"] = replace(ci, old, new, 1)
+
+    # 6. Armor header values sqv may trim.
+    for tag, h in {
+        "val_trail_nbsp": b"Comment: x\xc2\xa0",
+        "val_only_nbsp": b"Comment: \xc2\xa0",
+        "val_only_u2028": b"Comment: \xe2\x80\xa8",
+        "val_trail_nel": b"Comment: x\xc2\x85",
+        "val_only_u3000": b"Comment: \xe3\x80\x80",
+        "val_del": b"Comment: a\x7fb",
+        "key_underscore": b"Com_ment: x",
+        "key_dash_end": b"Comment-: x",
+    }.items():
+        inl[f"h_hdr_{tag}"] = head + armor_parts(p, headers=[h])
+        if tag.startswith("val_only") or tag == "val_trail_nbsp":
+            det[f"h_d_hdr_{tag}"] = armor_parts(pd, headers=[h])
+
+    # 7. The grammar's limits.
+    inl["l_hdr_16"] = head + armor_parts(
+        p, headers=[b"Comment: %d" % n for n in range(16)]
+    )
+    inl["l_hdr_17"] = head + armor_parts(
+        p, headers=[b"Comment: %d" % n for n in range(17)]
+    )
+    inl["l_hdr_val_1024"] = head + armor_parts(p, headers=[b"Comment: " + b"x" * 1024])
+    inl["l_hdr_val_1025"] = head + armor_parts(p, headers=[b"Comment: " + b"x" * 1025])
+    inl["l_hdr_key_64"] = head + armor_parts(p, headers=[b"K" * 64 + b": x"])
+    inl["l_hdr_key_65"] = head + armor_parts(p, headers=[b"K" * 65 + b": x"])
+    inl["l_pkts_8"] = head + armor_parts(p * 8)
+    inl["l_pkts_9"] = head + armor_parts(p * 9)
+
+    # 8. Packet-level edges on an unknown key's packet, after the good one.
+    inl["k_good_plus_unknownB_sha224"] = head + armor_parts(p + body_edit(qb, 3, 11))
+    inl["k_good_plus_unknownB_sha3_256"] = head + armor_parts(p + body_edit(qb, 3, 12))
+    inl["k_good_plus_unknownB_type13"] = head + armor_parts(p + body_edit(qb, 1, 0x13))
+    _, bh, _, _ = v4_parts(one_signature(qb))
+
+    def sp_type(s: bytes) -> int:
+        return s[1 if s[0] < 192 else (2 if s[0] < 255 else 5)] & 0x7F
+
+    no_created = b"".join(s for s in split_subpackets(bh) if sp_type(s) != 2)
+    crit7 = subpacket(7, b"\x01", critical=True)
+    crit12 = subpacket(12, b"\x80\x01" + b"\x00" * 20, critical=True)
+    inl["k_good_plus_unknownB_nocreated"] = head + armor_parts(
+        p + with_hashed(qb, no_created)
+    )
+    inl["k_good_plus_unknownB_hashed_crit7"] = head + armor_parts(
+        p + with_hashed(qb, bh + crit7)
+    )
+    inl["k_good_plus_unknownB_hashed_crit12"] = head + armor_parts(
+        p + with_hashed(qb, bh + crit12)
+    )
+    inl["k_unknownB_hashed_crit7_first"] = head + armor_parts(
+        with_hashed(qb, bh + crit7) + p
+    )
+
+    # 9. A NUL, and junk, in the cleartext armor headers (apt discards them).
+    inl["n_clearhdr_nul"] = replace(ci, b"Hash: SHA256\n", b"Hash: SHA\x00256\n", 1)
+    inl["n_clearhdr_junk_hdr"] = replace(
+        ci, b"Hash: SHA256\n", b"Hash: SHA256\nComment: \xff\xfe x\n", 1
+    )
+    return inl, det, {}
+
+
+def fx15_rr2(c: Controls) -> Batch:
+    """The re-review's round 2 (rr2): how far sqv's subpacket parsing
+    reaches (an unknown key's packet; hashed types go-crypto does not
+    validate; reserved and LibrePGP types; duplicates), and apt's erasure
+    in three-packet orders."""
+    k = fx15_packets(c)
+    head, p, pd, qb, sha1_a = k.head, k.p, k.pd, k.qb, k.sha1_a
+    inl: Shapes = {}
+    det: Shapes = {}
+    # 1. Malformed unhashed subpackets on an unknown key's packet.
+    bad_unh = {
+        "created_3": subpacket(2, b"\x01\x02\x03"),
+        "sigexp_2": subpacket(3, b"\x00\x01"),
+        "recipient_5": subpacket(35, b"\x04\x01\x02\x03\x04"),
+        "notation_badlen": subpacket(20, b"\x80\x00\x00\x00\x00\x10\x00\x10ab"),
+        "aead_odd": subpacket(39, b"\x09"),
+        "revocable_2": subpacket(7, b"\x01\x01"),
+    }
+    for tag, sp in bad_unh.items():
+        inl[f"v_good_plus_unknownB_unh_{tag}"] = head + armor_parts(
+            p + with_unhashed(qb, sp)
+        )
+    inl["v_unknownB_unh_created_3_first"] = head + armor_parts(
+        with_unhashed(qb, bad_unh["created_3"]) + p
+    )
+    det["v_d_good_plus_unknownB_unh_created_3"] = armor_parts(
+        pd + body_edit(with_unhashed(qb, bad_unh["created_3"]), 1, 0x00)
+    )
+    # 2. Malformed hashed subpackets go-crypto does not validate, on an
+    # unknown key's packet (its signature covers nothing anyway).
+    _, bh, _, _ = v4_parts(one_signature(qb))
+    for tag, sp in {
+        "revocable_2": subpacket(7, b"\x01\x01"),
+        "revkey_5": subpacket(12, b"\x80\x01\x02\x03\x04"),
+        "sigtarget_1": subpacket(31, b"\x01"),
+        "attested_3": subpacket(37, b"\x01\x02\x03"),
+        "regexp_nonul_go": subpacket(6, b"abc"),
+    }.items():
+        inl[f"v_good_plus_unknownB_hashed_{tag}"] = head + armor_parts(
+            p + with_hashed(qb, bh + sp)
+        )
+    # 3. The good packet's unhashed area: reserved and LibrePGP types, and
+    # well-formed duplicates.
+    for tag, sp in {
+        "type1_odd": subpacket(1, b"\x01\x02\x03"),
+        "type10_odd": subpacket(10, b"\x01"),
+        "type36_odd": subpacket(36, b"\x01"),
+        "type38_odd": subpacket(38, b"\x01\x02"),
+        "type40_odd": subpacket(40, b"\x01"),
+        "two_created_ok": subpacket(2, b"\x6a\xe2\xc1\x4c")
+        + subpacket(2, b"\x6a\xe2\xc1\x4d"),
+        "features_long": subpacket(30, b"\x01" * 40),
+        "keyflags_empty": subpacket(27, b""),
+        "prefsym_empty": subpacket(11, b""),
+        "signeruid_empty": subpacket(28, b""),
+        "policy_empty": subpacket(26, b""),
+        "ksprefs_empty": subpacket(23, b""),
+    }.items():
+        inl[f"x_good_unh_{tag}"] = head + armor_parts(with_unhashed(p, sp))
+    # 4. apt's erasure, three packets.
+    inl["e2_good_sha1A_good"] = head + armor_parts(p + sha1_a + p)
+    inl["e2_sha1A_good_sha1A"] = head + armor_parts(sha1_a + p + sha1_a)
+    inl["e2_good_unknownB_sha1A"] = head + armor_parts(p + qb + sha1_a)
+    inl["e2_unknownB_good_sha1A"] = head + armor_parts(qb + p + sha1_a)
+    det["e2_d_text_good_sha1A_good"] = armor_parts(p + sha1_a + p)
+    return inl, det, {}
+
+
+def fx15_rr3(c: Controls) -> Batch:
+    """The re-review's round 3 (rr3): base64 padding forms (A4's strict
+    decode), and well-formed and malformed unhashed subpackets sqv parses
+    (exportable, revocation key, approved certifications, an embedded
+    signature)."""
+    k = fx15_packets(c)
+    head, p, pd, qb = k.head, k.p, k.pd, k.qb
+    inl: Shapes = {}
+    det: Shapes = {}
+    # A stream whose base64 ends in padding: A's packet, then B's with a
+    # four-octet unknown unhashed subpacket.
+    qbx = with_unhashed(qb, subpacket(100, b"xy"))
+    stream = p + qbx
+    if len(stream) % 3 == 0:
+        raise ValueError("the stream's base64 ends in no padding")
+    lines = armor_lines(stream)
+    npad = lines[-1].count(b"=")
+    unpadded = lines[:-1] + [lines[-1][:-npad]] if len(lines[-1]) > npad else lines[:-1]
+    inl["z_b64_padded_control"] = head + armor_parts(stream)
+    inl["z_b64_unpadded"] = head + armor_parts(stream, body=unpadded)
+    inl["z_b64_unpadded_nocrc"] = head + armor_parts(stream, body=unpadded, crc=None)
+    inl["z_b64_extra_pad"] = head + armor_parts(
+        stream, body=lines[:-1] + [lines[-1] + b"="]
+    )
+    dl = armor_lines(pd + qbx)
+    dn = dl[-1].count(b"=")
+    det["z_d_b64_unpadded"] = armor_parts(
+        pd + qbx, body=dl[:-1] + [dl[-1][:-dn]] if dn else dl
+    )
+    # Unhashed subpackets sqv parses, well-formed and malformed, on the good
+    # packet.
+    for tag, sp in {
+        "exportable0": subpacket(4, b"\x00"),
+        "exportable0_crit": subpacket(4, b"\x00", critical=True),
+        "revkey_ok_crit": subpacket(12, b"\x80\x01" + bytes(20), critical=True),
+        "attested_ok": subpacket(37, bytes(32)),
+        "attested_odd": subpacket(37, b"\x01\x02\x03"),
+        "embedded_sig": subpacket(32, one_signature(qb)),
+        "pref_aead34_ok": subpacket(34, b"\x02"),
+        "features_ok": subpacket(30, b"\x01"),
+    }.items():
+        inl[f"z_good_unh_{tag}"] = head + armor_parts(with_unhashed(p, sp))
+    return inl, det, {}
+
+
+def fx15_rr4(c: Controls) -> Batch:
+    """The re-review's round 4 (rr4): which packets sqv's subpacket parsing
+    keeps from counting — a malformed unhashed subpacket on a good packet
+    beside another good one (an expired key's, a subkey's)."""
+    k = fx15_packets(c)
+    head, p, pd = k.head, k.p, k.pd
+    ex = split_packets(sig_packets(c.read("i_good_plus_expired_good.InRelease")))
+    sig_e = old_frame(ex[1][1], 2)
+    sub = sig_packets(c.read("x3i_subkey_good.InRelease"))
+    bad3 = subpacket(2, b"\x01\x02\x03")
+    pm = with_unhashed(p, bad3)
+    inl = {
+        "y_good_plus_goodmalformed": head + armor_parts(p + pm),
+        "y_goodmalformed_plus_good": head + armor_parts(pm + p),
+        "y_expiredE_malformed_plus_good": head
+        + armor_parts(with_unhashed(sig_e, bad3) + p),
+        "y_good_plus_expiredE_malformed": head
+        + armor_parts(p + with_unhashed(sig_e, bad3)),
+        "y_subkeygood_malformed_plus_good": head
+        + armor_parts(with_unhashed(sub, bad3) + p),
+        "y_good_plus_subkeygood_malformed": head
+        + armor_parts(p + with_unhashed(sub, bad3)),
+    }
+    det = {
+        "y_d_good_plus_goodmalformed": armor_parts(pd + with_unhashed(pd, bad3)),
+        "y_d_goodmalformed_plus_good": armor_parts(with_unhashed(pd, bad3) + pd),
+    }
+    return inl, det, {}
+
+
+def fx15_rr5(c: Controls) -> Batch:
+    """The re-review's round 5 (rr5): gpgvChecks against a differing hash
+    (a good SHA-256 packet, then a bad known one of another hash, the same
+    type), a type-mismatched bad packet after a good one, and malformed
+    hashed subpackets in A's packet (a bad signature then)."""
+    k = fx15_packets(c)
+    head, p, pd, bad = k.head, k.p, k.pd, k.bad
+    bad_sha512 = body_edit(bad, 3, 10)  # A bad, 0x01, SHA-512 (its hash octet changed)
+    bad00 = body_edit(bad, 1, 0x00)  # A bad, 0x00
+    inl = {
+        "g5_good256_then_bad512": head + armor_parts(p + bad_sha512),
+        "g5_bad512_then_good256": head + armor_parts(bad_sha512 + p),
+        "g5_good256_then_badsha1": head + armor_parts(p + body_edit(bad, 3, 2)),
+        "g5_good_then_bad_control": head + armor_parts(p + bad),
+        "g5_good01_then_bad00A": head + armor_parts(p + bad00),
+        "g5_good01_then_bad00A_then_good01": head + armor_parts(p + bad00 + p),
+    }
+    det = {"g5_d_good00_then_bad01A": armor_parts(pd + bad)}
+    _, hashed_a, _, _ = v4_parts(one_signature(p))
+    for tag, sp in {
+        "attested_odd": subpacket(37, b"\x01\x02\x03"),
+        "aead_odd": subpacket(39, b"\x09"),
+        "recipient_5": subpacket(35, b"\x04\x01\x02\x03\x04"),
+        "sigtarget_1": subpacket(31, b"\x01"),
+    }.items():
+        inl[f"g5_hashed_{tag}"] = head + armor_parts(with_hashed(p, hashed_a + sp))
+    return inl, det, {}
+
+
+def batch_fx15_from(c: Controls) -> Batch:
+    """Task 9b's re-review, its adversarial lens (PE/final-review/A-report.txt,
+    "Re-review (e819372)"): 193 shapes in its batches rr1 to rr5, by its
+    names, cut without a key from committed fixtures exactly as its
+    generator (tools/gen_a.py, batch_rr1 to batch_rr5) cut them. Among them
+    the shapes of its findings A-RC1 (u_good_unh_*, u_d_good_unh_*,
+    z_good_unh_attested_odd: debian:13's sqv refuses a good packet with a
+    malformed subpacket, the cache adopted it) and A-RC2 (e_good_then_sha1A
+    and its twins: the five gpgv-based apt erase a key's good signature at
+    its later SHA-1 one), and its strict deviations (l_*, h_hdr_*, w_d_*_cr_sp,
+    n_clearhdr_nul, k_*)."""
+    return merge(fx15_rr1(c), fx15_rr2(c), fx15_rr3(c), fx15_rr4(c), fx15_rr5(c))
+
+
+def armored_keys(keyring: bytes, *uids: bytes) -> bytes:
+    """keyring's keys holding the given user IDs, in that order, each in an
+    armor block of its own (a PUBLIC KEY BLOCK, base64 64 wide, a CRC line):
+    a multi-block .asc key file."""
+    keys: list[bytes] = []
+    for tag, body in split_packets(keyring):
+        if tag == 6:
+            keys.append(b"")
+        if keys:
+            keys[-1] += packet(tag, body)
+    out = b""
+    for uid in uids:
+        found = [k for k in keys if uid in k]
+        if len(found) != 1:
+            raise ValueError(f"want one key holding {uid!r}, got {len(found)}")
+        lines = armor_lines(found[0])
+        out += (
+            b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n"
+            + b"\n".join(lines)
+            + b"\n"
+            + crc_line(found[0])
+            + b"\n-----END PGP PUBLIC KEY BLOCK-----\n"
+        )
+    return out
+
+
+def batch_fx16_from(c: Controls) -> Batch:
+    """Task 9b's re-review, its verifier lens (PE/final-review/V-report.txt,
+    "Re-review (e819372)", V-RM5), cut without a key from committed fixtures
+    as its probes cut them (rr/detblanks.py, crsp.py, mkasc.py):
+
+    - rd_* (16): x7d_control_good with trailing blanks or CRs on its base64,
+      CRC, header and header-ending lines (layer A reads a Release.gpg's
+      lines as AptLine leaves them; apt hands gpgv or sqv the raw file);
+    - c_* (5): x7i_control_good with a cleartext "Comment:" header, three
+      CRs after "SHA256:", or a signed line ending in CRs then a blank
+      (go-crypto's canonical-text hashing differs from gpgv's text filter
+      on "x\\r\\r", sqv refuses it too);
+    - ka_ae_* and ka_ea_* (6): x7i_control_good, x7d_control_good and
+      i_expired_bad_plus_good, each with its own signed-by, the keys A and
+      E in one two-block keys.asc (A then E, E then A): every apt reads
+      every block (V-RC1), so each verdict is keys.gpg's (keyrings_fx16_from
+      writes the key files)."""
+    det_lines = c.detached.split(b"\n")
+    if det_lines[-1] != b"" or det_lines[0] != BEGIN or det_lines[1] != b"":
+        raise ValueError("x7d_control_good: not BEGIN, an empty line, ..., a final LF")
+    det_lines = det_lines[:-1]
+    crc = next(i for i, line in enumerate(det_lines) if line.startswith(b"="))
+    b64 = list(range(2, crc))
+    end = len(det_lines) - 1
+
+    def build(edit: dict[int, bytes], hdr: bytes | None = None) -> bytes:
+        ls = [edit.get(i, line) for i, line in enumerate(det_lines)]
+        if hdr is not None:
+            ls.insert(1, hdr)
+        return b"\n".join(ls) + b"\n"
+
+    def each(idx: list[int], suffix: bytes) -> dict[int, bytes]:
+        return {i: det_lines[i] + suffix for i in idx}
+
+    detached = {
+        "rd_b64_trail_sp": build(each(b64, b"  ")),
+        "rd_b64_trail_tab": build(each(b64, b"\t")),
+        "rd_b64_trail_sp_tab_sp": build(each(b64, b" \t ")),
+        "rd_b64_trail_cr": build(each(b64, b"\r")),
+        "rd_b64_trail_crcr": build(each(b64, b"\r\r")),
+        "rd_b64_trail_sp_cr": build(each(b64, b" \r")),
+        "rd_b64_last_trail_sp": build(each([b64[-1]], b" ")),
+        "rd_crc_trail_sp": build(each([crc], b" ")),
+        "rd_crc_trail_tab": build(each([crc], b"\t")),
+        "rd_hdrterm_sp": build({1: b"   "}),
+        "rd_hdrterm_tab": build({1: b"\t"}),
+        "rd_hdrterm_cr": build({1: b"\r"}),
+        "rd_hdr_trail_sp": build({}, hdr=b"Comment: x   "),
+        "rd_hdr_trail_tab": build({}, hdr=b"Comment: x\t"),
+        "rd_all_trail_sp": build(each(list(range(end + 1)), b"  ")),
+        "rd_end_trail_crcr": build(each([end], b"\r\r")),
+    }
+    ci = c.inline
+    inline = {
+        "c_text_cr_sp": replace(ci, b"\nSuite: test\n", b"\nSuite: test\r \n", 1),
+        "c_text_crcr_sp": replace(ci, b"\nSuite: test\n", b"\nSuite: test\r\r \n", 1),
+        "c_text_crcrcr_sp": replace(
+            ci, b"\nSuite: test\n", b"\nSuite: test\r\r\r \n", 1
+        ),
+        "c_sha256_crcrcr": replace(ci, b"\nSHA256:\n", b"\nSHA256:\r\r\r\n", 1),
+        "c_cleartext_comment": replace(
+            ci, b"Hash: SHA256\n", b"Hash: SHA256\nComment: x\n", 1
+        ),
+    }
+    for order in ("ae", "ea"):
+        inline[f"ka_{order}_x7i_control_good"] = ci
+        inline[f"ka_{order}_i_expired_bad_plus_good"] = c.read(
+            "i_expired_bad_plus_good.InRelease"
+        )
+        detached[f"ka_{order}_x7d_control_good"] = c.detached
+    return inline, detached, {}
+
+
+def keyrings_fx16_from(c: Controls) -> Shapes:
+    """The own signed-by (<name>.keys.asc) of batch fx16's ka_* shapes: the
+    keys A and E in one two-block keys.asc, A's block first (ka_ae_*) or
+    E's (ka_ea_*)."""
+    keyring = c.read("keys.gpg")
+    a, e = b"Apt-shape A <", b"Apt-shape E <"
+    ae, ea = armored_keys(keyring, a, e), armored_keys(keyring, e, a)
+    out: Shapes = {}
+    for name in (
+        "x7i_control_good",
+        "i_expired_bad_plus_good",
+        "x7d_control_good",
+    ):
+        out[f"ka_ae_{name}"] = ae
+        out[f"ka_ea_{name}"] = ea
+    return out
+
+
+def batch_fx17_from(c: Controls) -> Batch:
+    """Task 9b's fix round: Sequoia's subpacket rules the re-review did not
+    measure (internal/gpg's sqvSubpacketFault, derived from
+    sequoia-openpgp 2.0.0's parser, the one debian:13's sqv 1.3.0 is built
+    with), each appended to A's good packet's unhashed area (no key needed),
+    measured so that the table is held to sqv itself: a boolean of value 2,
+    a revocation key without its class bit or longer than 22 octets, a
+    notation whose name is not UTF-8, a signature target whose digest is
+    short, recipients of other versions, an empty approved certifications
+    subpacket, a regular expression that is its NUL alone."""
+    head, p = c.head, c.sig_a
+    probes = {
+        "exportable_v2": subpacket(4, b"\x02"),
+        "revocable_v2": subpacket(7, b"\x02"),
+        "primaryuid_v2": subpacket(25, b"\x02"),
+        "revkey_noclassbit": subpacket(12, b"\x40\x01" + bytes(20)),
+        "revkey_23": subpacket(12, b"\x80\x01" + bytes(21)),
+        "notation_name_not_utf8": subpacket(
+            20, b"\x80\x00\x00\x00\x00\x02\x00\x00\xc3\x28"
+        ),
+        "notation_ok": subpacket(20, b"\x80\x00\x00\x00\x00\x01\x00\x01nv"),
+        "sigtarget_short_digest": subpacket(31, b"\x01\x08\x01\x02\x03"),
+        "recipient_v5_short": subpacket(35, b"\x05\x01\x02"),
+        "recipient_v6_21": subpacket(35, b"\x06" + bytes(20)),
+        "attested_empty": subpacket(37, b""),
+        "regexp_nul_only": subpacket(6, b"\x00"),
+    }
+    inline = {
+        f"sq_unh_{tag}": head + armor_parts(with_unhashed(p, sp))
+        for tag, sp in probes.items()
+    }
+    return inline, {}, {}
+
+
 @dataclass(frozen=True)
 class OwnMaterial:
     """What batch fx13 is cut from: key O's signatures (see the module
@@ -2551,7 +3166,16 @@ FROM_CONTROLS: list[Callable[[Controls], Batch]] = [
     batch_fx11_from,
     batch_fx12_from,
     batch_fx14_from,
+    batch_fx15_from,
+    batch_fx16_from,
+    batch_fx17_from,
 ]
+
+# The own signed-by key files (<name>.keys.asc) of shapes the batches above
+# define, cut without a key from the committed keys.gpg: a shape with one
+# is measured, and table-tested, with that file as its keyring instead of
+# keys.gpg.
+KEYRINGS_FROM_CONTROLS: list[Callable[[Controls], Shapes]] = [keyrings_fx16_from]
 
 
 @dataclass
@@ -2562,6 +3186,7 @@ class Corpus:
     inline: Shapes = field(default_factory=dict)
     detached: Shapes = field(default_factory=dict)
     releases: Shapes = field(default_factory=dict)
+    keyrings: Shapes = field(default_factory=dict)
 
     def add(
         self, inline: Shapes, detached: Shapes, releases: Shapes | None = None
@@ -2582,11 +3207,22 @@ class Corpus:
                 )
             self.releases[name] = data
 
+    def add_keyrings(self, keyrings: Shapes) -> None:
+        """Adds shapes' own signed-by key files; a name that is no shape, or
+        has one already, fails."""
+        for name, data in keyrings.items():
+            if name not in self.inline and name not in self.detached:
+                raise ValueError(f"{name}.keys.asc: no shape {name}")
+            if name in self.keyrings:
+                raise ValueError(f"{name}.keys.asc is defined twice")
+            self.keyrings[name] = data
+
     def files(self) -> dict[str, bytes]:
         """The shapes' files, by file name."""
         out = {f"{n}.InRelease": d for n, d in self.inline.items()}
         out |= {f"{n}.Release.gpg": d for n, d in self.detached.items()}
         out |= {f"{n}.Release": d for n, d in self.releases.items()}
+        out |= {f"{n}.keys.asc": d for n, d in self.keyrings.items()}
         return out
 
 
@@ -2600,6 +3236,8 @@ def build_shapes(m: Material, om: OwnMaterial, keyring: bytes) -> Corpus:
     controls = controls_from(corpus.files() | {"keys.gpg": keyring, "Release": RELEASE})
     for batch_from in FROM_CONTROLS:
         corpus.add(*batch_from(controls))
+    for keyrings_from in KEYRINGS_FROM_CONTROLS:
+        corpus.add_keyrings(keyrings_from(controls))
     corpus.add(*batch_fx13(om))
     return corpus
 
@@ -2654,6 +3292,8 @@ def write_from_controls(out: Path) -> Corpus:
     corpus = Corpus()
     for batch in FROM_CONTROLS:
         corpus.add(*batch(controls))
+    for keyrings_from in KEYRINGS_FROM_CONTROLS:
+        corpus.add_keyrings(keyrings_from(controls))
     write_files(out, corpus.files())
     return corpus
 
