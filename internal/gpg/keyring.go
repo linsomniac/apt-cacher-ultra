@@ -298,6 +298,29 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 				continue
 			}
 			path := filepath.Join(dir, name)
+			// AIDEV-NOTE: the fourth re-review's V-R4M1: the loader opened
+			// anything that was not a directory. open(2) of a FIFO waits for
+			// a writer, so a FIFO named .gpg in a keyring directory blocked
+			// the start forever (apt-key and apt 3 block on it too), and a
+			// symlink to /dev/zero (its stat's size 0) was read to the cap,
+			// 828 MiB, at every start. os.Stat follows a symlink and opens
+			// nothing; only a regular file (a symlinked one included:
+			// /usr/share/keyrings is full of them) is read.
+			fi, err := os.Stat(path)
+			if err != nil {
+				logger.Warn("keyring: stat failed; skipping file",
+					"path", path,
+					"err", err,
+				)
+				continue
+			}
+			if !fi.Mode().IsRegular() {
+				logger.Warn("keyring: not a regular file; skipping",
+					"path", path,
+					"mode", fi.Mode().String(),
+				)
+				continue
+			}
 			parsed, err := parseKeyringFile(path)
 			if err != nil {
 				logger.Warn("keyring: parse failed; skipping file",
