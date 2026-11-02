@@ -1,9 +1,9 @@
 package gpg
 
 // Tests of the keyring loader's reading of a key file as apt reads it: every
-// public key block of an armored file, wherever it stands, and nothing
-// around them (the re-review's V-RC1, its second's V-R2C1), a binary file to
-// its end, and a refusal where some apt cannot use the file.
+// key any supported apt reads from it (the re-review's V-RC1, its second's
+// V-R2C1, its third's V-R3C1: keyring_reader_test.go), a binary file to its
+// end, and a refusal only where every apt fails the file.
 
 import (
 	"bytes"
@@ -87,9 +87,11 @@ func fingerprintsOf(ents openpgp.EntityList) map[string]bool {
 // re-review measured every apt reading (V-R2C1, its rr2 kr cases), which
 // fix round 1 refused: a comment line before the block, text after it or
 // between blocks, binary bytes after it, a signature block beside it,
-// text past the first 64 octets before it; apt 3 skips every line
-// outside a public key block and every block of another type, apt-key's
-// awk prints only lines inside blocks, sqv reads them all.
+// text past the first 64 octets before it; outside a block no apt reads a
+// line. And the keys some apt reads that fix round 2 skipped (V-R3C1): in
+// a block of another type (apt-key and sqv read them), in a block without
+// its END line or one restarted by a BEGIN line (apt-key reads on, both
+// blocks' base64 joined).
 func TestParseKeyring_ReadsEveryArmorBlock(t *testing.T) {
 	a := newTestEntity(t, "A", "a@example.com")
 	b := newTestEntity(t, "B", "b@example.com")
@@ -101,6 +103,7 @@ func TestParseKeyring_ReadsEveryArmorBlock(t *testing.T) {
 	if bytes.Equal(badCRC, kb) {
 		t.Fatal("test premise: the checksum was AAAA already")
 	}
+	unterminated := ka[:bytes.LastIndex(ka, []byte("-----END"))]
 	for _, tc := range []struct {
 		name string
 		file []byte
@@ -128,12 +131,20 @@ func TestParseKeyring_ReadsEveryArmorBlock(t *testing.T) {
 		// by a line starting with its BEGIN line and closed by any line
 		// starting "-----END".
 		{"a comment line before the block, text lines after it", joined([]byte("# A's key, from the vendor's page\n"), ka, []byte("junk\n(checked)\n")), []*openpgp.Entity{a}},
-		{"a signature block holding C's key after the key block", joined(ka, armorOf(t, "PGP SIGNATURE", binaryKey(t, c))), []*openpgp.Entity{a}},
-		{"a signature block holding C's key before the key block", joined(armorOf(t, "PGP SIGNATURE", binaryKey(t, c)), ka), []*openpgp.Entity{a}},
-		{"a private key block holding C's key, then B's block", joined(armorOf(t, "PGP PRIVATE KEY BLOCK", binaryKey(t, c)), kb), []*openpgp.Entity{b}},
+		{"a signature block holding C's key after the key block", joined(ka, armorOf(t, "PGP SIGNATURE", binaryKey(t, c))), []*openpgp.Entity{a, c}},
+		{"a signature block holding C's key before the key block", joined(armorOf(t, "PGP SIGNATURE", binaryKey(t, c)), ka), []*openpgp.Entity{c, a}},
+		{"a private key block holding C's key, then B's block", joined(armorOf(t, "PGP PRIVATE KEY BLOCK", binaryKey(t, c)), kb), []*openpgp.Entity{c, b}},
 		{"a signature block left open after the key block", joined(ka, []byte("-----BEGIN PGP SIGNATURE-----\n\nAAAA\n")), []*openpgp.Entity{a}},
 		{"a BEGIN line with text after it", bytes.Replace(ka, []byte("BLOCK-----\n"), []byte("BLOCK----- (A)\n"), 1), []*openpgp.Entity{a}},
 		{"a block closed by another type's END line", bytes.Replace(ka, []byte("-----END PGP PUBLIC KEY BLOCK-----"), []byte("-----END PGP SIGNATURE-----"), 1), []*openpgp.Entity{a}},
+		// Fix round 2 refused these; apt-key reads each (V-R3C1; the parser
+		// returns a key read twice twice, LoadKeyring merges them).
+		{"kr7_private_block: the key in a private key block alone", bytes.ReplaceAll(ka, []byte("PUBLIC KEY"), []byte("PRIVATE KEY")), []*openpgp.Entity{a}},
+		{"kr7_signature_block: the key in a signature block alone", armorOf(t, "PGP SIGNATURE", binaryKey(t, a)), []*openpgp.Entity{a}},
+		{"kr6_unterminated: a block without its END line", unterminated, []*openpgp.Entity{a}},
+		{"a block, then one without its END line", joined(ka, unterminated), []*openpgp.Entity{a, a}},
+		{"a block without its END line, then the block again", joined(unterminated, ka), []*openpgp.Entity{a, a}},
+		{"another type's BEGIN line inside a block", joined(unterminated, []byte("-----BEGIN PGP SIGNATURE-----\n"), ka[bytes.LastIndex(ka, []byte("-----END")):]), []*openpgp.Entity{a}},
 	} {
 		ents, err := parseKeyringBytes(tc.file)
 		if err != nil {
@@ -180,16 +191,17 @@ func TestParseKeyring_ReadsEveryArmorBlock(t *testing.T) {
 	}
 }
 
-// TestParseKeyring_RefusesWhatAptReadsOtherwise: a file some apt cannot use
-// is refused, which LoadKeyring logs at WARN and skips (SPEC2 §7.6.1):
-// binary packets with anything after them (every apt fails such a
-// keyring: measured), a public key block without its END line (apt 3
-// ignores the whole file), a line after a block's checksum line (apt 2
-// and 3 both fold it into the base64, and every apt then fails: measured),
-// a block that decodes to anything but whole packets, and a file holding
-// no public key block (key packets only in a private key or signature
-// block: apt 3.2's gpgv path reads no key from it, measured). A file
-// larger than the cap is refused before it is read whole.
+// TestParseKeyring_RefusesWhatAptReadsOtherwise: a file every apt fails is
+// refused, which LoadKeyring logs at WARN and skips (SPEC2 §7.6.1), each
+// measured REJ in all six images: binary packets with anything after them
+// (kr_gpg_trailing_lf, kr_gpg_trailing_junk), binary packets then armor
+// (kr8_asc_bin_A_then_armor_A, kr8_asc_bin_E_then_armor_A,
+// kr8_gpg_bin_A_then_armor_A), a line after a block's checksum line
+// (kr6_after_crc: apt-key's awk and apt 3 both fold it into the base64,
+// and every apt then fails the keyring); with them a block that decodes to
+// anything but whole packets, and a file of no key at all (text alone, a
+// block without its empty line after BEGIN, which no apt reads a line of).
+// A file larger than the cap is refused before it is read whole.
 func TestParseKeyring_RefusesWhatAptReadsOtherwise(t *testing.T) {
 	a := newTestEntity(t, "A", "a@example.com")
 	ka, bin := armoredKey(t, a), binaryKey(t, a)
@@ -199,11 +211,13 @@ func TestParseKeyring_RefusesWhatAptReadsOtherwise(t *testing.T) {
 		t.Fatalf("test premise: no checksum line before the END line in %q", ka[crcAt:])
 	}
 	unterminated := ka[:bytes.LastIndex(ka, []byte("-----END"))]
+	b := newTestEntity(t, "B", "b@example.com")
 	for _, tc := range []struct {
 		name, why string // why: a substring of the refusal
 		file      []byte
 	}{
-		{"binary, then an armor block", "starts no OpenPGP packet", joined(bin, ka)},
+		{"kr8_asc_bin_A_then_armor_A, kr8_gpg_bin_A_then_armor_A: binary, then an armor block", "starts no OpenPGP packet", joined(bin, ka)},
+		{"kr8_asc_bin_E_then_armor_A: another key's binary, then an armor block", "starts no OpenPGP packet", joined(binaryKey(t, b), ka)},
 		{"binary, then a newline (kr_gpg_trailing_lf)", "starts no OpenPGP packet", joined(bin, []byte("\n"))},
 		{"binary, then a text line (kr_gpg_trailing_junk)", "starts no OpenPGP packet", joined(bin, []byte("junk\n"))},
 		{"binary, a truncated packet", "running past the end", bin[:len(bin)-1]},
@@ -213,17 +227,15 @@ func TestParseKeyring_RefusesWhatAptReadsOtherwise(t *testing.T) {
 		{"binary, a truncated two-octet new-format length", "truncated packet header", joined(bin, []byte{0xc6, 0xc0})},
 		{"binary, a truncated five-octet new-format length", "truncated packet header", joined(bin, []byte{0xc6, 0xff, 0, 0})},
 		{"binary, a truncated old-format length", "truncated packet header", joined(bin, []byte{0x99, 0x00})},
-		{"text alone", "no public key block", []byte("# no key here\n")},
-		{"kr7_private_block: the key in a private key block alone", "no public key block", bytes.ReplaceAll(ka, []byte("PUBLIC KEY"), []byte("PRIVATE KEY"))},
-		{"kr7_signature_block: the key in a signature block alone", "no public key block", armorOf(t, "PGP SIGNATURE", bin)},
-		{"kr6_unterminated: a block without its END line", "without its END line", unterminated},
-		{"a block, then one without its END line", "without its END line", joined(ka, unterminated)},
-		{"a BEGIN line inside a block", "inside a public key block", joined(unterminated, ka)},
-		{"kr6_after_crc: a line after the checksum line", "after the block's checksum line", afterCRC},
-		{"another type's BEGIN line inside a block", "inside a public key block", joined(unterminated, []byte("-----BEGIN PGP SIGNATURE-----\n"), ka[bytes.LastIndex(ka, []byte("-----END")):])},
+		{"text alone", "no armor block", []byte("# no key here\n")},
+		{"kr6_after_crc: a line after the checksum line", "after a block's checksum line", afterCRC},
 		{"a block of bytes that are no packets", "starts no OpenPGP packet", armorOf(t, openpgp.PublicKeyType, []byte("no packets here"))},
 		{"a block of a key, then bytes that are no packets", "starts no OpenPGP packet", armorOf(t, openpgp.PublicKeyType, joined(bin, []byte("junk")))},
-		{"a block with no empty line after BEGIN", "does not decode", bytes.Replace(ka, []byte("-----\n\n"), []byte("-----\n"), 1)},
+		{"a block with no empty line after BEGIN", "no key", bytes.Replace(ka, []byte("-----\n\n"), []byte("-----\n"), 1)},
+		// apt-key's reading holds bytes that are no packets, apt 3 ignores a file
+		// whose last public key block has no END line, sqv refuses one (kr6_unterminated:
+		// d13, u26 REJ): no apt reads A.
+		{"a signature block of no packets, then a block without its END line", "starts no OpenPGP packet", joined(armorOf(t, "PGP SIGNATURE", []byte("no packets here")), unterminated)},
 	} {
 		if ents, err := parseKeyringBytes(tc.file); err == nil || !strings.Contains(err.Error(), tc.why) {
 			t.Errorf("%s: %d keys, %v; want the file refused, %q", tc.name, len(ents), err, tc.why)
@@ -239,7 +251,6 @@ func TestParseKeyring_RefusesWhatAptReadsOtherwise(t *testing.T) {
 	}
 	// LoadKeyring skips the refused file and loads the rest.
 	dir := makeTestDir(t)
-	b := newTestEntity(t, "B", "b@example.com")
 	writeFile(t, filepath.Join(dir, "mixed.gpg"), joined(bin, ka))
 	writeFile(t, filepath.Join(dir, "good.asc"), armoredKey(t, b))
 	k, err := LoadKeyring([]string{dir}, silentLogger())
