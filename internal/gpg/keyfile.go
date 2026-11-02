@@ -12,14 +12,58 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 )
 
-// parseKeyringFile reads one keyring file: parseKeyringReader.
+// parseKeyringFile reads one keyring file (readKeyFile, under
+// keyringMaxFile) and its keys: parseKeyring.
 func parseKeyringFile(path string) (openpgp.EntityList, error) {
+	b, err := readKeyFile(path, keyringMaxFile)
+	if err != nil {
+		return nil, err
+	}
+	return parseKeyring(b)
+}
+
+// readKeyFile reads the key file at path whole, under maxFile. A file its
+// stat says is larger is refused before an octet of it is read; one under it
+// is read into one buffer of its size and one octet more, which finds a file
+// that grew since the stat (or whose stat gives no size, a special file):
+// that one is read on, under maxFile.
+//
+// AIDEV-NOTE: the third re-review's V-R3M2: the loader read every file
+// whole before it judged it, so a misplaced non-keyring in a keyring
+// directory (a disk image named .gpg) cost up to 256 MiB, and io.ReadAll's
+// growth, at every start, before its refusal
+// (TestParseKeyringFile_RefusesAFileOverTheCapUnread). A real keyring
+// costs its size: debian-keyring.gpg, if installed, still costs its 31 MB
+// and its keys' parse (3.6 s) at every start, as on main.
+func readKeyFile(path string, maxFile int) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
-	return parseKeyringReader(f)
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if fi.Size() > int64(maxFile) {
+		return nil, fmt.Errorf("larger than %d octets (%d)", maxFile, fi.Size())
+	}
+	buf := make([]byte, fi.Size()+1)
+	n, err := io.ReadFull(f, buf)
+	switch {
+	case errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
+		return buf[:n], nil
+	case err != nil:
+		return nil, fmt.Errorf("read: %w", err)
+	}
+	rest, err := io.ReadAll(io.LimitReader(f, int64(maxFile)+1-int64(n)))
+	if err != nil {
+		return nil, fmt.Errorf("read: %w", err)
+	}
+	if b := append(buf, rest...); len(b) <= maxFile {
+		return b, nil
+	}
+	return nil, fmt.Errorf("larger than %d octets", maxFile)
 }
 
 // parseKeyringBytes parses an in-memory keyring blob (used for
