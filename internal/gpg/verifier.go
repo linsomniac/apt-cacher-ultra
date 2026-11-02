@@ -673,6 +673,24 @@ func (v *Verifier) verifyAnyTrusted(
 		}
 		return true
 	}
+	// uncountableKey records that S2 does not count pkts[i], a packet it
+	// trusts, because the keyring marks its signing key fp (uppercase; "" when
+	// the entity holds no key of its key ID) as revoked or expired by a
+	// signature the cache cannot read (Keyring.uncountableKey, ruling R2:
+	// every gpgv-based apt refuses the anchor, REVKEYSIG or EXPKEYSIG), and
+	// says whether it does. It outranks a verification error as discount's
+	// reasons do: S1 has verified the packet (its key is known), so it names
+	// why a good signature did not count.
+	uncountableKey := func(fp string, i int) bool {
+		why := v.keyring.uncountableKey(fp)
+		if why == nil {
+			return false
+		}
+		if discounted == nil {
+			discounted = fmt.Errorf("S2: packet %d: its key %s is not counted: %w", pkts[i].n, fp, why)
+		}
+		return true
+	}
 	for i, p := range pkts {
 		sawSignature = true
 
@@ -707,7 +725,7 @@ func (v *Verifier) verifyAnyTrusted(
 				continue
 			}
 			anyTrustedSeen = true
-			if skip(i) {
+			if skip(i) || uncountableKey(fingerprintByKeyID(matched, p.issuer), i) {
 				continue
 			}
 			// The entity whose keyid resolved the trust check is the
@@ -728,7 +746,7 @@ func (v *Verifier) verifyAnyTrusted(
 			continue
 		}
 		anyTrustedSeen = true
-		if skip(i) {
+		if skip(i) || uncountableKey(issuerFP, i) {
 			continue
 		}
 		// Verify this one packet in isolation, as framed: the packet
@@ -846,6 +864,20 @@ func erasedBy(pkts []sigPacket, i int) (sigPacket, bool) {
 // MD5, SHA-1, RIPE-MD/160, and any id past the table (FindDigest's
 // fallback, "Invalid digest"). Of the hashes layer P reads, SHA-1 alone.
 func aptUntrustedDigest(h byte) bool { return h < 4 || h > 11 }
+
+// fingerprintByKeyID is the uppercase fingerprint of e's primary key or
+// subkey whose key ID is id, "" when e holds none.
+func fingerprintByKeyID(e *openpgp.Entity, id uint64) string {
+	if e.PrimaryKey != nil && e.PrimaryKey.KeyId == id {
+		return upperFP(e.PrimaryKey.Fingerprint)
+	}
+	for _, sub := range e.Subkeys {
+		if sub.PublicKey != nil && sub.PublicKey.KeyId == id {
+			return upperFP(sub.PublicKey.Fingerprint)
+		}
+	}
+	return ""
+}
 
 // findUniqueEntityByKeyID looks up a short 8-byte issuer keyid against
 // the given EntityList — checking each entity's primary key and every

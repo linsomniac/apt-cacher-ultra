@@ -146,7 +146,7 @@ func TestParseKeyring_ReadsEveryArmorBlock(t *testing.T) {
 		{"a block without its END line, then the block again", joined(unterminated, ka), []*openpgp.Entity{a, a}},
 		{"another type's BEGIN line inside a block", joined(unterminated, []byte("-----BEGIN PGP SIGNATURE-----\n"), ka[bytes.LastIndex(ka, []byte("-----END")):]), []*openpgp.Entity{a}},
 	} {
-		ents, err := parseKeyringBytes(tc.file)
+		ents, err := parseKeys(tc.file)
 		if err != nil {
 			t.Errorf("%s: %v; want every block read", tc.name, err)
 			continue
@@ -175,11 +175,11 @@ func TestParseKeyring_ReadsEveryArmorBlock(t *testing.T) {
 		"the key packet old-format, four octets":  joined(binary.BigEndian.AppendUint32([]byte{0x9a}, uint32(n)), body, rest),
 		"the key packet old-format, two octets":   joined(binary.BigEndian.AppendUint16([]byte{0x99}, uint16(n)), body, rest),
 	} {
-		if ents, err := parseKeyringBytes(file); err != nil || len(ents) == 0 || !fingerprintsOf(ents)[upperFP(a.PrimaryKey.Fingerprint)] {
+		if ents, err := parseKeys(file); err != nil || len(ents) == 0 || !fingerprintsOf(ents)[upperFP(a.PrimaryKey.Fingerprint)] {
 			t.Errorf("%s: %d keys, %v; want A's key read", name, len(ents), err)
 		}
 	}
-	if ents, err := parseKeyringBytes(nil); err != nil || len(ents) != 0 {
+	if ents, err := parseKeys(nil); err != nil || len(ents) != 0 {
 		t.Errorf("an empty file: %d keys, %v; want none and no error", len(ents), err)
 	}
 	// Through the directory loader, as production reads /etc/apt/keyrings.
@@ -237,7 +237,7 @@ func TestParseKeyring_RefusesWhatAptReadsOtherwise(t *testing.T) {
 		// d13, u26 REJ): no apt reads A.
 		{"a signature block of no packets, then a block without its END line", "starts no OpenPGP packet", joined(armorOf(t, "PGP SIGNATURE", []byte("no packets here")), unterminated)},
 	} {
-		if ents, err := parseKeyringBytes(tc.file); err == nil || !strings.Contains(err.Error(), tc.why) {
+		if ents, err := parseKeys(tc.file); err == nil || !strings.Contains(err.Error(), tc.why) {
 			t.Errorf("%s: %d keys, %v; want the file refused, %q", tc.name, len(ents), err, tc.why)
 		}
 	}
@@ -441,9 +441,9 @@ func TestParseKeyring_ReadsADebianKeyringSizedFile(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "debian-keyring.gpg"), big.Bytes())
 	writeFile(t, filepath.Join(dir, "debian-keyring.asc"), armorOf(t, openpgp.PublicKeyType, big.Bytes()))
 	for _, name := range []string{"debian-keyring.gpg", "debian-keyring.asc"} {
-		ents, err := parseKeyringFile(filepath.Join(dir, name))
-		if err != nil || len(ents) != 1 || !fingerprintsOf(ents)[upperFP(a.PrimaryKey.Fingerprint)] {
-			t.Errorf("%s: %d keys, %v; want A's key read", name, len(ents), err)
+		kf, err := parseKeyringFile(filepath.Join(dir, name))
+		if err != nil || len(kf.entities) != 1 || !fingerprintsOf(kf.entities)[upperFP(a.PrimaryKey.Fingerprint)] {
+			t.Errorf("%s: %v; want A's key read alone", name, err)
 		}
 	}
 }

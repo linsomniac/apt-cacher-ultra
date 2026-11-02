@@ -7,14 +7,24 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
+	pgperrors "github.com/ProtonMail/go-crypto/openpgp/errors"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 )
 
+// keyFile is what the reader read of one key file: its keys, and S2's
+// marks on them (uncountable: the key or subkey fingerprints, uppercase, S2
+// must not count, each with why; the controller's ruling R2, keyBlock.marks).
+type keyFile struct {
+	entities    openpgp.EntityList
+	uncountable map[string]error
+}
+
 // parseKeyringFile reads one keyring file (readKeyFile, under
 // keyringMaxFile) and its keys: parseKeyring.
-func parseKeyringFile(path string) (openpgp.EntityList, error) {
+func parseKeyringFile(path string) (*keyFile, error) {
 	b, err := readKeyFile(path, keyringMaxFile)
 	if err != nil {
 		return nil, err
@@ -68,7 +78,7 @@ func readKeyFile(path string, maxFile int) ([]byte, error) {
 
 // parseKeyringBytes parses an in-memory keyring blob (used for
 // embedded sources), as parseKeyringFile reads a file.
-func parseKeyringBytes(b []byte) (openpgp.EntityList, error) {
+func parseKeyringBytes(b []byte) (*keyFile, error) {
 	return parseKeyringReader(bytes.NewReader(b))
 }
 
@@ -90,13 +100,13 @@ const keyringMaxFile = 256 << 20
 
 // parseKeyringReader reads one key file whole, under keyringMaxFile, and
 // reads its keys: parseKeyring.
-func parseKeyringReader(r io.Reader) (openpgp.EntityList, error) {
+func parseKeyringReader(r io.Reader) (*keyFile, error) {
 	return parseKeyringReaderMax(r, keyringMaxFile)
 }
 
 // parseKeyringReaderMax is parseKeyringReader with the cap given (tests
 // read past a small one).
-func parseKeyringReaderMax(r io.Reader, maxFile int) (openpgp.EntityList, error) {
+func parseKeyringReaderMax(r io.Reader, maxFile int) (*keyFile, error) {
 	b, err := io.ReadAll(io.LimitReader(r, int64(maxFile)+1))
 	if err != nil {
 		return nil, fmt.Errorf("read: %w", err)
@@ -168,8 +178,10 @@ func parseKeyringReaderMax(r io.Reader, maxFile int) (openpgp.EntityList, error)
 //
 // What is left of the other direction (some apt reads a key the cache does
 // not): a key go-crypto does not read (an algorithm it lacks, a primary key
-// that cannot sign, a key revocation it cannot verify, a designated
-// revoker's; no user ID with a self-signature it verifies), and a file both
+// that cannot sign; no user ID with a self-signature it verifies; a key
+// revocation it cannot verify, a designated revoker's or a corrupt one, no
+// longer: the strict re-read drops it and marks the key for S2,
+// keyBlock.marks), and a file both
 // of apt's text readings fail but whose blocks before the failure apt-key's
 // base64 -d decoded (it stops at the first bad character). A key beside
 // packets that are no part of it, which go-crypto alone drops, is read
@@ -179,9 +191,9 @@ func parseKeyringReaderMax(r io.Reader, maxFile int) (openpgp.EntityList, error)
 // subkey it cannot read, whose binding it then took for the previous
 // subkey's; for a subkey whose one binding uses RIPEMD-160; for a
 // certification after a subkey).
-func parseKeyring(b []byte) (openpgp.EntityList, error) {
+func parseKeyring(b []byte) (*keyFile, error) {
 	if len(b) == 0 {
-		return nil, nil
+		return &keyFile{}, nil
 	}
 	kind, data := "binary", b
 	if b[0]&0x80 == 0 {
@@ -195,11 +207,11 @@ func parseKeyring(b []byte) (openpgp.EntityList, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", kind, err)
 	}
-	entities, err := readKeyBlocks(pkts)
+	kf, err := readKeyBlocks(pkts)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", kind, err)
 	}
-	return entities, nil
+	return kf, nil
 }
 
 // The armor lines an armored key file's blocks open and close at (a line,
@@ -451,7 +463,21 @@ type keyComponent struct {
 	raw  []byte
 	uid  string
 	key  *packet.PublicKey
-	sigs []rawPacket
+	sigs []keySig
+}
+
+// keySig is one signature packet standing on a component of a keyBlock, of
+// a type go-crypto reads there (sigFits): the packet, and what the reader
+// made of it (keySig.read): whether it is the key's own, when it was made,
+// and whether go-crypto keeps it on the component without failing the key
+// (ok), else why not.
+type keySig struct {
+	raw     rawPacket
+	typ     byte
+	self    bool      // its issuer is the key itself, or cannot be read
+	created time.Time // its creation time; zero when it cannot be read
+	ok      bool
+	why     string
 }
 
 // readKeyBlocks reads the keys of a joined keyring, key by key, so that a
@@ -466,10 +492,12 @@ type keyComponent struct {
 // reads as part of a key is kept, a secret key's public part in its
 // place. Each is read with the signatures that stand where they are, by
 // their type; if go-crypto still refuses it, again with only the
-// signatures it parses, and of the key's own on a user ID or subkey only
-// those that verify, a subkey kept only with a binding that does
-// (keyBlock.packets); a key go-crypto refuses both ways is skipped. A
-// keyring of which no key is read is refused.
+// signatures it keeps there (keySig.ok: those it parses, and of the key's
+// own on a user ID or subkey, or any on the primary key, only those that
+// verify), a subkey kept only with a binding that does (keyBlock.packets);
+// a key go-crypto refuses both ways is skipped. A keyring of which no key
+// is read is refused. Whichever read succeeds, a signature the cache
+// cannot use that gpgv would is marked for S2 (keyBlock.marks).
 //
 // AIDEV-NOTE: go-crypto's ReadEntity under this reader (v1.5.2). Three of
 // v1.5.0's changes beneath ReadKeyRing (the third re-review's V-R3M3)
@@ -488,10 +516,11 @@ type keyComponent struct {
 //
 // Re-check these, and sigFits' types and positions (go-crypto's addUserID
 // and addSubkey), when go-crypto is upgraded.
-func readKeyBlocks(pkts []rawPacket) (openpgp.EntityList, error) {
-	var out openpgp.EntityList
+func readKeyBlocks(pkts []rawPacket) (*keyFile, error) {
+	out := &keyFile{}
 	var lastErr error
 	for _, kb := range keyBlocksOf(pkts) {
+		kb.classify()
 		e, err := readEntity(kb.packets(false))
 		if err != nil {
 			e, err = readEntity(kb.packets(true))
@@ -500,9 +529,17 @@ func readKeyBlocks(pkts []rawPacket) (openpgp.EntityList, error) {
 			lastErr = err
 			continue
 		}
-		out = append(out, e)
+		out.entities = append(out.entities, e)
+		for fp, why := range kb.marks() {
+			if out.uncountable == nil {
+				out.uncountable = make(map[string]error)
+			}
+			if _, dup := out.uncountable[fp]; !dup {
+				out.uncountable[fp] = why
+			}
+		}
 	}
-	if len(out) == 0 {
+	if len(out.entities) == 0 {
 		if lastErr != nil {
 			return nil, fmt.Errorf("no key go-crypto reads: %w", lastErr)
 		}
@@ -563,7 +600,7 @@ func keyBlocksOf(pkts []rawPacket) []*keyBlock {
 				continue
 			}
 			if t, ok := sigTypeOf(p, kb.key.Version); ok && sigFits(kb.components[at].kind, t) {
-				kb.components[at].sigs = append(kb.components[at].sigs, p)
+				kb.components[at].sigs = append(kb.components[at].sigs, keySig{raw: p, typ: t})
 			}
 		case tagUserAttribute:
 			at = -1
@@ -650,17 +687,14 @@ func sigFits(kind int, t byte) bool {
 
 // packets returns kb's packets as go-crypto's ReadEntity reads them: its
 // primary key, then each component with the signatures that stand on it, a
-// subkey only with a binding among them. With strict, a signature only if
-// go-crypto parses it, and the key's own signature on a user ID, or any on
-// a subkey, only if it verifies there (go-crypto verifies those and fails
-// the key on one that does not; it keeps another key's certification
-// unverified, and verifies a key revocation itself).
+// subkey only with a binding among them. With strict, only the signatures
+// go-crypto keeps there (keySig.ok).
 func (kb *keyBlock) packets(strict bool) []byte {
 	size := len(kb.primary)
 	for _, c := range kb.components {
 		size += len(c.raw)
 		for _, s := range c.sigs {
-			size += len(s.raw)
+			size += len(s.raw.raw)
 		}
 	}
 	out := append(make([]byte, 0, size), kb.primary...)
@@ -668,11 +702,11 @@ func (kb *keyBlock) packets(strict bool) []byte {
 		var sigs []byte
 		bound := false
 		for _, s := range c.sigs {
-			if strict && !kb.sigOK(c, s) {
+			if strict && !s.ok {
 				continue
 			}
-			bound = bound || s.body[1] == byte(packet.SigTypeSubkeyBinding)
-			sigs = append(sigs, s.raw...)
+			bound = bound || s.typ == byte(packet.SigTypeSubkeyBinding)
+			sigs = append(sigs, s.raw.raw...)
 		}
 		if c.kind == onSubkey && !bound {
 			continue
@@ -683,20 +717,228 @@ func (kb *keyBlock) packets(strict bool) []byte {
 	return out
 }
 
-// sigOK reports whether go-crypto keeps s on c without failing the key: s
-// parses, and on a user ID is another key's certification or the key's own
-// verifying there, on a subkey verifies there.
-func (kb *keyBlock) sigOK(c keyComponent, s rawPacket) bool {
-	p, err := packet.Read(bytes.NewReader(s.raw))
-	sig, ok := p.(*packet.Signature)
-	if err != nil || !ok {
-		return false
+// classify reads every signature of kb's components (keySig.read).
+func (kb *keyBlock) classify() {
+	for i := range kb.components {
+		for j := range kb.components[i].sigs {
+			kb.components[i].sigs[j].read(kb, &kb.components[i])
+		}
 	}
-	switch c.kind {
-	case onUserID:
-		return !sig.CheckKeyIdOrFingerprint(kb.key) || kb.key.VerifyUserIdSignature(c.uid, kb.key, sig) == nil
-	case onSubkey:
-		return kb.key.VerifyKeySignature(c.key, sig) == nil
+}
+
+// read fills in what the reader makes of s on c: whether go-crypto parses
+// it, whether it is the key's own (its issuer the key: go-crypto's
+// CheckKeyIdOrFingerprint, or the raw subpackets' issuer where go-crypto
+// does not parse it; one whose issuer cannot be read at all counts as the
+// key's own), its creation time, and whether go-crypto keeps it on c
+// without failing the key (ok): on the primary key only the key's own
+// revocation or direct-key signature that verifies (ReadEntity fails the
+// key for a revocation by another key, "signed by alternate key", and
+// passes over a direct-key signature that does not verify); on a user ID
+// another key's certification unverified, or the key's own that verifies
+// (addUserID); on a subkey a binding or revocation that verifies by the
+// primary key, whoever its issuer says (addSubkey).
+func (s *keySig) read(kb *keyBlock, c *keyComponent) {
+	p, err := packet.Read(bytes.NewReader(s.raw.raw))
+	sig, isSig := p.(*packet.Signature)
+	if err == nil && !isSig {
+		err = errors.New("not a signature packet")
 	}
-	return true
+	if err != nil {
+		s.self, s.created = rawSigIssuerAndTime(s.raw.body, kb.key)
+		s.why = fmt.Sprintf("go-crypto does not read it (%v)", err)
+		if len(s.raw.body) > 3 {
+			s.why = fmt.Sprintf("go-crypto does not read it (hash algorithm %d: %v)", s.raw.body[3], err)
+		}
+		return
+	}
+	s.self, s.created = sig.CheckKeyIdOrFingerprint(kb.key), sig.CreationTime
+	var verr error
+	switch {
+	case c.kind == onPrimary && !s.self:
+		verr = fmt.Errorf("its issuer %016X is not the key", issuerOf(sig))
+	case c.kind == onPrimary && s.typ == byte(packet.SigTypeKeyRevocation):
+		verr = kb.key.VerifyRevocationSignature(sig)
+	case c.kind == onPrimary:
+		verr = kb.key.VerifyDirectKeySignature(sig)
+	case c.kind == onUserID && s.self:
+		verr = kb.key.VerifyUserIdSignature(c.uid, kb.key, sig)
+	case c.kind == onSubkey:
+		verr = kb.key.VerifyKeySignature(c.key, sig)
+	}
+	if verr != nil {
+		s.why = fmt.Sprintf("it does not verify as the key's own (%v)", verr)
+		return
+	}
+	s.ok = true
+}
+
+// issuerOf is sig's issuer key ID, 0 when it names none.
+func issuerOf(sig *packet.Signature) uint64 {
+	if sig.IssuerKeyId == nil {
+		return 0
+	}
+	return *sig.IssuerKeyId
+}
+
+// rawSigIssuerAndTime reads, from the body of a v4 (or v6) signature packet
+// go-crypto does not parse, whether its issuer is key (its issuer
+// fingerprint subpacket, 33, or issuer key ID, 16, in either area; with
+// neither, or a body not framed so, the signature counts as the key's own:
+// it is not known to be another's) and its creation time (subpacket 2 in
+// the hashed area; zero when not read).
+func rawSigIssuerAndTime(body []byte, key *packet.PublicKey) (self bool, created time.Time) {
+	if len(body) < 6 {
+		return true, time.Time{}
+	}
+	lengthOctets := 2
+	if body[0] == 6 {
+		lengthOctets = 4
+	}
+	var areas [][]byte
+	off := 4
+	for range 2 {
+		if len(body) < off+lengthOctets {
+			return true, time.Time{}
+		}
+		var n int
+		for _, c := range body[off : off+lengthOctets] {
+			n = n<<8 | int(c)
+		}
+		off += lengthOctets
+		if n > len(body)-off {
+			return true, time.Time{}
+		}
+		areas = append(areas, body[off:off+n])
+		off += n
+	}
+	var fpr, keyID []byte
+	issuerIsKey := func() bool {
+		switch {
+		case fpr != nil:
+			return bytes.Equal(fpr, key.Fingerprint)
+		case keyID != nil:
+			return binary.BigEndian.Uint64(keyID) == key.KeyId
+		}
+		return true
+	}
+	for i, area := range areas {
+		for len(area) > 0 {
+			var size, hl int
+			switch l0 := area[0]; {
+			case l0 < 192:
+				size, hl = int(l0), 1
+			case l0 < 255 && len(area) >= 2:
+				size, hl = (int(l0)-192)<<8+int(area[1])+192, 2
+			case l0 == 255 && len(area) >= 5:
+				size, hl = int(binary.BigEndian.Uint32(area[1:5])), 5
+			}
+			if size == 0 || hl == 0 || size > len(area)-hl {
+				return issuerIsKey(), created // the area is not whole subpackets
+			}
+			sub := area[hl : hl+size]
+			area = area[hl+size:]
+			switch typ, data := sub[0]&0x7f, sub[1:]; {
+			case typ == 2 && i == 0 && len(data) == 4 && created.IsZero():
+				created = time.Unix(int64(binary.BigEndian.Uint32(data)), 0)
+			case typ == 16 && len(data) == 8 && keyID == nil:
+				keyID = data
+			case typ == 33 && len(data) == 21 && fpr == nil:
+				fpr = data[1:]
+			}
+		}
+	}
+	return issuerIsKey(), created
+}
+
+// Signature types a key's own signature supersedes by a newer one, and
+// so can revoke or expire a component the cache has read as valid
+// (keyBlock.marks): a subkey's binding, the key's direct-key signature,
+// a user ID's self-certification (four types, one class).
+func supersedes(typ byte) byte {
+	switch t := packet.SignatureType(typ); {
+	case t == packet.SigTypeSubkeyBinding, t == packet.SigTypeDirectSignature:
+		return typ
+	case t >= packet.SigTypeGenericCert && t <= packet.SigTypePositiveCert:
+		return byte(packet.SigTypePositiveCert)
+	}
+	return 0
+}
+
+// marks returns S2's marks on kb's key and subkeys (keyFile.uncountable):
+// each component on which stands a signature the cache cannot use (keySig
+// not ok) and gpgv would, so that gpgv may treat the component as revoked,
+// expired or unbound where the cache reads it valid — a revocation of the
+// key (0x20) or of a subkey (0x28) that is not the key's own verified
+// signature, whoever its issuer (a designated revoker's, which gpgv honours
+// when it holds that key, the cache cannot verify); the key's own revocation
+// of a user ID (0x30); or the key's own binding, direct-key signature or
+// self-certification made no earlier than the newest one the cache kept of
+// that class on the component (gpgv takes the newest; it may carry an
+// expiry), or whose time cannot be read. A revocation marks its component
+// as revoked (pgperrors.ErrKeyRevoked), a superseding signature as expired
+// (pgperrors.ErrKeyExpired): what S2 refuses a readable one with. A mark on
+// a subkey is the subkey's alone; one on the key or a user ID is the whole
+// key's (LoadKeyring extends it to the subkeys).
+//
+// AIDEV-NOTE: the controller's ruling R2 (Task 9b's fix round 4; the fourth
+// re-review's V-R4I1): integrity fails closed. go-crypto's packet reader
+// skips a signature it does not parse without a word (an UnsupportedError:
+// a RIPEMD-160 hash, since main), and the strict re-read dropped one it
+// fails on (a StructuralError: a malformed subpacket, since fix round 3), so
+// a key or subkey every gpgv-based apt treats as revoked or expired was
+// usable, S2 counting it (V's kr14 rows: K revoked by P, P revoked, a newer
+// expired binding of K, each hashed with RIPEMD-160 or with an empty
+// reason or a one-octet trust-signature subpacket; REVKEYSIG or EXPKEYSIG
+// in the five gpgv-based apt, which debian:13's sqv does not read either).
+// The component is marked rather than dropped, so that S1 still knows the
+// key and a bad signature by it beside a good one is refused (gpgv's
+// BADSIG); the mark is per component, as gpgv's verdict is (a key whose
+// old subkey carries an unreadable revocation still counts by its current
+// one). The cost: a real key with such an unreadable self-signature stops
+// counting; measured over debian-keyring, debian-maintainers and the 70
+// surveyed vendor files, no key or subkey is marked
+// (TestVerifier_UnreadableRevocationsAndBindingsAreNotCounted,
+// TestParseKeyring_MarksWhatItCannotRead). Not marked: a signature by
+// another key that gpgv ignores too (its certification of a user ID, a
+// binding it did not make) and a v3 signature (sigTypeOf passes it over, as
+// go-crypto does; gpg refuses v3 self-signatures on a v4 key).
+func (kb *keyBlock) marks() map[string]error {
+	var out map[string]error
+	mark := func(fp string, err error) {
+		if out == nil {
+			out = make(map[string]error)
+		}
+		if _, dup := out[fp]; !dup {
+			out[fp] = err
+		}
+	}
+	key := upperFP(kb.key.Fingerprint)
+	for _, c := range kb.components {
+		fp, what := key, "the key"
+		if c.kind == onSubkey {
+			fp, what = upperFP(c.key.Fingerprint), "the subkey"
+		}
+		newest := make(map[byte]time.Time)
+		for _, s := range c.sigs {
+			if cls := supersedes(s.typ); s.ok && cls != 0 && s.created.After(newest[cls]) {
+				newest[cls] = s.created
+			}
+		}
+		for _, s := range c.sigs {
+			if s.ok {
+				continue
+			}
+			cls := supersedes(s.typ)
+			switch t := packet.SignatureType(s.typ); {
+			case t == packet.SigTypeKeyRevocation, t == packet.SigTypeSubkeyRevocation:
+				mark(fp, fmt.Errorf("%w: a revocation of %s (signature type 0x%02x) stands on it that %s; gpgv honours it", pgperrors.ErrKeyRevoked, what, s.typ, s.why))
+			case t == packet.SigTypeCertificationRevocation && s.self:
+				mark(key, fmt.Errorf("%w: the key's revocation of its user ID %q (signature type 0x30) stands on it that %s; gpgv honours it", pgperrors.ErrKeyRevoked, c.uid, s.why))
+			case cls != 0 && s.self && (s.created.IsZero() || !s.created.Before(newest[cls])):
+				mark(fp, fmt.Errorf("%w: a signature of type 0x%02x by the key on %s, newer than the one the cache kept, stands on it that %s; gpgv takes the newest, and it may expire or unbind the component", pgperrors.ErrKeyExpired, s.typ, what, s.why))
+			}
+		}
+	}
+	return out
 }

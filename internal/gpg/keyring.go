@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -72,7 +73,18 @@ type Keyring struct {
 	// every key (primary + subkeys) in entities. Used by trust-set
 	// narrowing and by the IssuerFingerprint check in the verifier.
 	fingerprints map[string]struct{}
+
+	// uncountable holds the keys and subkeys, by uppercase fingerprint, that
+	// S2 must not count, each with why (keyFile.uncountable, the reader's
+	// marks under ruling R2: a revocation or a newer binding the cache
+	// cannot read, which gpgv honours), a mark on a primary key extended to
+	// its subkeys. S1 knows them as it knows every key (uncountableKey).
+	uncountable map[string]error
 }
+
+// uncountableKey says why S2 must not count the key or subkey whose
+// uppercase fingerprint is fp (uncountable), nil when it may.
+func (k *Keyring) uncountableKey(fp string) error { return k.uncountable[fp] }
 
 // Empty reports whether the keyring loaded zero entities.
 func (k *Keyring) Empty() bool { return len(k.entities) == 0 }
@@ -225,9 +237,17 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 	//     too would close it without reopening V-R2C2.
 	seen := make(map[string]int) // primary fingerprint -> its index in entries
 	var entries []KeyringEntry
+	uncountable := make(map[string]error)
 
-	addEntities := func(parsed openpgp.EntityList, source string) {
-		for _, e := range parsed {
+	addEntities := func(parsed *keyFile, source string) {
+		// A mark from any copy of a key holds, as a revocation in any
+		// copy counts (the merge below).
+		for fp, why := range parsed.uncountable {
+			if _, dup := uncountable[fp]; !dup {
+				uncountable[fp] = why
+			}
+		}
+		for _, e := range parsed.entities {
 			if e == nil || e.PrimaryKey == nil {
 				continue
 			}
@@ -303,18 +323,23 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 	}
 
 	// The fingerprints last: a merge adds subkeys to an entry already
-	// listed.
+	// listed. A mark on a primary key marks every subkey of the merged
+	// entity: a signature by a subkey of a revoked key is REVKEYSIG too.
 	fingerprints := make(map[string]struct{})
 	entities := make(openpgp.EntityList, 0, len(entries))
 	for i := range entries {
 		e := entries[i].Entity
 		fingerprints[entries[i].PrimaryFingerprint] = struct{}{}
+		primaryMark := uncountable[entries[i].PrimaryFingerprint]
 		subFPs := make([]string, 0, len(e.Subkeys))
 		for _, sub := range e.Subkeys {
 			if sub.PublicKey != nil {
 				subFP := upperFP(sub.PublicKey.Fingerprint)
 				fingerprints[subFP] = struct{}{}
 				subFPs = append(subFPs, subFP)
+				if _, marked := uncountable[subFP]; primaryMark != nil && !marked {
+					uncountable[subFP] = fmt.Errorf("its primary key %s: %w", entries[i].PrimaryFingerprint, primaryMark)
+				}
 			}
 		}
 		entries[i].SubkeyFingerprints = subFPs
@@ -325,6 +350,7 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 		entries:      entries,
 		entities:     entities,
 		fingerprints: fingerprints,
+		uncountable:  uncountable,
 	}, nil
 }
 

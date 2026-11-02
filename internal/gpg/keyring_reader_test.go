@@ -63,6 +63,16 @@ func (o vArmor) of(data []byte) []byte {
 	return []byte(text)
 }
 
+// parseKeys is the keys parseKeyringBytes reads from a key file: what the
+// reader's tests compare (its marks: keyfile_marks_test.go).
+func parseKeys(b []byte) (openpgp.EntityList, error) {
+	kf, err := parseKeyringBytes(b)
+	if err != nil {
+		return nil, err
+	}
+	return kf.entities, nil
+}
+
 // corpusKeys returns the apt-shape corpus' keys A, E and S (keys.gpg), each
 // binary, as the re-review cut them.
 func corpusKeys(t *testing.T) (a, e, s []byte) {
@@ -152,7 +162,7 @@ func TestParseKeyring_ReadsWhatAnyAptReads(t *testing.T) {
 		// base64 -d refuses it): a blank inside a base64 line.
 		{"a base64 line with a blank inside", blankInside, []string{fpA}},
 	} {
-		ents, err := parseKeyringBytes(tc.file)
+		ents, err := parseKeys(tc.file)
 		if err != nil {
 			t.Errorf("%s: %v; want %d keys read", tc.name, err, len(tc.want))
 			continue
@@ -207,7 +217,7 @@ func TestParseKeyring_ReadsASecretKeyExportsPublicPart(t *testing.T) {
 		"W's secret export, then G's public block": joined(secretArmored(t, w), armoredKey(t, g)),
 		"W's binary secret keyring":                binSecret.Bytes(),
 	} {
-		ents, err := parseKeyringBytes(file)
+		ents, err := parseKeys(file)
 		if err != nil {
 			t.Errorf("%s: %v; want W read", name, err)
 			continue
@@ -289,7 +299,7 @@ func TestParseKeyring_PacketsBesideAKeyDoNotDropIt(t *testing.T) {
 		"a packet of an unknown critical tag":                         frame(15, []byte("x")),
 	}
 	for keyName, key := range map[string][]byte{"A with its subkey": withSub, "A without a subkey": noSub} {
-		clean, err := parseKeyringBytes(key)
+		clean, err := parseKeys(key)
 		if err != nil || len(clean) != 1 {
 			t.Fatalf("test premise: %s alone: %d keys, %v", keyName, len(clean), err)
 		}
@@ -300,7 +310,7 @@ func TestParseKeyring_PacketsBesideAKeyDoNotDropIt(t *testing.T) {
 				"in a signature block before the key's block": joined(armorOf(t, "PGP SIGNATURE", j), armorOf(t, openpgp.PublicKeyType, key)),
 				"after the key's binary packets":              joined(key, j),
 			} {
-				ents, err := parseKeyringBytes(file)
+				ents, err := parseKeys(file)
 				switch {
 				case err != nil:
 					t.Errorf("%s, %s %s: %v; want A read", keyName, junkName, layout, err)
@@ -336,7 +346,7 @@ func TestParseKeyring_ReadsAsApt3WhereTheAwkFails(t *testing.T) {
 		"a clearsigned message before the key":                        joined(clearsigned, []byte("\n"), ka),
 		"a clearsigned message after the key":                         joined(ka, clearsigned),
 	} {
-		ents, err := parseKeyringBytes(file)
+		ents, err := parseKeys(file)
 		if err != nil || len(ents) != 1 || !fingerprintsOf(ents)[upperFP(a.PrimaryKey.Fingerprint)] {
 			t.Errorf("%s: %d keys, %v; want A read, as apt 3 reads it", name, len(ents), err)
 		}
