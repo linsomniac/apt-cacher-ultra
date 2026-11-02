@@ -224,14 +224,34 @@ func parseKeyringReaderMax(r io.Reader, maxFile int) (*keyFile, error) {
 //     whole file).
 //
 // What is left of the other direction (some apt reads a key the cache does
-// not): a key go-crypto does not read (an algorithm it lacks, a primary key
-// that cannot sign; no user ID with a self-signature it verifies; a key
-// revocation it cannot verify, a designated revoker's or a corrupt one, no
-// longer: the strict re-read drops it and marks the key for S2,
-// keyBlock.marks). A key beside
-// packets that are no part of it, which go-crypto alone drops, is read
-// (readKeyBlocks): of the real debian-keyring.pgp (2025.07.26) the loader
-// reads 937 keys where go-crypto's ReadKeyRing reads 933, of
+// not, so a bad signature by it beside a good one is adopted where that apt
+// refuses it; each needs a key go-crypto cannot use, which is why it is
+// Open: the fourth re-review's V-R4M2):
+//   - a key go-crypto does not read: an algorithm it lacks, a primary key
+//     that cannot sign, no user ID with a self-signature it verifies (a key
+//     revocation it cannot verify, a designated revoker's or a corrupt one,
+//     no longer drops the key: the strict re-read drops the signature and
+//     marks the key for S2, keyBlock.marks);
+//   - a subkey whose only binding go-crypto cannot verify (one hashed with
+//     RIPEMD-160, which its packet reader skips): the subkey is dropped
+//     (keyBlock.packets keeps a subkey only with a binding), where gpg uses
+//     it, as in two of the six Debian keys below; S1 does not know it, and
+//     S2 cannot count it (fail closed, as ruling R2 asks);
+//   - what apt-key's gpgv reads from a file whose awk reading the cache
+//     stops at junk and apt 3's reading lacks: nothing measured (apt-key
+//     reads no partial decode: base64 -d's failure ends it, dearmorAs).
+//
+// And the ruling R2 outcome (keyBlock.marks): a key or subkey on which stands
+// a revocation or a newer self-signature the cache cannot read is known to
+// S1 and never counted by S2, where gpgv may count it (an unreadable
+// revocation that does not verify for gpgv either, say): the cache refuses
+// an anchor some apt accepts, by that key alone. Measured over
+// debian-keyring, debian-maintainers and the 70 surveyed vendor files: no
+// key or subkey is marked.
+//
+// A key beside packets that are no part of it, which go-crypto alone drops,
+// is read (readKeyBlocks): of the real debian-keyring.pgp (2025.07.26) the
+// loader reads 937 keys where go-crypto's ReadKeyRing reads 933, of
 // debian-maintainers.pgp 249 where it reads 247 (it dropped each for a
 // subkey it cannot read, whose binding it then took for the previous
 // subkey's; for a subkey whose one binding uses RIPEMD-160; for a

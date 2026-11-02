@@ -627,10 +627,16 @@ var s2Hashes = map[byte]bool{8: true, 9: true, 10: true}
 // packet while the library's verifier accepts a different packet. Each
 // packet is verified as layer P framed it (p.raw), alone.
 //
+// A trusted packet whose signing key the keyring marks as not countable
+// (Keyring.uncountableKey: a revocation or a newer binding the cache cannot
+// read, which gpgv honours; ruling R2) is not verified: S1 has, and it does
+// not count.
+//
 // Error precedence when no packet is accepted:
 //   - If a trusted packet was discounted for a reason that outranks the
-//     rest (discount: apt erases it), return the first such reason: it
-//     names why an otherwise good signature did not count.
+//     rest (discount: apt erases it; the keyring's mark on its key), return
+//     the first such reason: it names why an otherwise good signature did
+//     not count.
 //   - If at least one packet's IssuerFingerprint was trusted but
 //     none verified (or none was countable), return the last
 //     underlying verification error.
