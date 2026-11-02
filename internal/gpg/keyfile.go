@@ -14,12 +14,51 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 )
 
-// keyFile is what the reader read of one key file: its keys, and S2's
-// marks on them (uncountable: the key or subkey fingerprints, uppercase, S2
-// must not count, each with why; the controller's ruling R2, keyBlock.marks).
+// keyFile is what the reader read of one key file: its keys, each once (a
+// key read twice, in two blocks or two readings, merged as the loader
+// merges copies: addEntity), and S2's marks on them (uncountable: the key
+// or subkey fingerprints, uppercase, S2 must not count, each with why; the
+// controller's ruling R2, keyBlock.marks). broken is the error at which
+// the file's packets stopped being whole (packetsOf), nil when they are to
+// the end: the key whose packets run into it, and whatever follows, gpgv
+// does not read, and nor did this reading (readKeyring); LoadKeyring warns.
 type keyFile struct {
 	entities    openpgp.EntityList
 	uncountable map[string]error
+	broken      error
+}
+
+// addEntity adds e to kf's keys, merged into the key of its primary
+// fingerprint when kf holds one (mergeEntity).
+func (kf *keyFile) addEntity(e *openpgp.Entity) {
+	for _, have := range kf.entities {
+		if bytes.Equal(have.PrimaryKey.Fingerprint, e.PrimaryKey.Fingerprint) {
+			mergeEntity(have, e)
+			return
+		}
+	}
+	kf.entities = append(kf.entities, e)
+}
+
+// addMarks adds marks to kf's, the first mark on a fingerprint kept.
+func (kf *keyFile) addMarks(marks map[string]error) {
+	for fp, why := range marks {
+		if kf.uncountable == nil {
+			kf.uncountable = make(map[string]error)
+		}
+		if _, dup := kf.uncountable[fp]; !dup {
+			kf.uncountable[fp] = why
+		}
+	}
+}
+
+// add folds another reading of the same file, o, into kf: its keys
+// (addEntity) and marks (addMarks); kf's broken stands.
+func (kf *keyFile) add(o *keyFile) {
+	for _, e := range o.entities {
+		kf.addEntity(e)
+	}
+	kf.addMarks(o.uncountable)
 }
 
 // parseKeyringFile reads one keyring file (readKeyFile, under
@@ -120,11 +159,11 @@ func parseKeyringReaderMax(r io.Reader, maxFile int) (*keyFile, error) {
 // parseKeyring reads the keys of one key file, b, as the supported apt read
 // them: every key any of them reads (the third re-review's V-R3C1). A file
 // is armored when its first octet is text (an OpenPGP packet's first octet
-// has its top bit set), and dearmorKeyring joins its blocks into one
-// keyring; any other file is a binary keyring. Either way the keyring must
-// be whole OpenPGP packets (packetsOf), and its keys are read key by key
-// (readKeyBlocks). An empty file holds no key and is no error, as apt reads
-// it.
+// has its top bit set), and dearmorKeyring reads its blocks as apt's two
+// text readers do; any other file is a binary keyring (readKeyring). Either
+// way the keyring is read as gpgv reads it, key by key, up to the first
+// octet that is no whole packet (the fourth re-review's V-R4C1). An empty
+// file holds no key and is no error, as apt reads it.
 //
 // AIDEV-NOTE: the controller's ruling (Task 9b's fix round 3): the keyring
 // is trusted operator input. The cache reads every key that any supported
@@ -143,17 +182,25 @@ func parseKeyringReaderMax(r io.Reader, maxFile int) (*keyFile, error) {
 // checksum line not of five characters or a "-x" body line (go-crypto's
 // decoder refused them, every gpgv-based apt reads them), a block without
 // its END line (apt-key reads it), key packets in a PRIVATE KEY or SIGNATURE
-// block (apt-key and sqv read them) — each a key S1 did not know. A file is
+// block (apt-key and sqv read them) — each a key S1 did not know. A key is
 // refused only where every apt fails it, each measured REJ in all six
-// images: a line after a block's checksum line (kr6_after_crc: the awk and
-// apt 3 fold it into the base64, and every apt then fails the keyring;
-// dearmorAs), bytes after a binary keyring's packets (kr_gpg_trailing_lf,
-// kr_gpg_trailing_junk) and binary packets followed by armor
-// (kr8_asc_bin_A_then_armor_A, kr8_asc_bin_E_then_armor_A,
-// kr8_gpg_bin_A_then_armor_A); with them a keyring whose packets are not
-// whole (what such bytes make of it) and a file holding no key at all.
-// LoadKeyring logs a refusal at WARN and skips the file. All 70 surveyed
-// vendor files load.
+// images: the key whose packets run into bytes that are no whole packet —
+// a line after its block's checksum line (kr6_after_crc: the awk and apt 3
+// fold it into the base64), bytes after a binary keyring's packets
+// (kr_gpg_trailing_lf, kr_gpg_trailing_junk), binary packets followed by
+// armor (kr8_asc_bin_A_then_armor_A, kr8_asc_bin_E_then_armor_A,
+// kr8_gpg_bin_A_then_armor_A) — and whatever follows it. Fix round 3 refused
+// the whole file for such bytes, which holds for a file of one key only:
+// gpgv reads a keyring keyblock by keyblock, each ended by the next key's
+// primary key packet, and loses only the keyblock the junk interrupts (the
+// fourth re-review's V-R4C1, its kr12 and kr13 rows: A, E, then junk reads
+// A in all five gpgv-based apt; E, A, then junk none; A's block then E's
+// with a line after its checksum reads A; E, S, then junk beside A in
+// trusted.gpg.d has E's bad signature BADSIG in all five, which the cache
+// adopted). So each reading keeps the keys before the junk (readKeyring), a
+// file is refused only when no reading yields a key (no key at all, or the
+// junk breaking the only one), and LoadKeyring logs a refusal, or a key
+// lost to junk, at WARN. All 70 surveyed vendor files load.
 //
 // AIDEV-NOTE: where the cache reads more than some apt, the gaps left
 // (each one a file a client that cannot read fails with or without the
@@ -181,9 +228,7 @@ func parseKeyringReaderMax(r io.Reader, maxFile int) (*keyFile, error) {
 // that cannot sign; no user ID with a self-signature it verifies; a key
 // revocation it cannot verify, a designated revoker's or a corrupt one, no
 // longer: the strict re-read drops it and marks the key for S2,
-// keyBlock.marks), and a file both
-// of apt's text readings fail but whose blocks before the failure apt-key's
-// base64 -d decoded (it stops at the first bad character). A key beside
+// keyBlock.marks). A key beside
 // packets that are no part of it, which go-crypto alone drops, is read
 // (readKeyBlocks): of the real debian-keyring.pgp (2025.07.26) the loader
 // reads 937 keys where go-crypto's ReadKeyRing reads 933, of
@@ -195,23 +240,47 @@ func parseKeyring(b []byte) (*keyFile, error) {
 	if len(b) == 0 {
 		return &keyFile{}, nil
 	}
-	kind, data := "binary", b
 	if b[0]&0x80 == 0 {
-		kind = "armored"
-		var err error
-		if data, err = dearmorKeyring(b); err != nil {
-			return nil, fmt.Errorf("armored: %w", err)
-		}
+		return dearmorKeyring(b)
 	}
-	pkts, err := packetsOf(data)
+	kf, err := readKeyring(b)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", kind, err)
+		return nil, fmt.Errorf("binary: %w", err)
+	}
+	return kf, nil
+}
+
+// readKeyring reads the keys of one joined keyring, data, as gpgv reads it:
+// keyblock by keyblock (readKeyBlocks), up to the first octet that is no
+// whole packet (packetsOf's error). The key whose packets run into it, the
+// last to open before it, and whatever follows, gpgv does not read, and nor
+// does the cache (keyFile.broken, which LoadKeyring warns of). A keyring of
+// which no key is read is refused, naming the junk when there is some.
+func readKeyring(data []byte) (*keyFile, error) {
+	pkts, broken := packetsOf(data)
+	if broken != nil {
+		pkts = pkts[:lastKeyStart(pkts)]
 	}
 	kf, err := readKeyBlocks(pkts)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", kind, err)
+		if broken != nil {
+			return nil, fmt.Errorf("no key whose packets end before %w", broken)
+		}
+		return nil, err
 	}
+	kf.broken = broken
 	return kf, nil
+}
+
+// lastKeyStart is the index in pkts of the last primary key packet, public
+// or secret, where a key opens (keyBlocksOf); 0 when there is none.
+func lastKeyStart(pkts []rawPacket) int {
+	for i := len(pkts) - 1; i >= 0; i-- {
+		if pkts[i].tag == tagPublicKey || pkts[i].tag == tagSecretKey {
+			return i
+		}
+	}
+	return 0
 }
 
 // The armor lines an armored key file's blocks open and close at (a line,
@@ -223,22 +292,48 @@ var (
 	keyBlockBegin  = []byte("-----BEGIN PGP PUBLIC KEY BLOCK-----")
 )
 
-// dearmorKeyring joins the blocks of an armored key file into one keyring,
-// as apt-key's awk reads them (dearmorAs: every block, of any type), and
-// where that reading fails, as apt 3's dearmorKeyOrCheckFormat reads them
-// (public key blocks only): a block apt 3 skips (a clearsigned message's
-// text, a block whose base64 is no packets) cannot cost the file the keys
-// apt 3 reads. Where both readings fail, so does the file, with the first's
-// reason.
-func dearmorKeyring(b []byte) ([]byte, error) {
-	data, err := dearmorAs(b, false)
-	if err == nil {
-		return data, nil
+// dearmorKeyring reads the keys of an armored key file as apt-key's awk
+// reads its blocks (dearmorAs: every block, of any type, joined into one
+// keyring, read as gpgv reads it: readKeyring) and, where that reading fails
+// or loses a key to junk (keyFile.broken), also as apt 3's
+// dearmorKeyOrCheckFormat reads them (public key blocks only): the union of
+// the two readings, each key once (keyFile.add). A block of another type
+// that apt 3 skips (a clearsigned message's text, a SIGNATURE block of
+// junk, or with a line after its checksum line) so cannot cost the file the
+// keys apt 3 reads after it, nor the keys apt-key's gpgv reads before it
+// from such blocks (the fourth re-review's V-R4C1: fix round 3 took apt 3's
+// reading only when the awk's failed whole); where base64 -d refuses the
+// awk's input and apt-key reads nothing, apt 3's reading alone stands. When
+// the awk reading is whole, apt 3 reads no key it does not: apt 3's blocks
+// are among the awk's, each whole. Where both readings fail, so does the
+// file, with the awk's reason.
+func dearmorKeyring(b []byte) (*keyFile, error) {
+	var out *keyFile
+	var firstErr error
+	for _, apt3 := range []bool{false, true} {
+		if apt3 && out != nil && out.broken == nil {
+			break
+		}
+		data, err := dearmorAs(b, apt3)
+		if err == nil {
+			var kf *keyFile
+			if kf, err = readKeyring(data); err == nil {
+				if out == nil {
+					out = kf
+				} else {
+					out.add(kf)
+				}
+				continue
+			}
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
 	}
-	if data, err3 := dearmorAs(b, true); err3 == nil {
-		return data, nil
+	if out == nil {
+		return nil, fmt.Errorf("armored: %w", firstErr)
 	}
-	return nil, err
+	return out, nil
 }
 
 // dearmorAs reads the blocks of an armored key file as one of apt's text
@@ -255,10 +350,22 @@ func dearmorKeyring(b []byte) ([]byte, error) {
 // block. A block without its END line runs on into what follows, as the awk
 // reads it; apt 3 ignores such a file (its state at the end must be after
 // an END line). Every block's base64 is joined and decoded quantum by
-// quantum (base64Quanta), and must be whole packets. A line after a block's
-// checksum line is refused: both readers fold it into the base64, and every
-// apt then fails the keyring (measured REJ in all six images:
-// kr6_after_crc).
+// quantum (base64Quanta). A line after a block's checksum line is folded
+// into the base64, as both readers fold it (kr6_after_crc): it decodes to
+// octets that are no packet, where the keyring ends for gpgv and for the
+// cache (readKeyring), the key they follow lost (measured REJ in all six
+// images for a file of that key alone; the keys before it read in the five
+// gpgv-based apt: the fourth re-review's kr12 rows). The awk's base64 goes
+// to GNU base64 -d, which refuses a line holding any octet outside its
+// alphabet (a blank, a CR, a "!") and, on the supported images, a final
+// quantum short of four characters (a file cut inside a base64 line), and
+// apt-key, under `set -e`, then reads no key from the file at all (the
+// fourth re-review's section 4, its kr12_fb rows: not even the keys before
+// it): that reading fails here too, where apt 3's decoder passes over the
+// octet or the quantum (measured in the six images, Task 9b's fix round 4:
+// kr15_asc_A_blank and kr15_asc_AE_sigjunk_S, apt-key none and apt 3.2 every
+// key; kr15_asc_A_Ecut_q2 against q0, two characters apart, apt-key aborting
+// where it ran gpgv).
 func dearmorAs(b []byte, apt3 bool) ([]byte, error) {
 	const (
 		outside = iota // no block open (apt 3: before the first)
@@ -267,13 +374,14 @@ func dearmorAs(b []byte, apt3 bool) ([]byte, error) {
 		closed         // apt 3: after an END line
 	)
 	var b64 []byte
-	state, blocks, crc := outside, 0, false
+	state, blocks := outside, 0
 	for off, n := 0, 1; off < len(b); n++ {
 		next := len(b)
 		if i := bytes.IndexByte(b[off:], '\n'); i >= 0 {
 			next = off + i + 1
 		}
-		l := bytes.Trim(b[off:next], " \t\n\v\f\r") // apt's String::Strip: isspace
+		raw := bytes.TrimSuffix(b[off:next], []byte("\n")) // the line as base64 -d reads it
+		l := bytes.Trim(raw, " \t\v\f\r")                  // apt's String::Strip: isspace
 		off = next
 		begin := bytes.HasPrefix(l, armorBeginLine)
 		if apt3 {
@@ -281,17 +389,19 @@ func dearmorAs(b []byte, apt3 bool) ([]byte, error) {
 		}
 		switch {
 		case begin:
-			state, crc = header, false
+			state = header
 			blocks++
 		case state == header && len(l) == 0:
 			state = body
 		case state == body && len(l) > 0 && l[0] != '=' && l[0] != '-':
-			if crc {
-				return nil, fmt.Errorf("line %d: a line after a block's checksum line", n)
+			if !apt3 {
+				for _, c := range raw {
+					if base64Rank[c] == 0xff {
+						return nil, fmt.Errorf("line %d: an octet (0x%02x) base64 -d refuses, after which apt-key reads no key from the file", n, c)
+					}
+				}
 			}
 			b64 = append(b64, l...)
-		case state == body && len(l) > 0 && l[0] == '=':
-			crc = true
 		case bytes.HasPrefix(l, armorEndLine):
 			state = outside
 			if apt3 {
@@ -306,12 +416,10 @@ func dearmorAs(b []byte, apt3 bool) ([]byte, error) {
 		return nil, errors.New("no armor block")
 	case apt3 && state != closed:
 		return nil, errors.New("a public key block without its END line")
+	case !apt3 && len(b64)%4 != 0:
+		return nil, errors.New("a partial final base64 quantum, which base64 -d refuses, after which apt-key reads no key from the file")
 	}
-	data := base64Quanta(b64)
-	if _, err := packetsOf(data); err != nil {
-		return nil, fmt.Errorf("its blocks' packets: %w", err)
-	}
-	return data, nil
+	return base64Quanta(b64), nil
 }
 
 // base64Rank is apt's Base64Decode alphabet (3.2.0
@@ -379,17 +487,19 @@ type rawPacket struct {
 	raw, body []byte
 }
 
-// packetsOf splits b into its OpenPGP packets, which must be whole and of
-// definite lengths (RFC 9580 §4.2: old-format one-, two- or four-octet
-// lengths, new-format one-, two- or five-octet ones), any tag: a keyring as
-// gpgv reads it to its end. The framing is layer P1's (sigpacket.go,
-// sigPacketHeader), for every tag.
+// packetsOf splits b into its OpenPGP packets, whole and of definite lengths
+// (RFC 9580 §4.2: old-format one-, two- or four-octet lengths, new-format
+// one-, two- or five-octet ones), any tag: a keyring as gpgv reads it. At
+// the first octet that starts no whole packet it returns the packets before
+// it with the error naming it (readKeyring reads the keys among them, as
+// gpgv does). The framing is layer P1's (sigpacket.go, sigPacketHeader), for
+// every tag.
 func packetsOf(b []byte) ([]rawPacket, error) {
 	var out []rawPacket
 	for off := 0; off < len(b); {
 		h := b[off]
 		if h&0x80 == 0 {
-			return nil, fmt.Errorf("offset %d: an octet (0x%02x) that starts no OpenPGP packet", off, h)
+			return out, fmt.Errorf("offset %d: an octet (0x%02x) that starts no OpenPGP packet", off, h)
 		}
 		var tag byte
 		var hl int
@@ -397,32 +507,32 @@ func packetsOf(b []byte) ([]rawPacket, error) {
 		if h&0x40 != 0 {
 			tag = h & 0x3f
 			if len(b)-off < 2 {
-				return nil, fmt.Errorf("offset %d: a truncated packet header", off)
+				return out, fmt.Errorf("offset %d: a truncated packet header", off)
 			}
 			switch l0 := b[off+1]; {
 			case l0 < 192:
 				hl, n = 2, uint64(l0)
 			case l0 < 224:
 				if len(b)-off < 3 {
-					return nil, fmt.Errorf("offset %d: a truncated packet header", off)
+					return out, fmt.Errorf("offset %d: a truncated packet header", off)
 				}
 				hl, n = 3, (uint64(l0)-192)<<8+uint64(b[off+2])+192
 			case l0 == 255:
 				if len(b)-off < 6 {
-					return nil, fmt.Errorf("offset %d: a truncated packet header", off)
+					return out, fmt.Errorf("offset %d: a truncated packet header", off)
 				}
 				hl, n = 6, uint64(binary.BigEndian.Uint32(b[off+2:off+6]))
 			default:
-				return nil, fmt.Errorf("offset %d: a partial packet length", off)
+				return out, fmt.Errorf("offset %d: a partial packet length", off)
 			}
 		} else {
 			tag = (h >> 2) & 0x0f
 			octets := [4]int{1, 2, 4, 0}[h&0x03]
 			switch {
 			case octets == 0:
-				return nil, fmt.Errorf("offset %d: an indeterminate packet length", off)
+				return out, fmt.Errorf("offset %d: an indeterminate packet length", off)
 			case len(b)-off < 1+octets:
-				return nil, fmt.Errorf("offset %d: a truncated packet header", off)
+				return out, fmt.Errorf("offset %d: a truncated packet header", off)
 			}
 			for _, c := range b[off+1 : off+1+octets] {
 				n = n<<8 | uint64(c)
@@ -430,7 +540,7 @@ func packetsOf(b []byte) ([]rawPacket, error) {
 			hl = 1 + octets
 		}
 		if n > uint64(len(b)-off-hl) {
-			return nil, fmt.Errorf("offset %d: a packet running past the end", off)
+			return out, fmt.Errorf("offset %d: a packet running past the end", off)
 		}
 		end := off + hl + int(n)
 		out = append(out, rawPacket{tag: tag, raw: b[off:end], body: b[off+hl : end]})
@@ -529,15 +639,8 @@ func readKeyBlocks(pkts []rawPacket) (*keyFile, error) {
 			lastErr = err
 			continue
 		}
-		out.entities = append(out.entities, e)
-		for fp, why := range kb.marks() {
-			if out.uncountable == nil {
-				out.uncountable = make(map[string]error)
-			}
-			if _, dup := out.uncountable[fp]; !dup {
-				out.uncountable[fp] = why
-			}
-		}
+		out.addEntity(e)
+		out.addMarks(kb.marks())
 	}
 	if len(out.entities) == 0 {
 		if lastErr != nil {

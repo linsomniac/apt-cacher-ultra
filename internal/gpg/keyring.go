@@ -306,6 +306,12 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 				)
 				continue
 			}
+			if parsed.broken != nil {
+				logger.Warn("keyring: the file's packets are not whole to its end; the key they run into, and what follows, is skipped, as gpgv skips it",
+					"path", path,
+					"err", parsed.broken,
+				)
+			}
 			addEntities(parsed, path)
 		}
 	}
@@ -318,6 +324,12 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 				"err", err,
 			)
 			continue
+		}
+		if parsed.broken != nil {
+			logger.Warn("keyring: the embedded source's packets are not whole to its end; the key they run into, and what follows, is skipped, as gpgv skips it",
+				"name", es.Name,
+				"err", parsed.broken,
+			)
 		}
 		addEntities(parsed, "embedded:"+es.Name)
 	}
