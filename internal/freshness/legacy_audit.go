@@ -486,21 +486,62 @@ func inReleasePlaintext(blob []byte) (text []byte, err error) {
 			text, err = nil, fmt.Errorf("legacy audit: clearsign decode panicked: %v", r)
 		}
 	}()
-	block, _ := clearsign.Decode(aptpath.DecodableClearsign(blob))
+	decodable := aptpath.DecodableClearsign(blob)
+	block, _ := clearsign.Decode(decodable)
 	if block == nil {
 		return nil, errors.New("legacy audit: stored InRelease is not a valid clearsigned message")
 	}
-	// AIDEV-NOTE: go-crypto v1.4.1's Decode panicked on a message without
-	// signed text (I-1), which the recover above made this error; v1.5.0
-	// returns an empty plaintext instead. The audit keeps its verdict
-	// (malformed_envelope) whatever the version. (A signed text of one
-	// empty line, which v1.4.1 decoded to "" and the audit called
-	// unparseable, is malformed_envelope now too: both quarantine, and no
-	// verifier ever adopted either.)
-	if len(block.Plaintext) == 0 {
+	// AIDEV-NOTE: go-crypto v1.4.1's Decode panicked on a message without a
+	// line of signed text (I-1), which the recover above made this error
+	// (malformed_envelope, LegacyAuditQuarantine); it decoded a text of one
+	// empty or blank line to "", which ParseRelease refuses (unparseable,
+	// LegacyAuditQuarantineSigned, which marks the suite signed-seen).
+	// v1.5.0 decodes both to an empty plaintext. The audit keeps v1.4.1's
+	// verdicts, so the bump changes no outcome (the third re-review's
+	// V-R3M3): no line of text is this error, one empty line is "".
+	if len(block.Plaintext) == 0 && !hasSignedTextLine(decodable) {
 		return nil, errors.New("legacy audit: stored InRelease has no signed text")
 	}
 	return block.Plaintext, nil
+}
+
+// hasSignedTextLine reports whether the clearsigned message in b, which
+// go-crypto's clearsign.Decode read, has a line of signed text: whether the
+// line after its header block is other than its signature's BEGIN line.
+// The lines are go-crypto's (clearsignLine), its message found where
+// Decode finds it: at the start of b, or after a LF.
+func hasSignedTextLine(b []byte) bool {
+	const marker = "-----BEGIN PGP SIGNED MESSAGE-----"
+	i := 0
+	if !bytes.HasPrefix(b, []byte(marker)) {
+		if i = bytes.Index(b, []byte("\n"+marker)); i < 0 {
+			return false
+		}
+		i++
+	}
+	_, rest := clearsignLine(b[i:]) // the marker's line
+	for len(rest) > 0 {
+		var line []byte
+		if line, rest = clearsignLine(rest); len(bytes.TrimSpace(line)) == 0 {
+			break // the header block's end
+		}
+	}
+	line, _ := clearsignLine(rest)
+	return !bytes.Equal(line, []byte("-----BEGIN PGP SIGNATURE-----"))
+}
+
+// clearsignLine is go-crypto's clearsign getLine: b's line before its first
+// LF, a CR before the LF dropped, and the rest after it.
+func clearsignLine(b []byte) (line, rest []byte) {
+	i := bytes.IndexByte(b, '\n')
+	if i < 0 {
+		return b, nil
+	}
+	j := i + 1
+	if i > 0 && b[i-1] == '\r' {
+		i--
+	}
+	return b[:i], b[j:]
 }
 
 // clearsignCanonical returns b with every line canonicalised exactly as

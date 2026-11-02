@@ -470,6 +470,24 @@ type keyComponent struct {
 // those that verify, a subkey kept only with a binding that does
 // (keyBlock.packets); a key go-crypto refuses both ways is skipped. A
 // keyring of which no key is read is refused.
+//
+// AIDEV-NOTE: go-crypto's ReadEntity under this reader (v1.5.2). Three of
+// v1.5.0's changes beneath ReadKeyRing (the third re-review's V-R3M3)
+// change no real key measured (go-crypto's ReadKeyRing reads the same 933
+// keys and 2244 subkeys of debian-keyring.gpg under v1.4.1 and v1.5.2; the
+// 98 surveyed vendor keys alike):
+//   - a self-signature is recognised by CheckKeyIdOrFingerprint, which now
+//     requires an issuer fingerprint subpacket's (33) version to be the
+//     key's (signature.go:752, keys.go:616): a user ID left without one is
+//     no identity, and a key left with no identity is dropped;
+//   - an ECDH key whose KDF hash is shorter than its KEK is a parse error,
+//     for which go-crypto's ReadKeyRing dropped the whole key, signing
+//     subkeys and all; keyBlocksOf drops that subkey alone;
+//   - post-quantum (ML-KEM-768+X25519) v4 subkeys parse, which v1.4.1
+//     skipped.
+//
+// Re-check these, and sigFits' types and positions (go-crypto's addUserID
+// and addSubkey), when go-crypto is upgraded.
 func readKeyBlocks(pkts []rawPacket) (openpgp.EntityList, error) {
 	var out openpgp.EntityList
 	var lastErr error

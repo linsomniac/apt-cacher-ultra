@@ -77,6 +77,14 @@ func TestClassifyLegacyInline(t *testing.T) {
 		{"plain text (old require_signature=false)", []byte(genuine), cache.LegacyAuditQuarantine, "legacy_plaintext"},
 		{"marker but no END line", append([]byte{}, signed[:end]...), cache.LegacyAuditQuarantine, "malformed_envelope"},
 		{"zero plaintext (I-1)", []byte("-----BEGIN PGP SIGNED MESSAGE-----\n\n-----BEGIN PGP SIGNATURE-----\n\nwsBc\n-----END PGP SIGNATURE-----\n"), cache.LegacyAuditQuarantine, "malformed_envelope"},
+		{"zero plaintext, CRLF", crlf([]byte("-----BEGIN PGP SIGNED MESSAGE-----\n\n-----BEGIN PGP SIGNATURE-----\n\nwsBc\n-----END PGP SIGNATURE-----\n")), cache.LegacyAuditQuarantine, "malformed_envelope"},
+		{"zero plaintext, after leading whitespace", []byte("\n \n-----BEGIN PGP SIGNED MESSAGE-----\n\n-----BEGIN PGP SIGNATURE-----\n\nwsBc\n-----END PGP SIGNATURE-----\n"), cache.LegacyAuditQuarantine, "malformed_envelope"},
+		// The third re-review's V-R3M3: go-crypto v1.4.1 decoded a signed text
+		// of one empty (or blank) line to "", which the audit called
+		// unparseable and kept as signed-seen; v1.5.0 decodes it as it decodes
+		// no line at all. The audit keeps v1.4.1's verdicts.
+		{"one empty line of plaintext", []byte("-----BEGIN PGP SIGNED MESSAGE-----\n\n\n-----BEGIN PGP SIGNATURE-----\n\nwsBc\n-----END PGP SIGNATURE-----\n"), cache.LegacyAuditQuarantineSigned, "unparseable"},
+		{"one blank line of plaintext, after a Hash header", []byte("-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n \t\n-----BEGIN PGP SIGNATURE-----\n\nwsBc\n-----END PGP SIGNATURE-----\n"), cache.LegacyAuditQuarantineSigned, "unparseable"},
 		{"R-1: new member in the armor", inject("=AAAA\nSHA256:\n " + strings.Repeat("e", 64) + " 10 main/binary-evilarch/Packages\n"), cache.LegacyAuditQuarantineSigned, "unsigned_declarations"},
 		{"R-1: same path, other hash", inject("=AAAA\nSHA256:\n " + strings.Repeat("f", 64) + " 12340 main/binary-amd64/Packages\n"), cache.LegacyAuditQuarantineSigned, "unsigned_declarations"},
 		{"R-1: same path and hash, other size", inject("=AAAA\nSHA256:\n " + strings.Repeat("0", 64) + " 99 main/binary-amd64/Packages\n"), cache.LegacyAuditQuarantineSigned, "unsigned_declarations"},
