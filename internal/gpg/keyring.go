@@ -204,11 +204,25 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 	// it is given) — kept apart, a copy without it read first would still
 	// verify. A subkey's binding and an identity's self-signature are the
 	// newest of the copies' (go-crypto's rule within one copy, gpg's after
-	// a merge). The residual gap: gpgv reads only the first keyblock that
-	// holds the key ID, so where an older copy read first has an expired
-	// binding and a later copy renews it, gpgv refuses what the cache
-	// accepts (sqv agrees with the cache); a client that cannot use the key
-	// fails with or without the cache, as with V-R2M3's gaps.
+	// a merge). Two residual gaps, both measured (the third re-review's
+	// kr10: P a primary key that expired and was renewed, K its signing
+	// subkey):
+	//   - gpgv reads only the first keyblock that holds the key ID, so where
+	//     an older copy read first has P expired and a later one renews it,
+	//     gpgv refuses an anchor by K that the cache accepts (sqv agrees
+	//     with the cache: kr10_renew_old_first); a client that cannot use the
+	//     key fails with or without the cache, as with V-R2M3's gaps.
+	//   - the third re-review's V-R3M1, open (Task 9c records it): from a
+	//     copy holding K with P expired and a renewed copy without K, the
+	//     merged key verifies an anchor by K (K's binding from the one, P's
+	//     renewal from the other), which all six apt refuse (sqv: K "is not
+	//     bound") and each copy alone refuses too (kr10_mixed_*, either
+	//     order). sqv does not agree with the cache here. It is no
+	//     attacker's lever: it needs the vendor's own signature by K, and
+	//     every client of that keyring refuses every anchor by K, so the
+	//     cache's adopting one changes nothing a client accepts. Counting a
+	//     packet only when some single copy holding its issuer verifies it
+	//     too would close it without reopening V-R2C2.
 	seen := make(map[string]int) // primary fingerprint -> its index in entries
 	var entries []KeyringEntry
 
