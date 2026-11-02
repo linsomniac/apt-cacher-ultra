@@ -337,6 +337,19 @@ apt-cacher-ultra packages copy -config /etc/apt-cacher-ultra/config.toml \
     nginx_1.18.0-1_amd64.deb /tmp/
 ```
 
+## Health checks and load balancing
+
+Use `GET /healthz` directly on the proxy port (default `3142`) for HAProxy or
+other load balancers. It returns `200` only when startup has completed, the
+configured listeners are serving, and local readiness checks pass. It returns
+`503` during shutdown or when a check fails. The endpoint also works with
+`admin.enabled = false`; the existing admin `/healthz` keeps its authentication.
+
+Application ports stay closed during startup preparation, including migrations,
+startup GC and certificate setup. ACME HTTP-01 uses its separate challenge port
+during issuance. See [readiness and HAProxy setup](docs/configuration.md#readiness-and-load-balancers)
+for probe semantics, startup tradeoffs, and an example configuration.
+
 ## Recovering a degraded repository
 
 If a suite was adopted while a required index was briefly unavailable upstream,

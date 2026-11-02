@@ -11,6 +11,12 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Added
 
+- Proxy-port `GET`/`HEAD /healthz` for load balancers, also available with
+  admin disabled. Both proxy and admin health checks now require completed
+  startup, serving listeners and usable proxy TLS/MITM certificates, alongside
+  the existing local cache and database checks. Suggested by Andy Smith;
+  see [readiness and HAProxy setup](docs/configuration.md#readiness-and-load-balancers).
+
 - Optional admin HTTPS and a shared server-certificate lifecycle for the cache
   and admin listeners, including automatic reload of PEM certificates.
 - Automatic ACME issuance and renewal with HTTP-01 or DNS-01, using Lego's full
@@ -42,6 +48,12 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   in CI) and `make e2e-live` (a manual smoke against live vendors).
 
 ### Changed
+
+- HTTP, HTTPS and admin ports bind after startup preparation, including
+  certificate setup, database migration, the trust audit and startup GC.
+  A lifetime cache-directory lock prevents concurrent daemon maintenance;
+  bind failures now surface after preparation. ACME HTTP-01 still opens its
+  dedicated challenge port early. Suggested by Andy Smith.
 
 - The systemd service allows six minutes for shutdown and signals the daemon
   before its DNS worker, allowing bounded record cleanup after listeners stop.

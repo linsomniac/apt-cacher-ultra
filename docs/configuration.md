@@ -752,9 +752,9 @@ it again every 5 seconds.
 
 On its first start after an upgrade, the daemon audits every metadata snapshot
 adopted by earlier versions before it serves anything (a large cache can take
-a little while; progress is logged per 100 snapshots, and because the
-listeners are already open, connections made meanwhile wait — apt clients may
-time out once). A snapshot whose stored `InRelease` is not a signed, clean
+a little while; progress is logged per 100 snapshots). Application ports remain
+closed during this work; clients connecting directly may see connection refusal
+until startup finishes. A snapshot whose stored `InRelease` is not a signed, clean
 clearsigned message — a plain-text file adopted with `require_signature =
 false`, or one carrying declarations outside its signature — or whose pool
 file is missing or corrupt, is quarantined: it stops serving and vouching,
@@ -1151,6 +1151,107 @@ renewal status appear in admin HTML/JSON and metrics.
 See [server HTTPS and ACME](server-tls.md) for Certbot migration, staging,
 forwarding, DNS-provider credentials and delegation, systemd privileges, authenticated HTTPS healthchecks, Docker,
 backup and recovery. These certificates do not replace the MITM CA.
+
+## Readiness and load balancers
+
+`GET /healthz` and `HEAD /healthz` on either proxy listener report whether this
+instance is ready for client requests. These probes work even with the admin
+listener disabled. Request the path directly on the backend, for example:
+
+```sh
+curl --fail --max-time 3 http://127.0.0.1:3142/healthz
+```
+
+A successful check returns **200** with `ok\n`; a failed check returns **503**
+with `degraded\n` and `X-Acu-Check-Failed` naming a stable failure category.
+HEAD has no response body. Responses carry `Cache-Control: no-store`.
+
+| Failure category | Meaning |
+| --- | --- |
+| `startup` | At least one configured application listener has not entered its HTTP accept loop yet. |
+| `shutdown` | Shutdown was requested or a listener stopped; this process will not become ready again. |
+| `proxy_tls` | The configured HTTPS proxy certificate is unavailable, expired, or not yet valid. |
+| `mitm_ca` | The configured HTTPS interception CA is outside its validity period. |
+| `cache_dir` | Creating, writing, closing, or removing a probe file in the cache root failed. |
+| `db_ping` | The SQLite connection check failed or exceeded its one-second deadline. |
+
+Both proxy and admin probes require all configured application listeners to
+have started. The admin `/healthz` uses the same checks and still requires
+Basic authentication when `admin.htpasswd_file` is configured. Authentication
+has no exemption on the admin port. Proxy `/healthz` intentionally needs no
+credentials and exposes only the status and category above. It provides no
+access to admin status, metrics, configuration or maintenance operations.
+Only origin-form `/healthz` is reserved on the proxy: an absolute-form request
+such as `GET http://repository.example/healthz` still follows normal upstream
+routing and access policy. Other methods on the local probe return 405.
+
+Readiness measures local service availability. It does not fetch from upstream
+mirrors, validate every cached object, or guarantee a particular client trusts
+the configured certificates. Failed renewal/reload with a still-valid retained
+certificate remains ready. Upstream outages do not remove a cache that can
+still serve cached packages. A client timeout is necessary to detect a stuck
+process or filesystem; no in-process check can respond while the process is
+unable to run. A probe describes the instance at the time it runs, so configure
+load-balancer polling and failure thresholds for the failover delay you need.
+
+For an HTTP proxy backend, a TCP-mode HAProxy frontend preserves both ordinary
+proxy requests and CONNECT tunnels while HTTP checks verify readiness:
+
+```haproxy
+frontend apt_proxy
+    bind :3142
+    mode tcp
+    timeout client 5m
+    default_backend apt_caches
+
+backend apt_caches
+    mode tcp
+    timeout connect 5s
+    timeout server 5m
+    option httpchk GET /healthz
+    http-check expect status 200
+    server cache1 10.0.0.11:3142 check inter 2s fall 2 rise 2
+    server cache2 10.0.0.12:3142 check inter 2s fall 2 rise 2
+```
+
+Replace the addresses with your cache hosts. Requiring exactly 200 prevents a
+redirect or authentication failure being treated as ready. The HTTP check
+syntax is documented in [HAProxy's health-check guide](https://www.haproxy.com/documentation/haproxy-configuration-tutorials/reliability/health-checks/).
+For HTTPS backends, also configure backend TLS, certificate verification and
+SNI for the backend name; check the same encrypted service used by clients.
+
+### Startup binding and privileges
+
+Application ports now bind only after startup preparation: admin credential
+loading, MITM CA setup, server certificate loading or ACME issuance, cache open
+and schema migration, the legacy trust audit, startup GC, and construction of
+the proxy and admin handlers. Background maintenance starts afterwards. Once
+the sockets open there can be a brief 503 while the HTTP servers enter their
+accept loops, including the admin server's initial metrics refresh. HTTP checks
+cover this transition; a TCP-only check cannot detect runtime degradation.
+
+This is the default behavior and needs no new configuration. The daemon has no
+bind-then-drop-privileges step or socket activation path. The packaged systemd
+unit starts as `apt-cacher-ultra`, and Docker starts as UID/GID 10001. Delaying
+bind therefore requires no extra privilege or retained root process. Custom
+privileged ports need the same service capability or forwarding arrangement
+as before. The dedicated ACME HTTP-01 challenge listener is the exception: it
+must open during startup to obtain a certificate, and is not a readiness probe.
+DNS-01 needs no challenge listener.
+
+The tradeoff is that occupied ports or insufficient bind permissions are
+reported **after** preparation, which can include schema migration or ACME
+issuance. Ports cannot be reserved with `net.Listen` without appearing open
+to TCP probes. If one application bind fails, earlier binds are closed before
+cleanup. Cancellation during preparation prevents application binding.
+
+A daemon holds an exclusive advisory lock on `cache.dir/daemon.lock` for its
+entire lifetime, including startup and shutdown cleanup. This prevents two
+updated daemons from maintaining the same cache even when their ports differ;
+the lock is released automatically on exit or crash. Leave the file in place
+and do not delete it to bypass a running daemon. Older versions do not honor
+this lock: stop the old daemon before starting this version on its cache.
+The command-line package listing/copy tools remain available.
 
 ## `[admin]`: status, metrics, and maintenance
 

@@ -484,9 +484,8 @@ type AdminConfig struct {
 	TLSKey  string `toml:"tls_key"`
 	UseACME bool   `toml:"use_acme"`
 	// Enabled is the master switch. When false, the admin listener
-	// is not bound; /metrics, /, and /healthz are unreachable. The
-	// cache continues to serve proxy traffic normally — the
-	// operator has implicitly opted out of all observability. A
+	// is not bound; admin endpoints are unreachable. The cache
+	// continues to serve proxy traffic and the proxy /healthz probe. A
 	// startup admin_disabled Warn fires when false (parallel to
 	// gc_disabled SPEC4 §10.2). Default true.
 	Enabled bool `toml:"enabled"`
