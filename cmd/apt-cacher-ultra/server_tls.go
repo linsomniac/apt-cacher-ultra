@@ -38,8 +38,8 @@ type serverTLS struct {
 	closeOnce sync.Once
 }
 
-// prepareServerTLS runs after all application sockets have been reserved, but
-// before any application handler or refresh worker starts. The optional
+// prepareServerTLS runs before application sockets bind or refresh workers
+// start. Only the dedicated ACME HTTP-01 challenge socket may open here. The optional
 // transport is a test seam; production always passes nil (system trust).
 func prepareServerTLS(ctx context.Context, cfg *config.Config, logger *slog.Logger, transport http.RoundTripper) (*serverTLS, error) {
 	if err := cfg.ValidateServerTLS(); err != nil {

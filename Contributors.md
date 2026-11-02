@@ -1,6 +1,8 @@
 The apt-cacher-ultra project would like to thank the following for their
 contributions:
 
+Andy Smith -- suggested proxy readiness health checks and delaying the proxy listener until startup completes
+
 Nicholas Scott (@kband)
 Sam Parkes (@Sam-Parkes)
 @sdh91

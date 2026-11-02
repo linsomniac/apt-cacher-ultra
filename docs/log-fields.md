@@ -344,6 +344,7 @@ diagnostics (logged by `internal/freshness`, `internal/handler`,
 
 | Event | Level | Fields | Meaning |
 |---|---|---|---|
+| `startup_preparation_complete` | INFO | none | Startup constructors, certificate setup, cache migrations, trust audit and startup GC have finished. Application sockets bind next; use `/healthz` to confirm readiness. |
 | `acme_renewal_failed` | WARN | `category` (bounded error code) | A managed certificate attempt failed or is deferred; any currently valid certificate remains active. See [server certificate recovery](server-tls.md). No authority response details are logged. |
 | `server_tls_reload_failed` | WARN | `detail` (fixed remediation hint) | First failed file certificate reload; retains the previous certificate until expiry. |
 | `server_tls_reload_recovered` | INFO | none | File reload succeeded after a failure. |
