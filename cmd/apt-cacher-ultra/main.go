@@ -37,6 +37,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy/tlsmitm"
+	"github.com/linsomniac/apt-cacher-ultra/internal/usage"
 
 	"crypto/tls"
 )
@@ -546,7 +547,30 @@ func serveListeners(
 		return fmt.Errorf("build proxy parser: %w", err)
 	}
 
+	usageStats, err := usage.New(ctx, c)
+	if err != nil {
+		return fmt.Errorf("initialize usage statistics: %w", err)
+	}
+	usageCtx, usageCancel := context.WithCancel(context.Background())
+	usageDone := make(chan struct{})
+	go func() {
+		defer close(usageDone)
+		usageStats.Run(usageCtx, logger)
+	}()
+	// Registered before producer cleanup defers: the final absolute snapshot
+	// lands after request/adoption drain and before the cache is closed.
+	defer func() {
+		usageCancel()
+		<-usageDone
+		flushCtx, cancel := context.WithTimeout(context.Background(), usage.CheckpointTimeout)
+		defer cancel()
+		if err := usageStats.Flush(flushCtx); err != nil {
+			logger.Warn("usage_final_checkpoint_failed", "err", err)
+		}
+	}()
+
 	fetchClient, err := fetch.New(fetch.Options{
+		Usage:                    usageStats,
 		Proxy:                    cfg.Upstream.Proxy,
 		ConnectTimeout:           cfg.Upstream.ConnectTimeout.Duration,
 		TotalTimeout:             cfg.Upstream.TotalTimeout.Duration,
@@ -608,7 +632,9 @@ func serveListeners(
 		return fmt.Errorf("build suite reaper: %w", err)
 	}
 
-	h, err := handler.New(handlerConfig(cfg, parser, c, fetchClient, hostLimiter, logger, freshChecker, adopter))
+	hcfg := handlerConfig(cfg, parser, c, fetchClient, hostLimiter, logger, freshChecker, adopter)
+	hcfg.Usage = usageStats
+	h, err := handler.New(hcfg)
 	if err != nil {
 		return fmt.Errorf("build handler: %w", err)
 	}
@@ -655,6 +681,7 @@ func serveListeners(
 	var adminSrv *admin.Server
 	if cfg.Admin.Enabled {
 		adminSrv, err = admin.New(admin.Config{
+			Usage:                   usageStats,
 			Cache:                   c,
 			HealthCheck:             probe.Failure,
 			GC:                      gcsvc,

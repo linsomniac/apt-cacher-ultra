@@ -31,6 +31,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/usage"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
@@ -79,6 +80,7 @@ type AdoptionWaiter interface {
 // Config carries handler dependencies. All non-pointer fields are
 // optional and defaulted in New.
 type Config struct {
+	Usage  *usage.Collector
 	Parser *proxy.Parser
 	Cache  *cache.Cache
 	Fetch  Fetcher
@@ -166,6 +168,7 @@ type ConnectHandler interface {
 // blocked on. Close cancels that lifecycle ctx and waits on activeWG
 // for currently-running ServeHTTP invocations to complete.
 type Handler struct {
+	usage     *usage.Collector
 	parser    *proxy.Parser
 	cache     *cache.Cache
 	fetch     Fetcher
@@ -287,6 +290,7 @@ func New(cfg Config) (*Handler, error) {
 		logger:                  logger,
 		refuseUnvouchedDebs:     cfg.RefuseUnvouchedDebs,
 		adoptionEnabled:         cfg.AdoptionEnabled,
+		usage:                   cfg.Usage,
 		flipGate:                cfg.FlipGate,
 		keepDisplaced:           cfg.KeepDisplaced,
 		maxSuites:               cfg.MaxSuites,
@@ -449,6 +453,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		h.logRequest(r, "", "", "method_not_allowed", http.StatusMethodNotAllowed, 0, false, 0, start)
 		return
+	}
+
+	// CONNECT framing is excluded; each tunneled GET/HEAD comes back through
+	// this handler. Count actual successful writes, including partial serves.
+	if h.usage != nil {
+		cw := &countingWriter{ResponseWriter: w}
+		w = cw
+		defer func() {
+			status := cw.statusCode()
+			bytes := cw.bytes
+			if r.Method == http.MethodHead || status < 200 || status >= 300 {
+				bytes = 0
+			}
+			cacheStatus := cw.Header().Get(hdrXCache)
+			hit := (status >= 200 && status < 300 || status == http.StatusNotModified) &&
+				(cacheStatus == cacheHit || cacheStatus == cacheHitStale || cacheStatus == cacheCoalesced)
+			h.usage.RecordServe(bytes, time.Since(start), hit)
+		}()
 	}
 
 	req, err := h.parser.Parse(r.RequestURI, r.Host)
@@ -3212,6 +3234,8 @@ type countingWriter struct {
 	status int
 	bytes  int64
 }
+
+func (c *countingWriter) Unwrap() http.ResponseWriter { return c.ResponseWriter }
 
 func (c *countingWriter) WriteHeader(code int) {
 	c.status = code

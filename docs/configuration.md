@@ -908,7 +908,7 @@ Keep `ca/`: unless `tls_mitm.ca_storage_dir` is set, it holds the MITM CA the ca
 for every client that trusts the old one. The rest of `cache.dir`,
 `tmp/` and `staging/`, is scratch space that may go too. The audit then
 changes nothing, but the migration before it has:
-the database is at schema 7, which 1.0.x refuses, so going back to 1.0.x
+the database is at schema 8, which 1.0.x refuses, so going back to 1.0.x
 means restoring the `cache.db` copied before the upgrade: stop the
 daemon first (a refused start runs again every 5 seconds and would
 migrate the copy again, and a copy put back under a running daemon can be
@@ -1359,6 +1359,12 @@ this lock: stop the old daemon before starting this version on its cache.
 The command-line package listing/copy tools remain available.
 
 ## `[admin]`: status, metrics, and maintenance
+
+The status page includes [usage statistics](usage-statistics.md): lifetime and
+since-start traffic, cache hits, savings estimates and average effective transfer
+rates, also available under `usage` in `GET /?format=json`. Collection and
+checkpointing continue with admin disabled; existing admin authentication applies
+when viewing the data. No usage-specific configuration is required.
 
 The separate **HTTP or HTTPS** admin listener serves the status page, `/metrics`, and
 `/healthz`, plus the mutating `POST /reconcile` and `POST /forget` maintenance

@@ -11,6 +11,12 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Added
 
+- Persistent admin usage statistics: data fetched/served, cache hits, estimated
+  net bytes saved and average effective transfer rates, with lifetime and
+  since-start views in HTML and JSON. Includes background downloads and retries;
+  checkpoints every 30 seconds and at graceful shutdown. Requested by @sdh91 in
+  issue #11; see [usage statistics](docs/usage-statistics.md).
+
 - Optional `cache.db_dir` to keep SQLite database files on separate storage
   from cached content. Empty or omitted preserves the existing layout.
   Suggested by @grifferz in issue #13; see

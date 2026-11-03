@@ -352,6 +352,14 @@ check and `anchor_absent` record it was, whatever the knob.
 
 ## Operational events
 
+Usage statistics add these warning events; see [usage statistics](usage-statistics.md)
+for checkpoint behavior and the admin persistence warning.
+
+| Event | Level | Fields | Meaning |
+| --- | --- | --- | --- |
+| `usage_checkpoint_failed` | WARN | `err` | A periodic usage checkpoint failed or timed out. In-memory totals are retained and the next checkpoint retries the absolute snapshot. |
+| `usage_final_checkpoint_failed` | WARN | `err` | The final usage checkpoint after traffic drained failed. Completed operations since the last successful checkpoint will not survive this restart. |
+
 Structured events emitted outside the per-request `request` log line:
 goroutine panic recovery, freshness checks that end unknown, adoption
 failure and refusal records and their retry schedule, wall-clock step

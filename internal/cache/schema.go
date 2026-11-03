@@ -15,7 +15,7 @@ import (
 // expects. Forward-only: a database tagged with a higher version is treated
 // as written by a newer binary and the cache refuses to open it. SPEC §4.3,
 // SPEC2 §4.3, SPEC3 §4.3, SPEC4 §4.3, flat-repositories design §6.
-const CurrentSchemaVersion = 7
+const CurrentSchemaVersion = 8
 
 // migrations is indexed such that migrations[N] migrates the database from
 // schema version N to N+1. migrations[0] (v0 → v1) creates the entire
@@ -361,6 +361,20 @@ CREATE TABLE legacy_trust_audit (
 );
 INSERT INTO legacy_trust_audit (snapshot_id)
   SELECT snapshot_id FROM suite_snapshot WHERE adopted_at IS NOT NULL;
+`,
+	// v7 → v8: constant-size anonymous usage totals, independent of cache GC.
+	`
+CREATE TABLE usage_totals (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  since_unixtime INTEGER NOT NULL CHECK (since_unixtime > 0),
+  fetched_bytes INTEGER NOT NULL CHECK (fetched_bytes >= 0),
+  served_bytes INTEGER NOT NULL CHECK (served_bytes >= 0),
+  cache_hit_bytes INTEGER NOT NULL CHECK (cache_hit_bytes BETWEEN 0 AND served_bytes),
+  requests INTEGER NOT NULL CHECK (requests >= 0),
+  cache_hit_requests INTEGER NOT NULL CHECK (cache_hit_requests BETWEEN 0 AND requests),
+  fetch_nanoseconds INTEGER NOT NULL CHECK (fetch_nanoseconds >= 0),
+  serve_nanoseconds INTEGER NOT NULL CHECK (serve_nanoseconds >= 0)
+);
 `,
 }
 

@@ -21,6 +21,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/servertls"
+	"github.com/linsomniac/apt-cacher-ultra/internal/usage"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
@@ -33,6 +34,7 @@ import (
 // `"gc": {"last_run_unixtime": null}` with the rest of the gc.*
 // block omitted (a custom MarshalJSON on gcInfo handles this).
 type statusModel struct {
+	Usage           *usage.Snapshot               `json:"usage,omitempty"`
 	ServerTLS       map[string]servertls.Snapshot `json:"server_tls,omitempty"`
 	ACME            *acme.Status                  `json:"acme,omitempty"`
 	Process         processInfo                   `json:"process"`
@@ -455,6 +457,7 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 
 	uptime := time.Since(s.cfg.StartTime)
 	model := statusModel{
+		Usage: s.cfg.Usage.Snapshot(),
 		Process: processInfo{
 			Version:         s.cfg.BuildInfo.Version,
 			StartedUnixTime: s.cfg.StartTime.Unix(),
@@ -985,6 +988,7 @@ func buildKeyringEntries(p KeyringProvider) []keyringEntry {
 // renderStatus renders the SPEC5 §10.5 status page in either JSON
 // or HTML per content negotiation (§9.7.3).
 func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	start := time.Now()
 	format := chooseFormat(r)
 	defer func() {
@@ -1093,6 +1097,9 @@ func statusTemplateFuncMap() template.FuncMap {
 		"unixTime":            formatUnixTimeTag,
 		"unixTimePtr":         formatUnixTimePtrTag,
 		"formatBytes":         formatBytes,
+		"usageRate":           formatUsageRate,
+		"usagePercent":        formatUsagePercent,
+		"signedBytes":         formatSignedBytes,
 		"durationOf":          durationOf,
 		"i64Ptr":              formatInt64Ptr,
 		"hitRatePct":          formatHitRatePercent,
@@ -1243,6 +1250,35 @@ func formatBytes(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+func formatSignedBytes(n int64) string {
+	// Net savings is the difference of two nonnegative int64s, so never MinInt64.
+	if n < 0 {
+		return "−" + formatBytes(-n)
+	}
+	return formatBytes(n)
+}
+
+func formatUsageRate(v *float64) string {
+	if v == nil {
+		return "n/a"
+	}
+	n := *v
+	units := []string{"B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s", "PiB/s", "EiB/s"}
+	i := 0
+	for n >= 1024 && i < len(units)-1 {
+		n /= 1024
+		i++
+	}
+	return fmt.Sprintf("%.1f %s", n, units[i])
+}
+
+func formatUsagePercent(v *float64) string {
+	if v == nil {
+		return "n/a"
+	}
+	return fmt.Sprintf("%.1f%%", *v)
 }
 
 // formatHitRatePercent renders the SPEC6 §10.4 hit-rate cell. nil

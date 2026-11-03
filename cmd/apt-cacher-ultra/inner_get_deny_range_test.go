@@ -84,6 +84,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
 
 // prereadInnerConn presents a (conn, bufio.Reader) pair as a single
@@ -179,9 +181,7 @@ func TestServe_InnerGET_DenyRangeFiresAtConnectTime_Returns403(t *testing.T) {
 		return serveListeners(ctx, cfg, logger, cacheLn, nil, nil, nil)
 	})
 
-	if err := waitForDaemonReady(t, cacheAddr, 10*time.Second); err != nil {
-		t.Fatalf("daemon never became ready: %v", err)
-	}
+	waitUsageReady(t, cacheAddr)
 
 	pool := loadAutoCAPool(t, cacheDir)
 
@@ -259,6 +259,21 @@ func TestServe_InnerGET_DenyRangeFiresAtConnectTime_Returns403(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatalf("serveListeners did not return")
+	}
+
+	// Count the inner GET exactly once; neither CONNECT framing nor the
+	// readiness probe nor the refused response body contributes data bytes.
+	c, err := cache.Open(t.Context(), cacheDir, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	usageTotals, err := c.LoadUsage(t.Context())
+	_ = c.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usageTotals.Requests != 1 || usageTotals.FetchedBytes != 0 || usageTotals.ServedBytes != 0 {
+		t.Fatalf("inner GET usage: %+v", usageTotals)
 	}
 
 	// Walk the captured slog stream for the inner GET's request log
