@@ -42,6 +42,7 @@ import (
 
 	"golang.org/x/net/idna"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/clientaddr"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy/tlsmitm"
 )
 
@@ -436,7 +437,7 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := time.Now()
-	clientAddr := r.RemoteAddr
+	clientAddr := clientaddr.FromRequest(r)
 
 	// Step 1: parse the request-target.
 	target, err := ParseConnectTarget(r.RequestURI)
@@ -599,7 +600,7 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 		Host:       target.LiteralHost,
 		Header:     syntheticHeader,
 		Body:       http.NoBody,
-		RemoteAddr: clientAddr,
+		RemoteAddr: r.RemoteAddr,
 		Proto:      "HTTP/1.1",
 		ProtoMajor: 1,
 		ProtoMinor: 1,
@@ -618,7 +619,9 @@ func (h *ConnectHandler) ServeCONNECT(w http.ResponseWriter, r *http.Request) {
 	if h.deps.Manager != nil {
 		synthParent = h.deps.Manager.Context()
 	}
-	synth = synth.WithContext(WithMITMContext(synthParent))
+	// Use only the outer connection's established identity. The inner headers
+	// are supplied by the end client, even when the socket peer is trusted.
+	synth = synth.WithContext(WithMITMContext(clientAddr.WithContext(synthParent)))
 
 	// Wrap the encrypted stream as an http.ResponseWriter the
 	// handler can write to. Clear the deadline before dispatch so
@@ -835,14 +838,17 @@ func writeInnerStatus(c *tls.Conn, status int, allow string) {
 // affect the log line). Pre-handshake call sites pass false;
 // post-handshake call sites pass true. The flag is irrelevant for
 // every outcome other than `inner_stream_failed`.
-func (h *ConnectHandler) warnConnect(outcome ConnectOutcome, host string, port int, clientAddr string, start time.Time, reason, deniedGate string, tlsReached bool) {
+func (h *ConnectHandler) warnConnect(outcome ConnectOutcome, host string, port int, clientAddr clientaddr.Address, start time.Time, reason, deniedGate string, tlsReached bool) {
 	elapsed := time.Since(start)
 	fields := map[string]any{
 		"outcome":     string(outcome),
 		"host":        host,
 		"port":        port,
-		"client_addr": clientAddr,
+		"client_addr": clientAddr.Client,
 		"duration_ms": elapsed.Milliseconds(),
+	}
+	if clientAddr.Client != clientAddr.Peer {
+		fields["peer_addr"] = clientAddr.Peer
 	}
 	if reason != "" {
 		fields["reason"] = reason
@@ -860,14 +866,17 @@ func (h *ConnectHandler) warnConnect(outcome ConnectOutcome, host string, port i
 // for `OutcomeTunneled` (the only success outcome). tlsReached is
 // always true at the call sites; it is taken as a parameter for
 // signature symmetry with warnConnect.
-func (h *ConnectHandler) infoConnect(outcome ConnectOutcome, host string, port int, clientAddr string, start time.Time, reason string, tlsReached bool) {
+func (h *ConnectHandler) infoConnect(outcome ConnectOutcome, host string, port int, clientAddr clientaddr.Address, start time.Time, reason string, tlsReached bool) {
 	elapsed := time.Since(start)
 	fields := map[string]any{
 		"outcome":     string(outcome),
 		"host":        host,
 		"port":        port,
-		"client_addr": clientAddr,
+		"client_addr": clientAddr.Client,
 		"duration_ms": elapsed.Milliseconds(),
+	}
+	if clientAddr.Client != clientAddr.Peer {
+		fields["peer_addr"] = clientAddr.Peer
 	}
 	if reason != "" {
 		fields["reason"] = reason

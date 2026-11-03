@@ -22,6 +22,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/acmedns"
 	"github.com/linsomniac/apt-cacher-ultra/internal/admin"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/clientaddr"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
@@ -308,6 +309,11 @@ func serveListeners(
 	}
 	defer closeListeners()
 
+	clientAddresses, err := clientaddr.New(cfg.Cache.TrustedProxies)
+	if err != nil {
+		return fmt.Errorf("cache.%w", err)
+	}
+
 	// SPEC5 §10.2: count htpasswd users once up-front so both the
 	// startup config dump and the admin_authenticated Info line carry
 	// user_count. A parse failure here is fatal — refusing to start
@@ -344,6 +350,7 @@ func serveListeners(
 	logger.Info("apt-cacher-ultra starting",
 		"version", Version,
 		"listen", listenerAddress(plainLn, cfg.Cache.Listen),
+		"cache_trusted_proxies", cfg.Cache.TrustedProxies,
 		"listen_tls", listenerAddress(tlsLn, cfg.Cache.ListenTLS),
 		"cache_dir", cfg.Cache.Dir,
 		"db_dir", cfg.Cache.DatabaseDir(),
@@ -778,10 +785,11 @@ func serveListeners(
 		}()
 	}
 
-	plainSrv := newHTTPServer(probe.ProxyHandler(h), logger)
+	cacheHandler := probe.ProxyHandler(clientAddresses.Wrap(h))
+	plainSrv := newHTTPServer(cacheHandler, logger)
 	var tlsSrv *http.Server
 	if tlsLn != nil {
-		tlsSrv = newHTTPServer(probe.ProxyHandler(h), logger)
+		tlsSrv = newHTTPServer(cacheHandler, logger)
 		tlsSrv.TLSConfig = serverCerts.Config("cache")
 	}
 

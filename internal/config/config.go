@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/linsomniac/apt-cacher-ultra/internal/clientaddr"
 	"github.com/linsomniac/apt-cacher-ultra/internal/upstreamproxy"
 )
 
@@ -88,6 +89,10 @@ type CacheConfig struct {
 	// no path). Useful when Listen binds 0.0.0.0/:: and the snippet
 	// would otherwise emit a non-routable target.
 	AdvertiseHost string `toml:"advertise_host"`
+
+	// TrustedProxies enables X-Forwarded-For for cache request logging only.
+	// Empty trusts nobody. Entries are literal IPs or CIDRs, never hostnames.
+	TrustedProxies []string `toml:"trusted_proxies"`
 }
 
 // DatabaseDir returns DBDir, falling back to Dir when it is empty.
@@ -979,6 +984,10 @@ func (c *Config) Validate() error {
 	// effective value (user-supplied or default).
 	if err := validateListenAddr(c.Cache.Listen); err != nil {
 		errs = append(errs, fmt.Errorf("cache.listen: %w", err))
+	}
+
+	if _, err := clientaddr.New(c.Cache.TrustedProxies); err != nil {
+		errs = append(errs, fmt.Errorf("cache.%w", err))
 	}
 
 	if err := c.ValidateServerTLS(); err != nil {
