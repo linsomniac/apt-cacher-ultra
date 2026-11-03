@@ -10,6 +10,7 @@ import (
 
 type Cache interface {
 	Dir() string
+	DBDir() string
 	Ping(context.Context) error
 }
 
@@ -28,6 +29,11 @@ func (c Check) Failure(ctx context.Context) string {
 	}
 	if err := writable(c.Cache.Dir()); err != nil {
 		return "cache_dir"
+	}
+	if dir := c.Cache.DBDir(); dir != c.Cache.Dir() {
+		if err := writable(dir); err != nil {
+			return "db_dir"
+		}
 	}
 	pingCtx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()

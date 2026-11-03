@@ -11,11 +11,18 @@ import (
 )
 
 type testCache struct {
-	dir  string
-	ping func(context.Context) error
+	dbDir string
+	dir   string
+	ping  func(context.Context) error
 }
 
 func (c testCache) Dir() string { return c.dir }
+func (c testCache) DBDir() string {
+	if c.dbDir != "" {
+		return c.dbDir
+	}
+	return c.dir
+}
 func (c testCache) Ping(ctx context.Context) error {
 	if c.ping != nil {
 		return c.ping(ctx)
@@ -99,5 +106,28 @@ func TestFailuresAndRecovery(t *testing.T) {
 	entries, err := os.ReadDir(dir)
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("probe leaked files: %v %v", entries, err)
+	}
+}
+
+func TestSeparateDatabaseDirectoryFailureAndRecovery(t *testing.T) {
+	dbDir := t.TempDir()
+	check := Check{Cache: testCache{dir: t.TempDir(), dbDir: dbDir}}
+	if got := check.Failure(context.Background()); got != "" {
+		t.Fatalf("healthy database directory: %s", got)
+	}
+	if err := os.Remove(dbDir); err != nil {
+		t.Fatal(err)
+	}
+	if got := check.Failure(context.Background()); got != "db_dir" {
+		t.Fatalf("missing database directory: %s", got)
+	}
+	if err := os.Mkdir(dbDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if got := check.Failure(context.Background()); got != "" {
+		t.Fatalf("restored database directory: %s", got)
+	}
+	if entries, err := os.ReadDir(dbDir); err != nil || len(entries) != 0 {
+		t.Fatalf("database probe leaked files: %v %v", entries, err)
 	}
 }

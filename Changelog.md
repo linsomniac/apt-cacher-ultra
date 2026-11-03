@@ -11,6 +11,11 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Added
 
+- Optional `cache.db_dir` to keep SQLite database files on separate storage
+  from cached content. Empty or omitted preserves the existing layout.
+  Suggested by @grifferz in issue #13; see
+  [separate database storage](docs/configuration.md#separate-database-storage).
+
 - Proxy-port `GET`/`HEAD /healthz` for load balancers, also available with
   admin disabled. Both proxy and admin health checks now require completed
   startup, serving listeners and usable proxy TLS/MITM certificates, alongside

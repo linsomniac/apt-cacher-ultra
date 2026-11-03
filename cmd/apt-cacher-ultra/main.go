@@ -238,11 +238,11 @@ func serve(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	lock, err := lockDaemonCache(cfg.Cache.Dir)
+	unlock, err := lockDaemonStorage(cfg.Cache.Dir, cfg.Cache.DBDir)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = lock.Close() }()
+	defer unlock()
 	var preloadedCA *tlsmitm.CA
 	if cfg.TlsMitm.Enabled {
 		ca, err := loadMitmCA(cfg, logger)
@@ -346,6 +346,7 @@ func serveListeners(
 		"listen", listenerAddress(plainLn, cfg.Cache.Listen),
 		"listen_tls", listenerAddress(tlsLn, cfg.Cache.ListenTLS),
 		"cache_dir", cfg.Cache.Dir,
+		"db_dir", cfg.Cache.DatabaseDir(),
 		"upstream_proxy_enabled", cfg.Upstream.Proxy != "",
 		"upstream_connect_timeout", cfg.Upstream.ConnectTimeout.Duration,
 		"upstream_total_timeout", cfg.Upstream.TotalTimeout.Duration,
@@ -459,7 +460,7 @@ func serveListeners(
 		// file that admin.New fails to parse moments later.
 	}
 
-	c, err := cache.Open(ctx, cfg.Cache.Dir, logger)
+	c, err := cache.OpenWithDBDir(ctx, cfg.Cache.Dir, cfg.Cache.DBDir, logger)
 	if err != nil {
 		return fmt.Errorf("open cache: %w", err)
 	}

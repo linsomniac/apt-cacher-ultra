@@ -46,7 +46,8 @@ only the admin listener.
 
 | Key | Type | Default | Behavior and constraints |
 | --- | --- | --- | --- |
-| `dir` | string | **Required** | Existing writable cache root. The package example uses `/var/cache/apt-cacher-ultra`. Stores the database, blobs, temporary files, and, by default, the MITM CA. |
+| `dir` | string | **Required** | Existing writable cache root. The package example uses `/var/cache/apt-cacher-ultra`. Stores blobs, temporary files, and, by default, the database and MITM CA. |
+| `db_dir` | string | `""` (uses `cache.dir`) | Existing writable directory for `cache.db`, `cache.db-wal`, and `cache.db-shm`. May be on a different filesystem. |
 | `listen` | string | `"0.0.0.0:3142"` | HTTP proxy bind address. Empty string also selects the default. |
 | `listen_tls` | string | `""` | Additional TLS proxy listener; empty disables it. Select either `tls_cert` and `tls_key`, or `use_acme = true`. |
 | `tls_cert` | string | `""` | Readable PEM server certificate for `listen_tls`; validated with its key when the daemon starts. |
@@ -68,11 +69,53 @@ case. Omitting the line inherits the HTTP proxy setting, as described in
 [APT's HTTPS options](https://manpages.debian.org/unstable/apt/apt-transport-https.1.en.html#OPTIONS).
 
 The packaged systemd service runs as `apt-cacher-ultra` and permits writes under
-`/var/cache/apt-cacher-ultra`. If moving `cache.dir` or `tls_mitm.ca_storage_dir`,
-give the service user access and add the new writable location through a
-systemd override of `ReadWritePaths`. `ProtectSystem=strict` and `ProtectHome=true`
+`/var/cache/apt-cacher-ultra`. If moving `cache.dir`, `cache.db_dir`, or
+`tls_mitm.ca_storage_dir`, give the service user access and add the new writable
+location through a systemd override of `ReadWritePaths`. `ProtectSystem=strict` and `ProtectHome=true`
 also restrict access; placing cache or key files in a home directory requires
 additional service policy changes. See the [packaged service](../packaging/systemd/apt-cacher-ultra.service).
+
+### Separate database storage
+
+To put SQLite on flash while keeping cached content on bulk storage:
+
+```toml
+[cache]
+dir = "/var/cache/apt-cacher-ultra"
+db_dir = "/mnt/ssd/apt-cacher-ultra-db"
+```
+
+Omitting `db_dir` or setting it to `""` keeps the existing layout. Relative paths
+are relative to the process working directory, just like `cache.dir`; prefer
+absolute paths. The daemon and `packages list` / `packages copy` all use this
+setting. `pool/`, `tmp/`, and `staging/` stay under `cache.dir` on the same
+filesystem, preserving their hard links and atomic renames. MITM CA and ACME
+storage are unaffected. Use a distinct database directory for each cache;
+the daemon locks both storage directories to prevent concurrent use.
+
+Create the database directory before starting, with ownership and permissions
+that let the service user write it. For the packaged service, run
+`sudo systemctl edit apt-cacher-ultra` and add, for example:
+
+```ini
+[Service]
+ReadWritePaths=/mnt/ssd/apt-cacher-ultra-db
+```
+
+If the directory is on a separate mount, add `RequiresMountsFor=` for that
+path under `[Unit]` in the override so systemd waits for the filesystem.
+For Docker, mount the database directory separately, make it writable by
+UID/GID 10001, and set `db_dir` to the path **inside the container**.
+
+**Moving an existing database:** stop the daemon and any package commands,
+back up the database, then move `cache.db` and any remaining `cache.db-wal`
+and `cache.db-shm` together to the new directory. Leave the pool and CA in
+place. Set `db_dir`, update service access as above, and restart. No automatic
+migration between directories occurs. Pointing at an empty directory creates
+a fresh database; existing pool files then have no metadata and can be removed
+by garbage collection. To revert, stop all users of the database and move its
+current files back before clearing `db_dir`. Backups must include the selected
+database directory along with the cache's pool and certificate state.
 
 ## `[upstream]`: fetching and access policy
 
@@ -798,9 +841,9 @@ when it holds none of the queued inline snapshots' files and none of a
 sample of the files the current snapshots use, two or more files checked
 (a foreign or unmounted pool; snapshots that share an `InRelease` share
 its one file). Mount or restore it, or, to start empty, stop the daemon
-and remove `cache.db` (with any `cache.db-wal` and `cache.db-shm`) and
-`pool/` from `cache.dir`. Keep `ca/`: unless `tls_mitm.ca_storage_dir` is
-set, it holds the MITM CA the cache generated, and a new one breaks TLS
+and remove `cache.db` (with any `cache.db-wal` and `cache.db-shm`) from
+`cache.db_dir` (or `cache.dir` when unset), and `pool/` from `cache.dir`.
+Keep `ca/`: unless `tls_mitm.ca_storage_dir` is set, it holds the MITM CA the cache generated, and a new one breaks TLS
 for every client that trusts the old one. The rest of `cache.dir`,
 `tmp/` and `staging/`, is scratch space that may go too. The audit then
 changes nothing, but the migration before it has:
@@ -1173,6 +1216,7 @@ HEAD has no response body. Responses carry `Cache-Control: no-store`.
 | `proxy_tls` | The configured HTTPS proxy certificate is unavailable, expired, or not yet valid. |
 | `mitm_ca` | The configured HTTPS interception CA is outside its validity period. |
 | `cache_dir` | Creating, writing, closing, or removing a probe file in the cache root failed. |
+| `db_dir` | Creating, writing, closing, or removing a probe file in a separate database directory failed. |
 | `db_ping` | The SQLite connection check failed or exceeded its one-second deadline. |
 
 Both proxy and admin probes require all configured application listeners to

@@ -10,6 +10,11 @@
 [cache]
 # Required: an existing directory writable by the daemon user.
 dir         = "/var/cache/apt-cacher-ultra"
+# Optional existing writable directory for cache.db and its WAL/SHM files.
+# Empty/omitted uses dir. Blobs and scratch files stay under dir.
+# Example: "/mnt/ssd/apt-cacher-ultra-db". Stop the daemon and move existing
+# cache.db* files before changing this; see the reference for systemd access.
+db_dir      = ""
 listen      = "0.0.0.0:3142"               # proxy host:port; ports 1-65535
 # Optional TLS listener for client-to-cache traffic, separate from MITM.
 # Set listen_tls, tls_cert and tls_key together; PEM files must be readable.
