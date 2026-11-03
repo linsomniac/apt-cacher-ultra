@@ -1425,6 +1425,176 @@ func TestAdopter_PackageHash_GzipDecompressionWorks(t *testing.T) {
 	}
 }
 
+func TestAdopter_PackageHash_GzipTrailingNulPadding(t *testing.T) {
+	// Upstream publishers (e.g. packages.clickhouse.com) pad Packages.gz
+	// with trailing NUL (0x00) bytes to a block boundary before signing
+	// InRelease. Adoption must accept trailing NUL padding after a valid
+	// gzip member, matching GNU gzip and libapt-pkg behavior.
+	env := newAdoptionTestEnv(t)
+	debHash := strings.Repeat("e", 64)
+	stanzas := fakePackagesStanzas(map[string]string{
+		"pool/main/c/clickhouse/clickhouse.deb": debHash,
+	})
+	gz := append(gzipBytes(stanzas), make([]byte, 3057)...)
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages.gz": gz,
+	})
+	env.fetcher.put("http://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages.gz", gz)
+
+	if err := env.adopter.Run(context.Background(), env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	sf, _ := env.cache.GetSuiteFreshness(context.Background(),
+		env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+	if sf.CurrentSnapshotID == nil {
+		t.Fatal("adoption didn't flip pointer")
+	}
+	ph, err := env.cache.GetPackageHash(context.Background(),
+		env.suite.CanonicalScheme, env.suite.CanonicalHost,
+		"/ubuntu/pool/main/c/clickhouse/clickhouse.deb", *sf.CurrentSnapshotID)
+	if err != nil {
+		t.Fatalf("GetPackageHash: %v", err)
+	}
+	if ph.DeclaredSHA256 != debHash {
+		t.Errorf("declared = %s, want %s", ph.DeclaredSHA256, debHash)
+	}
+}
+
+func TestAdopter_PackageHash_GzipConcatenatedMultiMember(t *testing.T) {
+	// Genuine concatenated multi-member .gz files (both with and without
+	// trailing NUL padding after the final member) must decompress all
+	// members into a combined Packages stream.
+	for _, trailingNuls := range []int{0, 1024} {
+		name := "no_padding"
+		if trailingNuls > 0 {
+			name = "with_trailing_nuls"
+		}
+		t.Run(name, func(t *testing.T) {
+			env := newAdoptionTestEnv(t)
+			hashA := strings.Repeat("a", 64)
+			hashB := strings.Repeat("b", 64)
+			member1 := gzipBytes(fakePackagesStanzas(map[string]string{
+				"pool/main/a/alpha/alpha.deb": hashA,
+			}))
+			member2 := gzipBytes(fakePackagesStanzas(map[string]string{
+				"pool/main/b/beta/beta.deb": hashB,
+			}))
+			gz := append(append([]byte{}, member1...), member2...)
+			if trailingNuls > 0 {
+				gz = append(gz, make([]byte, trailingNuls)...)
+			}
+			releaseText, _ := makeRelease(map[string][]byte{
+				"main/binary-amd64/Packages.gz": gz,
+			})
+			env.fetcher.put("http://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages.gz", gz)
+
+			if err := env.adopter.Run(context.Background(), env.suite, releaseText, "", ""); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			sf, _ := env.cache.GetSuiteFreshness(context.Background(),
+				env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+			if sf.CurrentSnapshotID == nil {
+				t.Fatal("adoption didn't flip pointer")
+			}
+			for path, wantHash := range map[string]string{
+				"/ubuntu/pool/main/a/alpha/alpha.deb": hashA,
+				"/ubuntu/pool/main/b/beta/beta.deb":   hashB,
+			} {
+				ph, err := env.cache.GetPackageHash(context.Background(),
+					env.suite.CanonicalScheme, env.suite.CanonicalHost,
+					path, *sf.CurrentSnapshotID)
+				if err != nil {
+					t.Fatalf("GetPackageHash(%s): %v", path, err)
+				}
+				if ph.DeclaredSHA256 != wantHash {
+					t.Errorf("GetPackageHash(%s) = %s, want %s", path, ph.DeclaredSHA256, wantHash)
+				}
+			}
+		})
+	}
+}
+
+func TestAdopter_PackageHash_GzipTrailingGarbageRejected(t *testing.T) {
+	// Non-NUL trailing garbage (including non-NUL bytes or a second gzip
+	// member preceded by NUL padding) must still fail decompression with
+	// ErrAdoptionParseFailed / gzip.ErrHeader.
+	member := gzipBytes(fakePackagesStanzas(map[string]string{
+		"pool/main/g/gz/gz.deb": strings.Repeat("e", 64),
+	}))
+	cases := []struct {
+		name string
+		tail []byte
+	}{
+		{"immediate_non_nul_garbage", []byte("not-a-gzip-member")},
+		{"nul_followed_by_garbage", append(make([]byte, 128), []byte("garbage")...)},
+		{"nul_followed_by_second_member", append(make([]byte, 128), member...)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newAdoptionTestEnv(t)
+			gz := append(append([]byte{}, member...), tc.tail...)
+			releaseText, _ := makeRelease(map[string][]byte{
+				"main/binary-amd64/Packages.gz": gz,
+			})
+			env.fetcher.put("http://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages.gz", gz)
+
+			err := env.adopter.Run(context.Background(), env.suite, releaseText, "", "")
+			if !errors.Is(err, ErrAdoptionParseFailed) {
+				t.Fatalf("got %v, want ErrAdoptionParseFailed", err)
+			}
+			if !errors.Is(err, gzip.ErrHeader) {
+				t.Errorf("got %v, want wrapped gzip.ErrHeader", err)
+			}
+		})
+	}
+}
+
+func TestAdopter_PackageHash_GzipMultiMemberCapBoundary(t *testing.T) {
+	// Cumulative decompressed size across concatenated gzip members must
+	// permit exactly capBytes and reject capBytes+1 with the bomb-defense
+	// error (not merely a parser failure).
+	hashA := strings.Repeat("a", 64)
+	hashB := strings.Repeat("b", 64)
+	stanzaA := fakePackagesStanzas(map[string]string{
+		"pool/main/a/alpha/alpha.deb": hashA,
+	})
+	stanzaB := fakePackagesStanzas(map[string]string{
+		"pool/main/b/beta/beta.deb": hashB,
+	})
+	totalBytes := int64(len(stanzaA) + len(stanzaB))
+	gz := append(gzipBytes(stanzaA), gzipBytes(stanzaB)...)
+
+	t.Run("exact_cap_succeeds", func(t *testing.T) {
+		env := newAdoptionTestEnv(t)
+		env.adopter.maxDecompressedBytes = totalBytes
+		releaseText, _ := makeRelease(map[string][]byte{
+			"main/binary-amd64/Packages.gz": gz,
+		})
+		env.fetcher.put("http://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages.gz", gz)
+
+		if err := env.adopter.Run(context.Background(), env.suite, releaseText, "", ""); err != nil {
+			t.Fatalf("Run at exact cap (%d bytes): %v", totalBytes, err)
+		}
+	})
+
+	t.Run("one_byte_over_cap_rejected", func(t *testing.T) {
+		env := newAdoptionTestEnv(t)
+		env.adopter.maxDecompressedBytes = totalBytes - 1
+		releaseText, _ := makeRelease(map[string][]byte{
+			"main/binary-amd64/Packages.gz": gz,
+		})
+		env.fetcher.put("http://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages.gz", gz)
+
+		err := env.adopter.Run(context.Background(), env.suite, releaseText, "", "")
+		if !errors.Is(err, ErrAdoptionParseFailed) {
+			t.Fatalf("got %v, want ErrAdoptionParseFailed", err)
+		}
+		if !strings.Contains(err.Error(), "bomb defense") {
+			t.Errorf("got %v, want bomb-defense cap error", err)
+		}
+	})
+}
+
 func TestRepoRootFromSuitePath(t *testing.T) {
 	cases := []struct {
 		in      string
