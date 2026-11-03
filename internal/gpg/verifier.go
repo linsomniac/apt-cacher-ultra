@@ -196,6 +196,87 @@ var (
 	ErrAmbiguousKeyID = errors.New("ambiguous short issuer keyid in trust set")
 )
 
+// AIDEV-NOTE: I-1 and A-RC3, the 1.0.3 patch. go-crypto v1.4.1 panicked on
+// two malformed upstream signatures: clearsign.Decode on a clearsigned
+// message with no plaintext lines (I-1: slice bounds out of range [:-1],
+// clearsign.go:182), and packet.Read on a signature packet whose hashed
+// area holds an empty exportable-certification subpacket (A-RC3: index out
+// of range, signature.go:458; key-free, a packet from an unknown key beside
+// a good one is enough). The verifier runs in the freshness adoption
+// goroutine, which has no recover in 1.0.x, so either panic killed the
+// daemon, and systemd's restart fetched the same body again. go-crypto
+// v1.5.0 fixed both, and 1.0.3 bumps it to v1.5.2. As defence in depth,
+// every go-crypto call on upstream bytes in this file runs under a
+// recover: in decodeClearsigned, nextPacket and verifyPacket below, or in
+// readArmoredSignature and decodeMaybeArmoredSignature, which read the
+// armor. Each turns a panic into the error that call's path already
+// returns for a malformed body: ErrMissingSignature (reason
+// missing_signature) for the clearsign decode; for the armor, packet and
+// verify calls an ordinary error, which their callers wrap as before
+// (reason crypto_verify_failed). No new sentinel or reason code. A new
+// go-crypto call on upstream bytes goes under a recover too.
+//
+// The function variables are the go-crypto entry points the wrappers call,
+// variables only so that verifier_panic_test.go can make one panic;
+// nothing else assigns them.
+var (
+	clearsignDecode         = clearsign.Decode
+	armorDecode             = armor.Decode
+	packetReaderNext        = (*packet.Reader).Next
+	verifyDetachedSignature = openpgp.VerifyDetachedSignature
+)
+
+// errGoCryptoPanicked is in the chain of every error a wrapper makes from
+// a go-crypto panic, the panic value in its text (for the
+// adoption_gpg_failed log line). ClassifyVerifyErr does not look for it:
+// the error classifies by its path, as the malformed-body error it stands
+// for.
+var errGoCryptoPanicked = errors.New("go-crypto panicked")
+
+// recoverGoCrypto, deferred by a wrapper, turns a go-crypto panic into *err.
+func recoverGoCrypto(err *error) {
+	if r := recover(); r != nil {
+		*err = fmt.Errorf("%w: %v", errGoCryptoPanicked, r)
+	}
+}
+
+// decodeClearsigned is clearsign.Decode with a panic turned into
+// ErrMissingSignature, the error VerifyInline gives a body clearsign.Decode
+// cannot decode. VerifyInline returns it whatever require_signature says: a
+// body that crashes the decoder is not unsigned text. A nil block with a
+// nil error is go-crypto's own "not a clearsigned message".
+func decodeClearsigned(b []byte) (block *clearsign.Block, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			block, err = nil, fmt.Errorf("%w: %w: %v", ErrMissingSignature, errGoCryptoPanicked, r)
+		}
+	}()
+	block, _ = clearsignDecode(b)
+	return block, nil
+}
+
+// nextPacket is r.Next(), which reads and parses the next packet (A-RC3's
+// panic was in that parse), with a panic turned into an error, as for a
+// packet go-crypto cannot parse. Callers stop reading at an error.
+func nextPacket(r *packet.Reader) (p packet.Packet, err error) {
+	defer recoverGoCrypto(&err)
+	return packetReaderNext(r)
+}
+
+// verifyPacket re-serializes one signature packet and verifies it alone
+// against keyring, so the packet that passed the trust check is the one
+// whose hash is checked (SPEC2 §7.6.3, verifyAnyTrusted). A panic in the
+// serialize or the verify is an error, as a failed verification is.
+func verifyPacket(keyring openpgp.KeyRing, signed []byte, sig *packet.Signature) (err error) {
+	defer recoverGoCrypto(&err)
+	var sb bytes.Buffer
+	if serr := sig.Serialize(&sb); serr != nil {
+		return fmt.Errorf("re-serialize signature packet: %w", serr)
+	}
+	_, _, err = verifyDetachedSignature(keyring, bytes.NewReader(signed), &sb, nil)
+	return err
+}
+
 // VerifyInline implements freshness.Verifier. Returns the verified
 // Release-equivalent plaintext (the cleartext between BEGIN/END
 // markers) on success.
@@ -211,7 +292,8 @@ var (
 //     pool blob — a cache-pollution path.
 //  2. Resolve per-suite trust set; if RequirePinned and no match, abort.
 //  3. Decode clearsigned block; if absent and RequireSignature, abort.
-//     If absent and !RequireSignature, return body verbatim.
+//     If absent and !RequireSignature, return body verbatim. A body
+//     that makes the decoder panic aborts in either mode.
 //  4. Iterate signature packets, attempting cryptographic verification
 //     of each candidate (one with a trusted IssuerFingerprint)
 //     against the trust-set EntityList. Accept only on a packet that
@@ -240,8 +322,11 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 		return nil, err
 	}
 
-	// Step 3: clearsign decode.
-	block, _ := clearsign.Decode(inRelease)
+	// Step 3: clearsign decode. An error is a decoder panic (I-1).
+	block, err := decodeClearsigned(inRelease)
+	if err != nil {
+		return nil, err
+	}
 	if block == nil {
 		if v.requireSignature {
 			return nil, ErrMissingSignature
@@ -397,10 +482,15 @@ func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef,
 // Caps the binary output at 64 KiB — real Release.gpg signatures are
 // well under 1 KiB; the cap bounds memory if a hostile upstream feeds
 // a giant fake signature.
-func decodeMaybeArmoredSignature(b []byte) ([]byte, error) {
+//
+// A go-crypto panic in the armor decode or in the body read (the body
+// decodes lazily, on read) is an error, as an undecodable armor is (the
+// AIDEV-NOTE above decodeClearsigned).
+func decodeMaybeArmoredSignature(b []byte) (_ []byte, err error) {
+	defer recoverGoCrypto(&err)
 	const maxBinary = 64 << 10
 	if isArmoredSignature(b) {
-		block, err := armor.Decode(bytes.NewReader(b))
+		block, err := armorDecode(bytes.NewReader(b))
 		if err != nil {
 			return nil, fmt.Errorf("armor decode: %w", err)
 		}
@@ -544,8 +634,11 @@ func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (openpgp.EntityList
 
 // readArmoredSignature consumes the (already-de-armored) reader from
 // clearsign.Block.ArmoredSignature.Body and returns the binary
-// signature packet bytes.
-func readArmoredSignature(r io.Reader) ([]byte, error) {
+// signature packet bytes. The armor decodes lazily, as this reads it: a
+// go-crypto panic in that decode is an error, as an undecodable armor
+// is (the AIDEV-NOTE above decodeClearsigned).
+func readArmoredSignature(r io.Reader) (_ []byte, err error) {
+	defer recoverGoCrypto(&err)
 	const max = 64 << 10 // signatures are tiny — 64 KiB is generous
 	limited := io.LimitReader(r, max+1)
 	out, err := io.ReadAll(limited)
@@ -597,7 +690,7 @@ func (v *Verifier) verifyAnyTrusted(
 		rejectedSigners []string
 	)
 	for {
-		pkt, err := reader.Next()
+		pkt, err := nextPacket(reader)
 		if errors.Is(err, io.EOF) {
 			break
 		}
@@ -660,20 +753,10 @@ func (v *Verifier) verifyAnyTrusted(
 		}
 		anyTrustedSeen = true
 		// Re-serialize this single packet and verify it in
-		// isolation. This guarantees the packet that satisfied the
-		// IssuerFingerprint policy is the same packet whose hash is
-		// cryptographically validated.
-		var sb bytes.Buffer
-		if err := sig.Serialize(&sb); err != nil {
-			lastVerifyErr = fmt.Errorf("re-serialize signature packet: %w", err)
-			continue
-		}
-		_, _, verr := openpgp.VerifyDetachedSignature(
-			trustSet,
-			bytes.NewReader(signed),
-			&sb,
-			nil,
-		)
+		// isolation (verifyPacket). This guarantees the packet that
+		// satisfied the IssuerFingerprint policy is the same packet
+		// whose hash is cryptographically validated.
+		verr := verifyPacket(trustSet, signed, sig)
 		if verr == nil {
 			return nil
 		}
@@ -739,17 +822,7 @@ func findUniqueEntityByKeyID(list openpgp.EntityList, keyID uint64) (*openpgp.En
 // whose keyid resolved the trust check is the same entity whose key
 // is used for the cryptographic check.
 func (v *Verifier) verifyAgainst(e *openpgp.Entity, signed []byte, sig *packet.Signature) error {
-	var sb bytes.Buffer
-	if err := sig.Serialize(&sb); err != nil {
-		return fmt.Errorf("re-serialize signature packet: %w", err)
-	}
-	_, _, err := openpgp.VerifyDetachedSignature(
-		openpgp.EntityList{e},
-		bytes.NewReader(signed),
-		&sb,
-		nil,
-	)
-	return err
+	return verifyPacket(openpgp.EntityList{e}, signed, sig)
 }
 
 // logUntrustedSignerOnce emits one INFO log per (canonical_host,
@@ -835,7 +908,7 @@ func (v *Verifier) logUnverifiedSignerOnce(suite freshness.SuiteRef, sigSource i
 func requireParseableSignature(r io.Reader) error {
 	reader := packet.NewReader(r)
 	for {
-		pkt, err := reader.Next()
+		pkt, err := nextPacket(reader)
 		if errors.Is(err, io.EOF) {
 			return errors.New("signature body contains no signature packet")
 		}
@@ -860,7 +933,7 @@ func requireParseableSignature(r io.Reader) error {
 func extractSignerInfo(r io.Reader) string {
 	reader := packet.NewReader(r)
 	for {
-		pkt, err := reader.Next()
+		pkt, err := nextPacket(reader)
 		if errors.Is(err, io.EOF) {
 			return ""
 		}
