@@ -49,6 +49,25 @@ before emission — proxy-form requests' userinfo (any
 malicious proxy request cannot smuggle credentials into the log
 stream.
 
+## Client and peer addresses
+
+`request` and `mitm_connect` retain the socket `IP:port` in `client_addr` by
+default. With [cache.trusted_proxies](configuration.md#logging-client-addresses-behind-a-proxy)
+configured, an accepted `X-Forwarded-For` chain supplies `client_addr` as a
+canonical IP without a port. In that case `peer_addr` is also emitted with
+the original socket address, including its port. IPv4-mapped forwarded
+addresses are rendered as IPv4. No client port is invented from the proxy's
+connection port.
+
+Untrusted peers, missing headers, malformed trusted chains, and chains whose
+trusted suffix exceeds the parsing limits use the original `client_addr`
+with no `peer_addr`. Ignored prefixes do not count toward those limits, so
+clients cannot suppress attribution by prepending junk. Each keep-alive
+request is resolved independently. CONNECT and its inner request use the
+same established identity; inner forwarding headers are ignored. This is a
+logging setting only, with no effect on admin authentication or upstream
+access policy. The startup event includes `cache_trusted_proxies`.
+
 ## `path_class` (SPEC6_5 §2.3)
 
 Closed enum, 8 values. Emitted on every `request` log line where

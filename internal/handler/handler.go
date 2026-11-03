@@ -23,6 +23,7 @@ import (
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/clientaddr"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
@@ -2781,6 +2782,7 @@ func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, s
 // including HIT-STALE (which fired after a fetch failed).
 func (h *Handler) logRequestWithValidation(r *http.Request, canonHost, path, outcome string, status int, bytesWritten int64, fetchAttempted bool, upstreamStatus int, start time.Time, validation packageValidation) {
 	duration := time.Since(start)
+	addr := clientaddr.FromRequest(r)
 	attrs := []any{
 		"method", r.Method,
 		"url", urlForLog(r),
@@ -2790,7 +2792,10 @@ func (h *Handler) logRequestWithValidation(r *http.Request, canonHost, path, out
 		"status", status,
 		"bytes_sent", bytesWritten,
 		"duration_ms", duration.Milliseconds(),
-		"client_addr", r.RemoteAddr,
+		"client_addr", addr.Client,
+	}
+	if addr.Client != addr.Peer {
+		attrs = append(attrs, "peer_addr", addr.Peer)
 	}
 	// SPEC6_5 §2.3: per-request path_class + architecture fields.
 	// Empty path (the pre-canonicalize bad_request / method_not_allowed

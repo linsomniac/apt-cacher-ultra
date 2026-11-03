@@ -25,6 +25,11 @@ use_acme    = false # requires [acme]; conflicts with manual tls_cert/tls_key
 # Host or host:port for --print-apt-conf (no scheme/path). Required when
 # generating snippets from a wildcard listen address; no effect on binding.
 advertise_host = ""
+# Honor X-Forwarded-For for request logs only from these proxy IPs/CIDRs.
+# Empty disables it. List only controlled proxies, never client networks.
+# Walks chains right to left; malformed trusted chains use the socket peer.
+# trusted_proxies = ["192.0.2.10", "2001:db8:1234::/64"]
+trusted_proxies = []
 
 [upstream]
 # Optional HTTP(S) forward proxy for all repository fetches; empty = direct.

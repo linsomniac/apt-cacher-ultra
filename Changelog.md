@@ -22,6 +22,10 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   the existing local cache and database checks. Suggested by Andy Smith;
   see [readiness and HAProxy setup](docs/configuration.md#readiness-and-load-balancers).
 
+- Optional `cache.trusted_proxies` IP/CIDR allowlist for secure
+  `X-Forwarded-For` logging, with right-to-left chain validation and the
+  original socket peer retained in `peer_addr`. Supports HTTP, HTTPS, and
+  CONNECT. Thanks to @grifferz for requesting this in issue #15.
 - Optional admin HTTPS and a shared server-certificate lifecycle for the cache
   and admin listeners, including automatic reload of PEM certificates.
 - Automatic ACME issuance and renewal with HTTP-01 or DNS-01, using Lego's full

@@ -53,6 +53,7 @@ only the admin listener.
 | `tls_cert` | string | `""` | Readable PEM server certificate for `listen_tls`; validated with its key when the daemon starts. |
 | `tls_key` | string | `""` | Readable PEM private key matching `tls_cert`. |
 | `use_acme` | boolean | `false` | Use the shared managed certificate for `listen_tls`. Requires `[acme]` enabled and empty file options. |
+| `trusted_proxies` | array of strings | `[]` | IPs/CIDRs allowed to supply `X-Forwarded-For` for cache request logs. Empty disables it; malformed entries prevent startup. See [trusted proxy setup](#logging-client-addresses-behind-a-proxy). |
 | `advertise_host` | string | `""` | Client-facing hostname or `host:port` for `--print-apt-conf`, without a scheme or path. A missing port uses the port from `listen`. Does not change listener binding or request routing. |
 
 For file mode, `listen_tls`, `tls_cert`, and `tls_key` must be either all set or all empty.
@@ -116,6 +117,66 @@ a fresh database; existing pool files then have no metadata and can be removed
 by garbage collection. To revert, stop all users of the database and move its
 current files back before clearing `db_dir`. Backups must include the selected
 database directory along with the cache's pool and certificate state.
+
+### Logging client addresses behind a proxy
+
+For HAProxy or another reverse proxy in front of the cache, add only that
+proxy's source IPs (as seen by the cache) to the existing `[cache]` table:
+
+```toml
+[cache]
+# Keep your existing dir/listen settings.
+trusted_proxies = ["192.0.2.10", "192.0.2.11", "2001:db8:1234::/64"]
+```
+
+Restart after changing the list. A nonempty list enables `X-Forwarded-For`;
+there is no separate on/off flag. `[]` restores the default socket-address
+logging. Entries must be literal IPv4/IPv6 addresses or CIDRs, without ports,
+DNS names, zones, or surrounding whitespace. IPv4-mapped IPv6 addresses are
+normalized to IPv4; mapped CIDRs must have at least 96 prefix bits.
+
+The cache first checks the actual connection peer. If it is trusted, the
+header chain is walked **right to left**, stopping at the first untrusted
+address. Repeated header fields are processed as one ordered list. For
+example, with only `192.0.2.10` and `192.0.2.11` trusted, a request from
+`192.0.2.10` with `X-Forwarded-For: 203.0.113.99, 198.51.100.7, 192.0.2.11`
+is logged as `198.51.100.7`; the client cannot impersonate `203.0.113.99` by
+prepending it. If every hop is trusted, the leftmost address is used.
+This follows [Apache mod_remoteip's chain traversal](https://httpd.apache.org/docs/2.4/mod/mod_remoteip.html#remoteipprocessing).
+Private and loopback client addresses are accepted from trusted proxies,
+as with Apache's `RemoteIPInternalProxy`, since apt clients often use LANs.
+Private and loopback **proxies** are never implicitly trusted.
+
+Configure the front proxy to overwrite incoming `X-Forwarded-For` with the
+observed source IP, or to append that source IP after any incoming values.
+Simply passing through a client-supplied header allows impersonation.
+For HAProxy in HTTP mode,
+[`option forwardfor`](https://docs.haproxy.org/2.5/configuration.html#4-option%20forwardfor)
+appends the source address; avoid its `if-none` option on an untrusted
+client-facing listener. Trust only proxies you control and use the narrowest practical ranges. Listing
+client networks or all addresses (`0.0.0.0/0`, `::/0`) defeats the trust boundary.
+This setting does not restrict who can connect; use network access controls.
+
+Header entries must be bare IP addresses, separated by commas and optional
+spaces/tabs. Ports, brackets, zones, hostnames, `unknown`, unspecified,
+multicast, and IPv4 limited broadcast addresses are invalid. A missing header
+or malformed entry in the portion being trusted falls back to the socket
+peer. The walk examines at most 8 KiB (including separators) and 32 entries
+from the right; exhausting either limit before establishing the client also
+falls back to the peer. Entries left of the first untrusted address are
+ignored without scanning them, so a large client-supplied prefix cannot
+hide an address appended by a trusted proxy. The HTTP server's overall
+header-size limit still applies. Requests continue normally in every
+fallback case. Other identity headers,
+including `Forwarded` and `X-Real-IP`, are ignored.
+
+This applies to both cache HTTP and HTTPS listeners, including CONNECT logs.
+A tunneled HTTPS request inherits the outer CONNECT identity; its own
+forwarding headers cannot override it. `client_addr` becomes the resolved
+IP **without a port**, and `peer_addr` records the original socket `IP:port`
+when forwarding is used. Otherwise `client_addr` retains its existing socket
+address format and `peer_addr` is absent. The admin listener and authorization
+policies are unaffected. See [log fields](log-fields.md#client-and-peer-addresses).
 
 ## `[upstream]`: fetching and access policy
 

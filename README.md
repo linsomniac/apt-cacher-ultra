@@ -124,6 +124,10 @@ Snapshot adoption is initially disabled. The admin interface, including
 these settings before making either listener available beyond your trusted
 network.
 
+To log original client addresses behind HAProxy or another reverse proxy,
+set `cache.trusted_proxies` to its IPs/CIDRs. Forwarding headers are ignored
+by default; see [trusted proxy setup](docs/configuration.md#logging-client-addresses-behind-a-proxy).
+
 To fetch through another proxy, set `proxy = "http://proxy.example.net:3128"`
 in `[upstream]`. Direct access remains the default. See
 [upstream proxy setup](docs/configuration.md#using-an-upstream-proxy) for
