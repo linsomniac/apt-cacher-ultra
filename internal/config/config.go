@@ -74,6 +74,7 @@ type Config struct {
 type CacheConfig struct {
 	UseACME   bool   `toml:"use_acme"`
 	Dir       string `toml:"dir"`
+	DBDir     string `toml:"db_dir"` // Empty uses Dir; holds cache.db and its WAL/SHM files.
 	Listen    string `toml:"listen"`
 	ListenTLS string `toml:"listen_tls"`
 	TLSCert   string `toml:"tls_cert"`
@@ -87,6 +88,14 @@ type CacheConfig struct {
 	// no path). Useful when Listen binds 0.0.0.0/:: and the snippet
 	// would otherwise emit a non-routable target.
 	AdvertiseHost string `toml:"advertise_host"`
+}
+
+// DatabaseDir returns DBDir, falling back to Dir when it is empty.
+func (c CacheConfig) DatabaseDir() string {
+	if c.DBDir != "" {
+		return c.DBDir
+	}
+	return c.Dir
 }
 
 type UpstreamConfig struct {
@@ -953,6 +962,16 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("cache.dir %q is not a directory", c.Cache.Dir))
 	} else if err := checkWritable(c.Cache.Dir); err != nil {
 		errs = append(errs, fmt.Errorf("cache.dir %q: %w", c.Cache.Dir, err))
+	}
+
+	if dir := c.Cache.DBDir; dir != "" && dir != c.Cache.Dir {
+		if st, err := os.Stat(dir); err != nil {
+			errs = append(errs, fmt.Errorf("cache.db_dir %q: %w", dir, err))
+		} else if !st.IsDir() {
+			errs = append(errs, fmt.Errorf("cache.db_dir %q is not a directory", dir))
+		} else if err := checkWritable(dir); err != nil {
+			errs = append(errs, fmt.Errorf("cache.db_dir %q: %w", dir, err))
+		}
 	}
 
 	// AIDEV-NOTE: cache.listen is not "required" because Defaults() fills in

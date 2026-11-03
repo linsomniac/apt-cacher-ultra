@@ -41,6 +41,7 @@ func maxIdleConns() int {
 // connection pool freely. SPEC §9.4.
 type Cache struct {
 	dir    string
+	dbDir  string
 	db     *sql.DB
 	logger *slog.Logger
 
@@ -102,6 +103,16 @@ type Cache struct {
 // logger sinks the SPEC §10 schema-migration and blob-write structured
 // logs. Pass nil to fall back to slog.Default().
 func Open(ctx context.Context, dir string, logger *slog.Logger) (*Cache, error) {
+	return OpenWithDBDir(ctx, dir, "", logger)
+}
+
+// OpenWithDBDir is Open with a separate directory for cache.db and its WAL/SHM
+// files. An empty dbDir uses dir. All blob and scratch files remain under dir
+// so their hard links and renames stay on the same filesystem. Caller must Close.
+func OpenWithDBDir(ctx context.Context, dir, dbDir string, logger *slog.Logger) (*Cache, error) {
+	if dbDir == "" {
+		dbDir = dir
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -111,7 +122,10 @@ func Open(ctx context.Context, dir string, logger *slog.Logger) (*Cache, error) 
 		}
 	}
 
-	db, err := openDB(filepath.Join(dir, "cache.db"))
+	if err := os.MkdirAll(dbDir, 0o750); err != nil {
+		return nil, fmt.Errorf("create database directory %q: %w", dbDir, err)
+	}
+	db, err := openDB(filepath.Join(dbDir, "cache.db"))
 	if err != nil {
 		return nil, err
 	}
@@ -122,6 +136,7 @@ func Open(ctx context.Context, dir string, logger *slog.Logger) (*Cache, error) 
 
 	c := &Cache{
 		dir:     dir,
+		dbDir:   dbDir,
 		db:      db,
 		logger:  logger,
 		writes:  make(chan writeReq, writeBufferSize),
@@ -140,6 +155,9 @@ func Open(ctx context.Context, dir string, logger *slog.Logger) (*Cache, error) 
 
 // Dir is the on-disk root of the cache.
 func (c *Cache) Dir() string { return c.dir }
+
+// DBDir is the directory containing cache.db and its WAL/SHM files.
+func (c *Cache) DBDir() string { return c.dbDir }
 
 // Ping checks the SQLite handle responds to a round-trip query
 // within ctx. Used by the admin /healthz endpoint (SPEC5 §9.7.4

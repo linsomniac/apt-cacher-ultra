@@ -1135,3 +1135,18 @@ func TestRunLegacyTrustAudit_ErrorsCarryThePrefix(t *testing.T) {
 		t.Fatalf("err = %v, want the second batch's read error with the prefix", err)
 	}
 }
+
+func TestLegacyAuditStartEmptyWithSeparateDatabase(t *testing.T) {
+	dir, dbDir := t.TempDir(), t.TempDir()
+	c, err := cache.OpenWithDBDir(context.Background(), dir, dbDir, discardAuditLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	advice := legacyAuditStartEmpty(c)
+	for _, want := range []string{"cache.db-wal and cache.db-shm) from " + dbDir, "pool/ from " + dir, "keeping ca/"} {
+		if !strings.Contains(advice, want) {
+			t.Errorf("reset advice %q missing %q", advice, want)
+		}
+	}
+}

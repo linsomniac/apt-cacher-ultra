@@ -68,7 +68,7 @@ func runPackagesList(args []string, stdout, stderr io.Writer) int {
 	}
 
 	ctx := context.Background()
-	c, err := openReadOnlyCache(ctx, cfg.Cache.Dir)
+	c, err := openReadOnlyCache(ctx, cfg.Cache)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "packages list: open cache %q: %v\n", cfg.Cache.Dir, err)
 		return 2
@@ -100,9 +100,9 @@ func runPackagesList(args []string, stdout, stderr io.Writer) int {
 // schema_migrated Info lines that fire on first contact with an older
 // DB — the subcommand prints its own stderr diagnostics and operators
 // scripting against it should not see migration chatter spliced in.
-func openReadOnlyCache(ctx context.Context, dir string) (*cache.Cache, error) {
+func openReadOnlyCache(ctx context.Context, cfg config.CacheConfig) (*cache.Cache, error) {
 	discard := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	return cache.Open(ctx, dir, discard)
+	return cache.OpenWithDBDir(ctx, cfg.Dir, cfg.DBDir, discard)
 }
 
 func renderPackagesPlain(stdout, stderr io.Writer, debs []cache.CachedDeb) int {

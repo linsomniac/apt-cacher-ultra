@@ -36,3 +36,43 @@ func lockDaemonCache(dir string) (*os.File, error) {
 	}
 	return f, nil
 }
+
+// lockDaemonStorage keeps both the pool and its database exclusive to one
+// daemon. Sharing either with a different cache can make startup GC delete
+// files that the other daemon still needs. CLI readers do not take these locks.
+func lockDaemonStorage(dir, dbDir string) (func(), error) {
+	cacheLock, err := lockDaemonCache(dir)
+	if err != nil {
+		return nil, err
+	}
+	var dbLock *os.File
+	unlock := func() {
+		if dbLock != nil {
+			_ = dbLock.Close()
+		}
+		_ = cacheLock.Close()
+	}
+	if dbDir == "" || dbDir == dir {
+		return unlock, nil
+	}
+	cacheInfo, err := os.Stat(dir)
+	if err != nil {
+		unlock()
+		return nil, err
+	}
+	dbInfo, err := os.Stat(dbDir)
+	if err != nil {
+		unlock()
+		return nil, err
+	}
+	// Aliases (including symlinks) must not try to lock the same inode twice.
+	if os.SameFile(cacheInfo, dbInfo) {
+		return unlock, nil
+	}
+	dbLock, err = lockDaemonCache(dbDir)
+	if err != nil {
+		unlock()
+		return nil, err
+	}
+	return unlock, nil
+}
