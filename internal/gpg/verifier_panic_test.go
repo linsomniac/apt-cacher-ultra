@@ -16,6 +16,8 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
 )
 
 // The 1.0.3 patch: a malformed upstream signature must be an ordinary
@@ -172,13 +174,59 @@ func TestVerifyInline_I1RequireSignatureFalse_NoPanic(t *testing.T) {
 	})
 }
 
+// TestVerifyInline_EmptyPlaintextUnderAcceptAnySigner: I-1's shape with an
+// armored signature that parses (a signed InRelease's own, its signed text
+// cut out) decodes under v1.5.2 to a block with no plaintext.
+// accept_any_signer's bypass only checks that the signature parses, so the
+// verifier passes it with 0 bytes, and adoption's ParseRelease then refuses
+// it (no SHA256 block: parse_failed), so nothing is adopted. Without the
+// bypass the signature check refuses it: the packet signs other text.
+// v1.4.1 panicked on it, as on i1Bodies.
+func TestVerifyInline_EmptyPlaintextUnderAcceptAnySigner(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	keyring := newKeyring(t, signer)
+	signed := clearsignWith(t, signer, []byte(fakeReleasePlaintext))
+	sig := bytes.Index(signed, []byte("-----BEGIN PGP SIGNATURE-----"))
+	if sig < 0 {
+		t.Fatalf("no signature block in %q", signed)
+	}
+	body := append([]byte("-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n"), signed[sig:]...)
+	for _, acceptAny := range []bool{true, false} {
+		v, err := NewVerifier(VerifierConfig{
+			Keyring:          keyring,
+			RequireSignature: true,
+			AcceptAnySigner:  acceptAny,
+			Logger:           silentLogger(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := verifyNoPanic(t, func() ([]byte, error) {
+			return v.VerifyInline(context.Background(), newSuite(), body)
+		})
+		if !acceptAny {
+			if got := ClassifyVerifyErr(err); err == nil || got != "crypto_verify_failed" {
+				t.Errorf("accept_any_signer=false: out=%q err=%v (reason %q); want crypto_verify_failed", out, err, got)
+			}
+			continue
+		}
+		if err != nil || len(out) != 0 {
+			t.Fatalf("accept_any_signer=true: out=%q err=%v; want accepted with 0 bytes", out, err)
+		}
+		if members, err := freshness.ParseRelease(out); err == nil {
+			t.Errorf("ParseRelease accepted the empty plaintext (%d members); want it refused (no SHA256 block)", len(members))
+		}
+	}
+}
+
 // arc3Shapes are A-RC3's shapes (the hardening corpus's batch fx18, q10_):
 // a signature packet from B, a key no client has, whose hashed area holds
 // an exportable-certification subpacket (type 4; critical in _crit_) with
 // no value octet, alone or beside A's good packet. go-crypto v1.4.1 read
 // that empty body (subpacket[0], signature.go:458) and panicked: key-free,
-// an extra packet from an unknown key was enough. v1.5.0 returns a
-// StructuralError for it instead.
+// an unknown key's packet, alone or ahead of a good one, was enough. v1.5.0
+// fixed I-1, v1.5.1 fixed A-RC3: it returns a StructuralError for this
+// subpacket instead.
 //
 // want pins 1.0.3's verdict: "" accepts, else the refusal's reason. The
 // verifier reads packets in order and stops at the first one go-crypto

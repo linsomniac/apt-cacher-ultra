@@ -201,14 +201,14 @@ var (
 // message with no plaintext lines (I-1: slice bounds out of range [:-1],
 // clearsign.go:182), and packet.Read on a signature packet whose hashed
 // area holds an empty exportable-certification subpacket (A-RC3: index out
-// of range, signature.go:458; key-free, a packet from an unknown key beside
-// a good one is enough). The verifier runs in the freshness adoption
-// goroutine, which has no recover in 1.0.x, so either panic killed the
-// daemon, and systemd's restart fetched the same body again. go-crypto
-// v1.5.0 fixed both, and 1.0.3 bumps it to v1.5.2. As defence in depth,
-// every go-crypto call on upstream bytes in this file runs under a
-// recover: in decodeClearsigned, nextPacket and verifyPacket below, or in
-// readArmoredSignature and decodeMaybeArmoredSignature, which read the
+// of range, signature.go:458; key-free, a packet from an unknown key, alone
+// or ahead of a good one, is enough). The verifier runs in the freshness
+// adoption goroutine, which has no recover in 1.0.x, so either panic killed
+// the daemon, and systemd's restart fetched the same body again. go-crypto
+// v1.5.0 fixed I-1, v1.5.1 fixed A-RC3, and 1.0.3 bumps it to v1.5.2. As
+// defence in depth, every go-crypto call on upstream bytes in this file runs
+// under a recover: in decodeClearsigned, nextPacket and verifyPacket below,
+// or in readArmoredSignature and decodeMaybeArmoredSignature, which read the
 // armor. Each turns a panic into the error that call's path already
 // returns for a malformed body: ErrMissingSignature (reason
 // missing_signature) for the clearsign decode; for the armor, packet and
