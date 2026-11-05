@@ -24,8 +24,24 @@ import (
 // does not read, and nor did this reading (readKeyring); LoadKeyring warns.
 type keyFile struct {
 	entities    openpgp.EntityList
-	uncountable map[string]error
+	uncountable map[string]keyMark
 	broken      error
+}
+
+// keyMark is S2's mark on a key or subkey: why it is not counted, and from
+// when (from: zero for a mark that always holds; a direct-key expiry's is
+// the moment the key expires, judged at the verifier's clock: keyMark.at).
+type keyMark struct {
+	why  error
+	from time.Time
+}
+
+// at returns the mark's reason when it holds at now, nil before its time.
+func (m keyMark) at(now time.Time) error {
+	if m.from.IsZero() || !now.Before(m.from) {
+		return m.why
+	}
+	return nil
 }
 
 // addEntity adds e to kf's keys, merged into the key of its primary
@@ -41,13 +57,13 @@ func (kf *keyFile) addEntity(e *openpgp.Entity) {
 }
 
 // addMarks adds marks to kf's, the first mark on a fingerprint kept.
-func (kf *keyFile) addMarks(marks map[string]error) {
-	for fp, why := range marks {
+func (kf *keyFile) addMarks(marks map[string]keyMark) {
+	for fp, m := range marks {
 		if kf.uncountable == nil {
-			kf.uncountable = make(map[string]error)
+			kf.uncountable = make(map[string]keyMark)
 		}
 		if _, dup := kf.uncountable[fp]; !dup {
-			kf.uncountable[fp] = why
+			kf.uncountable[fp] = m
 		}
 	}
 }
@@ -620,6 +636,7 @@ type keySig struct {
 	created time.Time // its creation time; zero when it cannot be read
 	ok      bool
 	why     string
+	sig     *packet.Signature // as go-crypto parsed it; nil when it does not
 	// kept: go-crypto verified it as the key's own and every issuer
 	// subpacket it carries names the key (none: by the verification alone).
 	// The only signatures that may suppress a mark (marks: "newest kept").
@@ -1027,7 +1044,7 @@ func (s *keySig) read(kb *keyBlock, c *keyComponent) {
 		}
 		return
 	}
-	s.issuer, s.created = rawSig{fpr: sig.IssuerFingerprint}, sig.CreationTime
+	s.sig, s.issuer, s.created = sig, rawSig{fpr: sig.IssuerFingerprint}, sig.CreationTime
 	if sig.IssuerKeyId != nil {
 		s.issuer.keyID = binary.BigEndian.AppendUint64(nil, *sig.IssuerKeyId)
 	}
@@ -1265,16 +1282,17 @@ func supersedes(typ byte) byte {
 // such signature before the marks were made, and round 5's version 3
 // revocation rule, precise about the version, the type and the issuer, was
 // still under-strict twice.
-func (kb *keyBlock) marks() map[string]error {
-	var out map[string]error
-	mark := func(fp string, err error) {
+func (kb *keyBlock) marks() map[string]keyMark {
+	var out map[string]keyMark
+	markFrom := func(fp string, err error, from time.Time) {
 		if out == nil {
-			out = make(map[string]error)
+			out = make(map[string]keyMark)
 		}
 		if _, dup := out[fp]; !dup {
-			out[fp] = err
+			out[fp] = keyMark{why: err, from: from}
 		}
 	}
+	mark := func(fp string, err error) { markFrom(fp, err, time.Time{}) }
 	key := upperFP(kb.key.Fingerprint)
 	// Revocations first, over every component, then superseding signatures:
 	// a component both revoked and expired is reported revoked, as gpgv
@@ -1333,6 +1351,34 @@ func (kb *keyBlock) marks() map[string]error {
 				mark(fp, fmt.Errorf("%w: a signature of type 0x%02x by the key on %s, newer than the one the cache kept, stands on it that %s; gpgv takes the newest, and it may expire or unbind the component", pgperrors.ErrKeyExpired, s.typ, what, s.why))
 			}
 		}
+	}
+	// A readable direct-key expiry (the closure check's V-R8I3, since main):
+	// go-crypto v1.5.2 reads a v4 key's direct-key signatures and uses none
+	// (keys.go:546, a v6 key's alone), where every supported apt honours a
+	// key expiration one sets (kr26_dk_readable_exp: EXPKEYSIG in the five
+	// gpgv-based apt, refused by sqv). The newest kept direct-key signature
+	// (its issuers agreeing, as "newest kept" above) that sets a key
+	// expiration marks the key from that moment, judged at the verifier's
+	// clock (keyMark.at). Kept at that, by the controller's ruling: gpg's
+	// merge of the direct-key and user-ID self-signatures is not modelled,
+	// so a newer user-ID self-signature does not cancel it (over-strict,
+	// Minor and Open under R3; unmeasured). Measured over debian-keyring's
+	// four v4 keys with a direct-key expiry (V's dk-gwolf.txt): the one
+	// whose direct-key expiry has passed, 4D14050653A402D73687049D2404C9546E145360
+	// (2026-04-27), go-crypto takes as expired by its user-ID
+	// self-signatures too, so the mark changes no verdict; the other
+	// three expire in the future. After the unconditional marks: the first
+	// mark on a fingerprint stands.
+	var newestDK *keySig
+	for i := range kb.components[0].sigs {
+		s := &kb.components[0].sigs[i]
+		if s.kept && s.typ == byte(packet.SigTypeDirectSignature) && (newestDK == nil || s.created.After(newestDK.created)) {
+			newestDK = s
+		}
+	}
+	if newestDK != nil && newestDK.sig != nil && newestDK.sig.KeyLifetimeSecs != nil && *newestDK.sig.KeyLifetimeSecs != 0 {
+		expires := kb.key.CreationTime.Add(time.Duration(*newestDK.sig.KeyLifetimeSecs) * time.Second)
+		markFrom(key, fmt.Errorf("%w: the key's newest direct-key signature (made %s) sets it to expire at %s, which go-crypto does not read for a v4 key and every supported apt honours", pgperrors.ErrKeyExpired, newestDK.created.UTC().Format(time.RFC3339), expires.UTC().Format(time.RFC3339)), expires)
 	}
 	return out
 }

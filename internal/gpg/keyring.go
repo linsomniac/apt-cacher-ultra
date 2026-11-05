@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
@@ -79,12 +80,14 @@ type Keyring struct {
 	// marks under ruling R2: a revocation or a newer binding the cache
 	// cannot read, which gpgv honours), a mark on a primary key extended to
 	// its subkeys. S1 knows them as it knows every key (uncountableKey).
-	uncountable map[string]error
+	uncountable map[string]keyMark
 }
 
 // uncountableKey says why S2 must not count the key or subkey whose
-// uppercase fingerprint is fp (uncountable), nil when it may.
-func (k *Keyring) uncountableKey(fp string) error { return k.uncountable[fp] }
+// uppercase fingerprint is fp (uncountable) at now, the verifier's clock
+// (a direct-key expiry's mark holds from the moment the key expires), nil
+// when it may.
+func (k *Keyring) uncountableKey(fp string, now time.Time) error { return k.uncountable[fp].at(now) }
 
 // Empty reports whether the keyring loaded zero entities.
 func (k *Keyring) Empty() bool { return len(k.entities) == 0 }
@@ -237,14 +240,14 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 	//     too would close it without reopening V-R2C2.
 	seen := make(map[string]int) // primary fingerprint -> its index in entries
 	var entries []KeyringEntry
-	uncountable := make(map[string]error)
+	uncountable := make(map[string]keyMark)
 
 	addEntities := func(parsed *keyFile, source string) {
 		// A mark from any copy of a key holds, as a revocation in any
 		// copy counts (the merge below).
-		for fp, why := range parsed.uncountable {
+		for fp, m := range parsed.uncountable {
 			if _, dup := uncountable[fp]; !dup {
-				uncountable[fp] = why
+				uncountable[fp] = m
 			}
 		}
 		for _, e := range parsed.entities {
@@ -369,15 +372,18 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 	for i := range entries {
 		e := entries[i].Entity
 		fingerprints[entries[i].PrimaryFingerprint] = struct{}{}
-		primaryMark := uncountable[entries[i].PrimaryFingerprint]
+		primaryMark, primaryMarked := uncountable[entries[i].PrimaryFingerprint]
 		subFPs := make([]string, 0, len(e.Subkeys))
 		for _, sub := range e.Subkeys {
 			if sub.PublicKey != nil {
 				subFP := upperFP(sub.PublicKey.Fingerprint)
 				fingerprints[subFP] = struct{}{}
 				subFPs = append(subFPs, subFP)
-				if _, marked := uncountable[subFP]; primaryMark != nil && !marked {
-					uncountable[subFP] = fmt.Errorf("its primary key %s: %w", entries[i].PrimaryFingerprint, primaryMark)
+				if _, marked := uncountable[subFP]; primaryMarked && !marked {
+					uncountable[subFP] = keyMark{
+						why:  fmt.Errorf("its primary key %s: %w", entries[i].PrimaryFingerprint, primaryMark.why),
+						from: primaryMark.from,
+					}
 				}
 			}
 		}

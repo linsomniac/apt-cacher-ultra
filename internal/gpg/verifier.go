@@ -687,8 +687,12 @@ func (v *Verifier) verifyAnyTrusted(
 	// says whether it does. It outranks a verification error as discount's
 	// reasons do: S1 has verified the packet (its key is known), so it names
 	// why a good signature did not count.
+	now := time.Now()
+	if v.now != nil {
+		now = v.now()
+	}
 	uncountableKey := func(fp string, i int) bool {
-		why := v.keyring.uncountableKey(fp)
+		why := v.keyring.uncountableKey(fp, now)
 		if why == nil {
 			return false
 		}

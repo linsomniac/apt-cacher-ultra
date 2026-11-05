@@ -550,7 +550,7 @@ func TestParseKeyring_MarksWhatItCannotRead(t *testing.T) {
 			}
 			continue
 		}
-		why := kf.uncountable[want]
+		why := kf.uncountable[want].why
 		if len(kf.uncountable) != 1 || why == nil || !errors.Is(why, row.want) || !strings.Contains(why.Error(), typ) {
 			t.Errorf("%s: marks %v; want %s alone marked %v, naming %s", row.name, kf.uncountable, want, row.want, typ)
 		}
@@ -723,6 +723,62 @@ func TestVerifier_NewestKeptIsTheKeysOwnAlone(t *testing.T) {
 			t.Errorf("%s: K's good signature: %v; want it adopted", tc.name, err)
 		case tc.want != nil && !errors.Is(err, tc.want):
 			t.Errorf("%s: K's good signature: %v; want %v", tc.name, err, tc.want)
+		}
+		if _, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, aGood, kBad)); !errors.Is(err, ErrBadSignature) {
+			t.Errorf("%s: A's good signature and K's bad one: %v; want ErrBadSignature (S1 knows K)", tc.name, err)
+		}
+	}
+}
+
+// TestVerifier_AReadableDirectKeyExpiryIsHonoured: the closure check's
+// V-R8I3 (since main). go-crypto v1.5.2 reads a v4 key's direct-key
+// signatures and uses none, where every supported apt honours a key
+// expiration one sets (kr26_dk_readable_exp: EXPKEYSIG in the five
+// gpgv-based apt, refused by sqv). The newest kept direct-key signature
+// that sets an expiration marks the key from that moment, judged at the
+// verifier's clock: an expiry that has passed refuses, one in the future
+// counts now and refuses at a later clock, one by another key is ignored,
+// and the newest one governs (an older expiring one under a newer one
+// without expiry: counts). By the controller's ruling a newer user-ID
+// self-signature does not cancel the direct-key expiry (over-strict, R3).
+func TestVerifier_AReadableDirectKeyExpiryIsHonoured(t *testing.T) {
+	kk := newKR14Keys(t)
+	x := newTestEntity(t, "X", "x@example.com")
+	a := newTestEntity(t, "A", "a@example.com")
+	kGood, kBad := signedBy(t, kk.k, fakeReleasePlaintext), signedBy(t, kk.k, "Origin: Other\n")
+	aGood := signaturePacketsOf(t, clearsignWith(t, a, []byte(fakeReleasePlaintext)))
+	pMaterial := keyMaterial(t, kk.p.PrimaryKey)
+	lifetime := func(secs uint32) []byte { return subpacket(t, 9, binary.BigEndian.AppendUint32(nil, secs)) }
+	dk := func(signer *openpgp.Entity, when time.Time, extra ...[]byte) []byte {
+		return rsaKeySig(t, signer, byte(packet.SigTypeDirectSignature), crypto.SHA256, hashSHA256, joined(createdAt(t, when), issuerFpr(t, signer.PrimaryKey), joined(extra...)), pMaterial)
+	}
+	t0, t1 := time.Date(2024, 1, 3, 0, 0, 0, 0, time.UTC), time.Date(2024, 1, 4, 0, 0, 0, 0, time.UTC)
+	const day, year = 86400, 365 * 86400
+	later := time.Date(2035, 1, 1, 0, 0, 0, 0, time.UTC) // P (made 2024-01-01) with a five-year lifetime has expired
+	for _, tc := range []struct {
+		name string
+		ring []byte
+		at   time.Time // the verifier's clock; zero: the wall clock
+		want error     // nil: K's good signature adopted
+	}{
+		{"kr26_dk_readable_exp: P's readable 0x1f expiring P a day after its creation: refused", kk.ring(t, [][]byte{dk(kk.p, t1, lifetime(day))}, nil), time.Time{}, pgperrors.ErrKeyExpired},
+		{"P's readable 0x1f expiring P in a hundred years: counts", kk.ring(t, [][]byte{dk(kk.p, t1, lifetime(100*year))}, nil), time.Time{}, nil},
+		{"P's readable 0x1f expiring P in five years, at the wall clock: counts", kk.ring(t, [][]byte{dk(kk.p, t1, lifetime(5*year))}, nil), time.Time{}, nil},
+		{"the same, at a clock in 2035: refused", kk.ring(t, [][]byte{dk(kk.p, t1, lifetime(5*year))}, nil), later, pgperrors.ErrKeyExpired},
+		{"X's 0x1f expiring P a day after its creation: another key's, ignored; counts", kk.ring(t, [][]byte{dk(x, t1, lifetime(day))}, nil), time.Time{}, nil},
+		{"P's older 0x1f expiring P, then a newer one without expiry: the newest governs; counts", kk.ring(t, [][]byte{dk(kk.p, t0, lifetime(day)), dk(kk.p, t1)}, nil), time.Time{}, nil},
+		{"P's older 0x1f without expiry, then a newer one expiring P: refused", kk.ring(t, [][]byte{dk(kk.p, t0), dk(kk.p, t1, lifetime(day))}, nil), time.Time{}, pgperrors.ErrKeyExpired},
+	} {
+		v := kr14Verifier(t, map[string][]byte{"00-a.gpg": binaryKey(t, a), "20-p.gpg": tc.ring})
+		if !tc.at.IsZero() {
+			v.now = func() time.Time { return tc.at }
+		}
+		_, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, kGood))
+		switch {
+		case tc.want == nil && err != nil:
+			t.Errorf("%s: K's good signature: %v; want it adopted", tc.name, err)
+		case tc.want != nil && (!errors.Is(err, tc.want) || !strings.Contains(err.Error(), "direct-key signature")):
+			t.Errorf("%s: K's good signature: %v; want %v, the mark naming the direct-key signature", tc.name, err, tc.want)
 		}
 		if _, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, aGood, kBad)); !errors.Is(err, ErrBadSignature) {
 			t.Errorf("%s: A's good signature and K's bad one: %v; want ErrBadSignature (S1 knows K)", tc.name, err)
