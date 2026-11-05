@@ -2139,13 +2139,15 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 	// Release.gpg, dists or flat (F2-R1-M1). Measured with apt 3.0.3
 	// (debian:13), 2.8.3 (ubuntu:24.04) and 2.2.4 (debian:11): an empty
 	// or 204 InRelease or Release.gpg is a hard error (NOSPLIT/NODATA,
-	// exit 100), a 502 only warns (exit 0, old lists kept), and only a
-	// 404 makes apt fall back to Release + Release.gpg. Refused here:
+	// exit 100), a 502 only warns (exit 0, old lists kept), and of a 404,
+	// 502, 204 and an empty 200, only the 404 makes apt fall back to
+	// Release + Release.gpg (no other status was measured). Refused here:
 	// 502 + Retry-After (ErrUpstreamNoContent), nothing finalized (the
 	// deferred Abort drops the temp), so the next request fetches again.
 	// Do not widen 204 acceptance to anchors or package files without
 	// re-measuring apt and asking the maintainer. Do not narrow it below
-	// empty indexes: that breaks PR #22's GitLab case. Pinned by
+	// empty indexes without asking the maintainer: that breaks PR #22's
+	// GitLab case. Pinned by
 	// TestServeHTTP_NoContent{PackageFile,Anchor}IsAnUpstreamError,
 	// TestServeHTTP_NoContentMetadataIsAnEmptySuccess and
 	// TestAdopter_NoContentHTTP (internal/freshness).

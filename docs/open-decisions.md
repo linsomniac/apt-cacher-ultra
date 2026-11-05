@@ -999,12 +999,13 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   apt 3.0.3 (debian:13), 2.8.3 (ubuntu:24.04) and 2.2.4 (debian:11), an
   empty or 204 `InRelease` or `Release.gpg` is a hard error
   (NOSPLIT/NODATA, exit 100), a 502 only warns (exit 0, the old lists
-  kept), and only a 404 makes apt fall back to `Release` and
-  `Release.gpg`. A 204 is visible either way: `upstream_status` 204 and
+  kept), and of a 404, 502, 204 and an empty 200, only the 404 makes
+  apt fall back to `Release` and `Release.gpg` (no other status was
+  measured). A 204 is visible either way: `upstream_status` 204 and
   `acu_fetch_total{outcome="no_content"}` (F2-M3). Do not widen 204
   acceptance to anchors or package files without re-measuring apt and
-  asking the maintainer; do not narrow it below empty indexes, which
-  breaks PR #22's GitLab case. Residual: an anchor-named path with no
+  asking the maintainer. Do not narrow it below empty indexes without
+  asking the maintainer: that breaks PR #22's GitLab case. Residual: an anchor-named path with no
   suite (a host-root flat repository's `/InRelease`, unsupported and
   logged `flat_host_root_unsupported`; a non-canonical path) is
   classified as plain metadata and still accepts a 204. Commit c2ee1c2
