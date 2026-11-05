@@ -919,7 +919,11 @@ func (kb *keyBlock) classify() {
 			// subpacket of any of its own direct-key signatures or
 			// self-certifications, read or not (gpg reads them from the
 			// hashed area; a self-signature whose subpackets cannot be
-			// walked may name any key: anyRevoker).
+			// walked may name any key: anyRevoker). "Its own" by either
+			// issuer (keySig.read: the seventh re-review's V-R7I1, a
+			// readable 0x1f naming another key by fingerprint and the key by
+			// key ID designates to gpgv 2.2, REVKEYSIG in apt 2.2.4, 2.4.14
+			// and 2.6.1).
 			if s.self && !s.legacy && (c.kind == onPrimary && s.typ == byte(packet.SigTypeDirectSignature) ||
 				c.kind == onUserID && supersedes(s.typ) == byte(packet.SigTypePositiveCert)) {
 				r := rawSigInfo(s.raw.body)
@@ -988,14 +992,15 @@ func (s *keySig) read(kb *keyBlock, c *keyComponent) {
 	if sig.IssuerKeyId != nil {
 		s.issuer.keyID = binary.BigEndian.AppendUint64(nil, *sig.IssuerKeyId)
 	}
-	// go-crypto's own answer (the fingerprint first, where there is one);
-	// a revocation is also the key's own when either issuer names the key
-	// (the sixth re-review's V-R6I3, as rawSig.issuerIs), so one whose two
-	// disagree fails closed as the key's own that does not verify.
-	s.self = sig.CheckKeyIdOrFingerprint(kb.key)
-	if t := packet.SignatureType(s.typ); t == packet.SigTypeKeyRevocation || t == packet.SigTypeSubkeyRevocation || t == packet.SigTypeCertificationRevocation {
-		s.self = s.self || s.issuer.issuerIs(kb.key)
-	}
+	// go-crypto's own answer (the fingerprint first, where there is one), or
+	// either issuer naming the key (rawSig.issuerIs): a signature whose two
+	// issuers disagree is the key's own to gpgv 2.2 (the key ID) and so
+	// fails closed here, whatever its type — a revocation (the sixth
+	// re-review's V-R6I3) as the key's own that does not verify, a
+	// direct-key signature (the seventh's V-R7I1) as one whose designated
+	// revokers classify reads, a self-certification or binding as one the
+	// superseding rule weighs.
+	s.self = sig.CheckKeyIdOrFingerprint(kb.key) || s.issuer.issuerIs(kb.key)
 	var verr error
 	switch {
 	case c.kind == onPrimary && !s.self:

@@ -635,6 +635,11 @@ func TestVerifier_ThirdPartyRevocationsMarkOnlyWhenDesignated(t *testing.T) {
 		{"kr21_dr_fprmis_xin: P designates X, X's readable 0x20 naming Y by fingerprint and X by key ID: P marked", kk.ring(t, [][]byte{designating(x, crypto.SHA256, hashSHA256), rsaKeySig(t, x, byte(packet.SigTypeKeyRevocation), crypto.SHA256, hashSHA256, joined(createdAt(t, kr14Created), issuerFpr(t, y.PrimaryKey), reason), pMaterial)}, nil), pgperrors.ErrKeyRevoked},
 		{"kr23_dr_er_fprmis_xin: the same, unreadable (RIPEMD-160): P marked", kk.ring(t, [][]byte{designating(x, crypto.SHA256, hashSHA256), rsaKeySig(t, x, byte(packet.SigTypeKeyRevocation), crypto.RIPEMD160, hashRIPEMD160, joined(createdAt(t, kr14Created), issuerFpr(t, y.PrimaryKey), reason), pMaterial)}, nil), pgperrors.ErrKeyRevoked},
 		{"kr24_dr_er_fpronly_xin: P designates X, X's unreadable 0x20 naming X by fingerprint alone: P marked, the mark naming X's fingerprint", kk.ring(t, [][]byte{designating(x, crypto.SHA256, hashSHA256), rsaKeySigUnhashed(t, x, byte(packet.SigTypeKeyRevocation), crypto.RIPEMD160, hashRIPEMD160, joined(createdAt(t, kr14Created), issuerFpr(t, x.PrimaryKey), reason), nil, pMaterial)}, nil), pgperrors.ErrKeyRevoked},
+		// The designation itself with disagreeing issuers (the seventh
+		// re-review's V-R7I1): P's readable 0x1f naming Y by fingerprint and
+		// P by key ID designates X to gpgv 2.2 (REVKEYSIG in apt 2.2.4,
+		// 2.4.14 and 2.6.1), so X's 0x20 marks.
+		{"kr25_dr_desig_fprmis_xin: P's readable 0x1f designating X, naming Y by fingerprint and P by key ID; X's 0x20: P marked", kk.ring(t, [][]byte{rsaKeySig(t, kk.p, byte(packet.SigTypeDirectSignature), crypto.SHA256, hashSHA256, joined(createdAt(t, time.Date(2024, 1, 3, 0, 0, 0, 0, time.UTC)), issuerFpr(t, y.PrimaryKey), subpacket(t, 12, joined([]byte{0x80, byte(packet.PubKeyAlgoRSA)}, x.PrimaryKey.Fingerprint))), pMaterial), xRevP}, nil), pgperrors.ErrKeyRevoked},
 	} {
 		v := kr14Verifier(t, map[string][]byte{"00-a.gpg": binaryKey(t, a), "20-p.gpg": tc.ring})
 		_, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, kGood))
