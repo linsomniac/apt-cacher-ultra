@@ -346,7 +346,8 @@ detection, the startup legacy trust audit, the flip barrier, suite rows
 (cap refusals, evictions, reaping and `POST /forget`), a slow shutdown
 drain, garbage collection's recovered panics and the HTTP servers' own
 diagnostics (logged by `internal/freshness`, `internal/handler`,
-`internal/admin`, `internal/gc` and the daemon's `main`).
+`internal/admin`, `internal/gc`, `internal/gpg` for the keyring loader's
+file events and the daemon's `main`).
 
 | Event | Level | Fields | Meaning |
 |---|---|---|---|

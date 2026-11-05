@@ -234,9 +234,12 @@ func parseKeyringReaderMax(r io.Reader, maxFile int) (*keyFile, error) {
 //     marks the key for S2, keyBlock.marks);
 //   - a subkey whose only binding go-crypto cannot verify (one hashed with
 //     RIPEMD-160, which its packet reader skips): the subkey is dropped
-//     (keyBlock.packets keeps a subkey only with a binding), where gpg uses
-//     it, as in two of the six Debian keys below; S1 does not know it, and
-//     S2 cannot count it (fail closed, as ruling R2 asks);
+//     (keyBlock.packets keeps a subkey only with a binding), where gpg
+//     lists it; in two of the six Debian keys below those are revoked
+//     authentication subkeys, which gpg lists as revoked (the fifth
+//     re-review's V-R5M3), so nothing gpg would use is lost there; S1 does
+//     not know such a subkey, and S2 cannot count it (fail closed, as
+//     ruling R2 asks);
 //   - what apt-key's gpgv reads from a file whose awk reading the cache
 //     stops at junk and apt 3's reading lacks: nothing measured (apt-key
 //     reads no partial decode: base64 -d's failure ends it, dearmorAs).
@@ -246,8 +249,9 @@ func parseKeyringReaderMax(r io.Reader, maxFile int) (*keyFile, error) {
 // S1 and never counted by S2, where gpgv may count it (an unreadable
 // revocation that does not verify for gpgv either, say): the cache refuses
 // an anchor some apt accepts, by that key alone. Measured over
-// debian-keyring, debian-maintainers and the 70 surveyed vendor files: no
-// key or subkey is marked.
+// debian-keyring, debian-maintainers and the 70 surveyed vendor files: one
+// mark, on a debian-keyring subkey the reader drops anyway (keyBlock.marks'
+// note), so no loaded key or subkey is marked.
 //
 // A key beside packets that are no part of it, which go-crypto alone drops,
 // is read (readKeyBlocks): of the real debian-keyring.pgp (2025.07.26) the
@@ -1127,7 +1131,12 @@ func supersedes(typ byte) byte {
 // old subkey carries an unreadable revocation still counts by its current
 // one). The cost: a real key with such an unreadable self-signature stops
 // counting; measured over debian-keyring, debian-maintainers and the 70
-// surveyed vendor files, no key or subkey is marked
+// surveyed vendor files (Task 9b's fix round 5, after the v3 and
+// designated-revoker rules), one mark: debian-keyring's subkey
+// DF28DD6CA7AD27A9E3930C999EA0912EDF033203 (of A36878F464108681600CB648
+// 44173FA13D058888), an ElGamal encryption subkey whose only binding is
+// RIPEMD-160, which the reader drops anyway for want of a binding it reads,
+// so no verdict changes; no loaded key or subkey is marked
 // (TestVerifier_UnreadableRevocationsAndBindingsAreNotCounted,
 // TestParseKeyring_MarksWhatItCannotRead). Not marked: a signature by
 // another key that gpgv ignores too (its certification of a user ID, a
