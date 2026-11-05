@@ -15,8 +15,13 @@ The GC and upstream hardening plan of 2026-10-28 (the hardening plan
 below; `docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md`)
 worked five *Open* entries of this file for 1.1.0, now under *Decided*.
 Its rulings HD-1 to HD-10 are in its *Design notes and rulings*; HD-11
-to HD-15 were made while it was carried out, and the *Decided* entries
-of its work say what each decided.
+to HD-15 were made while it was carried out; HD-16 to HD-18 (the hybrid
+verifier) are in its addendum of 2026-10-29 and HD-19 (format rules and
+crypto policy, the signer downgrade guard) in its addendum of
+2026-11-03; the controller's rulings R1 to R3 (the key reader, its
+Task 9b) and G1 to G6 (the guard, its Task 9d) were made while those
+tasks were carried out. The *Decided* entries of its work say what each
+decided.
 
 ## Before the 1.1.0 release candidate
 
@@ -55,12 +60,18 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
    again on its final tree.
 4. **`make e2e-apt-oracle`** and **`make e2e-apt-oracle-old`** on the
    tree you tag (`e2e/apt-oracle/README.md`; add their row to that file's
-   *Results*): the real apt of the six client images, and of the five
-   older ones (debian:10, ubuntu:20.04, 18.04, 16.04 and 14.04), must
-   still give the verdicts recorded for the verifier's 865 signature-shape
-   fixtures; about 85 and 95 seconds with the images cached. The GC and
-   upstream hardening plan recorded them (2026-10-29; the older images
-   2026-11-05, its Task 9e).
+   *Results*), after `docker pull` of the eleven images (the README's
+   *Running it*: a cached tag is never refreshed, so a run without the
+   pull measures the images of 2026-10-29 and 2026-11-05 again and passes
+   by construction): the real apt of the six client images, and of the
+   five older ones (debian:10, ubuntu:20.04, 18.04, 16.04 and 14.04),
+   must still give the verdicts and error classes recorded for the
+   verifier's 876 signature-shape fixtures; about 85 and 95 seconds with
+   the images cached. A difference blocks the tag until it is recorded
+   and the table test agrees (the README's *When apt changes*). The GC
+   and upstream hardening plan recorded them (2026-10-29; the older
+   images 2026-11-05, its Task 9e). This item outlives the section: the
+   oracle runs before every release (*Decided*, below).
 5. **Run the release candidate once on a copy of a production 1.0.x
    cache** (raised 2026-10-27, the H3 final review R5 #5): every test
    builds its 1.0.x database by hand, so only a real `cache.db` and
@@ -74,7 +85,17 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
    before tagging); the startup `gc_run_complete`'s `duration_ms` (the
    listeners wait for it); and, an hour later,
    `suite_reaper_run_complete`, the `suite_reaped` reasons and
-   `gc_retired_run_complete`.
+   `gc_retired_run_complete`. The copy also runs the new verifier against
+   the operator's real repositories, beyond the 81 vendors surveyed: read
+   every `adoption_gpg_failed` of the first hour whose reason is
+   `malformed_clearsign`, `malformed_signature`, `bad_signature` or
+   `crypto_verify_failed`, every `adoption_signer_downgrade`, and the
+   start's `keyring_file_skipped`, `keyring_file_truncated` and
+   `keyring: parse failed; skipping file` lines, and compare each with
+   what the clients' apt does on that repository (the hardening plan's
+   final review, D-M10). A snapshot 1.0.x adopted keeps serving whatever
+   the new rules make of its anchor (the trust audit does not run the
+   verifier); it is the suite's next adoption that the rules decide.
 6. **Tag `1.1.0-rc1`** on `main`. The release workflow's
    `Verify no e2e test seam` step runs first on the tag: check it there.
 7. **The release notes** (`docs/release-notes/1.1.0.md`): bring them up
@@ -239,21 +260,26 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   row's size when that row survives.
 - **`accept_any_signer`'s bypass applies no S1** (raised 2026-10-28, the
   hardening plan's DN-8). Under `adoption.accept_any_signer` with no pin
-  matched, the verifier checks an anchor's structure (F0–F6) and that it
-  holds a parseable signature packet, and verifies no signature, so S1,
-  which refuses a bad signature from a key in the host keyring, is not
-  applied: it would be the bypass's only signature check (the AIDEV-NOTE in
-  `VerifyInline`'s bypass; `docs/configuration.md`, *Trust and signer
+  matched, the verifier checks an anchor's structure — the hybrid
+  verifier's layers T, A and P, the same code as on the trusted path
+  (`TestVerifier_BypassRefusesEveryMalformedRow`), so at least one signature
+  packet — and verifies no signature, so S1, which refuses a bad signature
+  from a key in the host keyring, is not applied: it would be the bypass's
+  only signature check (the AIDEV-NOTE in `checkSignatures`'s bypass,
+  `internal/gpg/verifier.go`; `docs/configuration.md`, *Trust and signer
   pins*). The cache can then adopt an anchor that a client holding the key
-  refuses. Recommendation: leave it, since the bypass makes the clients' own
-  verification the trust boundary, as `docs/configuration.md` says.
+  refuses. Nor does the signer downgrade guard ever fire on the bypass: it
+  counts no signer (ruling G1). Recommendation: leave it, since the bypass
+  makes the clients' own verification the trust boundary, as
+  `docs/configuration.md` says.
 - **The `Release.gpg` sniff still passes a binary signature** (raised
   2026-10-28, the hardening plan's DN-8). The verifier now refuses a
   `Release.gpg` that does not start with its armor's BEGIN line, a binary
   one included, as every measured apt does, but the sniff the handler and
   the freshness probe share (`aptpath.SniffReleaseGPG`, spec C3;
-  `TestSniffReleaseGPG`) still passes a binary signature, or blank lines
-  before the armor: such a file still earns its suite a signed-seen marker,
+  `TestSniffReleaseGPG`) still passes a binary signature, or whitespace
+  before the armor (it trims spaces, tabs, CRs and LFs; the final
+  review's D-M12): such a file still earns its suite a signed-seen marker,
   and the probe still takes a suite without an `InRelease` for a detached
   one, whose adoption the verifier then refuses (`malformed_signature`).
   Both only keep the suite from adopting unsigned, the fail-safe direction,
@@ -261,57 +287,96 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   review (2026-10-28) that publish a binary `Release.gpg` all publish an
   `InRelease`, which the check prefers. Recommendation: leave it.
 - **The cache is stricter than `debian:13`'s apt** (raised 2026-10-28, the
-  hardening plan's DN-2 and DN-3). `debian:13`'s apt 3.0.3 verifies with
-  Sequoia's `sqv` (the image has no gpgv) and accepts 27 of the corpus' 168
-  shapes that every gpgv-based apt refuses, among them a forged CRC line, a
-  bad signature from a known key beside a good one and an expired key's
-  signature alone (`verdicts.txt`). The cache now refuses all 27
-  (ruling HD-2: what any supported apt refuses is refused), so it does not
-  adopt such an anchor — the suite keeps its previous snapshot, if it has
-  one — where a `debian:13` client fetching directly accepts it: stricter
-  than that client, never looser. Recommendation: keep the rule.
-- **Fourteen anchor shapes every apt accepts are refused** (raised
-  2026-10-28, the hardening plan's DN-6 and ruling HD-9; two more by
-  ruling HD-13 and one by HD-14). `aptShapeDeviations`
-  (`internal/gpg/aptshape_test.go`) lists them with their reasons: a second
-  armor block, which neither decoder reads, so neither S1 nor S2 can check
-  it (4 shapes); go-crypto's clearsign decoder, which refuses spaces or a
-  second CR after the signature's BEGIN line and an armor header other than
-  `Hash` before the signed text (3); an armor with no blank line before its
-  body, which F5 refuses too (2); a packet go-crypto cannot parse, of an
-  unknown public-key algorithm or with zero bytes inside its declared length
-  (3); and two packets with rewritten issuer subpackets, where go-crypto
-  verifies by another subpacket than gpgv reads
-  (`x3i_goodsig_unhashed_fpr_added`, `t7g7b_33junk_33A`). The reasons record
-  that no surveyed vendor publishes a second block or zero bytes inside a
-  packet. Recommendation: keep them; revisit one when a vendor's anchor is
-  refused for it, or when go-crypto changes (the go-crypto entry below).
-- **Weak digests and keys (C-3), and the rest of C-1** (raised 2026-09-08,
+  hardening plan's DN-2 and DN-3; counts of 2026-11-05, Task 9c).
+  `debian:13`'s apt 3.0.3 verifies with Sequoia's `sqv` (the image has no
+  gpgv) and accepts 92 of the corpus' 876 shapes that every gpgv-based apt
+  refuses, among them a forged CRC line, a bad signature from a known key
+  beside a good one and an expired key's signature alone (`verdicts.txt`).
+  The cache refuses all 92 (ruling HD-2: what any supported apt refuses is
+  refused; 22 `bad_signature`, 55 `malformed_*`, 10
+  `crypto_verify_failed`, 5 `untrusted_signer`), so it does not adopt such
+  an anchor — the suite keeps its previous snapshot, if it has one — where
+  a `debian:13` client fetching directly accepts it: stricter than that
+  client, never looser. The other way round, `debian:13` alone refuses 132
+  shapes; the cache refuses 119 of them and accepts 13, each a key only
+  sqv's policy refuses (brainpool, secp256k1, SHA-1- or SHA-224-bound,
+  bound after the signature, or a weak primary under an Ed25519 subkey:
+  `aptShapeKeyPolicy`), since crypto policy is not intersected across
+  client generations (ruling HD-19, *Decided*). Recommendation: keep the
+  rule.
+- **127 anchor shapes every apt accepts are refused, in four families**
+  (raised 2026-10-28, the hardening plan's DN-6 and ruling HD-9, fourteen
+  shapes then; recorded as families by its addendum's DN-11 and rulings
+  HD-16 and HD-17, Task 9b; counts of 2026-11-05). `aptShapeDeviations`
+  (`internal/gpg/aptshape_test.go`) maps each strict deviation — a shape
+  every measured apt accepts, the six current images and the five older
+  ones, and the cache refuses — to its family, one reason a family, and
+  `TestAptShapeDeviations_EveryFamilyHasARow` requires a row in each: **one
+  armor block** (6 shapes: the cache reads one block, apt reads every
+  one; no surveyed vendor publishes two); **non-canonical armor layout**
+  (74: outside layer A's whitelist, `internal/gpg/armor_canon.go` — armor
+  lines over 76 characters, blanks or Unicode spaces inside the armor,
+  header grammar — or a NUL in the envelope's headers, layer T's T5);
+  **non-canonical packet layout** (40: outside layer P's v4 grammar,
+  `internal/gpg/sigpacket.go` — bytes left inside a packet, two issuer
+  subpackets, a non-minimal MPI, an embedded signature, a critical
+  subpacket gpgv 2.2 does not handle); and **unverifiable algorithm** (7:
+  a public-key or hash algorithm layer P does not read, SHA-224 and
+  SHA3-256 among them). Every one is an edit no surveyed signer makes: of
+  the vendor survey's 158 anchors (the verifier entry under *Decided*),
+  152 lie inside the grammar, and the six outside it are four binary
+  `Release.gpg` files every apt refuses and pkgs.k8s.io v1.30's two
+  anchors, whose version 3 packet `debian:13` refuses too; the twelve
+  in-tree vendor fixtures (`TestVerifier_AcceptsTheVendorAnchors`) all
+  verify.
+  Each is refused as `malformed_clearsign` or `malformed_signature` (95
+  and 32), and the suite keeps its previous snapshot; no setting lets one
+  through (ruling HD-17: widening the grammar is a code change with a
+  measured corpus row). DN-6's three go-crypto-decoder deviations and the
+  shapes HD-13 and HD-14 had added stopped being strict with the hybrid,
+  and Task 9e took out three that gpgv 1.4 refuses
+  (`q_good_plus_bigunh_dup`, `v6_i_good_plus_v6unknown`,
+  `v6_d_good_plus_v6unknown`). Recommendation: keep them; widen the
+  grammar for a family only when a real vendor's anchor needs it, with
+  that anchor as a vendor fixture.
+- **Weak keys (C-3's key half), and the rest of C-1** (raised 2026-09-08,
   the security review's C-3 and C-1; left out of the hardening plan, its
-  DN-1). C-3: the verifier applies no digest or key-size policy
-  (`VerifyDetachedSignature` runs with a nil config, so a SHA-1 signature,
-  or one by an RSA-1024 key, counts as good where apt does not count it),
-  and so adopts `x3i_sha1_only`, an `InRelease` whose only signature uses
-  SHA-1, which all six measured apt refuse: the table test's one
-  known-unsafe shape (`aptShapeKnownUnsafe`); only the signer can make it.
-  C-1: the `Date` rules and `rollback_refused` (spec C5) protect a suite
-  from a replayed anchor after its first adoption, but nothing checks
-  `Valid-Until`, and a replaying man in the middle can choose a suite's
-  first snapshot (the flat-repositories spec, §10 item 5). Recommendation:
-  in a later release, refuse what apt refuses for weak digests and keys,
-  with a corpus row each, and take up the spec's §10 item 5 (`Valid-Until`
-  and per-suite identity pinning).
+  DN-1; narrowed 2026-10-29 by ruling HD-18 and 2026-11-03 by HD-19).
+  C-3's digest half is closed (*Decided*, the verifier entry): S2 never
+  counts a SHA-1 signature, so `x3i_sha1_only`, which all six measured apt
+  refuse, is refused, and the table test's known-unsafe list
+  (`aptShapeKnownUnsafe`) is empty. Its key half stands by design: S2
+  counts what the gpgv-based apt count, an RSA-1024, DSA or SHA-1-bound key
+  included, where `debian:13`'s sqv or the `APT::Key::Assert-Pubkey-Algo`
+  of `ubuntu:24.04` and `26.04` refuse some of them (ruling HD-19: crypto
+  policy is not intersected across client generations, or the cache would
+  refuse vendors their own older clients read); the signer downgrade guard
+  covers the strip of a strong signature beside such a key, not a vendor
+  that signs with one alone (the six vendors' entry below). C-1: the `Date`
+  rules and `rollback_refused` (spec C5) protect a suite from a replayed
+  anchor after its first adoption, but nothing checks `Valid-Until`, and a
+  replaying man in the middle can choose a suite's first snapshot (the
+  flat-repositories spec, §10 item 5), as it can strip a strong signer
+  before the first adoption (the guard's entry below). Recommendation: take
+  up the spec's §10 item 5 (`Valid-Until` and per-suite identity pinning)
+  in a later release; re-measure the key policies (`make e2e-apt-oracle`)
+  before each date to come in `internal/gpg/strength.go`'s rules (RSA-2048
+  keys on 2030-02-01; the SHA-1 and SHA-224 binding date, 2026-02-01, has
+  passed).
 - **S1 covers only the keys the cache holds** (raised 2026-10-28, the
   hardening plan's DN-5). S1 refuses an anchor that carries a bad signature
-  from a key in the cache's host keyring, and ignores one from a key the
+  from a key in the cache's host keyring — any of its keys, a certify-only
+  primary or an encryption subkey too, since the hardening plan's Task 9e
+  (*Decided*) — and ignores one from a key the
   keyring lacks (gpgv's NO_PUBKEY); a client that trusts such a key still
   refuses the anchor, so the cache adopts what that client refuses.
   `docs/configuration.md` (*Trust and signer pins*) asks the operator to
   install in the cache every key the clients' `signed-by` names.
   Recommendation: leave it (inherent: the cache checks the keys it holds).
 - **S2's key-ID collision quirk** (raised 2026-10-28, the hardening plan's
-  ruling HD-10). S2 (`verifyAnyTrusted`, `internal/gpg/verifier.go`),
-  unchanged, verifies a packet whose issuer fingerprint is trusted against
+  ruling HD-10; unchanged by the hybrid verifier, checked 2026-11-05). S2
+  (`verifyAnyTrusted`, `internal/gpg/verifier.go`) verifies a packet whose
+  issuer fingerprint is trusted against
   the whole trust set at once, and go-crypto's `VerifyDetachedSignature`
   hashes once and tries each key holding the packet's key ID with that one
   hash, which only the first can pass: a host key that shares the signer's
@@ -362,7 +427,10 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   sign (`docs/log-fields.md`); since the final fix wave's follow-up a
   startup pass in which a pass failed sets the gauge too, so one that fails
   at every start of a daemon that never runs a periodic tick never pages
-  either. Since ruling HD-15 the passes after a failed one run (*Decided*,
+  either, and the status page's *Last GC* cell, which reads the same
+  last-run summary, shows that run with its partial counts where it showed
+  "no GC run yet" (the final review's G re-review, RR-M1). Since ruling
+  HD-15 the passes after a failed one run (*Decided*,
   below), but the failed pass's own work waits until its fault is fixed.
   Recommendation: a counter,
   `acu_gc_pass_failures_total{pass}`, and an alert line on it in the
@@ -378,55 +446,307 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   hash the first read found is not kept. Recommendation: keep it, and
   finalize with it (`FinalizeExpectingHash`), which refuses only bytes that
   do not match it, so it adds no flood of refusals.
-- **Some shape refusals are reported as `crypto_verify_failed`** (raised
-  2026-10-29, the hardening plan's Task 6 review, Minor 4). A base64 error
-  in a signature's armor body (`x4i_b64_invalid_char`,
-  `x4d_b64_invalid_char`) is refused, in both forms, with a plain error
-  rather than the `malformed_*` reasons the other shape refusals get, and so
-  are `accept_any_signer`'s bypass's refusal of an armor that holds no
-  signature packet (`signature body contains no signature packet`) and a
-  signature over the verifier's 64 KiB cap. `ClassifyVerifyErr` reports each
-  as `crypto_verify_failed`, whose tooltip on the status page ("The
-  signature's issuer was trusted but the cryptographic verification itself
-  failed.") is wrong for them. Recommendation: wrap the base64 error and the
-  empty armor's refusal in `ErrMalformedClearsign` and
-  `ErrMalformedSignature`, with a `TestClassifyVerifyErr` row each.
-- **S1 and S2 verify each packet as go-crypto writes it again** (raised
-  2026-10-29, the hardening plan's ruling HD-14). Both re-serialize a
-  signature packet (`sig.Serialize`) to verify it alone, and go-crypto then
-  declares the packet's length from each subpacket's length in its shortest
-  form, so a legitimately signed packet whose hashed area writes a length in
-  more octets than it needs comes out framed wrong and fails where gpgv
-  verifies it (the AIDEV-NOTE in `requireKnownSignaturesVerify`). Strict,
-  not unsafe: nothing passes that should fail, and no real signer writes
-  such lengths. Recommendation: leave it unless a vendor's anchor is refused
-  for it.
-- **Anchor shapes beyond the corpus are unmeasured** (raised 2026-10-29, the
-  hardening plan's Tasks 6 and 7). The cache adopts no anchor a supported
-  apt refuses, but for `x3i_sha1_only`, only as far as the corpus' 168
-  shapes go (`e2e/apt-oracle/README.md`, *What the oracle checks*). Tasks 6
-  and 7 each found shapes beyond the plan's 135 that the cache adopted and
-  some apt refused (batches fx8 and fx9, rulings HD-13 and HD-14), and their
-  reviews searched no further; the hardening plan's final review searches
-  for more that need no key, measured with the oracle. Recommendation: add
-  each shape a search, a review or a vendor turns up to the corpus with its
-  measured row, and then fix the verifier or list the shape with its reason.
-- **A go-crypto upgrade can move the verifier's verdicts** (raised
-  2026-10-29, the hardening plan's rulings HD-13 and HD-14). Several of the
-  fourteen strict deviations come from go-crypto: its clearsign decoder
-  (`i_sigbegin_trailing_ws`, `x7i_sigbegin_double_cr`,
-  `xi_cleartext_comment_hdr`; `x3i_armor_no_blank` and `x3d_armor_no_blank`
-  stay refused by F5 whatever it does), its packet reader
-  (`xi_good_plus_unknownpk_A`, `gi_p3_inner_zero_bytes`,
-  `gd_p3_inner_zero_bytes`) and the issuer subpacket it verifies by
-  (`x3i_goodsig_unhashed_fpr_added`, `t7g7b_33junk_33A`); and F0–F6 run
-  beside its lenient armor readers (`armor_shape.go`'s AIDEV-NOTE). A
-  go-crypto that reads these otherwise can turn a deviation into an
-  agreement with apt, or a refusal some apt shares into an acceptance.
-  Recommendation: at every go-crypto upgrade run the table test
-  (`go test ./internal/gpg`) and `make e2e-apt-oracle`
-  (`e2e/apt-oracle/README.md`, *When to run it*), and update
-  `aptShapeDeviations` from what they show.
+- **What `crypto_verify_failed` still means** (raised 2026-10-29, the
+  hardening plan's Task 6 review, Minor 4; the final review's D-M1 and
+  D-M6; rewritten 2026-11-05, its Task 9c). The shape refusals that used to
+  land here are `malformed_*` since the hybrid verifier (*Decided*): a
+  base64 error in the armor (`x4i_b64_invalid_char`,
+  `x4d_b64_invalid_char`: layer A's A4), an armor that holds no packet
+  (`a_b64_empty_body`: A4, on the bypass too) and a signature over 64 KiB
+  (A4). What falls to `ClassifyVerifyErr`'s default now is S2 finding a
+  trusted packet and counting none — 65 of the corpus' 876 rows, measured
+  2026-11-05 (Task 9c's scratch `reasons-a7d0d72.tsv`): a packet sqv does
+  not read (52 rows: a subpacket Sequoia's parser refuses, the
+  re-review's A-RC1), a good signature apt erases at a later SHA-1 packet
+  by the same key (9: A-RC2), a SHA-1 packet alone (`x3i_sha1_only`, ruling
+  HD-18), a packet by a known key that cannot sign (`us_good_primary_alone`,
+  `us_good_enc_alone`), and an expired key's signature alone
+  (`i_expired_only`: "openpgp: key expired", in the field the cache's copy
+  of a vendor key whose expiry the vendor has since extended); and outside
+  the corpus a revoked key, a key the keyring marks (ruling R2), S2's
+  key-ID collision quirk (above) and the detached form's empty inputs. The
+  log line's `err` says which; since Task 9c the status page's tooltip
+  lists these causes, and `ClassifyVerifyErr`'s comment too.
+  Recommendation: leave the reason; if operators meet the expired-key case
+  often, give it a reason of its own (`key_expired`), with a
+  `TestClassifyVerifyErr` row. (The verifier's own error text for a
+  detached refusal still begins "Release.gpg is not one ASCII-armored
+  signature block apt accepts" for every layer's refusal, a deviation
+  included, which overstates in the same way the tooltips did: a code
+  change, left with this entry.)
+- **What the hybrid verifier leaves** (raised 2026-10-29, the hardening
+  plan's Tasks 6 and 7, as "anchor shapes beyond the corpus are
+  unmeasured"; rewritten 2026-11-05, its Task 9c, for the residual risk of
+  the approach decision, `PE/approach-decision.md` §6). The table test
+  runs every one of the corpus' 876 shapes, none skipped
+  (`TestVerifier_FollowsTheAptShapeTable`), against the six current images'
+  verdicts and the five older ones', and the cache adopts no shape any
+  measured apt refuses but the crypto-policy rows a newest image alone
+  refuses (`aptShapeKeyPolicy`, ruling HD-19) and the older images'
+  refusals of crypto policy and real signers' layouts (`aptShapeOldExempt`,
+  below). What is left, by §6's list: (1) a bug in the port of apt's text
+  layer, which `TestAptTextLayer_RefusesExactlyTheSplitRows` holds to
+  apt's own refusals on every row; (2) signer-only policy differences
+  (dates, key strength, SHA-224 and SHA3 countability), which a vendor
+  makes for every client alike (the C-3 entry above); (3) go-crypto and
+  gpgv or sqv disagreeing on a known key's valid-looking signature,
+  signer-made, out of the cache's hands; (4) gpgv or sqv refusing a
+  canonical armor or packet for a reason not yet measured, which the
+  oracle's controls and the vendor survey would show as a changed row;
+  (5) the handler's `InRelease` sniff (`aptpath.SniffInRelease`), looser
+  than apt's splitter, the fail-safe direction (DN-8). And shapes beyond
+  the corpus stay unmeasured: until the hybrid every review round found
+  more; the final review's adversarial lens measured 586 candidates on the
+  hybrid of Task 9b's second fix round and found no gap (its re-review 3).
+  One real vendor's shape is outside the corpus (the final review's
+  D-M9): pkgs.k8s.io v1.30's `InRelease` and `Release.gpg` carry one
+  version 3 signature packet, which gpgv accepts in the five gpgv images
+  and `debian:13`'s sqv refuses ("Signature Packet v3 is not considered
+  secure since 2021-02-01"); layer P refuses it (`malformed_clearsign`,
+  `malformed_signature`: "a version 3 signature (the cache reads version 4
+  only)"), as the cache refused it on 1.0.x (`no_usable_signature` there),
+  and gpg makes no version 3 signature to build a corpus row from.
+  Recommendation: add each shape a search, a review or a vendor turns up
+  to the corpus with its measured row, and then fix the verifier or list
+  the shape in its family.
+- **A go-crypto upgrade can move the verifier's and the key reader's
+  verdicts** (raised 2026-10-29, the hardening plan's rulings HD-13 and
+  HD-14; rewritten 2026-11-05, its Task 9c). Since the hybrid verifier
+  go-crypto reads no armor and frames no packet: it parses one packet that
+  layer P has validated (P5, `packet.Read`) and verifies it (S1 and S2,
+  `VerifyDetachedSignature`, and for a key that cannot sign
+  `PublicKey.VerifySignature`), so the deviation families no longer
+  depend on its decoders. It still reads every key: the key reader hands
+  it each key block (`internal/gpg/keyfile.go`, whose AIDEV-NOTEs list what
+  v1.5.2 changed and what it skips — v3 signatures, RIPEMD-160, v4
+  direct-key expiry), and the downgrade guard reads its self-signature in
+  use (`strongSigner`). The bump to v1.5.2 (Task 9b, commit 4fa21be) gave
+  identical verdicts on the suite, the corpus and the vendor survey.
+  Recommendation: at every go-crypto upgrade run the table test and the
+  key reader's tests (`go test ./internal/gpg`), both oracles
+  (`e2e/apt-oracle/README.md`, *When to run it*) and the vendor re-run of
+  the hardening plan's Task 8 gate, and re-read the AIDEV-NOTEs that cite
+  go-crypto's lines (`grep -n 'go-crypto v1' internal/gpg/*.go`).
+- **A copy of a key that go-crypto cannot read is dropped with its marks**
+  (raised 2026-11-05, the final review's V lens, its re-review 10:
+  V-R10I1; class R2, under-strict; on `main` and 1.0.x too). The key
+  reader skips a key block that go-crypto reads in neither of its two
+  readings, and the loader a file that holds no key go-crypto reads
+  (`readKeyBlocks`, `internal/gpg/keyfile.go`; `LoadKeyringWithEmbedded`,
+  `internal/gpg/keyring.go`), and the marks of that block or file
+  (ruling R2: a revocation or binding gpgv honours) go with it. Alone, that
+  copy's key is unknown to the cache, which is harmless; with a second,
+  readable copy of the same key in the operator's directories, the cache
+  counts the key through it while every apt that reads the first copy
+  treats the key as revoked: `kr29_unread_b_signedby_a_too` (copy B holds
+  the key's own revocation and a RIPEMD-160 self-certification alone) is
+  refused in all six images and adopted by the cache at every commit,
+  `main` included (V's `rr10/meas/kr29.*`). Not key-free: it needs two
+  copies of one key in the operator's directories, one of them unreadable
+  to go-crypto; no real keyring has one (debian-keyring, debian-maintainers
+  and the 70 survey files hold no key twice with differing marks: Task 9b's
+  fix round 9). Recorded Open by the controller's rule that closed Task 9b
+  (only a round's own regressions reopened it). Recommendation: fix it in a
+  later release — run `keyBlock.marks` for every key block, read or not,
+  and keep a dropped block's or file's marks in the union — with
+  `kr29_unread_b_signedby_a_too` as its test.
+- **Key files and anchors the cache refuses where every apt accepts them**
+  (raised 2026-11-03 to 05, Task 9b's fix rounds 5 to 9 and Task 9e; class
+  R3, over-strict, or none). Ruling R3 bounds an S1 or S2 gap that needs a
+  malformed or unusual operator key file as availability-class (the
+  content is still authenticated by a good signature from a trusted, valid
+  key); the rulings of those rounds chose to fail closed, and these rows,
+  each `ok` in all six images, are refused by the cache (the final
+  review's V re-reviews 5 to 10, `rr5` to `rr10`; Task 9b's fix round
+  reports 6 to 9, their over-strict tables):
+  - **legacy (version 2 and 3) signatures, one fail-closed rule** (round
+    6): a third party's legacy key or subkey revocation
+    (`kr21_tp_v3rev_xin`, `kr25_tp_v3subrev`), a legacy binding older
+    than, or as old as, the one kept (`kr25_v3_bind_older`,
+    `kr25_v3_bind_tie_before`), a legacy direct-key signature
+    (`kr25_v3_directkey`), a legacy back-signature alone
+    (`kr25_v3_backsig_alone`);
+  - **designated revokers** (round 5; V-R6M1, ruled to stay): a designated
+    revocation without the revoker's key in the keyring, which the five
+    gpgv-based apt then ignore (`kr19_dr_rev_xout`, `kr21_dr_ctl_xout`), a
+    designated subkey revocation (`kr21_dr_subrev_xin`), a designation in a
+    direct-key signature that does not verify (`kr21_dr_baddesig_xin`) or
+    in a user-ID self-certification (`kr17_dr_keyrev_xin`,
+    `kr17_dr_keyrev_xout`), a forged designated revocation
+    (`kr20_dr_forged_xin`, `kr20_dr_forged_xout`);
+  - **issuers that disagree** (rounds 6 to 8, the issuer principle,
+    *Decided*): a verifying self-signature whose issuer subpackets name
+    two keys is not the key's own, so it neither supersedes nor extends
+    (`kr28_dk_fprmis_noexp`, `kr28_uid_fprmis_newer_noexp`), and
+    go-crypto verifies a revocation by the primary key whatever its issuer
+    says (`kr22_self_fprother_keyrev`, as on `main`);
+  - **the mark union** (round 9): two copies of a key in the keyring
+    directories, the one gpgv reads first unmarked
+    (`kr28_xcopy_both_a_first`: gpgv reads the first keyblock), and,
+    unmeasured, two copies with a past and a future direct-key expiry,
+    where gpg's merge takes the newest.
+  None touches a real file: debian-keyring (3,209 keys and subkeys),
+  debian-maintainers (761) and the 70 survey files (201) count exactly as
+  before those rounds (Task 9b's fix round 9). And 322 corpus rows are
+  accepted by some older image and refused by the cache (Task 9e, counted
+  again 2026-11-05): 127 are the strict deviations every image accepts
+  (their entry above), and 195 some current image refuses; by the rule
+  that refuses them (Task 9e's count at 28c72ea, 315 rows) layer T's T1
+  to T6 and F0 56, layer A 117, layer P 71, S1 10 and S2 61, where an old
+  image's lenient parser or older crypto reads the shape. Strict is safe:
+  the cache stays strict. Recommendation: leave them; narrow a rule only
+  if a real key file or anchor meets it, with a measured row.
+- **Three debian-keyring keys every apt refuses from 2027** (raised
+  2026-11-04, Task 9b's fix rounds 8 and 9; exact, not over-strict).
+  `440B7638ED88D68D5F351BCFB95B0493F5AB0C47` (from 2027-12-24),
+  `D477040C70C2156A5C298549BB7E9101495E6BF7` (2027-01-17) and
+  `F75FBFCD771DEB5E9C86050550C3634D3A291CF9` (2027-09-28), Debian
+  developers' keys in `/usr/share/keyrings/debian-keyring.gpg`, each carry
+  a readable direct-key self-signature with a key expiry, which go-crypto
+  v1.5.2 ignores and the key reader honours at the verifier's clock since
+  round 8 (commit 60d26f1; `TestVerifier_AReadableDirectKeyExpiryIsHonoured`).
+  A direct-key expiry outranks a newer user-ID self-signature in all six
+  images (V's `kr28_dk_exp_then_uid_later` and
+  `kr28_dk_exp_then_uid_none`: EXPKEYSIG in the five gpgv images, refused
+  by sqv), so from those dates every apt, and the cache, refuses an anchor
+  by one of these keys unless its owner renews the direct-key signature
+  itself (`gpg --quick-set-expire` does). A fourth key,
+  `4D14050653A402D73687049D2404C9546E145360`, expired on 2026-04-27 for
+  go-crypto too. Recommendation: nothing in the cache; a suite signed by
+  one of them that turns `crypto_verify_failed` needs the key renewed
+  upstream.
+- **Six vendors have no strong signer** (raised 2026-11-05, Task 9d; a
+  fact, not a defect). ceph (its only self-signature, of 2026-07-03, is
+  newer than its signatures, of 2026-03-12), mongodb, newrelic,
+  nvidia-cuda, openresty and raspberrypi (SHA-1 self-signatures), both
+  forms each: `debian:13`'s sqv refuses all twelve real anchors today
+  ("not bound"; ceph's "No binding signature at time …"), `ubuntu:24.04`
+  and `26.04` refuse none, and the cache adopts them, since S2 counts what
+  the gpgv-based apt count (ruling HD-19). Their suites' current anchors
+  have no strong signer, so the downgrade guard stands down for them. The
+  survey's 137 anchors the cache accepts were measured in the three
+  newest images, and the cache's strong flag equals "all three accept" on
+  every one: 125 strong, these 12 not (Task 9d; the vendor re-run of
+  2026-11-05 at a7d0d72 gives the same flags; mongodb's vendor fixture is
+  pinned with none, `TestVerifier_PinsTheVendorAnchorsStrongSigners`).
+  `debian:13` clients of these suites fail with or without the cache:
+  the vendor's to fix, by binding its key again with SHA-256 (ceph: with
+  a self-signature older than its signatures). Recommendation: nothing in
+  the cache; the release notes can name them.
+- **The signer downgrade guard cannot see a strip at a suite's first
+  adoption** (raised 2026-11-03, the plan's addendum, HD-19; ruling G6,
+  Task 9d). The guard compares a candidate with the suite's current
+  anchor, so it stands down when there is none: a suite's first adoption,
+  the one after `POST /forget`, and the one after the reaper deletes an
+  idle suite, each a first adoption
+  (`TestSignerGuard_AdoptsWhatLosesNoStrongSigner`, "first adoption by
+  weak"); it also stands down on its own errors, for a current anchor it
+  cannot read or verify, as a 1.0.x snapshot's may be (ruling G2,
+  `adoption_signer_guard_skipped`). A man in the middle at that moment can
+  strip a vendor's strong signature beside a weak one, and the cache
+  adopts what `debian:13` clients then refuse, until upstream changes and
+  the next adoption brings the strong signer back. The recourse for a
+  vendor that really downgrades (ruling G4; `adoption_signer_downgrade`'s
+  row in `docs/log-fields.md`): the vendor signs again with a strong key;
+  the operator removes the strong key from the keyring and restarts (the
+  keyring is read at start), after which the current anchor has no strong
+  signer; or `POST /forget`, which adopts the candidate as a first
+  adoption — no override and no configuration key (ruling HD-17).
+  Per-client tracking by User-Agent was considered and not taken (the
+  plan's addendum). Recommendation: leave it; the per-suite identity
+  pinning of the flat-repositories spec's §10 item 5 (the C-3 entry above)
+  would close it with the first-snapshot problem.
+- **Older clients refuse real vendors' layouts that the cache accepts**
+  (raised 2026-11-05, Task 9e, its classes (a) and (b); ruling E4: never
+  folded). Measured with the 158 survey anchors in the five older images:
+  `ubuntu:16.04`'s apt 1.2 refuses debian-buster-archive's real
+  `InRelease` and `Release.gpg` ("Invalid message from method gpgv:
+  NO_PUBKEY DCC9EFBF77E11517": one good signature beside two by keys the
+  client lacks; corpus row `us_good_plus_two_unknown`; class (b), and a
+  16.04 client of a buster archive is no real deployment, the controller's
+  ruling) and nginx's CRLF `InRelease` (a CR after the clearsign marker,
+  "Clearsigned file isn't valid, got 'NOSPLIT'": `i_crlf_all`,
+  `n_i_nginx_crlf`, `a_text_crlf_sig_lf`; (b)); `ubuntu:16.04` and `14.04`
+  (gpgv 1.4) refuse syncthing's `InRelease` (no CRC line and base64 that
+  needs no padding, read on into the END line, NODATA: `i_crc_missing`,
+  `d_crc_missing`; (b), and any CRC-less signer's — ms-*, signal,
+  tailscale — whose packets' length lands on a multiple of 3) and yarn's
+  two anchors (an EdDSA subkey, which gpgv 1.4 cannot use, as for 14 `pk_`
+  rows of EdDSA and ECDSA keys; class (a), crypto policy, not intersected:
+  HD-19). `aptShapeOldExempt` lists the 20 corpus rows and
+  `aptShapeOldRefusals` pins each class to its measured refusal. Those
+  clients fail fetching directly too. Recommendation: leave them; a
+  vendor's to fix.
+- **Three S1 cases Task 9e left unmeasured** (raised 2026-11-05, the Task
+  9e review's re-review 1). S1 checks a packet by a known key that cannot
+  sign directly (`verifiesDirectly`, *Decided*), which reads no usage,
+  expiry or notation: (1) a key whose self-signature has no key-flags
+  subpacket goes the direct way too, so a bad packet by it now refuses,
+  toward what gpgv 2.2.4 and 1.4 do (unmeasured); (2) an unknown critical
+  notation in a good packet by a key that cannot sign is not read, so the
+  packet passes, as before Task 9e (the older gpgv unmeasured); (3) a
+  packet naming an ElGamal or ECDH subkey can never verify, so S1 always
+  refuses an anchor that holds one (strict; no real signer emits one).
+  Class none (S1 is integrity; no vendor anchor changed). Recommendation:
+  measure them in a corpus batch when the generator next makes keys
+  (`--usage-keys` makes key U).
+- **Two layouts the guard calls not strong where every image accepts
+  them** (raised 2026-11-05, Task 9d; ruled accepted). `strongSigner`
+  reads go-crypto's self-signature in use (the newest, the primary
+  identity's), where `debian:13`'s sqv takes the binding in force at the
+  signature's time: a key file that also keeps an older valid
+  self-signature made before the packet (`pk_rsa3072_rebound_both`, `ok`
+  in all six images; `aptShapeStrongOverStrict`), and a key whose primary
+  user ID is SHA-1-bound while another is SHA-256-bound (unmeasured;
+  `TestStrongSigner_ReadsGoCryptosSelfSignatureInUse` pins go-crypto's
+  choice). The guard then stands down for such a current anchor (it fails
+  open), and could refuse such a candidate only after a strong current
+  anchor signed later than the candidate. No surveyed vendor has either
+  layout. Recommendation: leave it (defence in depth, ruling G2's
+  direction).
+- **A shutdown test that failed once under load** (raised 2026-11-03, Task
+  9b's fix round 6). `TestServe_GracefulShutdown_FetchMidStream_NoOrphanBlob`
+  (`cmd/apt-cacher-ultra/shutdown_orphan_blob_test.go`) took 5.44 s to shut
+  down once, against its 5 s bound, on a loaded machine; it passed alone
+  3 of 3 times, in a clean race re-run, and 10 of 10 under `-race` at
+  light load (the V lens's re-review 7). The release workflow runs
+  `-race`, and a teardown flake failed the 1.0.3 release run twice.
+  Recommendation: look at it before 1.1.0-rc1 (what the shutdown waits on
+  past the bound), and loosen the bound only with the reason.
+- **The key reader reads more than some apt reads** (raised 2026-11-01 to
+  03, Task 9b's fix rounds 2 and 3: the V lens's V-R2M3 and V-R3M1;
+  rulings R1 and R3). By R1 the cache reads every key that any supported
+  apt reads from a key file (`internal/gpg/keyfile.go`: apt-key's awk
+  reading and apt 3's, unioned), so for an odd operator file its keyring
+  holds more than some client's: an armored file named `.gpg`, from which
+  apt 2.x's gpgv and apt 3 read no key, or a `.asc` with CRLF line ends,
+  from which apt 2.2, 2.4 and 2.6 read none; such a client refuses the
+  suite as untrusted with or without the cache. And copies of a key are
+  merged (`mergeEntity`): a copy holding a signing subkey with its primary
+  expired, beside a renewed copy without the subkey, verifies an anchor by
+  the subkey that all six apt refuse (V-R3M1, `kr10_mixed_*`; the
+  AIDEV-NOTE in `LoadKeyringWithEmbedded`). Neither is an attacker's
+  lever: the first needs the operator's own file, the second the vendor's
+  own signature. Class R3. Recommendation: leave them.
+- **A skipped key file shows only in the start's log** (raised 2026-11-01,
+  the V lens's re-review 2; parked for Task 9c). A key file the loader
+  skips or reads only in part logs WARN once at start
+  (`keyring_file_skipped`, `keyring_file_truncated`, or `keyring: parse
+  failed; skipping file`), and nothing on the status page or in the
+  metrics names it; the suite then shows `untrusted_signer`, and a skipped
+  file is also a key S1 does not know. Since Task 9c the `untrusted_signer`
+  tooltip points at those lines. Recommendation: list skipped files on the
+  status page's keyring panel, or count them in a gauge, in a later
+  release.
+- **Two reconcile WARNs still repeat** (raised 2026-11-01, the V lens's
+  re-review 2; on 1.0.x too). Task 9b's fix round 2 made a failing
+  reconcile *decision* warn once per snapshot
+  (`acu_adoption_reconcile_failed_total{stage}` counts every failure), but
+  the heal stage's `adoption_reconcile_failed`
+  and each member's `adoption_reconcile_member_failed` still log WARN at
+  every attempt, on every unchanged check of a snapshot that cannot heal.
+  Recommendation: the same once-per-snapshot memo for both, with the
+  counter as the signal, when that code is next touched.
 
 ## Decided
 
@@ -515,11 +835,18 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   `main/binary-amd64/Packages`: 2,027,475 bytes, which came gzip-encoded
   and chunked while Go asked for gzip). And an upstream that sends
   `Content-Encoding: gzip` unasked now has its bytes stored as sent, so an
-  uncompressed index member served so fails its hash, which Go's decoding
-  used to rescue, and its suite stops adopting; no measured vendor does
+  uncompressed index member served so fails its declared size
+  (`member_fetch_failed`, before its hash is read; the final review's
+  F-M7), which Go's decoding used to rescue, and its suite stops adopting;
+  no measured vendor does
   (no answer to a request without `Accept-Encoding` carried one: the 81
   anchors, and 239 members of 69 vendors), and every supported apt fails
   such a file too ("File has unexpected size", in the six client images).
+  The same change fixes what an operator could meet in the field (DN-9;
+  the final review's D-M8): an Apache that serves `.gz` files with
+  `Content-Encoding: gzip` had them decoded by Go and stored as wrong
+  bytes, and they are now stored as sent
+  (`TestFetch_StoresAGzipBodyItDidNotAskFor`).
   Ruling HD-12: the long-member test asserts that the cache read
   exactly the declared size and one byte more, that the upstream's endless
   body then fails to write, and that `adoptMember` returns within 15 s, but
@@ -549,37 +876,241 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   fails still fails open (WARN `package_hash validate lookup failed`). Done
   in the hardening plan's Task 4 (commits 5c27a97 and 7c3aca0), pinned by
   `TestServeHTTP_StrictMissDecidesWhenVouchingEndsDuringTheDownload`.
-- **The verifier refuses the anchor shapes apt rejects** (the maintainer,
-  2026-10-28: worked for 1.1.0; raised 2026-09-08, the security review's
-  theme one: VC-2, C-4, VC-1; confirmed 2026-10-27 by the H3 final review
-  R6 #2). `VerifyInline` (`internal/gpg/verifier.go`) accepted a valid
-  `InRelease` followed by blank lines, a forged CRC line and an extra bad
-  signature from the same trusted key; `VerifyDetached`, lines around a
+- **The verifier refuses the anchor shapes apt rejects: the hybrid
+  verifier** (the maintainer, 2026-10-28: worked for 1.1.0; and
+  2026-10-29: the hybrid, rulings HD-16 to HD-18, chosen over closer
+  emulation of go-crypto's decoders and over shipping the first rules and
+  deferring; raised 2026-09-08, the security review's theme one: VC-2,
+  C-4, VC-1, and I-1; confirmed 2026-10-27 by the H3 final review R6 #2;
+  rewritten 2026-11-05 by the hardening plan's Task 9c). On 1.0.x,
+  `VerifyInline` (`internal/gpg/verifier.go`) accepted a valid `InRelease`
+  followed by blank lines, a forged CRC line and an extra bad signature
+  from the same trusted key, and `VerifyDetached` lines around a
   `Release.gpg`'s armor, a second armor block and a binary signature
   (ruling HD-1: both forms). The rule (ruling HD-2): refuse a shape any
   supported apt refuses, accept one all of them accept, with listed
-  exceptions. apt's verdicts are measured on 168 byte-exact shapes in the
-  six client images (apt 2.2 to 3.2; `internal/gpg/testdata/aptshapes`,
-  `e2e/apt-oracle/README.md`), which `TestVerifier_FollowsTheAptShapeTable`
-  holds the cache to and `make e2e-apt-oracle` re-measures; the plan's
-  Appendix A stays as measured on 2026-10-28 (135 shapes), and the README
-  and `verdicts.txt` record the 33 since (batches fx8 and fx9). Structure,
-  F0–F6 (rulings HD-8 and HD-13; HD-13 reads armor lines as go-crypto trims
-  them), in both forms and under `accept_any_signer`'s bypass too: nothing
-  after the END line, a CRC line that matches, no `-` line or header without
-  `: ` inside the armor, signature packets only, a `Release.gpg` that starts
-  with its BEGIN line (new reason `malformed_signature`). S1 (rulings HD-3,
-  HD-8 and HD-14; HD-14 reads the issuer as gpgv does), on the trusted path
-  only: a signature packet from a key in the host keyring that fails
-  verification refuses the anchor (new reason `bad_signature`). S2 is
-  unchanged (ruling HD-10); one armor block is read (HD-9). The exceptions,
-  each under *Open*: 14 strict deviations (DN-6's eleven, two of HD-13's
-  shapes, one of HD-14's) and one known-unsafe shape, `x3i_sha1_only` (C-3).
-  Two of the plan's statements are corrected here (the plan stays as
-  written): fourteen deviations, not eleven; key E expired on 2020-12-31,
-  not in 2021 (DN-2). Done in the hardening plan's Tasks 5 to 7: the corpus
-  and oracle (commits dc6c8ee and 3c54a22), F0–F6 (80af12b, b51ee0e and
-  132ebe6) and S1 (8d2900d, fdfa2b0, 40d3614, 276d60d and a900dbd).
+  exceptions. The hardening plan's Tasks 6 and 7 first enforced it with
+  structural rules (F0–F6) and S1 beside go-crypto's lenient decoders;
+  its final review found that every round left more (the verifier lens's
+  V-C1 to V-C3, among them a 4 GiB allocation before any check, a crash on
+  1.0.x too; the adversarial lens's 102 measured gaps in 11 families), and
+  the maintainer chose the hybrid (`PE/approach-decision.md`; the plan's
+  addendum of 2026-10-29, DN-11). It reads an anchor in four layers, each
+  refusal naming its layer and rule ("armor A4: line 7: 80 base64
+  characters, the limit is 76"):
+  - **T, the text** (`internal/apttext`): apt's own `LineBuffer`,
+    `SplitClearSignedFile` and detached check ported exactly, whose
+    output — the message M apt hands its verifier and its `Release`
+    parser — is what the signatures are checked against, what adoption
+    parses and what reconcile reads again (the re-review's V-RI1); on top,
+    no NUL (T5), no space or tab after the clearsign marker on line 1 (T6,
+    Task 9e: `ubuntu:16.04`'s apt 1.2 refuses it; a CR stays accepted,
+    nginx's layout), no END marker in M (F0, narrowed to M: every apt
+    accepts one in an armor header, `vm3_*`) and one armor block;
+  - **A, the armor** (`internal/gpg/armor_canon.go`): a canonical
+    whitelist that gpgv and sqv both read and real signers write, decoded
+    by the cache alone (strict base64: `debian:13`'s sqv refuses set pad
+    bits, `n_i_b64_pad_bits`);
+  - **P, the packets** (`internal/gpg/sigpacket.go`): the cache's own v4
+    parser with exact consumption — v3, v5 and v6 refused before go-crypto
+    sees them, one issuer key ID (and a fingerprint only if it agrees), no
+    embedded signature, bounded areas, minimal MPIs, at most 8 packets —
+    then go-crypto's `packet.Read` of each packet's own bytes as framed
+    (P5): no packet is written again before it is verified, which closes
+    the old Open entry on re-serialization (ruling HD-14's caveat);
+  - **S, the signatures**: S1 (`requireKnownSignaturesVerify`; rulings
+    HD-3, HD-8): a packet by any key in the host keyring that fails its
+    check refuses the anchor (`bad_signature`), as gpgv's BADSIG makes apt
+    refuse it, and since Task 9e whatever that key's usage (its own entry,
+    below); S2 (`verifyAnyTrusted`; ruling HD-10): one trusted packet that
+    verifies and counts. S1 and S2 read the packets gpgv checks: all of
+    them when they share one signature type, else the first only (gnupg's
+    `proc_tree`; `n_i_unknown00_first`). S2 counts a packet only if its
+    hash is SHA-256, SHA-384 or SHA-512 (ruling HD-18: SHA-1 never counts,
+    C-3's digest half), sqv reads it (the re-review's A-RC1: a subpacket
+    Sequoia's parser refuses makes `debian:13` ignore the packet) and apt
+    does not erase it at a later SHA-1 packet by the same key (A-RC2:
+    apt's `methods/gpgv.cc`).
+  Under `accept_any_signer`'s bypass T, A and P run unchanged
+  (`TestVerifier_BypassRefusesEveryMalformedRow`) and no signature is
+  verified (DN-8, *Open*). The trust set is resolved first, so an unpinned
+  suite under `require_pinned_signer` is `unpinned_suite` whatever its
+  anchor (the re-review's V-RM1); an empty keyring's `no_usable_signature`
+  comes after T, A and P. No runtime override (ruling HD-17): an anchor
+  outside the grammar is refused with its reason, the previous snapshot
+  keeps serving, and widening the grammar is a code change with a measured
+  corpus row. apt's verdicts are measured on 876 byte-exact shapes in the
+  six client images and the five older ones (`internal/gpg/testdata/aptshapes`,
+  `e2e/apt-oracle/README.md`; batches fx to fx21), which
+  `TestVerifier_FollowsTheAptShapeTable` runs every one of, none skipped,
+  with each refused row pinned to the rule that refuses it
+  (`TestVerifier_RefusesEachRowByItsRule`), the text layer held to apt's
+  own split refusals (`TestAptTextLayer_RefusesExactlyTheSplitRows`) and
+  every row's allocation under a mebibyte
+  (`TestVerifier_BoundsAllocationOnEveryRow`); twelve real vendors'
+  anchors, one per signer layout, verify in CI
+  (`TestVerifier_AcceptsTheVendorAnchors`). The exceptions: 127 strict
+  deviations in four families and the older images' exemptions (each
+  under *Open*); the known-unsafe list is empty
+  (`TestAptShapeKnownUnsafe_IsEmpty`: `x3i_sha1_only` is refused). The
+  vendor re-run (the security review's survey, 158 anchors of 81 vendors,
+  with every survey key; the Task 8 gate's method): on ff15ccf `InRelease`
+  ok 68 and `Release.gpg` ok 67 against 68 and 70 before the plan, the
+  only new refusals the binary `Release.gpg` of nginx, steam and syncthing,
+  each beside an `InRelease` the check prefers; since Task 9b's fix round
+  1 `InRelease` ok 69 and `Release.gpg` ok 68 (yarn's key in a later
+  armor block, read now), unchanged to a7d0d72; no vendor anchor is
+  refused `bad_signature`, and pkgs.k8s.io v1.30's version 3 packet is
+  refused as on 1.0.x (*Open*, the residual entry). The upgrade's trust
+  audit classifies 1.0.x snapshots with its own checks, not the verifier
+  (`internal/freshness/legacy_audit.go`), so a 1.0.x snapshot whose anchor
+  the new rules refuse keeps serving, and the suite's next adoption is
+  the one refused (the final review's D-M8). go-crypto moved to v1.5.2
+  (Task 9b's fix round 2, commit 4fa21be: identical verdicts on the suite,
+  the corpus and the survey), and the verifier no longer calls its
+  clearsign or armor decoders or its packet reader, so I-1's panic cannot
+  reach it. Two of the plan's statements are corrected here (the plan
+  stays as written): the deviations were fourteen, not eleven, before the
+  hybrid made them families; key E expired on 2020-12-31, not in 2021
+  (DN-2). Done in the hardening plan's Tasks 5 to 7 (commits dc6c8ee,
+  3c54a22, 80af12b, b51ee0e, 132ebe6, 8d2900d, fdfa2b0, 40d3614, 276d60d
+  and a900dbd), its Task 9a (9efa08d, the corpus to 490 shapes) and its
+  Task 9b (7701e7b, 2552ebf, 5d881fb, 5899af8, e819372; fix round 1
+  10098d1, 650f356, 72b8359, 3281d6a, a47437e; fix round 2 a89211f,
+  4fa21be, abc37e5, b7b5c31, ffbcbf9), with Task 9e's T6 (28c72ea).
+- **Format rules hold over every client generation; crypto policy does
+  not; the signer downgrade guard** (the maintainer, 2026-11-01: the cache
+  supports every distribution with upstream support, Ubuntu 14.04 through
+  Ubuntu Pro until May 2029 included, and 2026-11-03: the guard; ruling
+  HD-19, the plan's addendum of 2026-11-03; raised by the final review's
+  V lens, V-RC2, and its later ASSERT_PUBKEY_ALGO measurements). The
+  format rules (layers T, A and P) follow "refuse what any supported apt
+  refuses" over the six current images and the five older ones —
+  `debian:10`, `ubuntu:20.04`, `18.04`, `16.04` and `14.04`, all of which
+  ran — but fold an older image's refusal in only for a shape no real
+  signer emits (Task 9e's class (c): T6, and three rows layer P already
+  refused); a real signer's layout an old apt refuses is recorded, never
+  refused (class (b)), and so is crypto policy (class (a)), *Open*. Crypto
+  policy (layer S: algorithms, hashes, key bindings and sizes) is not
+  intersected: S2 counts what the gpgv-based apt count, with HD-18, since
+  intersecting would refuse real vendors their own clients read (gpgv 1.4
+  cannot verify EdDSA, which signs yarn; `debian:13` refuses SHA-1-bound
+  keys, which sign openresty). What that leaves — an on-path strip of a
+  vendor's strong signature beside a weak one (sublime's real `InRelease`:
+  its second packet dropped leaves a SHA-1-bound key's, which every gpgv
+  apt accepts and `debian:13` refuses) — the guard closes: a *strong
+  signer* is a packet S2 counts whose key `debian:13`'s sqv and the
+  `APT::Key::Assert-Pubkey-Algo` of `ubuntu:24.04` and `ubuntu:26.04` all
+  accept (`strongSigner`, `internal/gpg/strength.go`, its table settled by
+  measurement, batch fx20: Ed25519, ECDSA P-256 and P-384, RSA of 3072
+  bits or more, RSA-2048 until 2030-02-01, each bound by SHA-256 or
+  better no later than the signature, the primary of a signing subkey
+  judged too; DSA, RSA under 2048 bits, P-521 as a signer, brainpool,
+  secp256k1, SHA-1 and SHA-224 bindings, and anything unmeasured, Ed448
+  included, are not), and the adopter refuses a candidate with no strong
+  signer when the suite's current anchor, verified again at that moment
+  with the same verifier and keyring, has one (refusal `signer_downgrade`,
+  WARN `adoption_signer_downgrade`; after the rollback check and before
+  any download; the current snapshot keeps serving, and unlike
+  `rollback_refused` the suite's lag shows, since it really is behind
+  upstream). The guard runs in every mode, never fires under the bypass,
+  which counts no signer (ruling G1), stands down on its own errors (G2:
+  INFO `adoption_signer_guard_skipped`) and when there is no current
+  snapshot (G6, *Open*), dates its rules by the verifier's clock (G3),
+  and has no override (G4, HD-17: the recourse is in the *Open* entry);
+  WARN `adoption_signer_guard_unavailable` says once when a verifier that
+  reports no signers turns it off. It reads the stored anchor: no schema
+  change and no configuration key. Per-client tracking by User-Agent was
+  considered and not taken. The survey's 137 accepted anchors were
+  measured in the three newest images: the strong flag is "all three
+  accept" on every one, 125 strong and 12 not (*Open*). Done in the
+  hardening plan's Task 9d (commits ea28539, 3b6f550 and 65ba00a; its fix
+  round eb5ea57, e1f6c9f, 5f46774 and 0d7b103) and Task 9e (e190c8c,
+  28c72ea and 5176209; its fix round ea1c081, 9165670, 44e18d6 and
+  a7d0d72), pinned by `TestVerifier_StrongSignerFollowsTheAptShapeTable`,
+  `TestAptShapeKeyPolicy_AreTheNewestImagesRefusals`,
+  `TestAptShapeOldExempt_AreOlderImagesRefusals`,
+  `TestSignerGuard_RefusesTheStrongSignersStrip` and
+  `TestSignerGuard_RefusesTheStripOfEachWeakClass`.
+- **S1 checks every known key, whatever its usage** (the hardening plan's
+  controller, 2026-11-05, ruling for Task 9e's fix round, from its review's
+  9e-I1). gpgv 2.2.4 and 1.4 (`ubuntu:18.04`, `16.04` and `14.04`) check a
+  packet against any key of its key ID, a certify-only primary or an
+  encryption subkey too, and refuse the anchor on a bad one (BADSIG),
+  where later gpgv and sqv skip a key that cannot sign: `t7g5_s_primary`
+  and batch fx21's `us_bad_primary_plus_good`, `us_bad_enc_plus_good`,
+  `us_good_plus_bad_enc` and `us_d_bad_enc_plus_good`, each beside a good
+  packet. S1 is integrity, not crypto policy, so HD-19's rule against
+  intersecting layer S does not apply, and no real signer emits a bad
+  packet: S1 now covers a packet by any key of the host keyring, a signing
+  key through go-crypto's verification of its entity as before, any other
+  key directly (`verifiesDirectly`: go-crypto's own path would look the key
+  up again by signing usage and fail a good packet every image accepts,
+  `us_good_*_plus_good`); S2 is unchanged, so such a packet never counts
+  (`us_good_primary_alone`, `us_good_enc_alone`: refused, as every current
+  image refuses them). No vendor anchor changes (0 of 171). What it leaves
+  unmeasured is under *Open*. Done in commit 44e18d6, pinned by the table
+  test's fx21 rows and `TestVerifier_RefusesEachRowByItsRule`.
+- **The key reader reads what apt reads; integrity fails closed** (the
+  hardening plan's controller, 2026-11-01 to 05, rulings R1 to R3 and the
+  issuer principle, for Task 9b's fix rounds 3 to 9; raised by the final
+  review's V lens, V-RC1 and its re-reviews' V-R2C1 to V-R9I1). On 1.0.x
+  the loader read only an armored key file's first block and kept the
+  first copy of a key, dropping a later copy's subkeys, so a key S1 should
+  know could be missing and an anchor every apt accepts refused (yarn's
+  key, in a later block, was). Ruling R1: the keyring is trusted operator
+  input; the cache reads every key any supported apt reads from a key file
+  — apt-key's reading and apt 3's, unioned: every block of any type, the
+  keys before junk, whole packets (`internal/gpg/keyfile.go`; files of
+  regular type only, up to 256 MiB, so `debian-keyring.gpg` loads, 937
+  keys) — refuses a file only where every apt fails it, and merges copies
+  of a key into one entity (`mergeEntity`); one reader feeds S1 and S2,
+  and new WARN events say what it skips (`keyring_file_skipped`,
+  `keyring_file_truncated`). Ruling R2, integrity fails closed: S2 never
+  counts a key or subkey any supported apt treats as revoked, expired or
+  unbound — a revocation, expiry or newer binding by the key itself that
+  go-crypto cannot read, verify or apply (a version 2 or 3 signature,
+  RIPEMD-160, a v4 direct-key expiry go-crypto ignores) marks that component
+  uncountable for S2, S1 still knowing it. The marks are a union: a
+  fingerprint carries every mark any component, copy or reading gave it,
+  and is not counted while any holds (Task 9b's fix round 9: a choice of
+  one mark had let a copy's future expiry hide another copy's revocation).
+  The issuer principle, which settled rounds 5 to 8's back and forth over
+  where a signature is "the key's own": a decision that *adds* a mark may
+  take either issuer reading (the issuer fingerprint or the issuer key
+  ID), and a decision that *suppresses* one (a newer self-signature that
+  supersedes or extends) needs a self-signature go-crypto verified, every
+  issuer subpacket naming the key. Ruling R3: an S1 or S2 gap that needs a
+  malformed or unusual operator key file is availability-class — the
+  content is still authenticated by a good signature from a trusted,
+  valid key — and goes *Open* as Minor; the realistic cases (a truncated
+  download, a pasted key, a secret-key export) were fixed; integrity (R2)
+  is never deferred. Measured on every round: debian-keyring,
+  debian-maintainers and the 70 survey key files count as before but for
+  the marks R2 adds (one subkey go-crypto drops anyway, and four
+  direct-key expiries, *Open*), and the vendor re-run is unchanged. What
+  remains is under *Open* (a copy go-crypto cannot read; the over-strict
+  rows; the reader reading more than some apt). Done in Task 9b's fix
+  rounds 1 to 9 (commits 3f5afc4; fd12bc9, d1966ea, 7a80473; dc8f058,
+  654ed58, e5856a7, 38c89be; eade3f8, 1d2664d, 0dd821b, abe49d3, 8bd8182;
+  c43e04f, 40fec4b, 5f7394c, ee95aef; 7be2e70, df4de65, 9e89d14, d5dde1f;
+  6a68a62, 74f7a90, c8a8f7f; abd5bac, 60d26f1; 09b50fe, ad653a7), pinned
+  by the key reader's tests (`internal/gpg/keyfile_*_test.go`,
+  `keyring_*_test.go`), among them
+  `TestVerifier_UnreadableRevocationsAndBindingsAreNotCounted`,
+  `TestVerifier_NewestKeptIsTheKeysOwnAlone` and
+  `TestVerifier_EveryMarkOnAKeyIsKept`.
+- **The apt oracle runs before every release, both sets of images** (the
+  hardening plan's Task 5, its ruling E5 for Task 9e, and its final
+  review's D-M5). `make e2e-apt-oracle` (the six client images) and
+  `make e2e-apt-oracle-old` (the five older ones; a separate target, as
+  one run would take about three minutes) run before every release, after
+  `docker pull` of the images, and after a go-crypto upgrade or a change
+  to `internal/gpg`'s armor, packet or signature checks; a difference
+  blocks the release until it is recorded and the table test agrees
+  (`e2e/apt-oracle/README.md`, *When to run it* and *When apt changes*).
+  They are the only check that sees apt drift between releases; the table
+  test holds the cache to the recorded verdicts in CI.
 - **Dependencies updated for 1.1.0** (the maintainer, 2026-10-28; raised
   2026-09-08, the security review's finding H-3): `golang.org/x/net`
   0.58.0, `golang.org/x/text` 0.41.0, `golang.org/x/crypto` 0.55.0,
@@ -587,7 +1118,15 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   each the newest that keeps `go 1.25.0` (the toolchain entry, below).
   `govulncheck` reported 16 vulnerabilities the code reaches before
   (with go1.26.8), none after under go1.27.3; what remains is the
-  `govulncheck` entry under *Open*.
+  `govulncheck` entry under *Open*. And `github.com/ProtonMail/go-crypto`
+  1.4.1 to 1.5.2 (the hardening plan's controller, 2026-11-01, for its
+  Task 9b's fix round 2, commit 4fa21be; still `go 1.25.0`): it fixes the
+  `clearsign.Decode` panic (I-1, in 1.5.0) and the parse panic on an empty
+  hashed type-4 subpacket (A-RC3, in 1.5.1), and gave identical verdicts
+  on the test suite, the apt-shape corpus and the vendor survey; if it is
+  ever wrong, that commit reverts alone (the verifier's own refusal of the
+  empty type 4 and its `recover` stand on 1.4.1). 1.0.3 carries the same
+  bump.
 - **Merge to `main` without a pull request; changes collect in
   `Changelog.md`** (the maintainer, 2026-10-28): the flat-repositories
   branch was merged into `main` directly, and `Changelog.md` lists each
