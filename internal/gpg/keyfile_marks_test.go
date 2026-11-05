@@ -119,6 +119,31 @@ func rsaKeySig(t *testing.T, signer *openpgp.Entity, sigType byte, hash crypto.H
 	return newPacket(tagSignature, body)
 }
 
+// rsaKeySigV3 crafts a version 3 signature packet (RFC 4880 §5.2.2) of
+// sigType by signer's primary RSA key over material, SHA-256, made at
+// kr14Created: the type and time hashed after the material, the issuer's
+// key ID in the clear. As V's mkkr17.py makes them.
+func rsaKeySigV3(t *testing.T, signer *openpgp.Entity, sigType byte, material []byte) []byte {
+	t.Helper()
+	priv, ok := signer.PrivateKey.PrivateKey.(*rsa.PrivateKey)
+	if !ok {
+		t.Fatalf("test premise: %T is no RSA key", signer.PrivateKey.PrivateKey)
+	}
+	hashed := binary.BigEndian.AppendUint32([]byte{sigType}, uint32(kr14Created.Unix()))
+	h := crypto.SHA256.New()
+	h.Write(material)
+	h.Write(hashed)
+	digest := h.Sum(nil)
+	sig, err := rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := joined([]byte{3, 5}, hashed, binary.BigEndian.AppendUint64(nil, signer.PrimaryKey.KeyId),
+		[]byte{byte(packet.PubKeyAlgoRSA), hashSHA256}, digest[:2])
+	body = binary.BigEndian.AppendUint16(body, uint16(priv.N.BitLen()))
+	return newPacket(tagSignature, append(body, sig...))
+}
+
 // serializedSig is sig as a packet.
 func serializedSig(t *testing.T, sig *packet.Signature) []byte {
 	t.Helper()
@@ -502,6 +527,70 @@ func TestParseKeyring_MarksWhatItCannotRead(t *testing.T) {
 		why := kf.uncountable[want]
 		if len(kf.uncountable) != 1 || why == nil || !errors.Is(why, row.want) || !strings.Contains(why.Error(), typ) {
 			t.Errorf("%s: marks %v; want %s alone marked %v, naming %s", row.name, kf.uncountable, want, row.want, typ)
+		}
+	}
+}
+
+// TestVerifier_V3RevocationsAreMarked: the fifth re-review's V-R5I1. A
+// version 3 revocation by the key itself, of the key (0x20) or of a subkey
+// (0x28), is honoured by every supported apt (kr17_v3_keyrev,
+// kr17_v3_subrev: REVKEYSIG in the five gpgv-based apt, refused by sqv too),
+// and fix round 4 dropped every v3 signature before the marks were made, so
+// S2 counted the key. The revocation now marks its component; S1 still
+// knows K. A v3 binding or certification is still passed over, as go-crypto
+// passes it over and gpg takes none as a v4 key's self-signature: a newer
+// v3 binding of K that would expire it changes nothing, another key's v3
+// certification of P's user ID changes nothing, and a subkey bound by a v3
+// binding alone is dropped (never counted), the rest of the key read.
+func TestVerifier_V3RevocationsAreMarked(t *testing.T) {
+	kk := newKR14Keys(t)
+	x := newTestEntity(t, "X", "x@example.com")
+	a := newTestEntity(t, "A", "a@example.com")
+	kGood, kBad := signedBy(t, kk.k, fakeReleasePlaintext), signedBy(t, kk.k, "Origin: Other\n")
+	aGood := signaturePacketsOf(t, clearsignWith(t, a, []byte(fakeReleasePlaintext)))
+	pMaterial, pkMaterial := keyMaterial(t, kk.p.PrimaryKey), keyMaterial(t, kk.p.PrimaryKey, kk.k.PublicKey)
+	uid := firstUID(kk.p)
+	tags, pkts := rawPacketList(t, binaryKey(t, kk.p))
+	if tags[1] != 13 || tags[2] != 2 || tags[len(tags)-2] != 14 {
+		t.Fatalf("test premise: P's packets have tags %v", tags)
+	}
+	v3Binding := rsaKeySigV3(t, kk.p, byte(packet.SigTypeSubkeyBinding), pkMaterial)
+	// K2, a subkey with a v3 binding alone, after K's packets.
+	k2 := signingSubkey(t, newTestEntity(t, "Q", "q@example.com"), time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC))
+	var k2Pkt bytes.Buffer
+	if err := k2.PublicKey.Serialize(&k2Pkt); err != nil {
+		t.Fatal(err)
+	}
+	k2Binding := rsaKeySigV3(t, kk.p, byte(packet.SigTypeSubkeyBinding), keyMaterial(t, kk.p.PrimaryKey, k2.PublicKey))
+	for _, tc := range []struct {
+		name string
+		ring []byte
+		want error // nil: K's good signature adopted
+	}{
+		{"kr17_v3_keyrev: P revoked by a v3 0x20 by P", kk.ring(t, [][]byte{rsaKeySigV3(t, kk.p, byte(packet.SigTypeKeyRevocation), pMaterial)}, nil), pgperrors.ErrKeyRevoked},
+		{"kr17_v3_subrev: K revoked by a v3 0x28 by P", kk.ring(t, nil, [][]byte{rsaKeySigV3(t, kk.p, byte(packet.SigTypeSubkeyRevocation), pkMaterial)}), pgperrors.ErrKeyRevoked},
+		{"a newer v3 binding of K by P: passed over, K counts", kk.ring(t, nil, [][]byte{v3Binding}), nil},
+		{"another key's v3 certification of P's user ID: passed over, K counts", joined(joined(pkts[:3]...), rsaKeySigV3(t, x, byte(packet.SigTypeGenericCert), joined(pMaterial, uidMaterial(uid))), joined(pkts[3:]...)), nil},
+		{"another key's v3 revocation of its certification (0x30) of P's user ID: not the key's own, not marked, K counts", joined(joined(pkts[:3]...), rsaKeySigV3(t, x, byte(packet.SigTypeCertificationRevocation), joined(pMaterial, uidMaterial(uid))), joined(pkts[3:]...)), nil},
+		{"P's own v3 revocation of its user ID (0x30): marked, as an unreadable v4 one is", joined(joined(pkts[:3]...), rsaKeySigV3(t, kk.p, byte(packet.SigTypeCertificationRevocation), joined(pMaterial, uidMaterial(uid))), joined(pkts[3:]...)), pgperrors.ErrKeyRevoked},
+		{"K2 bound by a v3 binding alone after K: K2 dropped, K counts", kk.ring(t, nil, [][]byte{k2Pkt.Bytes(), k2Binding}), nil},
+	} {
+		v := kr14Verifier(t, map[string][]byte{"00-a.gpg": binaryKey(t, a), "20-p.gpg": tc.ring})
+		_, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, kGood))
+		switch {
+		case tc.want == nil && err != nil:
+			t.Errorf("%s: K's good signature: %v; want it adopted", tc.name, err)
+		case tc.want != nil && (!errors.Is(err, tc.want) || !strings.Contains(err.Error(), "version 3")):
+			t.Errorf("%s: K's good signature: %v; want %v, the reader's mark naming the version 3 signature", tc.name, err, tc.want)
+		}
+		if _, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, aGood, kBad)); !errors.Is(err, ErrBadSignature) {
+			t.Errorf("%s: A's good signature and K's bad one: %v; want ErrBadSignature (S1 knows K)", tc.name, err)
+		}
+		if strings.HasPrefix(tc.name, "K2") {
+			kf, err := parseKeyringBytes(tc.ring)
+			if err != nil || len(kf.entities) != 1 || len(kf.entities[0].Subkeys) != 2 {
+				t.Errorf("%s: %v; want P read with K and its encryption subkey, K2 dropped", tc.name, err)
+			}
 		}
 	}
 }

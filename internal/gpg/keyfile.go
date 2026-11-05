@@ -604,6 +604,7 @@ type keyComponent struct {
 type keySig struct {
 	raw     rawPacket
 	typ     byte
+	v3      bool      // a version 3 revocation, kept for marks alone (never handed to go-crypto)
 	self    bool      // its issuer is the key itself, or cannot be read
 	created time.Time // its creation time; zero when it cannot be read
 	ok      bool
@@ -724,6 +725,8 @@ func keyBlocksOf(pkts []rawPacket) []*keyBlock {
 			}
 			if t, ok := sigTypeOf(p, kb.key.Version); ok && sigFits(kb.components[at].kind, t) {
 				kb.components[at].sigs = append(kb.components[at].sigs, keySig{raw: p, typ: t})
+			} else if t, ok := v3RevocationType(p); ok && sigFits(kb.components[at].kind, t) {
+				kb.components[at].sigs = append(kb.components[at].sigs, keySig{raw: p, typ: t, v3: true})
 			}
 		case tagUserAttribute:
 			at = -1
@@ -781,12 +784,36 @@ func newPacket(tag byte, body []byte) []byte {
 
 // sigTypeOf returns the signature type of p, a signature packet whose
 // version is the key's (go-crypto reads a v4 key's v4 signatures, a v6
-// key's v6 ones; a v3 signature it passes over).
+// key's v6 ones; a v3 signature it passes over: an UnsupportedError its
+// packet reader skips; v3RevocationType keeps the revocations among them
+// for marks).
 func sigTypeOf(p rawPacket, version int) (byte, bool) {
 	if len(p.body) < 2 || int(p.body[0]) != version {
 		return 0, false
 	}
 	return p.body[1], true
+}
+
+// v3RevocationType returns the signature type of p when p is a version 3
+// revocation, of a key (0x20), a subkey (0x28) or a user ID (0x30): RFC 4880
+// §5.2.2, a body of the version, the hashed material's length (5), the type,
+// a four-octet creation time, the issuer's eight-octet key ID, the
+// algorithms, two octets of the digest and the signature. Every supported
+// apt honours such a revocation by the key itself (the fifth re-review's
+// kr17_v3_keyrev and kr17_v3_subrev, REJ in all six images); go-crypto
+// passes it over, so the reader keeps it for marks alone (keySig.v3): it is
+// never handed to go-crypto, and never counts as a binding or a
+// self-signature. Any other v3 signature (a binding, a certification) is
+// dropped, as before.
+func v3RevocationType(p rawPacket) (byte, bool) {
+	if len(p.body) < 19 || p.body[0] != 3 || p.body[1] != 5 {
+		return 0, false
+	}
+	switch t := packet.SignatureType(p.body[2]); t {
+	case packet.SigTypeKeyRevocation, packet.SigTypeSubkeyRevocation, packet.SigTypeCertificationRevocation:
+		return byte(t), true
+	}
+	return 0, false
 }
 
 // sigFits reports whether go-crypto reads a signature of type t on a
@@ -825,7 +852,7 @@ func (kb *keyBlock) packets(strict bool) []byte {
 		var sigs []byte
 		bound := false
 		for _, s := range c.sigs {
-			if strict && !s.ok {
+			if s.v3 || strict && !s.ok {
 				continue
 			}
 			bound = bound || s.typ == byte(packet.SigTypeSubkeyBinding)
@@ -862,6 +889,14 @@ func (kb *keyBlock) classify() {
 // (addUserID); on a subkey a binding or revocation that verifies by the
 // primary key, whoever its issuer says (addSubkey).
 func (s *keySig) read(kb *keyBlock, c *keyComponent) {
+	if s.v3 {
+		// go-crypto reads no v3 signature; its issuer key ID stands at
+		// body[7:15], its creation time at body[3:7] (v3RevocationType).
+		s.self = binary.BigEndian.Uint64(s.raw.body[7:15]) == kb.key.KeyId
+		s.created = time.Unix(int64(binary.BigEndian.Uint32(s.raw.body[3:7])), 0)
+		s.why = "it is a version 3 signature, which go-crypto does not read"
+		return
+	}
 	p, err := packet.Read(bytes.NewReader(s.raw.raw))
 	sig, isSig := p.(*packet.Signature)
 	if err == nil && !isSig {
@@ -1024,8 +1059,13 @@ func supersedes(typ byte) byte {
 // (TestVerifier_UnreadableRevocationsAndBindingsAreNotCounted,
 // TestParseKeyring_MarksWhatItCannotRead). Not marked: a signature by
 // another key that gpgv ignores too (its certification of a user ID, a
-// binding it did not make) and a v3 signature (sigTypeOf passes it over, as
-// go-crypto does; gpg refuses v3 self-signatures on a v4 key).
+// binding it did not make), and a v3 binding or certification (sigTypeOf
+// passes it over, as go-crypto does; gpg takes no v3 self-signature as a
+// v4 key's binding or self-certification). A v3 revocation by the key
+// itself IS marked (the fifth re-review's V-R5I1): every supported apt
+// honours it (kr17_v3_keyrev, kr17_v3_subrev: REJ in all six images), and
+// fix round 4 dropped it with every v3 signature before the marks were
+// made; v3RevocationType keeps it for marks alone.
 func (kb *keyBlock) marks() map[string]error {
 	var out map[string]error
 	mark := func(fp string, err error) {
