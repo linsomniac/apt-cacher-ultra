@@ -640,7 +640,8 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
           <div class="k">Pool unlink errors</div>
           <div class="v"><code>{{.GC.PoolUnlinkErrors}}</code></div>
           <div class="k">Deadline reached</div>
-          <div class="v"><span class="b {{if .GC.LastRunDeadlineReached}}b--crit{{else}}b--ok{{end}}">{{.GC.LastRunDeadlineReached}}</span></div>
+          {{/* AIDEV-NOTE: issue #14 (the hardening plan's Task 8). Since a pass that reaches its deadline no longer ends the run, a reached deadline is a busy cache's steady state while it drains a backlog, not a failure: warn, with the tooltip; Blobs reaped staying 0 is the failure sign. */}}
+          <div class="v">{{if .GC.LastRunDeadlineReached}}<span class="b b--warn" title="The last run stopped a pass at its share of gc.max_tick_duration. The passes after it still ran, and the rest resumes at the next run (retired snapshots hourly): normal while a busy cache drains a backlog. Look further only if Blobs reaped stays 0 run after run.">true</span>{{else}}<span class="b b--ok">false</span>{{end}}</div>
         </div>
         {{else}}<div class="empty"><div class="empty__head">NO GC RUN YET</div><div class="empty__body">GC has not completed since process start.</div></div>{{end}}
       </section>

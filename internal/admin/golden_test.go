@@ -141,6 +141,27 @@ func TestGoldenDegradedGPG(t *testing.T) {
 	)
 }
 
+// Issue #14 (the hardening plan's Task 8): a pass that reaches its share of
+// gc.max_tick_duration no longer ends the run, so a reached deadline is a
+// busy cache's steady state while a backlog drains: the GC panel's
+// *Deadline reached* badge is warn, not crit, and its tooltip says what to
+// watch instead (Blobs reaped); a run that reached none stays ok.
+func TestGoldenGCDeadlineReachedIsNotAFailure(t *testing.T) {
+	m := newHealthyModel()
+	gc := *m.GC
+	gc.LastRunDeadlineReached = true
+	m.GC = &gc
+	html := renderHTMLForGolden(t, m)
+	mustContain(t, html,
+		`<span class="b b--warn" title="The last run stopped a pass at its share of gc.max_tick_duration.`,
+		`normal while a busy cache drains a backlog. Look further only if Blobs reaped stays 0 run after run.">true</span>`,
+	)
+	if strings.Contains(html, `b--crit">true</span>`) {
+		t.Error("the Deadline reached badge renders crit")
+	}
+	mustContain(t, renderHTMLForGolden(t, newHealthyModel()), `<span class="b b--ok">false</span>`)
+}
+
 // TestGoldenMemberFetchFailedShowsMember verifies the redesigned
 // adoptions row surfaces the failing member path + detail for a
 // member_fetch_failed outcome — the operator-facing "why did adoption
