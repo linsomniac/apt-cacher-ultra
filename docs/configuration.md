@@ -489,7 +489,7 @@ declares.
 | `require_signature` | boolean | `true` | Allows starting with an empty keyring. It no longer relaxes verification: only a decodable clearsigned `InRelease` is adopted as inline metadata in every mode (plain-text bodies are `missing_signature`, undecodable ones `malformed_clearsign`). Unsigned repositories are adopted in the unsigned form instead (`adopt_unsigned`). |
 | `adopt_unsigned` | boolean | `true` | Adopt a repository that publishes a `Release` with no signature (neither `InRelease` nor `Release.gpg`) as an unsigned snapshot: served coherently, but never trusted — it vouches no `.deb` and never counts for `integrity.refuse_unvouched_debs`. A suite the cache has seen signed is never adopted unsigned. `false` refuses every unsigned `Release` ("refused: unsigned_disabled", a state, not a failed check), so the cache no longer keeps unsigned repositories fresh: an unsigned suite already adopted keeps serving its last snapshot, coherent but frozen — never updated — until the knob is turned back on (it then updates at its next retry, at most 75 minutes later: a restart keeps a refusal's retry time), the suite is forgotten (`POST /forget`), or it is reaped after `gc.suite_idle_ttl` without a client. Forgotten or reaped with the knob still off, it is then a repository not yet adopted, which is worse: the forget or reap deletes its cached index files first, so its next requests fetch upstream's current files, but it stays unadopted and each file then stays as the cache first stored it, never refreshed, so an upstream publish can leave its clients with Hash Sum mismatches. Off also stops the refresh of a flat repository that publishes no `Release` at all (see *Flat repositories* under `[freshness]`): it is served as the cache first stored its files, and the status page shows "refused: unsigned_disabled"; turning the knob on resumes its refresh. Set it to `false` only if you do not serve unsigned repositories through the cache. Either way the suite is asked upstream again only at its retry times (2 minutes, doubling to an hour; for a suite not yet adopted, also once `periodic_refresh` has passed), never at the checks clients trigger in between. See *Anchor forms and unsigned repositories* for the safeguards and the threat notes. |
 | `require_pinned_signer` | boolean | `false` | Reject adoption when no `[[trusted_signer]]` matches the canonical host. Evaluated before `accept_any_signer`. |
-| `accept_any_signer` | boolean | `false` | For hosts without matching signer pins, skip both signer trust checks **and cryptographic signature verification**. A decodable clearsigned `InRelease` (or, for the detached pair, a parseable `Release.gpg` signature) is still required, as in every mode. Matching pins keep normal verification. Logs a startup warning. |
+| `accept_any_signer` | boolean | `false` | For hosts without matching signer pins, skip both signer trust checks **and cryptographic signature verification**. The anchor's structure is still checked, as in every mode: an `InRelease`, or an ASCII-armored `Release.gpg`, in the shape the cache accepts, holding at least one signature packet it can parse (a binary `Release.gpg` is refused, and so is every anchor the verifier refuses as `malformed_clearsign` or `malformed_signature`); only the signature checks are skipped, the bad-signature check and the signer downgrade guard included (*Trust and signer pins*). Matching pins keep normal verification. Logs a startup warning. |
 | `allow_short_keyid` | boolean | `true` | Accept signatures containing only a legacy 64-bit issuer key ID when it uniquely identifies a loaded trusted key and cryptographic verification succeeds. `false` requires the long issuer fingerprint. |
 | `keyring_dirs` | array of strings | `[]` | Extra startup keyring directories containing `.gpg` or `.asc` files. Entries must be nonempty absolute paths; nonexistent directories are skipped. Adds to built-in directories and bundled keys. |
 | `architectures` | array of strings | `[]` | Architectures to adopt; empty keeps all. Filters recognized per-architecture Packages, Sources, pdiff indexes, Contents, cnf Commands, and dep11 Components. Use `"source"` for source indexes. Architecture-independent `"all"` content is always retained. |
@@ -549,10 +549,46 @@ The default trust set combines bundled archive keys with `.gpg`/`.asc` files in
 `keyring_dirs`. Keys are read at startup. Without a matching signer pin, any
 loaded trusted key can verify a suite; the cache does not derive per-source
 restrictions from a client's `Signed-By` configuration. The cache refuses an
-anchor that carries a bad signature from any key in its keyring, as apt does,
-except under `accept_any_signer`'s bypass, which verifies no signature;
-install in the cache every key your clients' `signed-by` names, so that it
-refuses what they would.
+anchor that carries a bad signature from any key in its keyring (reason
+`bad_signature`), as apt does with gpgv (`debian:13`'s apt, which verifies
+with sqv, refuses only a lone one), except under `accept_any_signer`'s
+bypass, which verifies no signature; install in the cache every key your
+clients' `signed-by` names, so that it refuses what they would. A key file
+is read as apt reads it: every armor block, the keys before any junk, and
+a revocation or expiry the cache cannot read stops that key from counting,
+as gpgv honours it; a file the cache skips, or reads only in part, is
+named at start by WARN `keyring_file_skipped`, `keyring_file_truncated`
+or `keyring: parse failed; skipping file`.
+
+The verifier refuses what any supported apt refuses — the six current
+client images and the five older ones its corpus is measured on
+(`e2e/apt-oracle/README.md`) — and, beyond that, any anchor outside the
+canonical shape real signers write: a second armor block, armor lines over
+76 characters, bytes left inside a signature packet, a packet of an
+algorithm it does not read (SHA-224, SHA3-256), among others, refused as
+`malformed_clearsign` (an `InRelease`) or `malformed_signature` (a
+`Release.gpg`) even where apt would accept them; the status page's reason
+and the `adoption_gpg_failed` log line name the rule. No setting widens
+it. A signature hashed with SHA-1 never counts, as apt does not count it.
+An anchor signed only with a version 3 signature packet is refused
+(`debian:13`'s apt refuses it too; older OBS-built repositories, such as
+pkgs.k8s.io's v1.30, publish one). Key strength is not judged: the cache
+counts what the gpgv-based apt count, an RSA-1024, DSA or SHA-1-bound key
+included, which `debian:13`'s sqv and the newer Ubuntu releases refuse.
+
+The signer downgrade guard covers the strip of a strong signature beside
+a weak one: when the suite's current anchor, verified again with the same
+keyring, has a *strong* signer — a key `debian:13`, `ubuntu:24.04` and
+`ubuntu:26.04` all accept (Ed25519, ECDSA P-256 or P-384, or RSA of 2048
+bits or more, until 2030-02-01 for 2048, bound with SHA-256 or better) —
+and a new anchor has none, the new anchor is refused (refusal
+`signer_downgrade`, WARN `adoption_signer_downgrade`) and the current
+snapshot keeps serving, its lag showing. It cannot see a strip at a
+suite's first adoption, and stands down for a suite whose current anchor
+has no strong signer. If a vendor really drops its strong key, the vendor
+signing again with a strong key clears it; otherwise remove the strong key
+from the keyring and restart, or `POST /forget` the suite, which adopts
+the new anchor as a first adoption.
 
 `accept_any_signer = true` makes client-side apt verification the trust boundary
 for unpinned suites: the cache continues serving the original signed bytes, but

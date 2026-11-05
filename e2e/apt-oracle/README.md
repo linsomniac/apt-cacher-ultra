@@ -177,7 +177,8 @@ shapes they measured has the verdicts they measured:
 
 Four of those measurements are new to the plan: `debian:13`'s sqv refuses
 SHA-224 ("not considered secure"), every gpgv-based apt refuses SHA3-256
-(`Unknown error executing gpgv`; GnuPG 2.4 lists no SHA3) and the
+(`Unknown error executing apt-key`, on `ubuntu:26.04` `Unknown error
+executing gpgv`; GnuPG 2.4 lists no SHA3) and the
 binary-mode packet first (`n_i_unknown00_first`: gpgv then reports B's
 missing key and no good signature from A), and every apt accepts an END
 marker in an armor header (`vm3_*`).
@@ -383,14 +384,20 @@ its subkey, and U's, of U and its two subkeys.
    A detached shape that signs another text than the shared `Release`
    gives that text in its batch's third dict; the generator writes it as
    `<name>.Release`.
-2. Regenerate. With `--from-controls`, `--own-key` or `--subkeys-key`,
-   only that part changes, so in step 4 every other row must come out
-   unchanged. A full regeneration,
+2. Regenerate. With `--from-controls`, `--own-key`, `--subkeys-key`,
+   `--policy-keys` or `--usage-keys`, only that part changes, so in step 4
+   every other row must come out unchanged. A full regeneration,
    `python3 -I e2e/apt-oracle/gen_shapes.py internal/gpg/testdata/aptshapes`,
    makes new keys A, B, E, S, O and K and new signatures, so every fixture
    changes (the key-free batches are cut from the new controls, byte
    surgery the same); `verdicts.txt` and `classes.txt` are left in place,
-   and are now stale.
+   and are now stale. About one full run in 256 stops with "B's packet
+   leaves no padding: run again" (a cut needs base64 padding that the new
+   packet's length may not give): run it again. Two fx10 cuts
+   (`a_crc_on_last_line`, `a_pad_split_437`) assume the length of A's
+   packet that gpg 2.4 writes (438 octets) without checking it, so check
+   their rows after a full regeneration with another gpg (the Task 9a
+   review's 9A-M4).
 3. Re-measure, both sets: `bash e2e/apt-oracle/run.sh --record` and
    `bash e2e/apt-oracle/run.sh --old --record`.
 4. Review `git diff --no-ext-diff internal/gpg/testdata/aptshapes/verdicts.txt
@@ -425,28 +432,31 @@ derives each refusal's error class, prints the verdicts as one table
 `classes.txt`: each difference is printed as **apt changed**, with the
 first `E:` or `W:` line apt printed for that shape, and the run fails.
 
-It checks apt, not the cache: that the six images' apt still gives the
+It checks apt, not the cache: that the images' apt still gives the
 recorded verdicts on these bytes. Holding the cache to `verdicts.txt` is
-the job of the verifier's Go table test over the same files, which the
-hardening plan adds in its Tasks 6 and 7
-(`TestVerifier_FollowsTheAptShapeTable`): the cache refuses a shape when
-any of the six apt refuses it, and accepts a shape all six accept, but for
-the exceptions the test lists, each with its reason, and for the 138
-shapes of batches fx10 to fx13 it skips by name (`pendingHybrid`) until
-the plan's Task 9b: 105 the cache adopts though some apt refuses them, 29
-it refuses though every apt accepts them, and the four V-C2 shapes, which
-it refuses as apt does but only after go-crypto has allocated gibibytes
-for each. `TestAptShapeClasses_AgreeWithTheVerdicts` checks
-`classes.txt` against `verdicts.txt`.
+the job of the verifier's Go table test over the same files
+(`TestVerifier_FollowsTheAptShapeTable`, `go test ./internal/gpg`, in
+CI): it runs every shape, none skipped, and the cache refuses a shape when
+any of the six apt refuses it and accepts a shape all six accept, but for
+the strict deviations it lists, each in its family (127 shapes in four:
+one armor block, non-canonical armor layout, non-canonical packet layout,
+unverifiable algorithm; `aptShapeDeviations`), and the crypto-policy rows
+only a newest image refuses, which it accepts (`aptShapeKeyPolicy`, ruling
+HD-19). Its known-unsafe list is empty (`x3i_sha1_only` is refused since
+ruling HD-18: SHA-1 never counts), every refused row is pinned to the rule
+that refuses it (`TestVerifier_RefusesEachRowByItsRule`), and the cache's
+port of apt's text layer refuses exactly the `split` rows
+(`TestAptTextLayer_RefusesExactlyTheSplitRows`, *Error classes*).
+`TestAptShapeClasses_AgreeWithTheVerdicts` checks `classes.txt` against
+`verdicts.txt`.
 
 That guarantee — the cache adopts no anchor a supported apt refuses, but
-for the one known-unsafe shape the test lists (`x3i_sha1_only`: weak
-digests are outside the plan) — is only as wide as the corpus: it holds
-for the 352 shapes the table test runs, not for the 105 adopted ones it
-skips, nor for a shape the corpus lacks: an anchor shaped otherwise is
-unmeasured, and the cache may adopt it while some apt refuses it. When a
-new shape turns up (a vendor's anchor, a go-crypto change, a review), add
-it.
+for crypto policy — is only as wide as the corpus: it holds for the 876
+shapes the table test runs, not for a shape the corpus lacks: an anchor
+shaped otherwise is unmeasured, and the cache may adopt it while some apt
+refuses it (the hybrid verifier's canonical grammar makes that unlikely:
+the residual is in `docs/open-decisions.md`, *Open*). When a new shape
+turns up (a vendor's anchor, a go-crypto change, a review), add it.
 
 Since the plan's Task 9e the table test reads `verdicts-old.txt` too
 (ruling HD-19, *The older images*): the cache refuses a shape an older
@@ -493,7 +503,7 @@ refuse exactly the `split` rows.
 | `split` | by its own checks of the file, before its verifier (gpgv or sqv) ran: the clearsign sniff, `SplitClearSignedFile` or `VerifyDetachedSignatureFile` (`apt-pkg/contrib/gpgv.cc`) | `Splitting up … into data and signature failed`; `Clearsigned file isn't valid, got 'NOSPLIT'`; `does not start with a signed message block`; `Detached signature file … contains unexpected line starting with a dash`, `… contains lines not belonging to a signature`, `… is in unsupported binary format`, `… contains unclosed signatures`; and, for a `Release.gpg` with no BEGIN line, `Signed file isn't valid, got 'NODATA'`, which apt then writes itself |
 | `nodata` | its verifier ran and found no signature data: gpgv's NODATA | `Signed file isn't valid, got 'NODATA'` |
 | `badsig` | its verifier ran and a signature failed its check | gpgv's `The following signatures were invalid: BADSIG …`; sqv's `Message has been manipulated` |
-| `other` | its verifier ran and said anything else | sqv's malformed-armor, malformed-packet and policy errors, or its crash; gpgv 2.2's `seems good, but expected details are missing`; `EXPKEYSIG`; `Unknown error executing gpgv` |
+| `other` | any other refusal once apt had passed the file on to its verifier: what the verifier said, or a later refusal (`i_dash_escaped_end`: the verifier accepted the signature, and apt's `Release` parser refused the M its splitter made) | sqv's malformed-armor, malformed-packet and policy errors, or its crash; gpgv 2.2's `seems good, but expected details are missing`; `EXPKEYSIG`; `Unknown error executing apt-key` (`… gpgv` on `ubuntu:26.04`); `Unable to parse package file` |
 
 The split is apt's control flow, not its wording, because the wording
 cannot tell the two NODATA apart: for a refused shape `in-container.sh`
@@ -599,10 +609,14 @@ unhashed area beside a good signature.
 
 ## When to run it
 
-- Before a release, on the tree you tag (`docs/open-decisions.md`, the
-  list before the 1.1.0 release candidate), both sets (`make
-  e2e-apt-oracle` and `make e2e-apt-oracle-old`), adding a row to
-  *Results*.
+- Before every release, on the tree you tag, both sets (`make
+  e2e-apt-oracle` and `make e2e-apt-oracle-old`), after `docker pull` of
+  the eleven images (*Running it*: without it the run measures the cached
+  images again and passes by construction), adding a row to *Results*; a
+  difference blocks the release until it is recorded and the table test
+  agrees (*When apt changes*). `docs/open-decisions.md` records this under
+  *Decided* ("The apt oracle runs before every release"), and lists it for
+  1.1.0-rc1.
 - After a go-crypto upgrade, and after a change to `internal/gpg`'s armor
   or signature checks: the table test shows what the cache does, the
   oracle that apt still does what the table says.
@@ -616,11 +630,15 @@ verdict (or error class), and what apt said. Run that image alone again to
 rule out a flake (`E2E_APT_ORACLE_IMAGES=<image> make e2e-apt-oracle`);
 then:
 
-1. Record it: `bash e2e/apt-oracle/run.sh --record`, and check that the
-   diff of `verdicts.txt` and `classes.txt` holds only the changed cells.
-2. Update the shape's row in the record that succeeds the hardening
-   plan's Appendix A (the plan itself stays as measured on 2026-10-28),
-   and add a row to *Results* below with the date.
+1. Record it: `bash e2e/apt-oracle/run.sh --record` (`--old --record`
+   for an older image), and check that the diff of `verdicts.txt` and
+   `classes.txt` (or `verdicts-old.txt` and `classes-old.txt`) holds only
+   the changed cells.
+2. Update the shape's description in *The corpus* above if its meaning
+   changed (the hardening plan's Appendix A stays as measured on
+   2026-10-28: `verdicts.txt` and this README are its successors, and
+   step 1 has rewritten `verdicts.txt`), and add a row to *Results* below
+   with the date.
 3. Run the verifier's table test: the cache's verdict may now be a
    deviation to list (a refusal all six apt now accept), or a refusal to
    add (a shape some apt now refuses).
