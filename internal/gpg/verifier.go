@@ -748,8 +748,8 @@ func (v *Verifier) verifyAnyTrusted(
 	// must never change the verdict (the switch below runs only when
 	// nothing counted). The short key ID fallback's log stays the accepting
 	// packet's.
-	count := func(signer *openpgp.Entity, i int) bool {
-		fp, strong, why := signerStrength(signer, pkts[i].issuer, now)
+	count := func(sig *packet.Signature, signer *openpgp.Entity, i int) bool {
+		fp, strong, why := signerStrength(signer, pkts[i].issuer, sig.CreationTime, now)
 		if strong {
 			signers.Strong = fp
 			signers.Counted = append(signers.Counted, fp)
@@ -797,8 +797,9 @@ func (v *Verifier) verifyAnyTrusted(
 			}
 			// The entity whose keyid resolved the trust check is the
 			// one whose key is used for the cryptographic check.
-			if _, _, verr := openpgp.VerifyDetachedSignature(openpgp.EntityList{matched},
-				bytes.NewReader(signed), bytes.NewReader(p.raw), v.sigConfig()); verr != nil {
+			sig, _, verr := openpgp.VerifyDetachedSignature(openpgp.EntityList{matched},
+				bytes.NewReader(signed), bytes.NewReader(p.raw), v.sigConfig())
+			if verr != nil {
 				lastVerifyErr = verr
 				continue
 			}
@@ -806,7 +807,7 @@ func (v *Verifier) verifyAnyTrusted(
 				// The packet that accepts the anchor, as before Task 9d.
 				v.logShortKeyIDFallbackOnce(suite, matched, p.issuer)
 			}
-			if count(matched, i) {
+			if count(sig, matched, i) {
 				return signers, nil
 			}
 			continue
@@ -825,7 +826,7 @@ func (v *Verifier) verifyAnyTrusted(
 		// Verify this one packet in isolation, as framed: the packet
 		// that satisfied the IssuerFingerprint policy is the packet
 		// whose hash is cryptographically validated.
-		_, signer, verr := openpgp.VerifyDetachedSignature(
+		sig, signer, verr := openpgp.VerifyDetachedSignature(
 			trustSet,
 			bytes.NewReader(signed),
 			bytes.NewReader(p.raw),
@@ -835,7 +836,7 @@ func (v *Verifier) verifyAnyTrusted(
 			lastVerifyErr = verr
 			continue
 		}
-		if count(signer, i) {
+		if count(sig, signer, i) {
 			return signers, nil
 		}
 	}
@@ -861,18 +862,19 @@ func (v *Verifier) verifyAnyTrusted(
 
 // signerStrength is the uppercase fingerprint of signer's key whose key ID
 // is issuer and that may sign — the key go-crypto verified a counted packet
-// with (openpgp.EntityList.KeysByIdUsage, as VerifyDetachedSignature looks
-// it up) — and whether it is strong at now (strongSigner), else why not.
-// An entity holding two such keys (a key ID collision inside one key) is
-// strong only when both are; the first one's fingerprint names it.
-func signerStrength(signer *openpgp.Entity, issuer uint64, now time.Time) (fp string, strong bool, why string) {
+// made at made with (openpgp.EntityList.KeysByIdUsage, as
+// VerifyDetachedSignature looks it up) — and whether it is strong at now
+// (strongSigner), else why not. An entity holding two such keys (a key ID
+// collision inside one key) is strong only when both are; the first one's
+// fingerprint names it.
+func signerStrength(signer *openpgp.Entity, issuer uint64, made, now time.Time) (fp string, strong bool, why string) {
 	keys := openpgp.EntityList{signer}.KeysByIdUsage(issuer, packet.KeyFlagSign)
 	if len(keys) == 0 {
 		return fmt.Sprintf("%016X", issuer), false, "no signing key of its key ID"
 	}
 	fp = upperFP(keys[0].PublicKey.Fingerprint)
 	for _, k := range keys {
-		if ok, w := strongSigner(k, now); !ok {
+		if ok, w := strongSigner(k, made, now); !ok {
 			return fp, false, w
 		}
 	}

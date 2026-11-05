@@ -222,9 +222,21 @@ var aptShapeKeyPolicy = map[string]bool{
 	"pk_nistp521_on_ed25519":         true,
 	"pk_rsa1024":                     true,
 	"pk_rsa1024_on_ed25519":          true,
+	"pk_rsa3072_rebound_minimal":     true,
 	"pk_rsa3072_sha1bound":           true,
 	"pk_rsa3072_sha224bound":         true,
 	"pk_secp256k1":                   true,
+}
+
+// aptShapeStrongOverStrict are the rows every image accepts whose signer
+// the cache calls not strong, each with why: strongSigner reads go-crypto's
+// self-signature in use (the newest), never a second one, where debian:13's
+// sqv takes the binding in force at the signature's time (strength.go's
+// note). The cost: the downgrade guard stands down for such a current
+// anchor, and could refuse such a candidate after a strong current anchor
+// signed later than it.
+var aptShapeStrongOverStrict = map[string]string{
+	"pk_rsa3072_rebound_both": "its key file keeps the self-signature in force at the packet's time (sqv's) and a newer one (go-crypto's), made after the packet",
 }
 
 // aptShapeNewest are the columns of the newest-generation images, whose
@@ -575,6 +587,12 @@ func TestVerifier_StrongSignerFollowsTheAptShapeTable(t *testing.T) {
 			continue
 		}
 		want := !anyRejectsIn(s.rejected, aptShapeNewest)
+		if why, ok := aptShapeStrongOverStrict[s.name]; ok {
+			if !want || why == "" {
+				t.Errorf("%s: listed as over-strict (%q), but apt REJ per column %v", s.name, why, s.rejected)
+			}
+			want = false
+		}
 		if got := signers.Strong != ""; got != want {
 			t.Errorf("%s: strong signer %q (counted %v), want strong %v (apt REJ per column: %v)",
 				s.name, signers.Strong, signers.Counted, want, s.rejected)

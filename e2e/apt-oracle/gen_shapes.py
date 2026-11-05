@@ -54,12 +54,13 @@ and ``keys.gpg`` is checked to hold public packets only.
   them, and ``--subkeys-key`` makes the batch again alone.
 - Batch fx20's keys (POLICY_KEYS), one per class the signer downgrade
   guard's table names (Task 9d: RSA of four sizes, DSA, Ed25519, the NIST
-  and brainpool curves, secp256k1, SHA-1- and SHA-224-bound keys, and
+  and brainpool curves, secp256k1, SHA-1- and SHA-224-bound keys, keys
+  bound again after they sign (ceph's layout), and
   primary/subkey pairs). No client's keys.gpg holds them: each fx20 shape
   has its keys as its own signed-by, and ``--policy-keys`` makes the batch
   again alone.
 
-863 shapes, in 20 batches. The first 135 are the planning measurement's
+865 shapes, in 20 batches. The first 135 are the planning measurement's
 (2026-10-28; DN-2 and Appendix A of
 docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md), by the
 same names and built as its throwaway generators built them (the plan's
@@ -124,7 +125,7 @@ without a key from committed fixtures as its tools/gen_a.py cut them (the
 ``e8_`` shapes from fx13's ``n_i_sha224`` and ``n_i_sha3_256`` too); fx19,
 17 (``e7_``), its own-key batch rr7, made with key K.
 
-Batch fx20, 40 (``pk_``), is Task 9d's measurement of the newest clients'
+Batch fx20, 42 (``pk_``), is Task 9d's measurement of the newest clients'
 key policies: the shared Release clearsigned by each POLICY_KEYS key alone,
 and by POLICY_PAIRS' pairs (an Ed25519 key's signature and a weak key's),
 whose strip is the weak key's own shape.
@@ -3495,7 +3496,12 @@ class PolicyKey:
     sub, when set, that of a signing subkey, the primary then certifying
     only; cert and sub_cert, when set, gpg's --cert-digest-algo for the
     primary's self-signature and for the subkey's binding and back-signature
-    (gpg uses it for both); digest the data signature's hash."""
+    (gpg uses it for both); digest the data signature's hash. made, signs
+    and rebinds, when set, are gpg --faked-system-time values: the key is
+    made at made, signs RELEASE at signs, and is given a new self-signature
+    at rebinds (gpg --quick-set-expire), after its signature, as ceph's key
+    file was; minimal exports it with its newest self-signature alone
+    (export-minimal: ceph's file holds that one only)."""
 
     name: str
     primary: str
@@ -3503,6 +3509,10 @@ class PolicyKey:
     cert: str | None = None
     sub_cert: str | None = None
     digest: str = "SHA256"
+    made: str = ""
+    signs: str = ""
+    rebinds: str = ""
+    minimal: bool = False
 
     @property
     def uid(self) -> str:
@@ -3547,6 +3557,21 @@ POLICY_KEYS: tuple[PolicyKey, ...] = (
     PolicyKey("nistp521_on_ed25519", "ed25519", sub="nistp521", digest="SHA512"),
     PolicyKey("ed25519_on_ed25519_sha1self", "ed25519", sub="ed25519", cert="SHA1"),
     PolicyKey("ed25519_on_ed25519_sha1bind", "ed25519", sub="ed25519", sub_cert="SHA1"),
+    PolicyKey(
+        "rsa3072_rebound_minimal",
+        "rsa3072",
+        made="20250101T000000!",
+        signs="20250601T000000!",
+        rebinds="20250901T000000!",
+        minimal=True,
+    ),
+    PolicyKey(
+        "rsa3072_rebound_both",
+        "rsa3072",
+        made="20250101T000000!",
+        signs="20250601T000000!",
+        rebinds="20250901T000000!",
+    ),
 )
 
 # Batch fx20's pairs: an anchor signed by two of its keys, the strong one
@@ -3579,6 +3604,7 @@ def make_policy_key(g: GnuPG, k: PolicyKey) -> tuple[str, str]:
     """k, made in g's home; the primary's fingerprint and the signing key's
     (the subkey's, when k has one)."""
     cert = ["--cert-digest-algo", k.cert] if k.cert else []
+    cert += ["--faked-system-time", k.made] if k.made else []
     usage = "cert" if k.sub else "sign"
     out = g.run(
         *cert, "--status-fd", "1", "--quick-gen-key", k.uid, k.primary, usage, "never"
@@ -3606,6 +3632,30 @@ def make_policy_key(g: GnuPG, k: PolicyKey) -> tuple[str, str]:
     return primary, key_created(out, "S")
 
 
+def is_uid_certification(framed: bytes) -> bool:
+    """Whether framed, one packet, is a user ID certification (0x10 to
+    0x13): a key's self-signature in a key's own export."""
+    tag, body = split_packets(framed)[0]
+    return tag == 2 and 0x10 <= body[1] <= 0x13
+
+
+def self_signatures(keyring: bytes) -> int:
+    """The number of user ID self-signatures in keyring, one key."""
+    return sum(1 for f in frames(keyring) if is_uid_certification(f))
+
+
+def with_self_signatures_of(after: bytes, before: bytes) -> bytes:
+    """after, one key with one user ID, with before's self-signatures of
+    that user ID (the same key's, exported earlier) after its own."""
+    old = b"".join(f for f in frames(before) if is_uid_certification(f))
+    out = b""
+    for f in frames(after):
+        out += f
+        if is_uid_certification(f):
+            out += old
+    return out
+
+
 def make_policy_material(g: GnuPG) -> PolicyMaterial:
     """Makes every POLICY_KEYS key and signs RELEASE with each, each
     signature checked to name the key it was asked of."""
@@ -3613,11 +3663,26 @@ def make_policy_material(g: GnuPG) -> PolicyMaterial:
     signed: dict[str, bytes] = {}
     for k in POLICY_KEYS:
         primary, signer = make_policy_key(g, k)
-        out = g.clearsign(signer + "!", RELEASE, digest=k.digest)
+        out = g.clearsign(signer + "!", RELEASE, digest=k.digest, faked=k.signs)
         if issuer_fingerprint(sig_packets(out)) != signer:
             raise RuntimeError(f"gpg signed with another key than {signer}")
+        before = g.export(primary)
+        if k.rebinds:
+            # gpg replaces the self-signature it updates: the export after
+            # holds the new one alone (ceph's layout, minimal); the other
+            # variant gets the first one back, after it, from the export
+            # before (public packets, joined: no key needed).
+            g.run(
+                "--faked-system-time", k.rebinds, "--quick-set-expire", primary, "10y"
+            )
         public[k.name] = g.export(primary)
+        if k.rebinds and not k.minimal:
+            public[k.name] = with_self_signatures_of(public[k.name], before)
         check_keyring(public[k.name], {primary, signer})
+        if k.rebinds and self_signatures(public[k.name]) != (1 if k.minimal else 2):
+            raise RuntimeError(
+                f"{k.name}: {self_signatures(public[k.name])} self-signatures"
+            )
         signed[k.name] = out
     return PolicyMaterial(public=public, signed=signed)
 

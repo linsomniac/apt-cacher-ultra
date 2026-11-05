@@ -140,10 +140,55 @@ func signingKey(t *testing.T, e *openpgp.Entity) openpgp.Key {
 	return keys[0]
 }
 
-// strongAt is strongSigner's verdict on e's signing key, read back, at at.
+// strongAt is strongSigner's verdict on e's signing key, read back, for a
+// packet made at at, at at.
 func strongAt(t *testing.T, e *openpgp.Entity, at time.Time) (bool, string) {
 	t.Helper()
-	return strongSigner(signingKey(t, readBackKey(t, e)), at)
+	return strongSigner(signingKey(t, readBackKey(t, e)), at, at)
+}
+
+// rebindAt gives e's user IDs a new self-signature, as before but made at
+// at, in place of the old (as gpg --quick-set-expire does).
+func rebindAt(t *testing.T, e *openpgp.Entity, at time.Time) {
+	t.Helper()
+	for _, id := range e.Identities {
+		sig := *id.SelfSignature
+		sig.CreationTime = at
+		if err := sig.SignUserId(id.UserId.Id, e.PrimaryKey, e.PrivateKey,
+			&packet.Config{NonDeterministicSignaturesViaNotation: noSaltNotation}); err != nil {
+			t.Fatal(err)
+		}
+		id.SelfSignature, id.Signatures = &sig, []*packet.Signature{&sig}
+	}
+}
+
+// TestStrongSigner_TheBindingMustPrecedeThePacket: a binding chain
+// signature made after the packet is not strong (debian:13's sqv judges
+// the binding at the signature's time: ceph's real anchors,
+// pk_rsa3072_rebound_minimal), for the primary's self-signature and for a
+// subkey's binding; one made at the packet's very time, or before, is.
+func TestStrongSigner_TheBindingMustPrecedeThePacket(t *testing.T) {
+	rebound := policyKey(t, "rebound", cfgEd25519)
+	at := time.Date(2025, 9, 1, 0, 0, 0, 0, time.UTC)
+	rebindAt(t, rebound, at)
+	k := signingKey(t, readBackKey(t, rebound))
+	if got, why := strongSigner(k, at.Add(-time.Second), policyNow); got || !strings.Contains(why, "after the packet") {
+		t.Errorf("a packet a second before its key's self-signature: strong %v (%q); want not strong", got, why)
+	}
+	if got, why := strongSigner(k, at, policyNow); !got {
+		t.Errorf("a packet made with its key's self-signature: not strong (%s); want strong", why)
+	}
+	sub := withSigningSubkey(t, policyKey(t, "subrebound", cfgEd25519), cfgEd25519)
+	last := &sub.Subkeys[len(sub.Subkeys)-1]
+	last.Sig.CreationTime = at
+	resignBinding(t, sub, crypto.SHA256, crypto.SHA256)
+	sk := signingKey(t, readBackKey(t, sub))
+	if got, why := strongSigner(sk, at.Add(-time.Second), policyNow); got || !strings.Contains(why, "(type 0x18) made at") {
+		t.Errorf("a packet a second before its subkey's binding: strong %v (%q); want not strong", got, why)
+	}
+	if got, why := strongSigner(sk, at.Add(time.Hour), policyNow); !got {
+		t.Errorf("a packet after its subkey's binding: not strong (%s); want strong", why)
+	}
 }
 
 var policyNow = time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
@@ -291,7 +336,7 @@ func TestStrongSigner_AMissingLinkIsNotStrong(t *testing.T) {
 	e := withSigningSubkey(t, policyKey(t, "noback", cfgEd25519), cfgEd25519)
 	k := signingKey(t, e)
 	k.SelfSignature = &packet.Signature{Hash: crypto.SHA256, SigType: packet.SigTypeSubkeyBinding}
-	if got, why := strongSigner(k, policyNow); got || !strings.Contains(why, "lacks a signature") {
+	if got, why := strongSigner(k, policyNow, policyNow); got || !strings.Contains(why, "lacks a signature") {
 		t.Fatalf("no back-signature: strong %v (%q); want not strong", got, why)
 	}
 }

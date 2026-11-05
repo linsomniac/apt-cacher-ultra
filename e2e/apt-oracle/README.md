@@ -40,14 +40,14 @@ only some of the images, a corpus file missing.
 
 ## The corpus
 
-`internal/gpg/testdata/aptshapes/` holds 934 files, about 1.1 MiB:
+`internal/gpg/testdata/aptshapes/` holds 938 files, about 1.1 MiB:
 
 | File | What it is |
 |---|---|
-| `<name>.InRelease` | an inline shape (611 of them): the whole `InRelease`, its signed text included |
+| `<name>.InRelease` | an inline shape (613 of them): the whole `InRelease`, its signed text included |
 | `<name>.Release.gpg` | a detached shape (252): a `Release.gpg` that signs the shared `Release`, or its own |
 | `<name>.Release` | a detached shape's own `Release` (4: `a_d_release_crlf`, `a_d_release_extra_nl`, `a_d_release_no_final_nl`, `o2_textmode_detached_release_crlf`), which `in-container.sh` serves in the shared one's place |
-| `<name>.keys.asc` | a shape's own `signed-by` (63: batch fx16's `ka_*`, the keys A and E in one block each; fx19's `e7_*`, key K; fx20's `pk_*`, its keys): an armored key file, which `in-container.sh` names in `keys.gpg`'s place and the table test loads as that shape's host keyring, as `LoadKeyring` reads a `.asc` file (every block) |
+| `<name>.keys.asc` | a shape's own `signed-by` (65: batch fx16's `ka_*`, the keys A and E in one block each; fx19's `e7_*`, key K; fx20's `pk_*`, its keys): an armored key file, which `in-container.sh` names in `keys.gpg`'s place and the table test loads as that shape's host keyring, as `LoadKeyring` reads a `.asc` file (every block) |
 | `Release` | the shared `Release`, a flat repository's: the SHA256 line of an empty `Packages`, a fixed `Date:` in the past (2026-10-01), no `Valid-Until` |
 | `keys.gpg` | the public keys A, E, S and O, in binary: the clients' `signed-by` here, and the host keyring of the verifier's table test (the hardening plan's Task 6), which loads the file whole, so every key in it is a trusted signer there |
 | `verdicts.txt` | apt's verdicts: a `#` header naming the measurement's date and each image's apt and verifier versions, then one row per shape, `<name>` and one verdict per image in the order of *The images* below, `ok` (`apt-get update` exited 0) or `REJ` |
@@ -57,7 +57,7 @@ The repository's `.gitattributes` marks every file here `-text`, so no
 checkout or commit converts their line ends, whatever `core.autocrlf`
 says: several shapes differ from their controls only in CRs.
 
-There are 863 shapes, in twenty batches. The first 135 are those the
+There are 865 shapes, in twenty batches. The first 135 are those the
 hardening plan measured on 2026-10-28
 (`docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md`: DN-2
 sorts them into classes, Appendix A gives each one's verdicts), rebuilt by
@@ -247,12 +247,16 @@ with the verdicts it measured:
   Each shape's `signed-by` is K's public key alone, its own
   `<name>.keys.asc`, as the re-review measured it.
 
-Batch fx20, 40 shapes (`pk_`), is the plan's Task 9d's measurement for
+Batch fx20, 42 shapes (`pk_`), is the plan's Task 9d's measurement for
 the signer downgrade guard (ruling HD-19, `internal/gpg/strength.go`): the
 shared `Release` clearsigned by a throwaway key of each class alone —
 RSA-1024, 2048, 3072 and 4096, DSA-2048 and 3072, Ed25519, P-256, P-384,
 P-521, brainpoolP256r1, P384r1 and P512r1, secp256k1, an RSA-3072 key whose
-self-signature is SHA-1 and one whose is SHA-224 — and by primary/subkey
+self-signature is SHA-1 and one whose is SHA-224, and two RSA-3072 keys
+made on 2025-01-01, signing on 2025-06-01 and bound again on 2025-09-01
+(`pk_rsa3072_rebound_minimal`, its key file holding the new self-signature
+alone, as ceph's real key file does; `pk_rsa3072_rebound_both`, both) — and
+by primary/subkey
 pairs (`pk_<subkey>_on_<primary>`: an Ed25519 signing subkey under a weak
 primary, a weak signing subkey under an Ed25519 primary, an SHA-1
 self-signature or an SHA-1 subkey binding and back-signature), each with its
@@ -266,11 +270,16 @@ key, which layer P does not read, so it is not measured. The measurement:
 the primary too, and refuses DSA, RSA under 2048 bits, brainpool and
 secp256k1 keys (its backend verifies neither curve: "No binding
 signature", whatever its config's brainpool date says) and SHA-1 or SHA-224
-bindings ("not bound"); the gpgv 2.2 images accept every one. The table
-test holds the cache to accept the 19 rows only a newest image refuses
-(crypto policy is not intersected, HD-19) and to report no strong signer
-for them (`aptShapeKeyPolicy`), and a strong signer for every other row it
-accepts. `--policy-keys` makes the batch again alone.
+bindings ("not bound"), and a key whose only binding was made after the
+signature (`pk_rsa3072_rebound_minimal`: "No binding signature at time …",
+it judges the binding in force at the signature's time); the gpgv 2.2
+images accept every one. The table test holds the cache to accept the 20
+rows only a newest image refuses (crypto policy is not intersected, HD-19)
+and to report no strong signer for them (`aptShapeKeyPolicy`), and a
+strong signer for every other row it accepts but
+`pk_rsa3072_rebound_both`, which it calls not strong though every image
+accepts it (`aptShapeStrongOverStrict`: the cache reads go-crypto's
+newest self-signature, made after the packet). `--policy-keys` makes the batch again alone.
 
 The keys are made in a temporary GnuPG home that the generator deletes
 when the run ends, by an error, Ctrl-C, SIGTERM or SIGHUP too (only
@@ -503,4 +512,4 @@ together (*Adding a shape*).
 | 2026-10-29, 16:23 UTC (the plan's Task 9b) | the commit that adds batch fx14, on 9efa08d | `--from-controls` wrote fx14's 8 shapes (fx8 to fx12's 340 again, byte for byte); `--record`: 498 shapes in 6 images, the 490 earlier rows and their error classes unchanged; then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 51 s and 54 s, images cached |
 | 2026-11-01, 21:23 UTC (the plan's Task 9b, its fix round) | the commit that adds batches fx15 to fx17 | `--from-controls` wrote fx15 to fx17's 232 shapes and fx16's 6 key files (fx8 to fx12's and fx14's 348 again, byte for byte), the re-review's 226 files byte for byte as its generators wrote them; `--record`: 730 shapes in 6 images, the 498 earlier rows and their error classes unchanged, the 220 rows the re-review measured as it measured them, the 12 `sq_` rows as the table predicts; then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 68 s and 68 s, images cached |
 | 2026-11-01, 23:41 UTC (the plan's Task 9b, its second fix round) | the commit that adds batches fx18 and fx19 | `--from-controls` wrote fx18's 76 shapes (fx8 to fx12's and fx14 to fx17's 580 again, byte for byte), the second re-review's 76 files byte for byte as its generator wrote them; `--subkeys-key` fx19's 17 shapes and their 17 key files, signed by a new key K; `--record`: 823 shapes in 6 images, the 730 earlier rows and their error classes unchanged, the 93 new rows as the second re-review measured them (fx19's with K for its K3); then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 84 s and 77 s, images cached |
-| 2026-11-05, 07:51 UTC (the plan's Task 9d) | the commit that adds batch fx20 | `--policy-keys` wrote fx20's 40 shapes and their 40 key files, signed by new throwaway keys (two earlier runs of the same batch, at 07:32 and 07:35 UTC with other keys and fewer pairs, gave the same verdict on every row they shared); `--record`: 863 shapes in 6 images, the 823 earlier rows and their error classes unchanged, the 40 new rows as *Batch fx20* above describes them; then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 82 s, images cached |
+| 2026-11-05, 08:21 UTC (the plan's Task 9d) | the commit that adds batch fx20 | `--policy-keys` wrote fx20's 42 shapes and their 42 key files, signed by new throwaway keys (three earlier runs of the same batch, at 07:32, 07:35 and 07:51 UTC, each with other keys and fewer rows, gave the same verdict on every row they shared); `--record`: 865 shapes in 6 images, the 823 earlier rows and their error classes unchanged, the 42 new rows as *Batch fx20* above describes them; then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 82 s, images cached |

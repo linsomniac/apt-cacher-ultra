@@ -34,7 +34,13 @@ import (
 // pk_ed25519_on_secp256k1, pk_ed25519_on_bp256 refused; ..._on_nistp521,
 // _on_nistp256, _on_nistp384, _on_rsa2048, _on_rsa3072 accepted), while
 // the gpgv-based apt judge the signing key alone (pk_nistp521_on_ed25519 is
-// refused by ubuntu:24.04 and 26.04, pk_ed25519_on_nistp521 by none). A
+// refused by ubuntu:24.04 and 26.04, pk_ed25519_on_nistp521 by none). sqv
+// also judges a key's binding at the signature's time (strongSigner's
+// note). The survey's anchors measured the same way in the three images
+// (Task 9d): debian:13 refuses mongodb's, newrelic's, nvidia-cuda's,
+// openresty's and raspberrypi's (SHA-1 self-signatures) and ceph's (a
+// self-signature newer than the signature), and the cache calls exactly
+// those not strong; the plan expected openresty alone. A
 // class the corpus does not measure is never strong: Ed448 (gpg 2.4 makes
 // it a v5 key, which layer P does not read), Ed25519 as algorithm 27, RSA
 // sign-only (3), ElGamal and anything newer. Dates compare against the
@@ -188,12 +194,24 @@ func bindingChain(k openpgp.Key) []*packet.Signature {
 	return chain
 }
 
-// strongSigner reports whether k, the key that made a packet S2 counts, is
-// strong at now (the verifier's clock), and when it is not, why: its
-// algorithm (strongRules, as the signing key), its primary key's when k is
-// a subkey (as a primary), and every signature of its binding chain
-// (bindingChain, strongHashes).
-func strongSigner(k openpgp.Key, now time.Time) (bool, string) {
+// strongSigner reports whether k, the key that made a packet S2 counts at
+// made (the packet's creation time), is strong at now (the verifier's
+// clock), and when it is not, why: its algorithm (strongRules, as the
+// signing key), its primary key's when k is a subkey (as a primary), and
+// every signature of its binding chain (bindingChain): its hash
+// (strongHashes), and its time, which must not be after made.
+//
+// AIDEV-NOTE: the time rule is debian:13's sqv, which judges a key's
+// binding at the signature's time ("No binding signature at time T"):
+// ceph's real anchors, signed 2026-03-12 by a key whose file holds only a
+// self-signature of 2026-07-03, are refused there (the Task 9d vendor
+// measurement), as is pk_rsa3072_rebound_minimal. sqv takes the binding
+// in force at T among all of them; go-crypto keeps the newest, and this
+// reads go-crypto's (no second notion of "in use"), so a key whose file
+// also keeps an older valid self-signature made before the packet
+// (pk_rsa3072_rebound_both, accepted by every image) is called not strong:
+// over-strict, aptShapeStrongOverStrict.
+func strongSigner(k openpgp.Key, made, now time.Time) (bool, string) {
 	class := keyClass(k.PublicKey)
 	r, ok := ruleFor(class)
 	switch {
@@ -222,6 +240,9 @@ func strongSigner(k openpgp.Key, now time.Time) (bool, string) {
 			return false, "its binding chain lacks a signature"
 		case !hashStrong(s.Hash, now):
 			return false, fmt.Sprintf("its binding chain has a signature (type 0x%02x) hashed with %v", byte(s.SigType), s.Hash)
+		case s.CreationTime.After(made):
+			return false, fmt.Sprintf("its binding chain has a signature (type 0x%02x) made at %s, after the packet (%s)",
+				byte(s.SigType), s.CreationTime.UTC().Format(time.RFC3339), made.UTC().Format(time.RFC3339))
 		}
 	}
 	return true, ""
