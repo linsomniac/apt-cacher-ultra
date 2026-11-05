@@ -559,14 +559,21 @@ a revocation or expiry the cache cannot read stops that key from counting,
 as gpgv honours it; a file the cache skips, or reads only in part, is
 named at start by WARN `keyring_file_skipped`, `keyring_file_truncated`
 or `keyring: parse failed; skipping file`. A key that does not count is
-reported as `crypto_verify_failed`, and the `adoption_gpg_failed` line
-names the key and why (`its key … is not counted: …`, or go-crypto's
-"key expired" or "signature made by revoked key"): a revoked or expired
-key needs the vendor's current key file (check the vendor's key status:
-most vendors publish a renewed or replacement key where they published
-the first), and a key marked for a revocation, expiry or binding the
-cache cannot read needs the same, since every gpgv-based apt refuses that
-key too; install it and restart.
+reported as `crypto_verify_failed`. For a key the cache marks, the
+`adoption_gpg_failed` line names the key and why (`its key … is not
+counted: …`); for go-crypto's "key expired" or "signature made by
+revoked key" it gives only the cause, and the key is the suite's signing
+key: the cache has no view that names it, so read the issuer from the
+upstream anchor (`gpg --list-packets` on its `InRelease` or
+`Release.gpg`) and find that fingerprint on the status page's keyring
+panel. A revoked or expired key needs the vendor's current key file
+(check the vendor's key status: most vendors publish a renewed or
+replacement key where they published the first), and a key marked for a
+revocation, expiry or binding the cache cannot read needs the same:
+every gpgv-based apt refuses such a key too, but for a few unusual
+layouts the cache marks fail-closed where apt does not (*Open* in
+`docs/open-decisions.md`: "Key files and anchors the cache refuses where
+every apt accepts them"); install it and restart.
 
 The verifier refuses an anchor whose format any supported apt refuses —
 the six current client images and the five older ones its corpus is
