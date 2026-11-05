@@ -122,42 +122,19 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
    `Verify no e2e test seam` step runs first on the tag: check it there.
 7. **The release notes** (`docs/release-notes/1.1.0.md`): bring them up
    to date with what `Changelog.md` collected since this branch, then
-   paste them into the GitHub release. The notes say nothing yet of the
-   GC and upstream hardening plan's verifier work, which is
-   upgrade-relevant (its Changelog entries wait in that plan's Task 9c
-   draft for the maintainer): name in them the hybrid verifier and its
-   reasons (`malformed_clearsign`, the new `malformed_signature`,
-   `bad_signature`; suites whose anchors it refuses keep their snapshot
-   and stop adopting), the signer downgrade guard (`signer_downgrade`)
-   and its recourse, the six vendors with no strong signer, the SHA-1
-   refusal, the key reader's changes, and the older-client oracle (`make
-   e2e-apt-oracle-old`). No Changelog entry names the following, so add
-   them by hand (the final review 2's D2-M5): the new events WARN
-   `adoption_signer_downgrade` (with its `uncounted_signers`),
-   `adoption_signer_guard_unavailable`, `adoption_signer_guard_panicked`,
-   `keyring_file_skipped` and `keyring_file_truncated`, and INFO
-   `adoption_signer_guard_skipped` and `keyring_key_marked`; the new
-   metrics `acu_adoption_reconcile_failed_total{stage}` and
-   `acu_adoption_refused_total{reason}`, which make 23, not the 21 the
-   notes first counted (the notes' *New metrics* lists both now); the GC
-   counters' new double count — a displaced snapshot beyond
-   `gc.keep_displaced` counts in `displaced_reaped`
-   (`acu_gc_displaced_reaped_total`) when a periodic tick retires it and
-   again in `retired_reaped` (`acu_gc_retired_reaped_total`) when it is
-   deleted, so a dashboard that sums them counts it twice; and the refusal
-   count, eight (`signer_downgrade` added; six keep their lag), which the
-   notes' *Retry discipline* says now. The per-release steps that outlive
-   this section are in [docs/releasing.md](releasing.md). Their links name
-   the `1.1.0` tag;
-   for a release
-   candidate, paste them with that tag replaced by the candidate's:
-   `sed 's|/blob/1\.1\.0/|/blob/1.1.0-rc1/|g' docs/release-notes/1.1.0.md`.
-   The file is wrapped at about 72 columns: check the release editor's
-   *Preview*, and if GitHub breaks the lines where the file does, paste
-   the paragraphs unwrapped instead (lists, tables and headings kept):
-   `sed 's|/blob/1\.1\.0/|/blob/1.1.0-rc1/|g' docs/release-notes/1.1.0.md | perl -0777 -pe 's/([^\n|])\n *+(?![-|#\n]|\z)/$1 /g'`
-   (for 1.1.0 itself, drop the `sed` and pass the file name to `perl`:
-   `perl -0777 -pe '…' docs/release-notes/1.1.0.md`).
+   paste them into the GitHub release, as
+   [docs/releasing.md](releasing.md)'s step 6 says (it gives the
+   commands that rewrite the links for a release candidate and unwrap the
+   paragraphs for GitHub's editor; the per-release steps that outlive this
+   section are there). The GC and upstream hardening plan's Task 8 rebuilt
+   them from the Changelog on 2026-11-05, main's changes included: the
+   verifier and its reasons, the signer downgrade guard and its recourse,
+   the six vendors with no strong signer, the SHA-1 refusal, the key
+   reader's changes, the HTTP 204 rule, issue #14's GC fix, the
+   older-client oracle, the new events and metrics (29 metrics since
+   1.0.3), the GC counters' double count and the refusal count, eight. A
+   later change to `Changelog.md` before the tag needs its line there
+   too.
 
 ## Open
 
