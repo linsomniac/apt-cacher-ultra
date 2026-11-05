@@ -398,9 +398,14 @@ LIMIT ?`
 			// startup pass still deletes (retireDisplaced false): it runs before
 			// the scheduler and the listeners, so its long transactions hold up
 			// no other writer and no request in flight (a large backlog delays
-			// the start, as before; the periodic ticks keep it small), and a
-			// daemon that never lives until sub-job C runs still deletes its
-			// displaced snapshots at every start.
+			// the start, as before, up to max_tick_duration), and a daemon that
+			// never lives until sub-job C runs still deletes its displaced
+			// snapshots at every start. The periodic ticks keep the retired
+			// backlog small only while one budget's C deletes what a day's B
+			// retires; beyond that it grew without bound (issue #14, the final
+			// review 2's G2-I2), so internal/gc now repeats C hourly while a
+			// backlog lasts and runs it at every start (its Run and
+			// runSnapshotPass).
 			res, err := tx.ExecContext(ctx,
 				`UPDATE suite_snapshot SET retired_at = ? WHERE retired_at IS NULL AND snapshot_id IN (`+placeholders(len(displaced))+`)`,
 				append([]any{now}, displaced...)...)
@@ -476,17 +481,21 @@ func effectiveChunkRows(maxRows int) int {
 // Its pins were released when it stopped being current (displacement, the
 // reap's or quarantine's Step-8 decrement); deleting its rows and header
 // only drops the references the blob pass's reachability predicate reads,
-// so its blobs go at the next blob pass once blob_grace has passed. Two
-// callers delete them: a periodic tick's snapshot pass, whose blobs
-// normally go in the same tick's blob pass, and internal/gc's retired run
-// an hour after a start (gc.interval over an hour; the final review's
-// R3 #2), which runs no blob pass, so its blobs go at the next start's
-// startup pass or the next periodic tick. The startup pass runs no
-// sub-job C (ruling PF-15), and a pass or run that hits its deadline
-// leaves the rest to a later one: a retired snapshot normally goes within
-// two periodic GC ticks of its retirement (B's, in the tick that retired
-// it), or an hour after the next start. Chunking bounds the writer's hold
-// on a large suite (tens of thousands of package_hash rows).
+// so its blobs go at the next blob pass once blob_grace has passed. Three
+// callers delete them: a periodic tick's snapshot pass and the startup
+// pass's (ruling PF-15, re-ruled for issue #14), whose blobs normally go
+// in the same tick's or start's blob pass, and internal/gc's retired run
+// (gc.interval over an hour; the final review's R3 #2), an hour after a
+// start and again hourly while a run or a tick's snapshot pass ends at its
+// deadline with a backlog left (issue #14), which runs no blob pass, so
+// its blobs go at the next periodic tick or start. A pass or run that hits
+// its deadline leaves the rest to a later one: a retired snapshot goes in
+// the tick that retired it, or within the hours after it, the hourly runs
+// draining a backlog at up to one max_tick_duration an hour; before issue
+// #14's fix a retirement rate above one tick's capacity grew the backlog
+// without bound (the final review 2's G2-I2). Chunking bounds the
+// writer's hold on a large suite (tens of thousands of package_hash
+// rows).
 func (c *Cache) RunRetiredSnapshotGCChunk(ctx context.Context, maxRows int) (reaped int, more bool, err error) {
 	maxRows = effectiveChunkRows(maxRows)
 	// The op writes gotReaped/gotMore, never the named results: on a

@@ -770,11 +770,12 @@ UPDATE blob
 // past-event stamp — no gate reads it that way, so a stamp in the future
 // is harmless there. Residual (the Task 5 review's minor 1): the floor
 // covers only the snapshots still present. Sub-job C deletes a retired
-// snapshot at a periodic GC tick (normally the next; a startup GC pass
-// deletes none: ruling PF-15), a reap or /forget deletes the anchor rows,
-// and Step 3c seeds them with now, so after a backward step longer than
-// the time from a reap (or /forget) to the re-adoption, with that periodic
-// tick in between, the re-adoption can stamp below the reaped snapshot
+// snapshot at a periodic GC tick, in the retired run, or at the next
+// start's startup GC pass (ruling PF-15, re-ruled for issue #14), a reap
+// or /forget deletes the anchor rows, and Step 3c seeds them with now, so
+// after a backward step longer than the time from a reap (or /forget) to
+// the re-adoption, with such a deletion in between, the re-adoption can
+// stamp below the reaped snapshot
 // again and a client holding that anchor gets a 304 until a later flip is
 // stamped above it. C-11's own readers do not care then (the row is
 // gone); a durable per-suite floor needs a schema change, which phase F

@@ -165,11 +165,11 @@ const (
 )
 
 // phaseStartup is runTick's phase for StartupPass's one-shot pass, the
-// pass main runs before any listener serves. The snapshot pass runs no
-// sub-job C in it (runSnapshotPass, ruling PF-15), and its sub-job B
-// deletes the displaced snapshots beyond keep_displaced; the periodic
-// ticks ("periodic") run C, and their B only retires those snapshots, for
-// C to delete (DN-7 of the GC and upstream hardening plan).
+// pass main runs before any listener serves. Its snapshot pass's sub-job
+// B deletes the displaced snapshots beyond keep_displaced; the periodic
+// ticks' ("periodic") B only retires those snapshots, for C to delete (DN-7
+// of the GC and upstream hardening plan). Both run sub-job C (ruling PF-15,
+// re-ruled for issue #14: runSnapshotPass).
 const phaseStartup = "startup"
 
 // LastRunSummary is the SPEC5 §9.6 / §9.7.8 in-memory captured copy
@@ -286,12 +286,13 @@ func New(cfg Config) (*GC, error) {
 // its own gc_tick_failed line (runTick), and main logs the returned first
 // failure as the startup pass's (the fix wave's follow-up of HD-15).
 // Partial progress is preserved (DB rows / pool files reaped before cancel
-// are real). The one-shot pass runs no snapshot-GC sub-job C
-// (spec C9's retired snapshots): Run does, an hour after the start when
-// gc.interval is longer (retiredRun), and the periodic ticks, normally the
-// first — a later one when an earlier pass, this one's blob pass say, hits
-// its deadline, since the passes resume in rotation (ruling PF-15,
-// runSnapshotPass).
+// are real). The one-shot pass runs snapshot-GC sub-job C (spec C9's
+// retired snapshots) within its snapshot deadline, so a start with a
+// retired backlog may wait up to max_tick_duration before the listeners
+// open, the bound ruling HD-7 accepts (ruling PF-15, re-ruled for issue
+// #14: runSnapshotPass); what its budget leaves, Run's retired run (an hour
+// after the start when gc.interval is longer, hourly while a backlog lasts)
+// and the periodic ticks delete.
 //
 // Order matters: pool scan runs first so its
 // `gc_pool_orphans_repaired` count reflects only pre-existing orphan
@@ -321,9 +322,8 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 		return fmt.Errorf("gc startup: pool scan: %w", err)
 	}
 
-	// Step 6: one-shot GC pass — without snapshot-GC sub-job C, which Run
-	// runs an hour after the start (retiredRun) and in the periodic ticks
-	// (ruling PF-15: runSnapshotPass). A failed pass is returned after the
+	// Step 6: one-shot GC pass, sub-job C included (ruling PF-15, re-ruled
+	// for issue #14: runSnapshotPass). A failed pass is returned after the
 	// line, the metrics and the summary below, which report what the passes
 	// that ran did, as a periodic tick's do.
 	passesDone = false
@@ -752,11 +752,11 @@ func passDeadlines(start time.Time, budget time.Duration) tickDeadlines {
 //
 // `phase` is phaseStartup ("startup", StartupPass) or "periodic" (Run).
 // It labels the gc_tick_deadline_reached events, so an operator can
-// correlate, and it selects behaviour: in phaseStartup the snapshot pass
-// runs no sub-job C (runSnapshotPass, ruling PF-15) and its sub-job B
-// deletes the displaced snapshots; any other phase runs C, and its B
+// correlate, and it selects behaviour: in phaseStartup the snapshot pass's
+// sub-job B deletes the displaced snapshots; in any other phase its B
 // retires them for C to delete (DN-7 of the GC and upstream hardening
-// plan).
+// plan). Both run sub-job C (runSnapshotPass; ruling PF-15, re-ruled for
+// issue #14).
 func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 	deadlines := passDeadlines(time.Now(), g.cfg.MaxTickDuration)
 

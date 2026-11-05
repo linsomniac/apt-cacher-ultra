@@ -297,3 +297,39 @@ func TestRun_TheRetiredBacklogStaysBoundedUnderASustainedDisplacementRate(t *tes
 		}
 	})
 }
+
+// Issue #14 (G2-I2; ruling PF-15 re-ruled by the maintainer, 2026-11-05):
+// the startup pass runs sub-job C after A ∪ B, within its snapshot
+// deadline (48 s of a 1 min budget: five 10 s chunks of a backlog far
+// larger), and its blob pass still reaps a dead blob, so the start ends
+// within max_tick_duration (the bound HD-7 accepts) with the deadline
+// reported; the retired run an hour later goes on with the backlog.
+// TestStartupPass_DeletesRetiredSnapshotsAndReapsTheirBlobs pins what it
+// deletes on a real cache.
+func TestStartupPass_RunsSubJobCWithinItsSnapshotDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logger, buf := captureLogger()
+		f := &fakeStore{chunksMore: 900, chunkSleep: 10 * time.Second}
+		g, c := storeGC(t, f, 2, logger)
+		g.cfg.Interval = 24 * time.Hour
+		dead := seedReapableBlob(t, c, "a dead blob")
+		start := time.Now()
+		if err := g.StartupPass(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if took := time.Since(start); took > time.Minute {
+			t.Fatalf("the startup pass took %s, want at most max_tick_duration (1m)", took)
+		}
+		s, _ := g.LastRunSummary()
+		if len(f.chunkRows) != 5 || s.RetiredReaped != 5 || !s.DeadlineReached {
+			t.Fatalf("%d sub-job C chunks, summary %+v; want 5 chunks and retired_reaped 5 by the snapshot deadline", len(f.chunkRows), s)
+		}
+		if blobRowExists(t, dbOf(t, c), dead) || s.BlobsReaped != 1 {
+			t.Fatalf("blobs reaped %d: the startup pass's blob pass did not run after sub-job C's deadline", s.BlobsReaped)
+		}
+		runFor(g, time.Hour+time.Minute)
+		if runs := gcEvents(t, buf, "gc_retired_run_complete"); len(runs) != 1 || runs[0]["retired_reaped"] != float64(6) {
+			t.Fatalf("retired runs %v, want the one an hour after the start, going on with the backlog (6 chunks)", runs)
+		}
+	})
+}
