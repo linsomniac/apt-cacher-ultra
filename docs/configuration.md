@@ -1093,7 +1093,10 @@ when `acu_gc_blobs_reaped_total` also stays flat run after run, or the
 periodic runs' `displaced_reaped` retire. `max_tick_duration` is checked
 between batches and does not interrupt a running batch or bound the startup
 orphan-file scan: a batch that waits long for the database (behind adoptions,
-say) can use up a later pass's share, which then runs first at the next tick.
+say) can use up the later passes' shares. A blob pass left no time does no
+batch and keeps the rotation, so the next tick runs the blob pass alone, and
+the url-path and snapshot passes wait one more `interval` (a snapshot pass
+left no time runs at the tick after that, after the url-path pass).
 
 **Before 1.1.0 (1.0.x): a cache that keeps growing (issue #14).** In 1.0.x a
 run that reached `max_tick_duration` in its snapshot pass ended there, and the

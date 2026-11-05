@@ -1040,8 +1040,10 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   every tick (53, 2, 2, 4) but the retired count grows (11, 14, 17, 19),
   which the hourly runs bound. Under contention (adoptions during the tick)
   a batch queued behind them can overrun the budget and use the blob
-  pass's share (ticks of 4.9 and 6.5 s); the blob pass then runs first at
-  the next tick, which reaped 66 and 16. A busy cache's runs may now end
+  pass's share (ticks of 4.9 and 6.5 s); the next tick then runs the blob
+  pass alone, which reaped 66 and 16, and the url-path and snapshot passes
+  wait one more `gc.interval` (the final review 2's G2-RR1-M1: on day 4 of
+  that run 8 displaced snapshots waited a day to be retired). A busy cache's runs may now end
   with `deadline_reached=true` while they free disk, a healthy steady
   state (`docs/configuration.md`, `[gc]`, which also gives 1.0.x users the
   interim workaround); the status page's *Deadline reached* badge is warn,
