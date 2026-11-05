@@ -789,9 +789,21 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   rows of EdDSA and ECDSA keys; class (a), crypto policy, not intersected:
   HD-19). `aptShapeOldExempt` lists the 20 corpus rows and
   `aptShapeOldRefusals` pins each class to its measured refusal. Those
-  clients fail fetching directly too. Class none: the cache agrees with
-  the current clients, and the older ones refuse the vendor directly.
-  Recommendation: leave them; a vendor's to fix.
+  clients fail fetching directly too. For the vendors' own anchors, class
+  none: the cache agrees with the current clients, and the older ones
+  refuse the vendor directly. But each (b) class is also a key-free edit an
+  on-path attacker can make to any suite's anchor (the second final
+  review's V2-M1): converting it to CRLF (`i_crlf_all`), stripping the CRC
+  of one whose base64 needs no padding (`i_crc_missing`), or appending two
+  packets by keys the client lacks, even one unknown packet twice (the
+  lens's probe `o3_good_unkB_unkB`, [A good][B][B], refused by
+  `ubuntu:16.04`: "Invalid message from method gpgv: NO_PUBKEY
+  2628FEC1C3054C2B"); the cache adopts such an anchor and keeps serving it
+  to the 16.04 and 14.04 clients, which then fail `apt update` for the
+  suite. That residual is class R2 for those clients, accepted by the (b)
+  rulings (E3, E4): a fold would refuse nginx, syncthing or
+  debian-buster-archive. Recommendation: leave them; a vendor's to fix,
+  and the residual stays recorded here.
 - **Three S1 cases Task 9e left unmeasured** (raised 2026-11-05, the Task
   9e review's re-review 1). S1 checks a packet by a known key that cannot
   sign directly (`verifiesDirectly`, *Decided*), which reads no usage,
@@ -896,6 +908,26 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   can come after a whole download (502, `Retry-After: 60`, the request
   line carrying `upstream_status`): recommendation, one sentence. Class
   none: operability and docs.
+- **The verifier's maintainability** (raised 2026-11-05, the second final
+  review's V2-M3 and V2-M4; not done in Task 8's verifier fix by the
+  controller's ruling). (1) `verifyAnyTrusted` (internal/gpg/verifier.go)
+  runs two near-copies of one per-packet sequence (the short key ID branch
+  and the fingerprint branch: trust check, skip, the keyring's mark,
+  verify, count) with seven state variables and a long precedence comment
+  for its final switch, so a new S2 rule is made twice and its precedence
+  derived again; the smallest simplification is one helper that resolves a
+  packet to the entities to verify it against, its key's fingerprint, or
+  why it is untrusted, short or ambiguous, then a single skip, mark,
+  verify and count path. (2) The verifier's files carry about one comment
+  line per code line, most of it review history (V-RM1, A-RC1, 9e-I1,
+  HD-14) interleaved with the invariants, so that a stale sentence reads
+  as a rule (V2-C2's "2.2 is the strictest supported gpgv" was one): lead
+  each function's doc with its invariant in two or three lines and move the
+  history into one history file per package that the AIDEV-NOTEs point to,
+  shortening the notes, never removing one. Class none: maintainability;
+  the table tests and `TestVerifier_RefusesEachRowByItsRule` pin the
+  verdicts and reasons a refactor must keep. Recommendation: after 1.1.0,
+  as a refactor pinned by the table tests.
 
 ## Decided
 
