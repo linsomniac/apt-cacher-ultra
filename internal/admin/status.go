@@ -1105,6 +1105,12 @@ func statusTemplateFuncMap() template.FuncMap {
 // reason chip. Unknown tags pass through verbatim so future reasons
 // surface without a code change (just less helpful hover text until
 // the table is extended).
+//
+// AIDEV-TODO(9c): signer_downgrade (the hardening plan's Task 9d) has no
+// text here yet and passes through as the bare tag: add its tooltip, and
+// add "signer_downgrade" to TestReasonTooltip_PhaseBOutcomes'
+// (suites_status_test.go) list so that a missing one fails (the Task 9d
+// review's 9d-M4; ruling G5 gives tooltips to Task 9c).
 func reasonTooltip(reason string) string {
 	switch reason {
 	case "untrusted_signer":
