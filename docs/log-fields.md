@@ -27,6 +27,12 @@ Fields that follow this pattern:
   CONNECT/MITM tunnel (SPEC6 §6.2.1).
 - `upstream_status` — emitted only when a fetch was attempted; value 0
   means "fetch attempted, no response arrived" (timeout, dial denied).
+  Value 204 means upstream answered 204 No Content: for an index or
+  metadata path the empty file is served as a 200 and cached; for a
+  `.deb` or any other path the miss is refused (502 with `Retry-After`,
+  outcome `bad_gateway`, nothing cached). Either way the fetch counts in
+  `acu_fetch_total{outcome="no_content"}`, not `success` (see
+  configuration.md, `[upstream]`).
 - `snapshot_displaced` — emitted as `true` only when a by-hash request
   was served from one of its suite's displaced snapshots (spec C8
   retained by-hash, for a client holding an earlier `InRelease`);

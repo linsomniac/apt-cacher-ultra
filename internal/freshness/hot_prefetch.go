@@ -313,6 +313,20 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 		)
 		return "", hotFetchFailed
 	}
+	// AIDEV-NOTE: the maintainer's ruling of 2026-11-05 (F2-I1). A .deb
+	// is a package file, so an upstream 204 for it is an upstream error,
+	// not an empty .deb, even when its declared hash is the empty file's
+	// (TestRunHotPrefetch_NoContentIsAFailure). The deferred Abort drops
+	// the temp; nothing reaches the pool.
+	if res.NoContent {
+		a.logger.Warn("hot_prefetch_deb_failed",
+			"canonical_host", suite.CanonicalHost,
+			"path", entry.path,
+			"snapshot_id", snapshotID,
+			"err", errors.New("upstream answered 204 No Content"),
+		)
+		return "", hotFetchFailed
+	}
 	// SPEC3 §7.5 step 10: "discard the temp blob — do NOT promote to
 	// pool." FinalizeExpectingHash gates on the declared hash BEFORE
 	// any rename happens; on mismatch the temp is removed and

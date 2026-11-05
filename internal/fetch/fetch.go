@@ -177,15 +177,30 @@ type FetchDst interface {
 // Status is always 200 on success — the internal resume mechanics (a
 // 206 partial response or a validator-induced restart) are hidden from
 // the caller. An upstream 204 is normalized to an empty 200 response,
-// discarding any partial download. ContentLength is the declared full
-// object size, or -1 when the initial response length was unknown; a
-// normalized 204 always has ContentLength 0.
+// discarding any partial download, and sets NoContent. ContentLength is
+// the declared full object size, or -1 when the initial response length
+// was unknown; a normalized 204 always has ContentLength 0.
 type FetchResult struct {
 	Status        int
 	ContentType   string
 	ContentLength int64
 	ETag          string
 	LastModified  string
+
+	// NoContent reports that upstream answered 204 No Content, so the
+	// (empty) body is the 204's, not a 200's. Fetch accepts a 204 for
+	// every caller; each caller decides by its class whether an empty
+	// object is acceptable (see the AIDEV-NOTE in doAttempt).
+	NoContent bool
+}
+
+// UpstreamStatus is the status upstream answered with, for logs and the
+// X-Upstream-Status header: 204 for a NoContent result, otherwise Status.
+func (r *FetchResult) UpstreamStatus() int {
+	if r.NoContent {
+		return http.StatusNoContent
+	}
+	return r.Status
 }
 
 // New constructs a Client from validated upstream options.
@@ -302,8 +317,10 @@ func New(opts Options) (*Client, error) {
 
 // Fetch streams target.URL into dst, applying SPEC §6.6 hardening (host
 // allowlist + deny-CIDR check) and SPEC §6.3 resumable retries.
-// A 204 No Content is a successful empty fetch; callers remain responsible
-// for checking the body against any declared size and hash.
+// A 204 No Content is a successful empty fetch with FetchResult.NoContent
+// set (counted as outcome no_content); callers decide whether an empty
+// object is acceptable for what they fetched, and remain responsible for
+// checking the body against any declared size and hash.
 //
 // Errors are classified for callers via errors.Is:
 //
@@ -322,6 +339,12 @@ func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (resul
 	host := hostLabel(target)
 	defer func() {
 		outcome := ClassifyFetchOutcome(retErr)
+		// F2-M3: an upstream 204 is a success Fetch counts apart, so
+		// an operator can see it (ClassifyFetchOutcome sees only the
+		// error, and a 204's is nil).
+		if retErr == nil && result != nil && result.NoContent {
+			outcome = "no_content"
+		}
 		fetchTotal.Inc(outcome, host)
 		fetchDurationSeconds.Observe(time.Since(start).Seconds(), outcome, host)
 	}()
@@ -425,6 +448,7 @@ func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (resul
 				ContentLength: initial.ContentLength,
 				ETag:          initial.ETag,
 				LastModified:  initial.LastModified,
+				NoContent:     initial.NoContent,
 			}, nil
 		}
 		if !isRetryable(err) {
@@ -512,6 +536,21 @@ func (c *Client) doAttempt(
 		// 204 cannot supply the remainder of a Range request. Reset the
 		// bytes and hash state before reporting success. A local reset
 		// failure must not be retried as an upstream failure.
+		//
+		// AIDEV-NOTE: the maintainer's ruling of 2026-11-05 (final
+		// review 2's F2-I1, D2-M2 and F2-M3). Fetch accepts a 204 for
+		// every caller but marks it NoContent; the callers decide by
+		// class. An empty success only for indexes and metadata: the
+		// adoption path's Release members (verifyMember checks their
+		// declared size and hashes, so a member declared size 0 is
+		// the one a 204 can satisfy), the handler's metadata recovery
+		// (runSnapshotMemberFetch, declared hash) and the client
+		// path's proxy.IsMetadata paths (runFetch). For a .deb or any
+		// other package file a 204 is an upstream error, as before
+		// commit 3a6d5ba: runFetch answers 502 and caches nothing
+		// (ErrUpstreamNoContent), and hot prefetch counts a failed
+		// warm. Status stays 200 so the resume loop above treats the
+		// 204 as fresh headers; UpstreamStatus reports the 204.
 		if dst.Written() > 0 {
 			if err := dst.Truncate(); err != nil {
 				return out, fmt.Errorf("%w: truncate dst on 204: %v", ErrCacheWriteFailed, err)
@@ -519,6 +558,7 @@ func (c *Client) doAttempt(
 		}
 		out.Status = http.StatusOK
 		out.ContentLength = 0
+		out.NoContent = true
 		return out, nil
 	case http.StatusOK:
 		if target.MaxBytes > 0 && resp.ContentLength > target.MaxBytes {

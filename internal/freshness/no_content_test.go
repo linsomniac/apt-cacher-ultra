@@ -129,3 +129,34 @@ func TestAdopter_NoContentHTTP(t *testing.T) {
 		}
 	}
 }
+
+// The maintainer's ruling of 2026-11-05 (F2-I1): a .deb is a package
+// file, so hot prefetch counts an upstream 204 for it as a failed warm,
+// even when its declared hash is the empty file's, which
+// FinalizeExpectingHash alone would accept. Nothing reaches the pool.
+func TestRunHotPrefetch_NoContentIsAFailure(t *testing.T) {
+	f := newHotPrefetchFixture(t, 5*time.Second)
+	f.candidatePackageHashes[0].DeclaredSHA256 = shaOf(nil)
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	client, err := fetch.New(fetch.Options{Proxy: srv.URL, AllowedHostRegex: []string{`^archive\.example$`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.adopter.fetcher = client
+	rows, stats := f.adopter.runHotPrefetch(context.Background(), f.suite, f.candidate, f.candidatePackageHashes, nil)
+	if stats.hotCount != 1 || stats.failed != 1 || stats.fetched != 0 || stats.mismatched != 0 || len(rows) != 0 {
+		t.Errorf("hot=%d fetched=%d failed=%d mismatched=%d rows=%d; want 1 hot, failed, no row",
+			stats.hotCount, stats.fetched, stats.failed, stats.mismatched, len(rows))
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("upstream calls=%d, want 1", got)
+	}
+	if exists, _ := f.cache.BlobExists(shaOf(nil)); exists {
+		t.Error("the empty file reached the pool from a 204 for a .deb")
+	}
+}

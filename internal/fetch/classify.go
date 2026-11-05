@@ -9,7 +9,10 @@ import (
 // ClassifyFetchOutcome maps a fetch.Fetch() return to a single
 // outcome label. err is the second return value from Fetch; nil →
 // "success". The classifier is a TOTAL function — every fetch
-// terminal return yields exactly one label.
+// terminal return yields exactly one label. Its caller, Fetch's
+// deferred emitter, counts a nil-error return whose FetchResult has
+// NoContent (upstream answered 204) as "no_content" instead of
+// "success" (F2-M3).
 //
 // Precedence (first match wins) is specific-cause-first. The exact
 // ordering is load-bearing because the dialer wraps a cooldown-probe

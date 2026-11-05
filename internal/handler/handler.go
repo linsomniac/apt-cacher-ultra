@@ -395,6 +395,14 @@ var (
 	// writeFailClosed would have used had recovery not been attempted).
 	ErrSnapshotMemberMismatch = errors.New("handler: re-fetched snapshot metadata hash disagrees with declared hash")
 
+	// ErrUpstreamNoContent fires when upstream answers 204 No Content
+	// on a miss of a path proxy.IsMetadata does not classify as an
+	// index or metadata (a .deb or any other package file): the
+	// maintainer's ruling of 2026-11-05 makes that an upstream error,
+	// as before commit 3a6d5ba. respondError emits 502 + Retry-After
+	// (outcome bad_gateway, upstream_status 204); nothing is cached.
+	ErrUpstreamNoContent = errors.New("handler: upstream answered 204 No Content for a package file")
+
 	// ErrUnvouchedDebRefused fires when the SPEC3 §6.1/§6.2 strict-mode
 	// predicate refuses an unvouched .deb on the miss path. respondError
 	// maps this to 502 + Retry-After: 60 with outcome
@@ -1933,18 +1941,18 @@ func (h *Handler) runSnapshotMemberFetch(ctx context.Context, req *proxy.Request
 			"observed_sha256", hash,
 			"snapshot_id", snapshotID,
 		)
-		return sfResult{err: ErrSnapshotMemberMismatch, status: fres.Status}
+		return sfResult{err: ErrSnapshotMemberMismatch, status: fres.UpstreamStatus()}
 	}
 	if err != nil {
-		return sfResult{err: fmt.Errorf("handler: finalize blob: %w", err), status: fres.Status}
+		return sfResult{err: fmt.Errorf("handler: finalize blob: %w", err), status: fres.UpstreamStatus()}
 	}
 
 	dbCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if err := h.cache.PutBlob(dbCtx, hash, fres.ContentLength); err != nil {
-		return sfResult{err: fmt.Errorf("handler: put blob row: %w", err), status: fres.Status}
+		return sfResult{err: fmt.Errorf("handler: put blob row: %w", err), status: fres.UpstreamStatus()}
 	}
-	return sfResult{blobHash: hash, size: fres.ContentLength, status: fres.Status}
+	return sfResult{blobHash: hash, size: fres.ContentLength, status: fres.UpstreamStatus()}
 }
 
 // respondRecoveryError handles fetch errors from a SPEC2 §6.2 metadata
@@ -2116,13 +2124,25 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 		return sfResult{err: ferr, status: status}
 	}
 
+	// AIDEV-NOTE: the maintainer's ruling of 2026-11-05 (F2-I1, D2-M2).
+	// A 204 is an empty success only for a path proxy.IsMetadata
+	// classifies as an index or metadata. For anything else — a .deb or
+	// any other package file — it is an upstream error, as before commit
+	// 3a6d5ba: nothing is finalized (the deferred Abort drops the temp),
+	// so the next request fetches again instead of hitting an empty
+	// blob for good. Pinned by TestServeHTTP_NoContentPackageFileIsAnUpstreamError
+	// and TestServeHTTP_NoContentMetadataIsAnEmptySuccess.
+	if fres.NoContent && !req.IsMetadata {
+		return sfResult{err: ErrUpstreamNoContent, status: fres.UpstreamStatus()}
+	}
+
 	// Metadata paths bypass §6.2 .deb validation entirely.
 	var hash string
 	if req.IsMetadata {
 		var ferr2 error
 		hash, ferr2 = bw.Finalize(fres.ContentLength)
 		if ferr2 != nil {
-			return sfResult{err: fmt.Errorf("handler: finalize blob: %w", ferr2), status: fres.Status}
+			return sfResult{err: fmt.Errorf("handler: finalize blob: %w", ferr2), status: fres.UpstreamStatus()}
 		}
 	} else {
 		// Authoritative post-fetch dispatch (SPEC2.md §6.2).
@@ -2141,7 +2161,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 			var ferr2 error
 			hash, ferr2 = bw.Finalize(fres.ContentLength)
 			if ferr2 != nil {
-				return sfResult{err: fmt.Errorf("handler: finalize blob: %w", ferr2), status: fres.Status}
+				return sfResult{err: fmt.Errorf("handler: finalize blob: %w", ferr2), status: fres.UpstreamStatus()}
 			}
 		} else {
 			distinct := distinctDeclared(rows)
@@ -2163,14 +2183,14 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 				// WARN).
 				if (prefetchUnread || prefetchVouched) && isDebPath(req.Path) {
 					if res, end := h.strictAfterDownload(ctx, req); end {
-						res.status = fres.Status
+						res.status = fres.UpstreamStatus()
 						return res
 					}
 				}
 				var ferr2 error
 				hash, ferr2 = bw.Finalize(fres.ContentLength)
 				if ferr2 != nil {
-					return sfResult{err: fmt.Errorf("handler: finalize blob: %w", ferr2), status: fres.Status}
+					return sfResult{err: fmt.Errorf("handler: finalize blob: %w", ferr2), status: fres.UpstreamStatus()}
 				}
 			case 1:
 				observed := bw.HashSum()
@@ -2193,7 +2213,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 					return sfResult{
 						err: fmt.Errorf("%w: declared %s, observed %s",
 							ErrPackageHashMismatch, distinct[0], observed),
-						status: fres.Status,
+						status: fres.UpstreamStatus(),
 					}
 				}
 				// Defense in depth: bytes already match the declared
@@ -2205,7 +2225,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 				var ferr2 error
 				hash, ferr2 = bw.FinalizeExpectingHash(distinct[0], fres.ContentLength)
 				if ferr2 != nil {
-					return sfResult{err: fmt.Errorf("handler: finalize blob: %w", ferr2), status: fres.Status}
+					return sfResult{err: fmt.Errorf("handler: finalize blob: %w", ferr2), status: fres.UpstreamStatus()}
 				}
 				// SPEC6_5 §10.3 / §2.3: capture the validation
 				// outcome so the post-fetch logRequest can surface
@@ -2231,7 +2251,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 					"declared", declaredAttrs(rows),
 				)
 				serveHashValidatedTotal.Inc(classifyPath(req.Path), "mismatch")
-				return sfResult{err: ErrPackageHashConflict, status: fres.Status}
+				return sfResult{err: ErrPackageHashConflict, status: fres.UpstreamStatus()}
 			}
 		}
 	}
@@ -2246,7 +2266,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 	defer cancel()
 
 	if err := h.cache.PutBlob(dbCtx, hash, fres.ContentLength); err != nil {
-		return sfResult{err: fmt.Errorf("handler: put blob row: %w", err), status: fres.Status}
+		return sfResult{err: fmt.Errorf("handler: put blob row: %w", err), status: fres.UpstreamStatus()}
 	}
 
 	// AIDEV-NOTE: ruling R-G3. The row's stamp is read here, after the pool
@@ -2308,7 +2328,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 			if file.Marks() {
 				// A local disk fault, labelled like every other one
 				// (cache_write_failed; deferred minor D-38).
-				return sfResult{err: fmt.Errorf("handler: read suite file head: %w: %w", fetch.ErrCacheWriteFailed, herr), status: fres.Status}
+				return sfResult{err: fmt.Errorf("handler: read suite file head: %w: %w", fetch.ErrCacheWriteFailed, herr), status: fres.UpstreamStatus()}
 			}
 		}
 		if herr == nil && file.Sniff(req.Path, head) {
@@ -2328,7 +2348,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 	}
 	stored, err := h.cache.StoreFetched(dbCtx, fetched, h.suiteCaps(), h.suiteGuard)
 	if err != nil {
-		return sfResult{err: fmt.Errorf("handler: put url row: %w", err), status: fres.Status}
+		return sfResult{err: fmt.Errorf("handler: put url row: %w", err), status: fres.UpstreamStatus()}
 	}
 	if fetched.Create != nil {
 		h.noteCreate(sr.key, stored.Create)
@@ -2337,7 +2357,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 	return sfResult{
 		blobHash:       hash,
 		size:           fres.ContentLength,
-		status:         fres.Status,
+		status:         fres.UpstreamStatus(),
 		validatedHash:  validatedHash,
 		packageName:    packageName,
 		vouchingSuites: vouchers,
@@ -2593,6 +2613,15 @@ func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *prox
 		w.Header().Set("Retry-After", "30")
 		http.Error(w, "snapshot member hash mismatch", http.StatusBadGateway)
 		h.logRequest(r, req.CanonicalHost, req.Path, "snapshot_member_refetch_mismatch", http.StatusBadGateway, 0, true, res.status, start)
+		return
+	case errors.Is(err, ErrUpstreamNoContent):
+		// The ruling of 2026-11-05: a 204 for a package file is an
+		// upstream error. 502 + Retry-After like any other bad upstream
+		// answer; the request line's upstream_status (204) says why, so
+		// no "unclassified fetch error" ERROR is logged.
+		w.Header().Set("Retry-After", retryAfterForRequest(req))
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+		h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusBadGateway, 0, true, res.status, start)
 		return
 	case errors.Is(err, ErrUnvouchedDebRefused):
 		// SPEC3 §6.1 / §6.2 strict mode: refuse-with-Retry-After:60
