@@ -374,7 +374,7 @@ func TestGpgvChecks(t *testing.T) {
 		{[]byte{0x01, 0x00}, 1},
 		{[]byte{0x01, 0x01, 0x00}, 1},
 	} {
-		if got := gpgvChecks(p(tc.types...)); len(got) != tc.want || got[0].n != 1 {
+		if got := anyGpgvChecks(p(tc.types...)); len(got) != tc.want || got[0].n != 1 {
 			t.Errorf("types % x: gpgv checks %d packets from packet %d; want %d from packet 1", tc.types, len(got), got[0].n, tc.want)
 		}
 	}

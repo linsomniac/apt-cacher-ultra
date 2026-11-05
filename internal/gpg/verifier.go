@@ -477,19 +477,31 @@ func (v *Verifier) checkSignatures(suite freshness.SuiteRef, trust suiteTrust, s
 		}
 		return freshness.Signers{}, fmt.Errorf("%w: pin matched but no key in host keyring satisfies it", ErrNoUsableSignature)
 	}
-	checked := gpgvChecks(pkts)
+	checked := anyGpgvChecks(pkts)
 	if err := v.requireKnownSignaturesVerify(signed, checked); err != nil {
 		return freshness.Signers{}, err
+	}
+	if every := everyGpgvChecks(checked); len(every) < len(checked) {
+		if err := v.requireKnownSignerEveryGpgvChecks(every); err != nil {
+			return freshness.Signers{}, err
+		}
 	}
 	return v.verifyAnyTrusted(suite, trust.entities, trust.fps, signed, checked)
 }
 
-// gpgvChecks returns the packets gpgv checks: every one when they share
+// The packet sets layer S reads, named for what they model (the second
+// final review's V2-M5): anyGpgvChecks is what some supported gpgv checks,
+// so a bad one among them by a known key refuses (S1), and S2 counts from
+// it; everyGpgvChecks is what every supported gpgv checks, so it must hold
+// a signature by a known key (requireKnownSignerEveryGpgvChecks). A
+// generation's own rule about which packets it reads goes in the second.
+
+// anyGpgvChecks returns the packets gpgv checks: every one when they share
 // one signature type, else the first only. gpgv hashes the data as the
 // first packet's type says (text or binary) and, when another packet's
 // type differs, warns "multiple signatures detected. Only the first will
 // be checked." (gnupg 2.2.27 to 2.4.8, g10/mainproc.c, proc_tree's
-// multiple_ok).
+// multiple_ok; gnupg 1.4 too, everyGpgvChecks).
 //
 // AIDEV-NOTE: Task 9b's ruling on n_i_unknown00_first (batch fx12): every
 // gpgv-based apt refuses an unknown key's binary-mode packet before a good
@@ -502,13 +514,66 @@ func (v *Verifier) checkSignatures(suite freshness.SuiteRef, trust suiteTrust, s
 // n_i_badA00_then_good, n_d_badA01_then_good). So S1 and S2 read exactly
 // the packets gpgv checks, and a lone binary-mode packet in an InRelease
 // (o2_binary_sig_in_clearsign, every apt) still counts.
-func gpgvChecks(pkts []sigPacket) []sigPacket {
+func anyGpgvChecks(pkts []sigPacket) []sigPacket {
 	for _, p := range pkts[1:] {
 		if p.sigType != pkts[0].sigType {
 			return pkts[:1]
 		}
 	}
 	return pkts
+}
+
+// everyGpgvChecks returns, of checked (anyGpgvChecks' packets), those every
+// supported gpgv checks: all of them when they share one hash algorithm,
+// else the first only, which is all gpgv 1.4 checks then (gnupg 1.4's
+// proc_tree clears multiple_ok on any differing digest: "WARNING: multiple
+// signatures detected.  Only the first will be checked."), where gpgv 2.x
+// checks every one (it clears it on a differing digest only with attached
+// data).
+func everyGpgvChecks(checked []sigPacket) []sigPacket {
+	for _, p := range checked[1:] {
+		if p.hashAlgo != checked[0].hashAlgo {
+			return checked[:1]
+		}
+	}
+	return checked
+}
+
+// requireKnownSignerEveryGpgvChecks refuses an anchor whose packets every
+// gpgv checks (everyGpgvChecks) hold none by a key in the host keyring: some
+// supported gpgv then sees no good signature and its apt refuses the anchor.
+// A packet by a known key there has passed S1, so it is good. It runs only
+// where everyGpgvChecks narrows the set (gpgv 1.4's first-only): where every
+// gpgv checks every packet, S2's count implies it, and S2's reasons stand.
+//
+// AIDEV-NOTE: V2-C1 (the second final review's lens V2, Task 8's verifier
+// fix; a format rule over every generation, HD-19). gpgv 1.4 (ubuntu:16.04,
+// ubuntu:14.04) checks only the first packet when the packets' hashes
+// differ, so an unknown key's packet of another hash put first, key-free,
+// makes those two refuse ("NO_PUBKEY", apt's GPG error) an anchor every
+// other image accepts: batch fx22's mh_unkBsha1_then_good,
+// mh_unkB384_then_good, mh_unkB_good_unkB512 and mh_d_unkB512_then_good,
+// and e2_unknownB_good_sha1A (refused before by S2, now first here). Measured
+// the other way round, gpgv 1.4 accepts a good first packet by a known key,
+// whatever follows and whatever the key's usage (x3i_sha1_plus_good,
+// e8_sha224A_then_good, us_good_primary_then_good512,
+// us_good_enc_then_good512, mh_good_then_unkB384, mh_d_good_then_unkB512:
+// every image accepts), and refuses a bad one (S1 refuses it here:
+// g5_bad512_then_good256, us_bad_primary_then_good512). So the rule asks
+// for a known key, not for a packet S2 counts: S2's crypto policy (no SHA-1)
+// is not intersected, and a first packet by a known key that S2 does not
+// count (SHA-1, an expired key's) is the vendor's own, never an attacker's
+// edit. Host keyring, as S1: the parity caveat of docs/open-decisions.md's
+// "S1 covers only the keys the cache holds" applies. No surveyed anchor
+// mixes hashes. The accept_any_signer bypass reads no S (DN-8).
+func (v *Verifier) requireKnownSignerEveryGpgvChecks(every []sigPacket) error {
+	keyring := v.keyring.EntityList()
+	for _, p := range every {
+		if len(keyring.KeysById(p.issuer)) > 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: packet %d, issuer %016X, is the only one gpgv 1.4 checks (the packets' hashes differ), and no key in the host keyring has its ID", ErrNoUsableSignature, every[0].n, every[0].issuer)
 }
 
 // suiteTrust is a suite's trust set (resolveTrustSet).
@@ -590,7 +655,7 @@ func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (suiteTrust, error)
 
 // requireKnownSignaturesVerify is S1, apt's rule that a bad signature from
 // a known key is fatal (VC-1; rulings HD-3, HD-8): every packet of pkts
-// (the packets gpgv checks) whose issuer key ID names a key in the host
+// (the packets some gpgv checks: anyGpgvChecks) whose issuer key ID names a key in the host
 // keyring, a primary or a subkey whatever its usage (the hardening plan's
 // Task 9e fix round), must pass its cryptographic check against one of the
 // keys holding that key ID: a signing key's by go-crypto's verification of

@@ -170,7 +170,7 @@ var aptShapeRefusedBy = map[string]string{
 	"d_twoblocks":                                 "T4/one-block",
 	"e2_good_unknownB_sha1A":                      "S2:crypto_verify_failed",
 	"e2_sha1A_good_sha1A":                         "S2:crypto_verify_failed",
-	"e2_unknownB_good_sha1A":                      "S2:crypto_verify_failed",
+	"e2_unknownB_good_sha1A":                      "S2:no_usable_signature",
 	"e7_d_text_sub1_256_then_sub1_sha1":           "S2:crypto_verify_failed",
 	"e7_prim256_then_prim_sha1":                   "S2:crypto_verify_failed",
 	"e7_sub1_256_then_sub1_sha1":                  "S2:crypto_verify_failed",
