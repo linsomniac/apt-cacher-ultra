@@ -8,12 +8,10 @@
 //   - On periodic ticks (T2): scan known suites and check those whose
 //     last_success_at has aged past freshness.periodic_refresh.
 //
-// Phase 1 deliberately does not adopt newly-observed InRelease bytes:
-// doing so without atomically refreshing every referenced index would
-// open a hash-mismatch window for any client mid-update. Instead, the
-// Checker records the observation in inrelease_change_seen_at and the
-// cache keeps serving the consistent older set. Phase 2's atomic-flip
-// transaction will adopt.
+// Without adoption, a changed anchor invalidates the suite's mutable URL
+// metadata atomically. Later requests fetch current upstream bytes, under the
+// existing trust-upstream policy. Adopted snapshots are published only through
+// the verified adoption pipeline and never invalidated by that legacy path.
 package freshness
 
 import (
@@ -71,6 +69,8 @@ const checkDeadline = 2 * time.Minute
 // Defined as an interface so tests can supply a fake without standing
 // up an on-disk cache.
 type Cache interface {
+	RefreshURLPathBlob(ctx context.Context, scheme, host, path, old, newHash string, etag, lastmod *string) (bool, error)
+	InvalidateLegacyMetadata(ctx context.Context, key cache.SuiteKey, anchorPath, oldHash string) error
 	GetSuiteFreshness(ctx context.Context, scheme, host, suitePath string) (*cache.SuiteFreshness, error)
 	// HasSuiteRow is I-4's row gate before a lock-map entry is stored: one
 	// indexed existence read (SELECT 1), cheaper than GetSuiteFreshness.
@@ -374,6 +374,7 @@ type adoptionRequest struct {
 	// Detached form (form == adoptionFormDetached):
 	releaseBytes []byte
 	sigBytes     []byte
+	sigLastmod   string
 
 	// Validators captured from whichever metadata file the freshness
 	// checker conditional-GETs next time (Release in detached mode,
@@ -1070,17 +1071,16 @@ func (c *Checker) snapshotAnchorHash(ctx context.Context, snapshotID int64, file
 	return &v
 }
 
-// hasReleaseURLRow reports whether url_path has rows for both Release
-// and Release.gpg under (scheme, host, suitePath). Used by the inline
-// path's 404 fallback to decide whether a detached retry is even
-// possible — without both rows, the detached fetch would skip with a
-// "no cached Release url_path" debug log anyway.
+// hasReleaseURLRow checks for a legacy Release baseline. Adoption additionally
+// requires the detached signature row; trust-upstream refresh needs only Release.
 func (c *Checker) hasReleaseURLRow(ctx context.Context, scheme, host, suitePath string) bool {
 	if _, err := c.cache.LookupURL(ctx, scheme, host, suitePath+releaseFilename); err != nil {
 		return false
 	}
-	if _, err := c.cache.LookupURL(ctx, scheme, host, suitePath+releaseGPGFilename); err != nil {
-		return false
+	if c.adopter != nil {
+		if _, err := c.cache.LookupURL(ctx, scheme, host, suitePath+releaseGPGFilename); err != nil {
+			return false
+		}
 	}
 	return true
 }

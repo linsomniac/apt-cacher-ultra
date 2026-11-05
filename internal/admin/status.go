@@ -850,12 +850,11 @@ func adoptionStatus(s cache.SuiteFreshness, refused, long bool, now int64) strin
 }
 
 // suitesForHTML adapts the suite rows to the HTML page. With adoption
-// disabled nothing is attempted or adopted, so a record stored while it
+// disabled no snapshot adoption is attempted, so a record stored while it
 // was enabled is inert: its text gains " (adoption disabled)" and it marks
-// no warn (final review S I3). A lag is truthful but expected — Phase 1
-// never refreshes metadata — so rows keep their lag text without warning,
-// and vitalState shows the SUITES vital stale with "ADOPTION DISABLED —
-// METADATA NOT REFRESHED" (ruling A4). The JSON keeps the raw fields.
+// no warn. Legacy URL metadata refreshes independently. Existing snapshots
+// still require adoption, so lag text stays visible and vitalState says
+// "ADOPTION DISABLED". The JSON keeps the raw fields.
 func suitesForHTML(suites []suiteEntry, adoptionEnabled bool) []suiteEntry {
 	if adoptionEnabled {
 		return suites
@@ -1430,7 +1429,7 @@ func vitalState(kind string, m htmlRenderModel) string {
 			return "stale"
 		}
 		if !m.AdoptionEnabled {
-			// ADOPTION DISABLED — METADATA NOT REFRESHED (§9.1, the
+			// ADOPTION DISABLED (§9.1, the
 			// keyring panel's precedent): the lag is expected, not a
 			// fault, so it must not hold the page at DEGRADED.
 			return "stale"

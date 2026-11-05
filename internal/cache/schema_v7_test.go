@@ -74,8 +74,8 @@ func TestSchemaV7_MigratesPopulatedV6(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 	var v int
-	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil || v != 7 {
-		t.Fatalf("version = %d (%v), want 7", v, err)
+	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil || v != CurrentSchemaVersion {
+		t.Fatalf("version = %d (%v), want %d", v, err, CurrentSchemaVersion)
 	}
 	forms := map[int64]string{}
 	rows, err := db.Query(`SELECT snapshot_id, anchor_form, release_date IS NULL, retired_at IS NULL FROM suite_snapshot`)

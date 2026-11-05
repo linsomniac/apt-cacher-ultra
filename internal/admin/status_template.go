@@ -361,7 +361,7 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
         <span class="vital__unit">TRACKED</span>
       </div>
       <div class="vital__sub">
-        {{if not $adopting}}<span>ADOPTION DISABLED &mdash; METADATA NOT REFRESHED</span>{{else}}{{$lagCount := 0}}{{$failCount := 0}}{{$longCount := 0}}{{range .Suites}}{{if .LagWarn}}{{$lagCount = (add1 $lagCount)}}{{end}}{{if .AdoptionFailing}}{{$failCount = (add1 $failCount)}}{{end}}{{if .RefusedLong}}{{$longCount = (add1 $longCount)}}{{end}}{{end}}
+        {{if not $adopting}}<span>ADOPTION DISABLED</span>{{else}}{{$lagCount := 0}}{{$failCount := 0}}{{$longCount := 0}}{{range .Suites}}{{if .LagWarn}}{{$lagCount = (add1 $lagCount)}}{{end}}{{if .AdoptionFailing}}{{$failCount = (add1 $failCount)}}{{end}}{{if .RefusedLong}}{{$longCount = (add1 $longCount)}}{{end}}{{end}}
         <span>{{if eq $lagCount 0}}<b>0 LAGGING</b>{{else}}<b class="accent-warn">{{$lagCount}} LAGGING</b>{{end}} &middot; {{if eq $failCount 0}}0 FAILING{{else}}<b class="accent-warn">{{$failCount}} FAILING</b>{{end}}{{if gt $longCount 0}} &middot; <b class="accent-warn">{{$longCount}} REFUSED 24H+</b>{{end}}</span>{{end}}
       </div>
     </article>

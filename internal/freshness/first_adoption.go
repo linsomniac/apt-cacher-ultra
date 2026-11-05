@@ -187,7 +187,7 @@ func (t probeTree) request(suite SuiteRef) *adoptionRequest {
 		rel, sig := t.release.res, t.sig.res
 		return &adoptionRequest{suite: suite, form: adoptionFormDetached,
 			key:          contentKey(adoptionFormDetached, nil, rel.Body, sig.Body),
-			releaseBytes: rel.Body, sigBytes: sig.Body, etag: rel.ETag, lastmod: rel.LastModified}
+			releaseBytes: rel.Body, sigBytes: sig.Body, sigLastmod: sig.LastModified, etag: rel.ETag, lastmod: rel.LastModified}
 	case adoptionFormUnsigned:
 		rel := t.release.res
 		return &adoptionRequest{suite: suite, form: adoptionFormUnsigned,

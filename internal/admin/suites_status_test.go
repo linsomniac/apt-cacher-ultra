@@ -354,8 +354,8 @@ func TestSuitesTable_RendersRecordsAndCounts(t *testing.T) {
 // Final review S I3 / ruling A4: with adoption disabled (the shipped
 // default) a stored record is inert — its text gains "(adoption
 // disabled)" and it marks no warn — rows keep their lag text without
-// warning, and the SUITES vital is stale with "ADOPTION DISABLED —
-// METADATA NOT REFRESHED", so the page is not DEGRADED forever. Enabled,
+// warning, and the SUITES vital is stale with "ADOPTION DISABLED",
+// so the page is not DEGRADED forever. Enabled,
 // the same rows keep their warn states.
 func TestSuites_AdoptionDisabledIsNotDegraded(t *testing.T) {
 	const now = int64(1_800_000_000)
@@ -382,7 +382,7 @@ func TestSuites_AdoptionDisabledIsNotDegraded(t *testing.T) {
 	}
 	html := renderHTMLForGolden(t, disabled)
 	mustContain(t, html,
-		`ADOPTION DISABLED &mdash; METADATA NOT REFRESHED`,
+		`ADOPTION DISABLED`,
 		`(lagging 2d 0h)`,
 		`adoption failing 2h 0m · untrusted_signer · retry in 41m (adoption disabled)`,
 	)

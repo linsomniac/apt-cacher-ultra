@@ -193,14 +193,14 @@ func (h *Handler) suiteCaps() cache.SuiteCaps {
 }
 
 // suiteSeed is the row a creation inserts (spec C3). Only an
-// adoption-disabled miss of <suite>/InRelease stamps the miss as a
+// adoption-disabled miss of InRelease or Release stamps the miss as a
 // successful check with its validators — today's seed, byte for byte
 // (TestServeHTTP_AdoptionDisabledSeedParity); every other creation leaves
 // the stamps and validators NULL, so the suite's first check runs at once
 // and unconditionally.
 func (h *Handler) suiteSeed(sr *suiteReq, miss bool, etag, lastmod string, now int64) *cache.SuiteSeed {
 	s := &cache.SuiteSeed{SuiteKey: sr.key, RequestedAt: now}
-	if miss && !h.adoptionEnabled && sr.file == aptpath.FileInRelease {
+	if miss && !h.adoptionEnabled && (sr.file == aptpath.FileInRelease || sr.file == aptpath.FileRelease) {
 		s.LastCheckAt, s.LastSuccessAt = &now, &now
 		if etag != "" {
 			s.InReleaseETag = &etag

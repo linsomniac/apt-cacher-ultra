@@ -60,7 +60,6 @@ var sweptEvents = []sweptEvent{
 	{"freshness: repair deferred, no adoption slot", "freshness_repair_deferred_no_adoption_slot"},
 	{"legacy trust audit: cached anchor skipped", "legacy_trust_audit_cached_anchor_skipped"},
 	{"shutdown wait panicked", "shutdown_wait_panicked"},
-	{"snapshot adopted_at lookup failed", "snapshot_adopted_at_lookup_failed"},
 	{"suite cached anchor read failed", "suite_cached_anchor_read_failed"},
 	{"suite file head read failed", "suite_file_head_read_failed"},
 	{"suite reaper: suite busy, retried next run", "suite_reaper_suite_busy"},
