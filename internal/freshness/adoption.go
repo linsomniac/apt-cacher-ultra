@@ -1130,7 +1130,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// Both paths converge on "verified Release-equivalent text" for the
 	// §7.5 step 3 parse.
 	// With a SignerVerifier, the same verification also reports the
-	// anchor's signers, for the downgrade guard at Step 3b; the unsigned
+	// anchor's signers, for the downgrade guard at Step 4b; the unsigned
 	// form has none.
 	var (
 		releaseText []byte
@@ -1255,14 +1255,6 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			ErrAdoptionUpstreamOlder, relDate, *prior.ReleaseDate)
 	}
 
-	// Step 3b (Task 9d): the signer downgrade guard, beside the Date and
-	// rollback refusals and before any member download: a candidate that
-	// has lost the current anchor's strong signer is refused
-	// (signer_downgrade; signer_guard.go).
-	if err := a.signerGuard(ctx, suite, prior, signers); err != nil {
-		return err
-	}
-
 	// Step 4: insert the candidate suite_snapshot row. The schema
 	// CHECK constraint enforces XOR between inrelease_hash and
 	// (release_hash + release_gpg_hash); we set whichever pair this
@@ -1343,6 +1335,24 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			"suite_path", suite.SuitePath,
 			"snapshot_id", snapshotID,
 		)
+	}
+
+	// Step 4b (Task 9d): the signer downgrade guard, after the rollback
+	// refusal and before any member download: a candidate that has lost
+	// the current anchor's strong signer is refused (signer_downgrade;
+	// signer_guard.go). The candidate row it leaves is an orphan, as any
+	// failure after Step 4 leaves one (reused at the next attempt, deleted
+	// by GC).
+	//
+	// AIDEV-NOTE: the task review's 9d-M1. The guard sits after Step 4's
+	// rollback check, not before it: content equal to an adopted, displaced
+	// snapshot (a flapping mirror serving an older weak-only anchor again)
+	// must stay rollback_refused (no lag shown, the cache is current), not
+	// become signer_downgrade (a strip WARN, lag shown). Moving it back
+	// before the insert reclassifies that rollback
+	// (TestSignerGuard_ARollbackStaysRollbackRefused).
+	if err := a.signerGuard(ctx, suite, prior, signers); err != nil {
+		return err
 	}
 
 	// SPEC4 §7.5.1 Rule 1 race-window extension: track the in-flight

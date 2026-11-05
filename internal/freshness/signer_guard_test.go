@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
@@ -88,9 +89,15 @@ func newGuardEnv(t *testing.T) *guardEnv {
 // text says strong:<fp> when fp is set.
 func (g *guardEnv) adopt(t *testing.T, label, fp string) ([]byte, error) {
 	t.Helper()
+	return g.adoptDated(t, label, fp, 0)
+}
+
+// adoptDated is adopt with the Release dated date (0: no Date field).
+func (g *guardEnv) adoptDated(t *testing.T, label, fp string, date int64) ([]byte, error) {
+	t.Helper()
 	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": testHex64})
 	g.fetcher.put("http://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages", pkgs)
-	rel := datedRelease(label, 0, map[string][]byte{"main/binary-amd64/Packages": pkgs})
+	rel := datedRelease(label, date, map[string][]byte{"main/binary-amd64/Packages": pkgs})
 	if fp != "" {
 		rel = append([]byte("X-Note: strong:"+fp+"\n"), rel...)
 	}
@@ -130,6 +137,40 @@ func TestSignerGuard_RefusesBeforeAnyMemberDownload(t *testing.T) {
 	if !strings.Contains(g.logs.String(), `"level":"WARN","msg":"adoption_signer_downgrade"`) ||
 		!strings.Contains(g.logs.String(), `"current_strong_signer":"AAAA"`) {
 		t.Fatalf("no WARN adoption_signer_downgrade naming AAAA:\n%s", g.logs.String())
+	}
+}
+
+// TestSignerGuard_ARollbackStaysRollbackRefused (the task review's 9d-M1):
+// a flapping mirror serving an adopted, displaced weak-only anchor again
+// after a strong current one, undated or with the same Date (so the Date
+// rule passes it), is refused rollback_refused, as before Task 9d, not
+// signer_downgrade: the guard runs after Step 4's rollback check. The
+// current snapshot is kept and no downgrade WARN is logged.
+func TestSignerGuard_ARollbackStaysRollbackRefused(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		date int64
+	}{{"undated", 0}, {"same Date", time.Now().Add(-time.Hour).Unix()}} {
+		t.Run(c.name, func(t *testing.T) {
+			g := newGuardEnv(t)
+			if _, err := g.adoptDated(t, "v1", "", c.date); err != nil {
+				t.Fatalf("v1, weak: %v", err)
+			}
+			if _, err := g.adoptDated(t, "v2", "AAAA", c.date); err != nil {
+				t.Fatalf("v2, strong: %v", err)
+			}
+			cur := currentSnapshotID(t, g.adoptionTestEnv)
+			_, err := g.adoptDated(t, "v1", "", c.date)
+			if !errors.Is(err, ErrAdoptionRollbackRefused) || errors.Is(err, ErrAdoptionSignerDowngrade) {
+				t.Fatalf("v1 again: %v; want ErrAdoptionRollbackRefused, not signer_downgrade", err)
+			}
+			if got := currentSnapshotID(t, g.adoptionTestEnv); got != cur {
+				t.Fatalf("current snapshot moved from %d to %d", cur, got)
+			}
+			if strings.Contains(g.logs.String(), `"msg":"adoption_signer_downgrade"`) {
+				t.Fatalf("a rollback logged adoption_signer_downgrade:\n%s", g.logs.String())
+			}
+		})
 	}
 }
 

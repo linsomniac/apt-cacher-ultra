@@ -46,6 +46,15 @@ const (
 // it cannot be read or verified (ruling G2, logged at INFO as
 // adoption_signer_guard_skipped).
 //
+// runShared calls it at Step 4b: after the Date rules and Step 4's
+// rollback refusal, before any member download.
+//
+// AIDEV-NOTE: why after the rollback check (the task review's 9d-M1): a
+// flapping mirror that serves an adopted, displaced snapshot again is a
+// rollback (rollback_refused: the cache is current, no lag), even when
+// that older anchor is weak-only after a strong current one; only
+// genuinely new content that lost its strong signer is signer_downgrade.
+//
 // AIDEV-NOTE: the guard fails open on its own errors (ruling G2): it is
 // defence in depth behind a candidate that has already passed full
 // verification, so a guard fault must never freeze a suite; a strong flag
