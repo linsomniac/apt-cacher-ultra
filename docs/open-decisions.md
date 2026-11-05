@@ -807,8 +807,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   rulings (E3, E4): a fold would refuse nginx, syncthing or
   debian-buster-archive. Recommendation: leave them; a vendor's to fix,
   and the residual stays recorded here.
-- **Three S1 cases Task 9e left unmeasured** (raised 2026-11-05, the Task
-  9e review's re-review 1). S1 checks a packet by a known key that cannot
+- **Three S1 cases Task 9e left unmeasured, and a fourth of the liveness
+  check** (raised 2026-11-05, the Task 9e review's re-review 1; (4): the
+  final review 2's closure check). S1 checks a packet by a known key that cannot
   sign directly (`verifiesDirectly`, *Decided*), which reads no usage,
   expiry or notation: (1) a key whose self-signature has no key-flags
   subpacket goes the direct way too, so a bad packet by it now refuses,
@@ -817,8 +818,14 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   packet passes, as before Task 9e (the older gpgv unmeasured); (3) a
   packet naming an ElGamal or ECDH subkey can never verify, so S1 always
   refuses an anchor that holds one (strict; no real signer emits one).
+  (4) For gpgv 1.4's one checked packet, such a key's liveness (`keyLive`)
+  checks revocation, the key's lifetime and the packet's expiry, but not
+  whether the primary's self-signature, the subkey's binding or its
+  back-signature has itself expired, which go-crypto refuses for a signing
+  key: a dead binding passes (the final review 2's V2-CC-M1; vendor-only,
+  as it needs the vendor's own packet; unmeasured on gpgv 1.4).
   Class R3 for (3), an attacker's edit refused where the newer apt accept
-  it; (1) and (2) unmeasured, each toward the older gpgv; no vendor anchor
+  it; (1), (2) and (4) unmeasured, each toward the older gpgv; no vendor anchor
   changed. Recommendation:
   measure them in a corpus batch when the generator next makes keys
   (`--usage-keys` makes key U).

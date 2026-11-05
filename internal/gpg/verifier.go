@@ -638,10 +638,16 @@ func (v *Verifier) liveSigner(k openpgp.Key, signed []byte, p sigPacket, now tim
 }
 
 // keyLive reports whether k, a key that cannot sign (verifiesDirectly's), is
-// live at now as go-crypto's checkMessageSignatureDetails judges a signing
-// key: neither its primary, its primary identity nor (a subkey) itself
-// revoked, neither its primary nor itself expired, and the packet raw not
-// expired.
+// live at now: neither its primary, its primary identity nor (a subkey)
+// itself revoked, neither its primary nor itself expired (the key's
+// lifetime in its self-signature or binding), and the packet raw not
+// expired. That is part of what go-crypto's checkMessageSignatureDetails
+// judges for a signing key, not all of it: it does not check whether the
+// primary's self-signature, the subkey's binding or its back-signature has
+// itself expired (SigExpired), which that function refuses (the final
+// review 2's V2-CC-M1; unmeasured, vendor-only: docs/open-decisions.md,
+// *Open*, "Key files and anchors the cache refuses where every apt accepts
+// them").
 func keyLive(k openpgp.Key, raw []byte, now time.Time) bool {
 	e := k.Entity
 	selfSig, identity := e.PrimarySelfSignature()
