@@ -571,11 +571,17 @@ func packetsOf(b []byte) ([]rawPacket, error) {
 
 // keyBlock is one key of a joined keyring, as readKeyBlocks hands it to
 // go-crypto: its public primary key packet, the key, and its components in
-// the keyring's order, each with the signatures that may stand on it.
+// the keyring's order, each with the signatures that may stand on it; and
+// the key's designated revokers (classify): the fingerprints the
+// revocation-key subpackets of its self-signatures name, and whether a
+// self-signature's subpackets could not be read whole (anyRevoker: then any
+// third party may be one, failing closed).
 type keyBlock struct {
 	primary    []byte
 	key        *packet.PublicKey
 	components []keyComponent
+	revokers   [][]byte
+	anyRevoker bool
 }
 
 // The components a keyBlock's signatures stand on.
@@ -606,6 +612,7 @@ type keySig struct {
 	typ     byte
 	v3      bool      // a version 3 revocation, kept for marks alone (never handed to go-crypto)
 	self    bool      // its issuer is the key itself, or cannot be read
+	issuer  rawSig    // its issuer's fingerprint and key ID as read (keyBlock.designated)
 	created time.Time // its creation time; zero when it cannot be read
 	ok      bool
 	why     string
@@ -870,10 +877,46 @@ func (kb *keyBlock) packets(strict bool) []byte {
 // classify reads every signature of kb's components (keySig.read).
 func (kb *keyBlock) classify() {
 	for i := range kb.components {
-		for j := range kb.components[i].sigs {
-			kb.components[i].sigs[j].read(kb, &kb.components[i])
+		c := &kb.components[i]
+		for j := range c.sigs {
+			s := &c.sigs[j]
+			s.read(kb, c)
+			// The key's designated revokers: named by a revocation-key
+			// subpacket of any of its own direct-key signatures or
+			// self-certifications, read or not (gpg reads them from the
+			// hashed area; a self-signature whose subpackets cannot be
+			// walked may name any key: anyRevoker).
+			if s.self && !s.v3 && (c.kind == onPrimary && s.typ == byte(packet.SigTypeDirectSignature) ||
+				c.kind == onUserID && supersedes(s.typ) == byte(packet.SigTypePositiveCert)) {
+				r := rawSigInfo(s.raw.body)
+				kb.revokers = append(kb.revokers, r.revokers...)
+				kb.anyRevoker = kb.anyRevoker || !r.whole
+			}
 		}
 	}
+}
+
+// designated reports whether s, a signature by another key, is a designated
+// revoker's: its issuer is one of kb.revokers, by fingerprint when s names
+// one (subpacket 33), else by key ID (16, the fingerprint's last eight
+// octets); or kb.anyRevoker.
+func (kb *keyBlock) designated(s *keySig) bool {
+	if kb.anyRevoker {
+		return true
+	}
+	for _, r := range kb.revokers {
+		switch {
+		case s.issuer.fpr != nil:
+			if bytes.Equal(r, s.issuer.fpr) {
+				return true
+			}
+		case s.issuer.keyID != nil:
+			if bytes.Equal(r[len(r)-8:], s.issuer.keyID) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // read fills in what the reader makes of s on c: whether go-crypto parses
@@ -892,7 +935,8 @@ func (s *keySig) read(kb *keyBlock, c *keyComponent) {
 	if s.v3 {
 		// go-crypto reads no v3 signature; its issuer key ID stands at
 		// body[7:15], its creation time at body[3:7] (v3RevocationType).
-		s.self = binary.BigEndian.Uint64(s.raw.body[7:15]) == kb.key.KeyId
+		s.issuer = rawSig{keyID: s.raw.body[7:15]}
+		s.self = s.issuer.issuerIs(kb.key)
 		s.created = time.Unix(int64(binary.BigEndian.Uint32(s.raw.body[3:7])), 0)
 		s.why = "it is a version 3 signature, which go-crypto does not read"
 		return
@@ -903,7 +947,8 @@ func (s *keySig) read(kb *keyBlock, c *keyComponent) {
 		err = errors.New("not a signature packet")
 	}
 	if err != nil {
-		s.self, s.created = rawSigIssuerAndTime(s.raw.body, kb.key)
+		s.issuer = rawSigInfo(s.raw.body)
+		s.self, s.created = s.issuer.issuerIs(kb.key), s.issuer.created
 		s.why = fmt.Sprintf("go-crypto does not read it (%v)", err)
 		if len(s.raw.body) > 3 {
 			s.why = fmt.Sprintf("go-crypto does not read it (hash algorithm %d: %v)", s.raw.body[3], err)
@@ -911,6 +956,10 @@ func (s *keySig) read(kb *keyBlock, c *keyComponent) {
 		return
 	}
 	s.self, s.created = sig.CheckKeyIdOrFingerprint(kb.key), sig.CreationTime
+	s.issuer = rawSig{fpr: sig.IssuerFingerprint}
+	if sig.IssuerKeyId != nil {
+		s.issuer.keyID = binary.BigEndian.AppendUint64(nil, *sig.IssuerKeyId)
+	}
 	var verr error
 	switch {
 	case c.kind == onPrimary && !s.self:
@@ -939,15 +988,38 @@ func issuerOf(sig *packet.Signature) uint64 {
 	return *sig.IssuerKeyId
 }
 
-// rawSigIssuerAndTime reads, from the body of a v4 (or v6) signature packet
-// go-crypto does not parse, whether its issuer is key (its issuer
-// fingerprint subpacket, 33, or issuer key ID, 16, in either area; with
-// neither, or a body not framed so, the signature counts as the key's own:
-// it is not known to be another's) and its creation time (subpacket 2 in
-// the hashed area; zero when not read).
-func rawSigIssuerAndTime(body []byte, key *packet.PublicKey) (self bool, created time.Time) {
+// rawSig is what rawSigInfo reads of a v4 (or v6) signature packet's
+// subpackets without go-crypto: its issuer fingerprint (33) and key ID (16),
+// nil when absent; its creation time (2, hashed; zero when not read); the
+// fingerprints its revocation-key subpackets (12, hashed) name; and whether
+// both areas were whole subpackets (whole; a short or misframed area stops
+// the walk with what was read).
+type rawSig struct {
+	fpr, keyID []byte
+	created    time.Time
+	revokers   [][]byte
+	whole      bool
+}
+
+// issuerIs reports whether the signature's issuer is key: by fingerprint
+// when it names one, else by key ID; one naming neither counts as the key's
+// own (it is not known to be another's).
+func (r rawSig) issuerIs(key *packet.PublicKey) bool {
+	switch {
+	case r.fpr != nil:
+		return bytes.Equal(r.fpr, key.Fingerprint)
+	case r.keyID != nil:
+		return binary.BigEndian.Uint64(r.keyID) == key.KeyId
+	}
+	return true
+}
+
+// rawSigInfo reads a v4 (or v6) signature packet's body for rawSig: the
+// version octet, type, algorithms, then the hashed and unhashed subpacket
+// areas, each behind its two-octet (v6: four-octet) length.
+func rawSigInfo(body []byte) (r rawSig) {
 	if len(body) < 6 {
-		return true, time.Time{}
+		return r
 	}
 	lengthOctets := 2
 	if body[0] == 6 {
@@ -957,7 +1029,7 @@ func rawSigIssuerAndTime(body []byte, key *packet.PublicKey) (self bool, created
 	off := 4
 	for range 2 {
 		if len(body) < off+lengthOctets {
-			return true, time.Time{}
+			return r
 		}
 		var n int
 		for _, c := range body[off : off+lengthOctets] {
@@ -965,20 +1037,10 @@ func rawSigIssuerAndTime(body []byte, key *packet.PublicKey) (self bool, created
 		}
 		off += lengthOctets
 		if n > len(body)-off {
-			return true, time.Time{}
+			return r
 		}
 		areas = append(areas, body[off:off+n])
 		off += n
-	}
-	var fpr, keyID []byte
-	issuerIsKey := func() bool {
-		switch {
-		case fpr != nil:
-			return bytes.Equal(fpr, key.Fingerprint)
-		case keyID != nil:
-			return binary.BigEndian.Uint64(keyID) == key.KeyId
-		}
-		return true
 	}
 	for i, area := range areas {
 		for len(area) > 0 {
@@ -992,21 +1054,24 @@ func rawSigIssuerAndTime(body []byte, key *packet.PublicKey) (self bool, created
 				size, hl = int(binary.BigEndian.Uint32(area[1:5])), 5
 			}
 			if size == 0 || hl == 0 || size > len(area)-hl {
-				return issuerIsKey(), created // the area is not whole subpackets
+				return r // the area is not whole subpackets
 			}
 			sub := area[hl : hl+size]
 			area = area[hl+size:]
 			switch typ, data := sub[0]&0x7f, sub[1:]; {
-			case typ == 2 && i == 0 && len(data) == 4 && created.IsZero():
-				created = time.Unix(int64(binary.BigEndian.Uint32(data)), 0)
-			case typ == 16 && len(data) == 8 && keyID == nil:
-				keyID = data
-			case typ == 33 && len(data) == 21 && fpr == nil:
-				fpr = data[1:]
+			case typ == 2 && i == 0 && len(data) == 4 && r.created.IsZero():
+				r.created = time.Unix(int64(binary.BigEndian.Uint32(data)), 0)
+			case typ == 16 && len(data) == 8 && r.keyID == nil:
+				r.keyID = data
+			case typ == 33 && len(data) == 21 && r.fpr == nil:
+				r.fpr = data[1:]
+			case typ == 12 && i == 0 && len(data) == 22: // class, algorithm, a v4 fingerprint
+				r.revokers = append(r.revokers, data[2:])
 			}
 		}
 	}
-	return issuerIsKey(), created
+	r.whole = true
+	return r
 }
 
 // Signature types a key's own signature supersedes by a newer one, and
@@ -1027,9 +1092,16 @@ func supersedes(typ byte) byte {
 // each component on which stands a signature the cache cannot use (keySig
 // not ok) and gpgv would, so that gpgv may treat the component as revoked,
 // expired or unbound where the cache reads it valid — a revocation of the
-// key (0x20) or of a subkey (0x28) that is not the key's own verified
-// signature, whoever its issuer (a designated revoker's, which gpgv honours
-// when it holds that key, the cache cannot verify); the key's own revocation
+// key (0x20) or of a subkey (0x28) that is the key's own but does not
+// verify or cannot be read, or another key's when that key is a designated
+// revoker (keyBlock.designated: named by a revocation-key subpacket of one
+// of the key's own direct-key signatures or self-certifications, read or
+// not; the fifth re-review's V-R5M1, the controller's ruling: a third party
+// the key never designated is ignored, as every supported apt ignores it,
+// kr17_tp_keyrev ok in all six images; a designated revoker's is REVKEYSIG
+// in the five gpgv-based apt when they hold the revoker's key and ignored
+// when they do not, the round's kr19 rows, so the cache's mark without that
+// key fails closed); the key's own revocation
 // of a user ID (0x30); or the key's own binding, direct-key signature or
 // self-certification made no earlier than the newest one the cache kept of
 // that class on the component (gpgv takes the newest; it may carry an
@@ -1077,6 +1149,31 @@ func (kb *keyBlock) marks() map[string]error {
 		}
 	}
 	key := upperFP(kb.key.Fingerprint)
+	// Revocations first, over every component, then superseding signatures:
+	// a component both revoked and expired is reported revoked, as gpgv
+	// reports REVKEYSIG before EXPKEYSIG (the first mark on a fingerprint
+	// stands).
+	for _, c := range kb.components {
+		fp, what := key, "the key"
+		if c.kind == onSubkey {
+			fp, what = upperFP(c.key.Fingerprint), "the subkey"
+		}
+		for _, s := range c.sigs {
+			if s.ok {
+				continue
+			}
+			switch t := packet.SignatureType(s.typ); {
+			case (t == packet.SigTypeKeyRevocation || t == packet.SigTypeSubkeyRevocation) && !s.self:
+				if kb.designated(&s) {
+					mark(fp, fmt.Errorf("%w: a revocation of %s (signature type 0x%02x) by a designated revoker, %X, stands on it, which the cache cannot verify; gpgv honours it when it holds that key", pgperrors.ErrKeyRevoked, what, s.typ, s.issuer.keyID))
+				}
+			case t == packet.SigTypeKeyRevocation, t == packet.SigTypeSubkeyRevocation:
+				mark(fp, fmt.Errorf("%w: a revocation of %s (signature type 0x%02x) stands on it that %s; gpgv honours it", pgperrors.ErrKeyRevoked, what, s.typ, s.why))
+			case t == packet.SigTypeCertificationRevocation && s.self:
+				mark(key, fmt.Errorf("%w: the key's revocation of its user ID %q (signature type 0x30) stands on it that %s; gpgv honours it", pgperrors.ErrKeyRevoked, c.uid, s.why))
+			}
+		}
+	}
 	for _, c := range kb.components {
 		fp, what := key, "the key"
 		if c.kind == onSubkey {
@@ -1089,16 +1186,7 @@ func (kb *keyBlock) marks() map[string]error {
 			}
 		}
 		for _, s := range c.sigs {
-			if s.ok {
-				continue
-			}
-			cls := supersedes(s.typ)
-			switch t := packet.SignatureType(s.typ); {
-			case t == packet.SigTypeKeyRevocation, t == packet.SigTypeSubkeyRevocation:
-				mark(fp, fmt.Errorf("%w: a revocation of %s (signature type 0x%02x) stands on it that %s; gpgv honours it", pgperrors.ErrKeyRevoked, what, s.typ, s.why))
-			case t == packet.SigTypeCertificationRevocation && s.self:
-				mark(key, fmt.Errorf("%w: the key's revocation of its user ID %q (signature type 0x30) stands on it that %s; gpgv honours it", pgperrors.ErrKeyRevoked, c.uid, s.why))
-			case cls != 0 && s.self && (s.created.IsZero() || !s.created.Before(newest[cls])):
+			if cls := supersedes(s.typ); !s.ok && cls != 0 && s.self && (s.created.IsZero() || !s.created.Before(newest[cls])) {
 				mark(fp, fmt.Errorf("%w: a signature of type 0x%02x by the key on %s, newer than the one the cache kept, stands on it that %s; gpgv takes the newest, and it may expire or unbind the component", pgperrors.ErrKeyExpired, s.typ, what, s.why))
 			}
 		}

@@ -431,12 +431,14 @@ func TestVerifier_AMarkIsPerComponentAndMerged(t *testing.T) {
 // binding of K older than the one kept (gpgv takes the newest), another
 // key's certification of P's user ID (RIPEMD-160 certifications stand on
 // real keys in debian-keyring). And what the cache could not verify, the
-// key's own revocation that does not verify (corrupt) or one by another
-// key (a designated revoker's, which gpgv honours when it holds that key),
-// marks the component — go-crypto dropped such a key whole, so S1 did not
-// know it; now S1 refuses its bad signature beside a good one, and S2 does
-// not count it, as before (fix round 3's "a key revocation go-crypto
-// cannot verify still drops the key", pinned here for S2).
+// key's own revocation that does not verify (corrupt), marks the component
+// — go-crypto dropped such a key whole, so S1 did not know it; now S1
+// refuses its bad signature beside a good one, and S2 does not count it, as
+// before (fix round 3's "a key revocation go-crypto cannot verify still
+// drops the key", pinned here for S2). A revocation by another key the key
+// never designated is ignored, as every supported apt ignores it (the fifth
+// re-review's kr17_tp_keyrev: ok in all six images; the designated case is
+// TestVerifier_ThirdPartyRevocationsMarkOnlyWhenDesignated).
 func TestVerifier_WhatGpgvIgnoresIsNotMarked(t *testing.T) {
 	kk := newKR14Keys(t)
 	x := newTestEntity(t, "X", "x@example.com")
@@ -477,7 +479,7 @@ func TestVerifier_WhatGpgvIgnoresIsNotMarked(t *testing.T) {
 		{"another key's certification of P's user ID, newer than P's own, and its revocation of it (0x30): K counts", withXCertRev, nil},
 		{"the same certification and revocation (0x30) by another key, both unreadable: K counts", withXCertRevRIPEMD, nil},
 		{"P's own revocation that does not verify: P is known, not counted", kk.ring(t, [][]byte{corrupt}, nil), pgperrors.ErrKeyRevoked},
-		{"a revocation of P by another key: P is known, not counted", kk.ring(t, [][]byte{byX}, nil), pgperrors.ErrKeyRevoked},
+		{"a revocation of P by another key P never designated: ignored, as every apt ignores it (kr17_tp_keyrev); K counts", kk.ring(t, [][]byte{byX}, nil), nil},
 		{"P's own revocation of K that does not verify: K is known, not counted", kk.ring(t, nil, [][]byte{corruptSub}), pgperrors.ErrKeyRevoked},
 	} {
 		v := kr14Verifier(t, map[string][]byte{"00-a.gpg": binaryKey(t, a), "20-p.gpg": tc.ring})
@@ -527,6 +529,83 @@ func TestParseKeyring_MarksWhatItCannotRead(t *testing.T) {
 		why := kf.uncountable[want]
 		if len(kf.uncountable) != 1 || why == nil || !errors.Is(why, row.want) || !strings.Contains(why.Error(), typ) {
 			t.Errorf("%s: marks %v; want %s alone marked %v, naming %s", row.name, kf.uncountable, want, row.want, typ)
+		}
+	}
+}
+
+// TestVerifier_ThirdPartyRevocationsMarkOnlyWhenDesignated: the fifth
+// re-review's V-R5M1, the controller's ruling. A revocation of P (0x20) or
+// of K (0x28) by another key, X, marks its component only when P designated
+// X as a revoker: a revocation-key subpacket (12) naming X in one of P's
+// own direct-key signatures (0x1f, as gpg's addrevoker writes it) or
+// self-certifications, readable or not (an unreadable one fails closed; one
+// whose subpackets cannot be walked at all makes any third party a
+// revoker). Undesignated, the revocation is ignored, as every supported
+// apt ignores it (kr17_tp_keyrev: ok in all six images); designated, the
+// five gpgv-based apt honour it when they hold X's key (the round's kr19
+// rows: REVKEYSIG with X's key in the keyring, ok without; sqv ok), so the
+// cache's mark, made whether or not X's key is loaded, fails closed. A
+// designation of another key, Y, is no designation of X. S1 knows K
+// throughout.
+func TestVerifier_ThirdPartyRevocationsMarkOnlyWhenDesignated(t *testing.T) {
+	kk := newKR14Keys(t)
+	x := newTestEntity(t, "X", "x@example.com")
+	y := newTestEntity(t, "Y", "y@example.com")
+	a := newTestEntity(t, "A", "a@example.com")
+	kGood, kBad := signedBy(t, kk.k, fakeReleasePlaintext), signedBy(t, kk.k, "Origin: Other\n")
+	aGood := signaturePacketsOf(t, clearsignWith(t, a, []byte(fakeReleasePlaintext)))
+	pMaterial, pkMaterial := keyMaterial(t, kk.p.PrimaryKey), keyMaterial(t, kk.p.PrimaryKey, kk.k.PublicKey)
+	uid := firstUID(kk.p)
+	reason := subpacket(t, 29, []byte("\x02designated revocation"))
+	xRevP := rsaKeySig(t, x, byte(packet.SigTypeKeyRevocation), crypto.SHA256, hashSHA256, joined(createdAt(t, kr14Created), issuerFpr(t, x.PrimaryKey), reason), pMaterial)
+	xRevK := rsaKeySig(t, x, byte(packet.SigTypeSubkeyRevocation), crypto.SHA256, hashSHA256, joined(createdAt(t, kr14Created), issuerFpr(t, x.PrimaryKey), reason), pkMaterial)
+	xRevPv3 := rsaKeySigV3(t, x, byte(packet.SigTypeKeyRevocation), pMaterial)
+	designating := func(revoker *openpgp.Entity, hash crypto.Hash, hashID byte) []byte { // P's direct-key signature naming revoker
+		return rsaKeySig(t, kk.p, byte(packet.SigTypeDirectSignature), hash, hashID,
+			joined(createdAt(t, time.Date(2024, 1, 3, 0, 0, 0, 0, time.UTC)), issuerFpr(t, kk.p.PrimaryKey), subpacket(t, 12, joined([]byte{0x80, byte(packet.PubKeyAlgoRSA)}, revoker.PrimaryKey.Fingerprint))),
+			pMaterial)
+	}
+	designatingCert := rsaKeySig(t, kk.p, byte(packet.SigTypePositiveCert), crypto.SHA256, hashSHA256, // a newer self-certification of P's user ID naming X
+		joined(createdAt(t, time.Date(2024, 1, 3, 0, 0, 0, 0, time.UTC)), issuerFpr(t, kk.p.PrimaryKey), subpacket(t, 27, []byte{byte(packet.KeyFlagCertify | packet.KeyFlagSign)}), subpacket(t, 12, joined([]byte{0x80, byte(packet.PubKeyAlgoRSA)}, x.PrimaryKey.Fingerprint))),
+		joined(pMaterial, uidMaterial(uid)))
+	// A direct-key signature by P whose hashed area is no whole subpackets
+	// (a subpacket length running past it): go-crypto refuses it, its issuer
+	// cannot be read, and it may name any revoker.
+	garbled := rsaKeySig(t, kk.p, byte(packet.SigTypeDirectSignature), crypto.SHA256, hashSHA256, []byte{0xbf, 0x02, 0x00}, pMaterial)
+	tags, pkts := rawPacketList(t, binaryKey(t, kk.p))
+	if tags[1] != 13 || tags[2] != 2 {
+		t.Fatalf("test premise: P's packets have tags %v", tags)
+	}
+	withCert := func(cert []byte, afterPrimary ...[]byte) []byte {
+		return joined(pkts[0], joined(afterPrimary...), pkts[1], pkts[2], cert, joined(pkts[3:]...))
+	}
+	for _, tc := range []struct {
+		name string
+		ring []byte
+		want error // nil: K's good signature adopted
+	}{
+		{"X's 0x20 of P, X never designated (kr17_tp_keyrev): K counts", kk.ring(t, [][]byte{xRevP}, nil), nil},
+		{"X's 0x28 of K, X never designated: K counts", kk.ring(t, nil, [][]byte{xRevK}), nil},
+		{"X's v3 0x20 of P, X never designated: K counts", kk.ring(t, [][]byte{xRevPv3}, nil), nil},
+		{"P designates X (0x1f), X's 0x20 of P (kr19_dr_rev): P marked", kk.ring(t, [][]byte{designating(x, crypto.SHA256, hashSHA256), xRevP}, nil), pgperrors.ErrKeyRevoked},
+		{"P designates X (0x1f), X's 0x28 of K: K marked", kk.ring(t, [][]byte{designating(x, crypto.SHA256, hashSHA256)}, [][]byte{xRevK}), pgperrors.ErrKeyRevoked},
+		{"P designates X (0x1f), X's v3 0x20 of P: P marked (by key ID)", kk.ring(t, [][]byte{designating(x, crypto.SHA256, hashSHA256), xRevPv3}, nil), pgperrors.ErrKeyRevoked},
+		{"P designates X in a newer self-certification of its user ID, X's 0x20 of P: P marked", withCert(designatingCert, xRevP), pgperrors.ErrKeyRevoked},
+		{"P designates X in a 0x1f the cache cannot read (RIPEMD-160), X's 0x20 of P: P marked", kk.ring(t, [][]byte{designating(x, crypto.RIPEMD160, hashRIPEMD160), xRevP}, nil), pgperrors.ErrKeyRevoked},
+		{"a 0x1f by P whose subpackets cannot be walked, X's 0x20 of P: P marked (any third party may be designated)", kk.ring(t, [][]byte{garbled, xRevP}, nil), pgperrors.ErrKeyRevoked},
+		{"P designates Y (0x1f), X's 0x20 of P: K counts", kk.ring(t, [][]byte{designating(y, crypto.SHA256, hashSHA256), xRevP}, nil), nil},
+		{"P designates X (0x1f), no revocation (kr19_dr_desig): K counts", kk.ring(t, [][]byte{designating(x, crypto.SHA256, hashSHA256)}, nil), nil},
+	} {
+		v := kr14Verifier(t, map[string][]byte{"00-a.gpg": binaryKey(t, a), "20-p.gpg": tc.ring})
+		_, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, kGood))
+		switch {
+		case tc.want == nil && err != nil:
+			t.Errorf("%s: K's good signature: %v; want it adopted", tc.name, err)
+		case tc.want != nil && (!errors.Is(err, tc.want) || !strings.Contains(err.Error(), "designated revoker")):
+			t.Errorf("%s: K's good signature: %v; want %v, the reader's mark naming a designated revoker", tc.name, err, tc.want)
+		}
+		if _, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, aGood, kBad)); !errors.Is(err, ErrBadSignature) {
+			t.Errorf("%s: A's good signature and K's bad one: %v; want ErrBadSignature (S1 knows K)", tc.name, err)
 		}
 	}
 }
