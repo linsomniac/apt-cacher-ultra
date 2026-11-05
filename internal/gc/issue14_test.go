@@ -4,9 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
 
 // Issue #14's tests (the hardening plan's final review 2, G2-I1 and
@@ -150,4 +153,147 @@ func TestRunTick_AURLPathDeadlineDoesNotDeferTheLaterPasses(t *testing.T) {
 			})
 		})
 	}
+}
+
+// backlogStore is fakeStore whose sub-job C works a retired backlog: each
+// chunk takes chunkSleep and deletes one retired snapshot while any is left
+// (1, more), and reports none left once it is empty (0, no more), as the
+// cache's chunk does for small snapshots; and each periodic snapshot pass's
+// sub-job B (its batch with retireDisplaced) retires retiresPerPass more,
+// as a periodic B retires the displaced snapshots of the day's adoptions.
+type backlogStore struct {
+	*fakeStore
+	mu             sync.Mutex
+	backlog        int
+	maxBacklog     int
+	retiresPerPass int
+}
+
+func (s *backlogStore) RunSnapshotGCBatch(ctx context.Context, n int, grace int64, keep int, retire bool) (cache.SnapshotGCBatchResult, error) {
+	if retire {
+		s.mu.Lock()
+		s.backlog += s.retiresPerPass
+		s.maxBacklog = max(s.maxBacklog, s.backlog)
+		s.mu.Unlock()
+	}
+	return s.fakeStore.RunSnapshotGCBatch(ctx, n, grace, keep, retire)
+}
+
+func (s *backlogStore) RunRetiredSnapshotGCChunk(context.Context, int) (int, bool, error) {
+	time.Sleep(s.chunkSleep)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.backlog == 0 {
+		return 0, false, nil
+	}
+	s.backlog--
+	return 1, true, nil
+}
+
+func (s *backlogStore) left() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.backlog
+}
+
+// runFor runs g.Run for d of virtual time and stops it.
+func runFor(g *GC, d time.Duration) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { g.Run(ctx); close(done) }()
+	time.Sleep(d)
+	cancel()
+	<-done
+}
+
+// Issue #14 (G2-I2, the cadence): while retiredRun's run ends at its
+// deadline with retired snapshots left, Run repeats it an hour later, until
+// one drains them. With five left and two 30 s chunks a 1 min run: runs an
+// hour, two and three hours in (2, 2, then 1 and none left), and no fourth.
+// Before the fix the run came once a process.
+func TestRun_RepeatsTheRetiredRunHourlyWhileABacklogRemains(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logger, buf := captureLogger()
+		g, _ := storeGC(t, &fakeStore{chunksMore: 5, chunkSleep: 30 * time.Second}, 2, logger)
+		g.cfg.Interval = 24 * time.Hour
+		runFor(g, 6*time.Hour)
+		var got []string
+		for _, r := range gcEvents(t, buf, "gc_retired_run_complete") {
+			got = append(got, fmt.Sprintf("%v/%v", r["retired_reaped"], r["deadline_reached"]))
+		}
+		if fmt.Sprint(got) != "[2/true 2/true 1/false]" {
+			t.Fatalf("retired runs (retired_reaped/deadline_reached) %v, want [2/true 2/true 1/false]: hourly until drained", got)
+		}
+	})
+}
+
+// Issue #14 (G2-I2): a periodic tick whose snapshot pass hits its deadline
+// (here sub-job C, behind the 10 its sub-job B retired: five 10 s chunks by
+// its 48 s) arms the retired run an hour later, which deletes the other
+// five, when gc.interval (2 h here) is longer than an hour; the run an hour
+// after the start found nothing and did not re-arm.
+func TestPeriodicTick_ASnapshotDeadlineArmsTheRetiredRun(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logger, buf := captureLogger()
+		s := &backlogStore{fakeStore: &fakeStore{chunkSleep: 10 * time.Second}, retiresPerPass: 10}
+		g, _ := storeGC(t, s, 2, logger)
+		g.cfg.Interval = 2 * time.Hour
+		runFor(g, 3*time.Hour+30*time.Minute)
+		runs := gcEvents(t, buf, "gc_retired_run_complete")
+		if len(runs) != 2 || runs[0]["retired_reaped"] != float64(0) || runs[1]["retired_reaped"] != float64(5) {
+			t.Fatalf("retired runs %v, want two: an hour after the start (none left), and an hour after the tick (5)", runs)
+		}
+		if ticks := gcEvents(t, buf, "gc_run_complete"); len(ticks) != 1 || ticks[0]["deadline_reached"] != true {
+			t.Fatalf("periodic ticks %v, want one, which reached its snapshot deadline", ticks)
+		}
+	})
+}
+
+// Issue #14 (G2-I2), no retry storm: a retired run that fails is not
+// repeated hourly (the next periodic tick retries C, as before): one run,
+// one gc_tick_failed, in five hours.
+func TestRun_AFailedRetiredRunIsNotRepeatedHourly(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logger, buf := captureLogger()
+		g, _ := storeGC(t, &fakeStore{chunkErrs: true}, 2, logger)
+		g.cfg.Interval = 24 * time.Hour
+		runFor(g, 5*time.Hour)
+		if runs := gcEvents(t, buf, "gc_retired_run_complete"); len(runs) != 1 {
+			t.Fatalf("retired runs %v, want one: a failed run is not repeated", runs)
+		}
+		if failed := gcEvents(t, buf, "gc_tick_failed"); len(failed) != 1 {
+			t.Fatalf("gc_tick_failed lines %v, want one", failed)
+		}
+	})
+}
+
+// Issue #14 (G2-I2, the lens's probe P3 scaled down): each daily periodic
+// tick's sub-job B retires 40 displaced snapshots, and one snapshot pass's C
+// deletes 5 (five 10 s chunks by its 48 s; a chunk shorter than the blob
+// pass's 12 s floor, as real chunks are), about the capacity C had a day
+// before the fix, when the retired run (6 a run) came once a process. The
+// hourly retired runs drain the rest within the day, so 20 hours after each
+// of four ticks nothing retired is left, and the backlog never exceeds one
+// day's 40. Before the fix it grew 35 a day.
+func TestRun_TheRetiredBacklogStaysBoundedUnderASustainedDisplacementRate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logger, _ := captureLogger()
+		s := &backlogStore{fakeStore: &fakeStore{chunkSleep: 10 * time.Second}, retiresPerPass: 40}
+		g, _ := storeGC(t, s, 2, logger)
+		g.cfg.Interval = 24 * time.Hour
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { g.Run(ctx); close(done) }()
+		time.Sleep(24*time.Hour + 20*time.Hour)
+		var left []int
+		for range 4 {
+			left = append(left, s.left())
+			time.Sleep(24 * time.Hour)
+		}
+		cancel()
+		<-done
+		if fmt.Sprint(left) != "[0 0 0 0]" || s.maxBacklog > 40 {
+			t.Fatalf("retired left 20 h after each tick %v, at most %d; want [0 0 0 0], at most 40", left, s.maxBacklog)
+		}
+	})
 }

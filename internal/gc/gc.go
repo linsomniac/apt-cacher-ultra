@@ -400,8 +400,26 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 // long tick cannot leave a pending timer firing that starts work again
 // immediately, even when an individual batch exceeds the tick budget.
 // When `gc.interval` is longer than an hour, Run also deletes the retired
-// snapshots once, an hour after the start (retiredRun; the final review's
-// R3 #2).
+// snapshots an hour after the start (retiredRun; the final review's R3 #2),
+// and again an hour after any retired run or periodic tick whose sub-job C
+// stopped at its deadline with retired snapshots left (issue #14), until
+// one drains them.
+//
+// AIDEV-NOTE: issue #14 (the hardening plan's final review 2, G2-I2; the
+// maintainer's decision of 2026-11-05). Since DN-7 a periodic tick's
+// sub-job B only retires the displaced snapshots beyond keep_displaced, and
+// chunked sub-job C deletes them, 1.6-2.3x slower than main's one
+// transaction; with C run once a day (the default gc.interval) and once an
+// hour after a start, a sustained displacement rate above one budget's C
+// capacity grew the retired backlog without bound. Re-arming the retired
+// run hourly while a run or a tick's snapshot pass ends at its deadline
+// gives C up to 24 budgets a day while a backlog lasts, each bounded and
+// chunked as before, on this goroutine (never beside a tick): no new knob,
+// goroutine or table. A tick's snapshot deadline re-arms it even when only
+// A ∪ B had work left; that run then finds nothing retired and costs one
+// SELECT. Never re-armed after a failure or a panic (no hourly retry
+// storm: the next periodic tick retries C, as before), nor when gc.interval
+// is an hour or less, whose ticks already come hourly.
 //
 // When Enabled = false, returns immediately — the goroutine is not
 // started.
@@ -412,11 +430,23 @@ func (g *GC) Run(ctx context.Context) {
 	t := time.NewTimer(g.cfg.Interval)
 	defer t.Stop()
 	// nil when gc.interval is an hour or less: no separate run, since the
-	// first periodic tick, within the hour, normally runs sub-job C itself.
-	var retiredDue <-chan time.Time
+	// periodic ticks, within the hour, run sub-job C themselves.
+	var (
+		rt         *time.Timer
+		retiredDue <-chan time.Time
+	)
 	if g.cfg.Interval > retiredRunAfterStart {
-		rt := time.NewTimer(retiredRunAfterStart)
+		rt = time.NewTimer(retiredRunAfterStart)
 		defer rt.Stop()
+		retiredDue = rt.C
+	}
+	// rearmRetired arms the retired run an hour from now, unless it is off
+	// or already armed.
+	rearmRetired := func() {
+		if rt == nil || retiredDue != nil {
+			return
+		}
+		rt.Reset(retiredRunAfterStart)
 		retiredDue = rt.C
 	}
 
@@ -429,12 +459,16 @@ func (g *GC) Run(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			g.retiredRun(ctx)
+			if g.retiredRun(ctx) {
+				rearmRetired()
+			}
 		case <-t.C:
 			if ctx.Err() != nil {
 				return
 			}
-			g.periodicTick(ctx)
+			if g.periodicTick(ctx) {
+				rearmRetired()
+			}
 			t.Reset(g.cfg.Interval)
 		}
 	}
@@ -448,7 +482,10 @@ func (g *GC) Run(ctx context.Context) {
 // summary stay inside the recovered function, so a tick that panicked
 // leaves acu_gc_last_run_unixtime as it was: its age is the alert. A
 // panic in a pass moves the rotation past that pass (skipPanickedPass).
-func (g *GC) periodicTick(ctx context.Context) {
+// It reports snapshotBacklog, for Run's retired run (issue #14): its
+// snapshot pass stopped at its deadline with work left; false when a pass
+// panicked.
+func (g *GC) periodicTick(ctx context.Context) (snapshotBacklog bool) {
 	passesDone := false
 	defer g.skipPanickedPass(&passesDone)
 	defer g.recoverPanic("tick")
@@ -458,6 +495,7 @@ func (g *GC) periodicTick(ctx context.Context) {
 	// StartupPass's caller, so a tick logs none of its own for it.
 	tick, _ := g.runTick(ctx, "periodic")
 	passesDone = true
+	snapshotBacklog = tick.snapshotDeadlineReached
 	duration := time.Since(start)
 	endUnix := wallclock.Unix()
 	g.cfg.Logger.Info("gc_run_complete",
@@ -517,6 +555,7 @@ func (g *GC) periodicTick(ctx context.Context) {
 		PoolUnlinkErrors:        tick.poolUnlinkErrors,
 		DeadlineReached:         tick.deadlineReached,
 	})
+	return snapshotBacklog
 }
 
 // gcStore is what the url-path pass, the snapshot pass and the pool scan
@@ -646,10 +685,13 @@ type tickResult struct {
 	urlPathRowsReaped      int
 	poolUnlinkErrors       int
 	deadlineReached        bool
-	urlPath                urlPathResult
-	urlPathDuration        time.Duration
-	snapshotDuration       time.Duration
-	blobDuration           time.Duration
+	// snapshotDeadlineReached: the snapshot pass stopped at its deadline
+	// with work left (A ∪ B, or sub-job C); Run re-arms its retired run.
+	snapshotDeadlineReached bool
+	urlPath                 urlPathResult
+	urlPathDuration         time.Duration
+	snapshotDuration        time.Duration
+	blobDuration            time.Duration
 }
 
 // tickDeadlines are one tick's three pass deadlines (passDeadlines).
@@ -798,6 +840,7 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 		res.retiredReaped += snap.retired
 		if snapDeadline {
 			res.deadlineReached = true
+			res.snapshotDeadlineReached = true
 		}
 		switch {
 		case err != nil: // passFailed moves the rotation to the blob pass

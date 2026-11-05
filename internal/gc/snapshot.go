@@ -174,16 +174,20 @@ func (g *GC) runSubJobC(ctx context.Context, expired func() bool, batchesRun *in
 }
 
 // retiredRunAfterStart is when, after the start, Run deletes the retired
-// snapshots once (retiredRun), if gc.interval is longer.
+// snapshots (retiredRun), if gc.interval is longer, and how long after a
+// run or a periodic tick that left a backlog it runs again (issue #14).
 const retiredRunAfterStart = time.Hour
 
 // phaseRetired labels retiredRun's gc_tick_deadline_reached line.
 const phaseRetired = "retired"
 
-// retiredRun runs sub-job C alone, once, retiredRunAfterStart after the
-// start (Run), within max_tick_duration, and logs INFO
-// gc_retired_run_complete. A panic is recovered (gc_panicked,
-// where=retired); the periodic ticks are not affected.
+// retiredRun runs sub-job C alone, retiredRunAfterStart after the start
+// (Run), within max_tick_duration, and logs INFO gc_retired_run_complete.
+// It reports backlog: C stopped at its deadline with retired snapshots
+// left, so Run runs it again an hour later (issue #14: hourly while a
+// backlog lasts); false when it drained them, failed, panicked or was
+// stopped by ctx. A panic is recovered (gc_panicked, where=retired); the
+// periodic ticks are not affected.
 //
 // AIDEV-NOTE: the final review's R3 #2. Sub-job C ran only in the periodic
 // ticks (the startup pass skips it, ruling PF-15), and the first tick comes
@@ -203,7 +207,10 @@ const phaseRetired = "retired"
 // this run takes those still retired when a tick's pass stopped before its
 // C had deleted them (its deadline, a shutdown, or a batch or chunk that
 // failed or panicked), which the startup pass's B no longer selects.
-func (g *GC) retiredRun(ctx context.Context) {
+// Since issue #14 it also repeats hourly while a backlog lasts (Run's
+// AIDEV-NOTE): once a process could not keep up with a sustained
+// displacement rate.
+func (g *GC) retiredRun(ctx context.Context) (backlog bool) {
 	defer g.recoverPanic("retired")
 	start := time.Now()
 	batchesRun := 0
@@ -222,4 +229,7 @@ func (g *GC) retiredRun(ctx context.Context) {
 		"deadline_reached", deadlineHit,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
+	// deadlineHit is false after a failed chunk or a shutdown
+	// (runSubJobC): no hourly retry storm.
+	return deadlineHit
 }
