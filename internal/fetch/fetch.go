@@ -537,20 +537,23 @@ func (c *Client) doAttempt(
 		// bytes and hash state before reporting success. A local reset
 		// failure must not be retried as an upstream failure.
 		//
-		// AIDEV-NOTE: the maintainer's ruling of 2026-11-05 (final
-		// review 2's F2-I1, D2-M2 and F2-M3). Fetch accepts a 204 for
-		// every caller but marks it NoContent; the callers decide by
-		// class. An empty success only for indexes and metadata: the
-		// adoption path's Release members (verifyMember checks their
-		// declared size and hashes, so a member declared size 0 is
-		// the one a 204 can satisfy), the handler's metadata recovery
-		// (runSnapshotMemberFetch, declared hash) and the client
-		// path's proxy.IsMetadata paths (runFetch). For a .deb or any
-		// other package file a 204 is an upstream error, as before
-		// commit 3a6d5ba: runFetch answers 502 and caches nothing
-		// (ErrUpstreamNoContent), and hot prefetch counts a failed
-		// warm. Status stays 200 so the resume loop above treats the
-		// 204 as fresh headers; UpstreamStatus reports the 204.
+		// AIDEV-NOTE: the maintainer's rulings of 2026-11-05 (final
+		// review 2's F2-I1, D2-M2, F2-M3 and F2-R1-M1; the history and
+		// the rule not to flip are in handler.runFetch's AIDEV-NOTE).
+		// Fetch accepts a 204 for every caller but marks it NoContent;
+		// the callers decide by class. An empty success only for
+		// indexes and metadata: the adoption path's Release members
+		// (verifyMember checks their declared size and hashes, so a
+		// member declared size 0 is the one a 204 can satisfy), the
+		// handler's metadata recovery (runSnapshotMemberFetch, declared
+		// hash) and the client path's proxy.IsMetadata paths that are
+		// no anchor (runFetch). For a .deb or any other package file,
+		// and for an anchor (InRelease, Release, Release.gpg), a 204 is
+		// an upstream error, as before commit 3a6d5ba: runFetch answers
+		// 502 and caches nothing (ErrUpstreamNoContent), and hot
+		// prefetch counts a failed warm. Status stays 200 so the resume
+		// loop above treats the 204 as fresh headers; UpstreamStatus
+		// reports the 204.
 		if dst.Written() > 0 {
 			if err := dst.Truncate(); err != nil {
 				return out, fmt.Errorf("%w: truncate dst on 204: %v", ErrCacheWriteFailed, err)

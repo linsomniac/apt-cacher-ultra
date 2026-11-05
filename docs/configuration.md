@@ -102,16 +102,19 @@ handling requires those bytes escaped in a path. Request paths containing a
 decoded control byte are rejected with 400.
 
 An upstream answer of 204 No Content is an empty file only for index and
-metadata files: a `Release` member an adoption fetches (its declared size and
-hashes still decide, so only a member declared empty passes), and a client's
-request for an `InRelease`, `Release` or `Release.gpg`, an index
-(`Packages*`, `Sources*`, `Contents-*`, `Translation-*`, `Components-*`,
-`icons-*`, a `.diff/Index`) or a `by-hash` file, which is cached and served as
-an empty 200. For a `.deb` or any other file a 204 is an upstream error: the
-client gets 502 with `Retry-After`, nothing is cached, and hot prefetch counts
-the `.deb` as failed. The request line's `upstream_status` (and
-`X-Upstream-Status`) is 204 either way, and the fetch counts in
-`acu_fetch_total{outcome="no_content"}`, not `success`.
+metadata files (some registries, GitLab's Debian one among them, serve an
+empty index such as `binary-all/Packages` as 204): a `Release` member an
+adoption fetches (its declared size and hashes still decide, so only a member
+declared empty passes), and a client's request for an index (`Packages*`,
+`Sources*`, `Contents-*`, `Translation-*`, `Components-*`, `icons-*`, a
+`.diff/Index`) or a `by-hash` file, which is cached and served as an empty
+200. For a `.deb` or any other package file, and for a suite's `InRelease`,
+`Release` or `Release.gpg` (apt reads no empty one: it fails `apt update`
+outright, where a 502 only warns and keeps the old lists), a 204 is an
+upstream error: the client gets 502 with `Retry-After`, nothing is cached,
+and hot prefetch counts the `.deb` as failed. The request line's
+`upstream_status` (and `X-Upstream-Status`) is 204 either way, and the fetch
+counts in `acu_fetch_total{outcome="no_content"}`, not `success`.
 
 ### Using an upstream proxy
 

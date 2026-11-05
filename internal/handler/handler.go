@@ -397,11 +397,13 @@ var (
 
 	// ErrUpstreamNoContent fires when upstream answers 204 No Content
 	// on a miss of a path proxy.IsMetadata does not classify as an
-	// index or metadata (a .deb or any other package file): the
-	// maintainer's ruling of 2026-11-05 makes that an upstream error,
-	// as before commit 3a6d5ba. respondError emits 502 + Retry-After
-	// (outcome bad_gateway, upstream_status 204); nothing is cached.
-	ErrUpstreamNoContent = errors.New("handler: upstream answered 204 No Content for a package file")
+	// index or metadata (a .deb or any other package file), or of an
+	// anchor (InRelease, Release, Release.gpg): the maintainer's rulings
+	// of 2026-11-05 make that an upstream error, as before commit
+	// 3a6d5ba (the history is in runFetch's AIDEV-NOTE). respondError
+	// emits 502 + Retry-After (outcome bad_gateway, upstream_status
+	// 204); nothing is cached.
+	ErrUpstreamNoContent = errors.New("handler: upstream answered 204 No Content for a package file or an anchor")
 
 	// ErrUnvouchedDebRefused fires when the SPEC3 §6.1/§6.2 strict-mode
 	// predicate refuses an unvouched .deb on the miss path. respondError
@@ -2124,15 +2126,32 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 		return sfResult{err: ferr, status: status}
 	}
 
-	// AIDEV-NOTE: the maintainer's ruling of 2026-11-05 (F2-I1, D2-M2).
-	// A 204 is an empty success only for a path proxy.IsMetadata
-	// classifies as an index or metadata. For anything else — a .deb or
-	// any other package file — it is an upstream error, as before commit
-	// 3a6d5ba: nothing is finalized (the deferred Abort drops the temp),
-	// so the next request fetches again instead of hitting an empty
-	// blob for good. Pinned by TestServeHTTP_NoContentPackageFileIsAnUpstreamError
-	// and TestServeHTTP_NoContentMetadataIsAnEmptySuccess.
-	if fres.NoContent && !req.IsMetadata {
+	// AIDEV-NOTE: HTTP 204 acceptance — the history, and a rule not to flip.
+	// History: PR #22 by Laurent Corbes (@lcaflc): GitLab's Debian
+	// registry serves zero-byte index files, such as an empty
+	// main/debian-installer/binary-all/Packages, as 204. The maintainer
+	// implemented it on 2026-11-01 (main 2e987d1, this branch 3a6d5ba),
+	// accepting a 204 on every path. Narrowing: on 2026-11-05 the
+	// maintainer limited it to indexes, metadata and declared-size-0
+	// downloads (adoption members, whose declared size and hashes decide).
+	// A 204 for a package file is an upstream error (final review 2,
+	// F2-I1, D2-M2), and so is a 204 for an anchor, InRelease, Release or
+	// Release.gpg, dists or flat (F2-R1-M1). Measured with apt 3.0.3
+	// (debian:13), 2.8.3 (ubuntu:24.04) and 2.2.4 (debian:11): an empty
+	// or 204 InRelease or Release.gpg is a hard error (NOSPLIT/NODATA,
+	// exit 100), a 502 only warns (exit 0, old lists kept), and only a
+	// 404 makes apt fall back to Release + Release.gpg. Refused here:
+	// 502 + Retry-After (ErrUpstreamNoContent), nothing finalized (the
+	// deferred Abort drops the temp), so the next request fetches again.
+	// Do not widen 204 acceptance to anchors or package files without
+	// re-measuring apt and asking the maintainer. Do not narrow it below
+	// empty indexes: that breaks PR #22's GitLab case. Pinned by
+	// TestServeHTTP_NoContent{PackageFile,Anchor}IsAnUpstreamError,
+	// TestServeHTTP_NoContentMetadataIsAnEmptySuccess and
+	// TestAdopter_NoContentHTTP (internal/freshness).
+	// The three anchor classes, not file.Marks(), which leaves out Release.
+	anchor := file == aptpath.FileInRelease || file == aptpath.FileRelease || file == aptpath.FileReleaseGPG
+	if fres.NoContent && (!req.IsMetadata || anchor) {
 		return sfResult{err: ErrUpstreamNoContent, status: fres.UpstreamStatus()}
 	}
 

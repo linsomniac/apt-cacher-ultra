@@ -934,6 +934,50 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
 
 ## Decided
 
+- **An upstream HTTP 204 is an empty file for indexes and metadata only**
+  (the maintainer, 2026-11-05; raised by the hardening plan's final review
+  2, F2-I1 and D2-M2, then F2-R1-M1). History: PR #22 by Laurent Corbes
+  (@lcaflc) — GitLab's Debian registry serves zero-byte index files, such
+  as an empty `main/debian-installer/binary-all/Packages`, as 204 — which
+  the maintainer implemented on 2026-11-01 (main 2e987d1, this branch
+  3a6d5ba), accepting a 204 on every path. On this branch a 204 for a
+  `.deb` the snapshots do not vouch for was then cached as an empty file
+  and served as a HIT for good, where 1.0.x answered 502 and cached
+  nothing; a 204 for an anchor was cached as an empty anchor. The
+  narrowing: a 204 is an empty success only for indexes, metadata and
+  declared-size-0 downloads — an adoption's `Release` members (declared
+  size and hashes decide), an adopted suite's metadata recovery (declared
+  hash decides) and a client's index or metadata miss (`proxy.IsMetadata`)
+  that is no anchor. A 204 for a `.deb` or any other package file is an
+  upstream error (F2-I1, D2-M2), and so is a 204 for an anchor, a path
+  `aptpath.ClassifySuiteFile` classifies as `InRelease`, `Release` or
+  `Release.gpg`, dists and flat suites alike (F2-R1-M1): a 502 with
+  `Retry-After`, nothing cached; hot prefetch counts such a `.deb` as a
+  failed warm. Measured (`PE/final-review-2/F2-report.txt`, *Re-review 1*
+  (3)): with
+  apt 3.0.3 (debian:13), 2.8.3 (ubuntu:24.04) and 2.2.4 (debian:11), an
+  empty or 204 `InRelease` or `Release.gpg` is a hard error
+  (NOSPLIT/NODATA, exit 100), a 502 only warns (exit 0, the old lists
+  kept), and only a 404 makes apt fall back to `Release` and
+  `Release.gpg`. A 204 is visible either way: `upstream_status` 204 and
+  `acu_fetch_total{outcome="no_content"}` (F2-M3). Do not widen 204
+  acceptance to anchors or package files without re-measuring apt and
+  asking the maintainer; do not narrow it below empty indexes, which
+  breaks PR #22's GitLab case. Residual: an anchor-named path with no
+  suite (a host-root flat repository's `/InRelease`, unsupported and
+  logged `flat_host_root_unsupported`; a non-canonical path) is
+  classified as plain metadata and still accepts a 204. Commit c2ee1c2
+  and its anchor follow-up; the decision point is `runFetch`'s
+  AIDEV-NOTE (`internal/handler/handler.go`). Pinned by
+  `TestServeHTTP_NoContentPackageFileIsAnUpstreamError`,
+  `TestServeHTTP_NoContentAnchorIsAnUpstreamError`,
+  `TestServeHTTP_NoContentMetadataIsAnEmptySuccess`,
+  `TestServeHTTP_NoContentMissThenHit`,
+  `TestServeHTTP_NoContentSnapshotMemberRecovery`,
+  `TestAdopter_NoContentHTTP` (PR #22's case through adoption),
+  `TestRunHotPrefetch_NoContentIsAFailure`,
+  `TestFetch_NoContentIsEmptySuccess` and `TestFetch_NoContentOnlyForA204`.
+
 - **Issue #14: GC frees disk again on a busy cache, and the retired backlog
   stays bounded** (the maintainer, 2026-11-05: worked for 1.1.0, all three
   parts of a consult's design; raised 2026-09-28 as GitHub issue #14, and

@@ -29,8 +29,9 @@ Fields that follow this pattern:
   means "fetch attempted, no response arrived" (timeout, dial denied).
   Value 204 means upstream answered 204 No Content: for an index or
   metadata path the empty file is served as a 200 and cached; for a
-  `.deb` or any other path the miss is refused (502 with `Retry-After`,
-  outcome `bad_gateway`, nothing cached). Either way the fetch counts in
+  suite's `InRelease`, `Release` or `Release.gpg`, a `.deb` or any other
+  path the miss is refused (502 with `Retry-After`, outcome
+  `bad_gateway`, nothing cached). Either way the fetch counts in
   `acu_fetch_total{outcome="no_content"}`, not `success` (see
   configuration.md, `[upstream]`).
 - `snapshot_displaced` — emitted as `true` only when a by-hash request
