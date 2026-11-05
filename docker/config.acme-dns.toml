@@ -1,0 +1,38 @@
+# Edit the DNS name, authority and terms choice before deploying.
+[cache]
+dir = "/var/cache/apt-cacher-ultra"
+listen = "0.0.0.0:3142"
+listen_tls = "0.0.0.0:3143"
+use_acme = true
+
+[admin]
+listen = "0.0.0.0:6789"
+use_acme = true
+htpasswd_file = "/run/secrets/admin.htpasswd"
+
+[acme]
+enabled = true
+directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"
+dns_name = "cache.example.net"
+challenge_type = "dns-01"
+dns_provider = "cloudflare"
+dns_resolvers = ["1.1.1.1:53", "8.8.8.8:53"]
+accept_terms = false
+
+[upstream]
+allowed_host_regex = ['^.*$']
+deny_target_ranges = [
+  "0.0.0.0/8", "127.0.0.0/8", "::/128", "::1/128",
+  "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7",
+  "169.254.0.0/16", "fe80::/10", "100.64.0.0/10",
+]
+allow_https_to_http_redirect = false
+
+[tls_mitm]
+enabled = false
+
+[adoption]
+enabled = false
+
+[log]
+format = "json"

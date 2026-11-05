@@ -15,7 +15,7 @@ import (
 // expects. Forward-only: a database tagged with a higher version is treated
 // as written by a newer binary and the cache refuses to open it. SPEC §4.3,
 // SPEC2 §4.3, SPEC3 §4.3, SPEC4 §4.3, flat-repositories design §6.
-const CurrentSchemaVersion = 7
+const CurrentSchemaVersion = 9
 
 // migrations is indexed such that migrations[N] migrates the database from
 // schema version N to N+1. migrations[0] (v0 → v1) creates the entire
@@ -361,6 +361,50 @@ CREATE TABLE legacy_trust_audit (
 );
 INSERT INTO legacy_trust_audit (snapshot_id)
   SELECT snapshot_id FROM suite_snapshot WHERE adopted_at IS NOT NULL;
+`,
+	// v7 → v8: URL-specific HTTP dates and legacy refresh publication fence.
+	`
+ALTER TABLE suite_freshness ADD COLUMN metadata_generation INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE metadata_clock (id INTEGER PRIMARY KEY CHECK (id = 1), generation INTEGER NOT NULL);
+INSERT INTO metadata_clock VALUES (1, 0);
+CREATE TRIGGER suite_metadata_generation AFTER INSERT ON suite_freshness BEGIN
+  UPDATE metadata_clock SET generation = generation + 1 WHERE id = 1;
+  UPDATE suite_freshness SET metadata_generation = (SELECT generation FROM metadata_clock WHERE id = 1)
+    WHERE rowid = NEW.rowid;
+END;
+CREATE TABLE representation_metadata (
+  canonical_scheme TEXT NOT NULL,
+  canonical_host TEXT NOT NULL,
+  path TEXT NOT NULL,
+  blob_hash TEXT NOT NULL REFERENCES blob(hash) ON DELETE CASCADE,
+  last_modified TEXT NOT NULL,
+  observed_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (canonical_scheme, canonical_host, path, blob_hash)
+);
+CREATE INDEX idx_representation_blob ON representation_metadata(blob_hash);
+CREATE INDEX idx_representation_observed ON representation_metadata(observed_at);
+INSERT OR IGNORE INTO representation_metadata (canonical_scheme, canonical_host, path, blob_hash, last_modified)
+  SELECT canonical_scheme, canonical_host, path, blob_hash, upstream_lastmod
+  FROM url_path WHERE blob_hash IS NOT NULL AND upstream_lastmod IS NOT NULL;
+INSERT OR IGNORE INTO representation_metadata (canonical_scheme, canonical_host, path, blob_hash, last_modified)
+  SELECT canonical_scheme, canonical_host,
+         suite_path || CASE WHEN anchor_form = 'inline' THEN '/InRelease' ELSE '/Release' END,
+         COALESCE(inrelease_hash, release_hash), inrelease_lastmod
+  FROM suite_snapshot WHERE inrelease_lastmod IS NOT NULL;
+`,
+	// v8 → v9: constant-size anonymous usage totals, independent of cache GC.
+	`
+CREATE TABLE usage_totals (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  since_unixtime INTEGER NOT NULL CHECK (since_unixtime > 0),
+  fetched_bytes INTEGER NOT NULL CHECK (fetched_bytes >= 0),
+  served_bytes INTEGER NOT NULL CHECK (served_bytes >= 0),
+  cache_hit_bytes INTEGER NOT NULL CHECK (cache_hit_bytes BETWEEN 0 AND served_bytes),
+  requests INTEGER NOT NULL CHECK (requests >= 0),
+  cache_hit_requests INTEGER NOT NULL CHECK (cache_hit_requests BETWEEN 0 AND requests),
+  fetch_nanoseconds INTEGER NOT NULL CHECK (fetch_nanoseconds >= 0),
+  serve_nanoseconds INTEGER NOT NULL CHECK (serve_nanoseconds >= 0)
+);
 `,
 }
 

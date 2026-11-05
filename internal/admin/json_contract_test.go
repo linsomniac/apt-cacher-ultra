@@ -28,6 +28,7 @@ func TestJSONContractPreserved(t *testing.T) {
 	}{
 		{"populated", "json_contract_golden.json", populatedJSONContractFixture},
 		{"minimal", "json_contract_minimal_golden.json", minimalJSONContractFixture},
+		{"server_tls", "json_contract_server_tls_golden.json", serverTLSJSONFixture},
 	}
 
 	for _, c := range cases {

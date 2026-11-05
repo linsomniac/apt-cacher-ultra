@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/health"
 )
 
 // handleMetrics serves the /metrics endpoint in Prometheus text
@@ -75,69 +76,26 @@ func (e *errCapturingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// handleHealthz serves the /healthz endpoint. SPEC5 §9.7.4.
-//
-// Checks (in order; first failure short-circuits):
-//
-//  1. Process not in graceful shutdown — atomic load, microseconds.
-//  2. Cache directory writable — os.CreateTemp + write + remove.
-//  3. DB pingable — c.Ping under a 1s deadline.
-//
-// On all-pass: 200 ok\n. On any failure: 503 degraded\n with
-// X-Acu-Check-Failed naming the failing check.
+// handleHealthz shares proxy readiness while retaining admin authentication
+// and metrics. Recheck shutdown after I/O so a draining probe fails closed.
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	check := s.cfg.HealthCheck
+	if check == nil {
+		check = (health.Check{Cache: s.cfg.Cache}).Failure
+	}
+	failure := "shutdown"
+	if !s.shuttingDown.Load() {
+		failure = check(r.Context())
+	}
 	if s.shuttingDown.Load() {
-		writeHealthzFail(w, "shutdown")
-		s.self.healthzTotal.Inc("degraded")
-		return
+		failure = "shutdown"
 	}
-	if err := s.checkCacheDirWritable(); err != nil {
-		writeHealthzFail(w, "cache_dir")
-		s.self.healthzTotal.Inc("degraded")
-		return
+	health.Respond(w, r, failure)
+	status := "ok"
+	if failure != "" {
+		status = "degraded"
 	}
-	pingCtx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
-	defer cancel()
-	if err := s.cfg.Cache.Ping(pingCtx); err != nil {
-		writeHealthzFail(w, "db_ping")
-		s.self.healthzTotal.Inc("degraded")
-		return
-	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("ok\n"))
-	s.self.healthzTotal.Inc("ok")
-}
-
-// checkCacheDirWritable creates a unique-suffix temp file under
-// the cache directory, writes one byte, and removes it. SPEC5
-// §9.7.4 check 2: CreateTemp avoids the race a fixed filename
-// would create when concurrent probes overlap.
-func (s *Server) checkCacheDirWritable() error {
-	dir := s.cfg.Cache.Dir()
-	f, err := os.CreateTemp(dir, ".acu-healthz-*")
-	if err != nil {
-		return err
-	}
-	name := f.Name()
-	if _, werr := f.Write([]byte{0}); werr != nil {
-		_ = f.Close()
-		_ = os.Remove(name)
-		return werr
-	}
-	if cerr := f.Close(); cerr != nil {
-		_ = os.Remove(name)
-		return cerr
-	}
-	return os.Remove(name)
-}
-
-// writeHealthzFail writes the SPEC5 §9.7.4 503 response.
-func writeHealthzFail(w http.ResponseWriter, check string) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("X-Acu-Check-Failed", check)
-	w.WriteHeader(http.StatusServiceUnavailable)
-	_, _ = w.Write([]byte("degraded\n"))
+	s.self.healthzTotal.Inc(status)
 }
 
 // handleStatus serves the SPEC5 §9.7.3 status page. Content

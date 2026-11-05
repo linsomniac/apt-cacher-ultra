@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/upstreamproxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/usage"
 )
 
 // Sentinel errors. Callers identify retryable-vs-fatal failures with
@@ -89,7 +90,8 @@ const defaultUserAgent = "apt-cacher-ultra/0.1"
 // timeouts mean "no timeout" at the transport level and rely on
 // TotalTimeout (set by Defaults) for the overall budget.
 type Options struct {
-	Proxy            string // explicit HTTP(S) proxy URL; empty means direct; may contain credentials
+	Usage            *usage.Collector // optional aggregate accounting shared with the cache handler
+	Proxy            string           // explicit HTTP(S) proxy URL; empty means direct; may contain credentials
 	ConnectTimeout   time.Duration
 	TotalTimeout     time.Duration
 	IdleReadTimeout  time.Duration // currently informational; per-byte read timeouts are a Phase 2 candidate.
@@ -235,6 +237,9 @@ func New(opts Options) (*Client, error) {
 	allowDowngrade := opts.AllowHTTPSToHTTPRedirect
 	tracker := newUnreachableTracker(opts.UnreachableCooldown, opts.UnreachableProbeTimeout, opts.now)
 	transport := newTransport(opts, deny, tracker, proxyURL)
+	if opts.Usage != nil {
+		transport = usage.Transport{Base: transport, Usage: opts.Usage}
+	}
 	ua := opts.UserAgent
 	if ua == "" {
 		ua = defaultUserAgent

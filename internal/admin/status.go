@@ -14,11 +14,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/acme"
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/gc"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
+	"github.com/linsomniac/apt-cacher-ultra/internal/servertls"
+	"github.com/linsomniac/apt-cacher-ultra/internal/usage"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
@@ -31,18 +34,21 @@ import (
 // `"gc": {"last_run_unixtime": null}` with the rest of the gc.*
 // block omitted (a custom MarshalJSON on gcInfo handles this).
 type statusModel struct {
-	Process         processInfo      `json:"process"`
-	Cache           cacheInfo        `json:"cache"`
-	CacheSummary    cacheSummary     `json:"cache_summary"`
-	RepoCoverage    repoCoverageInfo `json:"repo_coverage"`
-	Listeners       []listenerInfo   `json:"listeners"`
-	TLSMITM         *tlsMITMInfo     `json:"tls_mitm"`
-	Suites          []suiteEntry     `json:"suites"`
-	GC              *gcInfo          `json:"gc"`
-	HotURLPaths     []hotURLEntry    `json:"hot_url_paths"`
-	RecentAdoptions []adoptionEntry  `json:"recent_adoptions"`
-	ActiveHosts     []activeHostInfo `json:"active_hosts"`
-	Keyring         []keyringEntry   `json:"keyring"`
+	Usage           *usage.Snapshot               `json:"usage,omitempty"`
+	ServerTLS       map[string]servertls.Snapshot `json:"server_tls,omitempty"`
+	ACME            *acme.Status                  `json:"acme,omitempty"`
+	Process         processInfo                   `json:"process"`
+	Cache           cacheInfo                     `json:"cache"`
+	CacheSummary    cacheSummary                  `json:"cache_summary"`
+	RepoCoverage    repoCoverageInfo              `json:"repo_coverage"`
+	Listeners       []listenerInfo                `json:"listeners"`
+	TLSMITM         *tlsMITMInfo                  `json:"tls_mitm"`
+	Suites          []suiteEntry                  `json:"suites"`
+	GC              *gcInfo                       `json:"gc"`
+	HotURLPaths     []hotURLEntry                 `json:"hot_url_paths"`
+	RecentAdoptions []adoptionEntry               `json:"recent_adoptions"`
+	ActiveHosts     []activeHostInfo              `json:"active_hosts"`
+	Keyring         []keyringEntry                `json:"keyring"`
 }
 
 // htmlRenderModel is the additive presentation wrapper used by the
@@ -237,8 +243,9 @@ type cacheInfo struct {
 }
 
 type listenerInfo struct {
-	Role string `json:"role"`
-	Addr string `json:"addr"`
+	Scheme string `json:"scheme,omitempty"`
+	Role   string `json:"role"`
+	Addr   string `json:"addr"`
 }
 
 type suiteEntry struct {
@@ -451,6 +458,7 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 
 	uptime := time.Since(s.cfg.StartTime)
 	model := statusModel{
+		Usage: s.cfg.Usage.Snapshot(),
 		Process: processInfo{
 			Version:         s.cfg.BuildInfo.Version,
 			StartedUnixTime: s.cfg.StartTime.Unix(),
@@ -475,6 +483,12 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 		RecentAdoptions: buildAdoptionEntries(s.cfg.Ring.Snapshot()),
 		ActiveHosts:     buildActiveHostEntries(s.cfg.HostLimiter.Snapshot()),
 		Keyring:         buildKeyringEntries(s.cfg.Keyring),
+	}
+	if s.cfg.ServerTLS != nil {
+		model.ServerTLS = s.cfg.ServerTLS()
+	}
+	if s.cfg.ACME != nil {
+		model.ACME = s.cfg.ACME()
 	}
 	annotateSuiteEntries(model.Suites, s.adoptionEnabled(), s.cfg.CheckBackoff, wallclock.Now().Unix())
 
@@ -619,12 +633,16 @@ func buildRepoCoverageInfo(rc cache.RepoCoverage, filter []string) repoCoverageI
 
 func buildListenerInfo(cfg Config) []listenerInfo {
 	out := []listenerInfo{
-		{Role: "proxy", Addr: cfg.ProxyAddr},
+		{Role: "proxy", Addr: cfg.ProxyAddr, Scheme: "http"},
 	}
 	if cfg.TLSAddr != "" {
-		out = append(out, listenerInfo{Role: "tls", Addr: cfg.TLSAddr})
+		out = append(out, listenerInfo{Role: "tls", Addr: cfg.TLSAddr, Scheme: "https"})
 	}
-	out = append(out, listenerInfo{Role: "admin", Addr: cfg.AdminAddr})
+	scheme := "http"
+	if cfg.TLS != nil {
+		scheme = "https"
+	}
+	out = append(out, listenerInfo{Role: "admin", Addr: cfg.AdminAddr, Scheme: scheme})
 	return out
 }
 
@@ -836,12 +854,11 @@ func adoptionStatus(s cache.SuiteFreshness, refused, long bool, now int64) strin
 }
 
 // suitesForHTML adapts the suite rows to the HTML page. With adoption
-// disabled nothing is attempted or adopted, so a record stored while it
+// disabled no snapshot adoption is attempted, so a record stored while it
 // was enabled is inert: its text gains " (adoption disabled)" and it marks
-// no warn (final review S I3). A lag is truthful but expected — Phase 1
-// never refreshes metadata — so rows keep their lag text without warning,
-// and vitalState shows the SUITES vital stale with "ADOPTION DISABLED —
-// METADATA NOT REFRESHED" (ruling A4). The JSON keeps the raw fields.
+// no warn. Legacy URL metadata refreshes independently. Existing snapshots
+// still require adoption, so lag text stays visible and vitalState says
+// "ADOPTION DISABLED". The JSON keeps the raw fields.
 func suitesForHTML(suites []suiteEntry, adoptionEnabled bool) []suiteEntry {
 	if adoptionEnabled {
 		return suites
@@ -972,6 +989,7 @@ func buildKeyringEntries(p KeyringProvider) []keyringEntry {
 // renderStatus renders the SPEC5 §10.5 status page in either JSON
 // or HTML per content negotiation (§9.7.3).
 func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	start := time.Now()
 	format := chooseFormat(r)
 	defer func() {
@@ -1080,6 +1098,9 @@ func statusTemplateFuncMap() template.FuncMap {
 		"unixTime":            formatUnixTimeTag,
 		"unixTimePtr":         formatUnixTimePtrTag,
 		"formatBytes":         formatBytes,
+		"usageRate":           formatUsageRate,
+		"usagePercent":        formatUsagePercent,
+		"signedBytes":         formatSignedBytes,
 		"durationOf":          durationOf,
 		"i64Ptr":              formatInt64Ptr,
 		"hitRatePct":          formatHitRatePercent,
@@ -1247,6 +1268,35 @@ func formatBytes(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+func formatSignedBytes(n int64) string {
+	// Net savings is the difference of two nonnegative int64s, so never MinInt64.
+	if n < 0 {
+		return "−" + formatBytes(-n)
+	}
+	return formatBytes(n)
+}
+
+func formatUsageRate(v *float64) string {
+	if v == nil {
+		return "n/a"
+	}
+	n := *v
+	units := []string{"B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s", "PiB/s", "EiB/s"}
+	i := 0
+	for n >= 1024 && i < len(units)-1 {
+		n /= 1024
+		i++
+	}
+	return fmt.Sprintf("%.1f %s", n, units[i])
+}
+
+func formatUsagePercent(v *float64) string {
+	if v == nil {
+		return "n/a"
+	}
+	return fmt.Sprintf("%.1f%%", *v)
 }
 
 // formatHitRatePercent renders the SPEC6 §10.4 hit-rate cell. nil
@@ -1434,7 +1484,7 @@ func vitalState(kind string, m htmlRenderModel) string {
 			return "stale"
 		}
 		if !m.AdoptionEnabled {
-			// ADOPTION DISABLED — METADATA NOT REFRESHED (§9.1, the
+			// ADOPTION DISABLED (§9.1, the
 			// keyring panel's precedent): the lag is expected, not a
 			// fault, so it must not hold the page at DEGRADED.
 			return "stale"

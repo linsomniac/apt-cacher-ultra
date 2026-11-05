@@ -72,6 +72,9 @@ jobs:
       # main, but a tag can be created on any commit (including a hotfix
       # branch), so run the race-enabled suite here too rather than
       # publish an artifact that has never been tested.
+      - name: Reject legacy OpenPGP dependencies
+        run: make check-deps
+
       - name: Test
         run: go test -race -timeout 10m ./...
 
@@ -144,7 +147,7 @@ jobs:
             -o "dist/apt-cacher-ultra-${VERSION}-source.tar.gz" \
             "${REF_NAME}"
 
-          (cd dist && sha256sum * > SHA256SUMS)
+          (cd dist && sha256sum -- * > SHA256SUMS)
           ls -lh dist/
 
       - name: Create GitHub release

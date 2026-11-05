@@ -214,7 +214,7 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 // AIDEV-NOTE: the final review's R5 #2 / R7 #2. main runs the audit after
 // cache.Open, which has already committed the v7 migration, so a refusal
 // changes nothing of the audit's own but the database is no longer one
-// 1.0.x opens ("schema version 7 is newer than this binary supports"): an
+// 1.0.x opens ("schema version 8 is newer than this binary supports"): an
 // operator who rolls the package back needs the cache.db copy the release
 // notes tell them to take before upgrading. The R5 re-review: the way back
 // starts by stopping the daemon — a refused start runs again every 5 s
@@ -228,18 +228,23 @@ var legacyAuditRefusalTail = fmt.Sprintf("The audit changed nothing, but the dat
 	cache.CurrentSchemaVersion)
 
 // legacyAuditStartEmpty is the way to start empty that the lost-pool
-// refusals offer beside mounting or restoring the pool, for cache.dir dir.
+// refusals offer beside mounting or restoring the pool.
 //
 // AIDEV-NOTE: ruling PH3-33 (the R5 re-review's out-of-scope 1). Not "wipe
 // the cache directory": unless tls_mitm.ca_storage_dir is set, the
 // generated MITM CA lives in <cache.dir>/ca (config.EffectiveCaStorageDir),
 // and a new one breaks TLS for every client that trusts the old one. The
-// rest of cache.dir is cache.db with its -wal and -shm, pool/, and
-// cache.Open's scratch directories tmp/ and staging/; without the database
+// database and its -wal and -shm live in DBDir; pool/ and scratch directories
+// tmp/ and staging/ stay in Dir. Without the database
 // and the pool the next start creates an empty cache, and ca/ is loaded as
 // it is (cmd/apt-cacher-ultra's
 // TestServeListeners_RefusedStartStartsEmptyKeepingTheGeneratedCA).
-func legacyAuditStartEmpty(dir string) string {
+func legacyAuditStartEmpty(c *cache.Cache) string {
+	dir := c.Dir()
+	if c.DBDir() != dir {
+		return "to start empty instead, stop the daemon and remove cache.db (with any cache.db-wal and cache.db-shm) from " +
+			c.DBDir() + " and pool/ from " + dir + ", keeping ca/ (a generated MITM CA your clients trust)"
+	}
 	return "to start empty instead, stop the daemon and remove cache.db (with any cache.db-wal and cache.db-shm) and pool/ from " +
 		dir + ", keeping ca/ (a generated MITM CA your clients trust)"
 }
@@ -305,7 +310,7 @@ func preflightLegacyAudit(ctx context.Context, c *cache.Cache) error {
 	// single anchor. A lone missing anchor in a NON-empty pool is still
 	// quarantined by the audit (spec §6.1).
 	if errors.Is(rerr, io.EOF) {
-		return fmt.Errorf("legacy trust audit: pool %s is empty but the audit queue holds inline snapshots (%d) — is the pool mounted? Mount or restore it and restart; %s. %s", pool, queued, legacyAuditStartEmpty(c.Dir()), legacyAuditRefusalTail)
+		return fmt.Errorf("legacy trust audit: pool %s is empty but the audit queue holds inline snapshots (%d) — is the pool mounted? Mount or restore it and restart; %s. %s", pool, queued, legacyAuditStartEmpty(c), legacyAuditRefusalTail)
 	}
 	if rerr != nil {
 		return fmt.Errorf("legacy trust audit: pool %s is not readable: %w. Fix it and restart. %s", pool, rerr, legacyAuditRefusalTail)
@@ -322,7 +327,7 @@ func preflightLegacyAudit(ctx context.Context, c *cache.Cache) error {
 		others[i] = c.BlobPath(h)
 	}
 	if len(anchors)+len(others) >= 2 && !anyPoolFileExists(others) {
-		return fmt.Errorf("legacy trust audit: none of the %d files checked exists under %s (%d queued inline anchors, %d other files current snapshots use) — is the pool mounted? Mount or restore it and restart; %s. %s", len(anchors)+len(others), pool, len(anchors), len(others), legacyAuditStartEmpty(c.Dir()), legacyAuditRefusalTail)
+		return fmt.Errorf("legacy trust audit: none of the %d files checked exists under %s (%d queued inline anchors, %d other files current snapshots use) — is the pool mounted? Mount or restore it and restart; %s. %s", len(anchors)+len(others), pool, len(anchors), len(others), legacyAuditStartEmpty(c), legacyAuditRefusalTail)
 	}
 	return nil
 }

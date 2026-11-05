@@ -12,9 +12,9 @@ sudo systemctl restart apt-cacher-ultra
 sudo journalctl -u apt-cacher-ultra -n 50 --no-pager
 ```
 
-There is no configuration reload or `SIGHUP` reload handler. Certificate and
-keyring changes also require a restart. The admin password file is an exception:
-its contents are checked for changes on admin requests, as described below.
+There is no configuration reload or `SIGHUP` reload handler. Keyring and MITM CA
+changes require a restart. Server certificate files reload every minute. The
+admin password file is checked for changes on requests, as described below.
 
 ## Syntax and defaults
 
@@ -46,14 +46,18 @@ only the admin listener.
 
 | Key | Type | Default | Behavior and constraints |
 | --- | --- | --- | --- |
-| `dir` | string | **Required** | Existing writable cache root. The package example uses `/var/cache/apt-cacher-ultra`. Stores the database, blobs, temporary files, and, by default, the MITM CA. |
+| `dir` | string | **Required** | Existing writable cache root. The package example uses `/var/cache/apt-cacher-ultra`. Stores blobs, temporary files, and, by default, the database and MITM CA. |
+| `db_dir` | string | `""` (uses `cache.dir`) | Existing writable directory for `cache.db`, `cache.db-wal`, and `cache.db-shm`. May be on a different filesystem. |
 | `listen` | string | `"0.0.0.0:3142"` | HTTP proxy bind address. Empty string also selects the default. |
-| `listen_tls` | string | `""` | Additional TLS proxy listener; empty disables it. Set together with `tls_cert` and `tls_key`. |
+| `listen_tls` | string | `""` | Additional TLS proxy listener; empty disables it. Select either `tls_cert` and `tls_key`, or `use_acme = true`. |
 | `tls_cert` | string | `""` | Readable PEM server certificate for `listen_tls`; validated with its key when the daemon starts. |
 | `tls_key` | string | `""` | Readable PEM private key matching `tls_cert`. |
+| `use_acme` | boolean | `false` | Use the shared managed certificate for `listen_tls`. Requires `[acme]` enabled and empty file options. |
+| `trusted_proxies` | array of strings | `[]` | IPs/CIDRs allowed to supply `X-Forwarded-For` for cache request logs. Empty disables it; malformed entries prevent startup. See [trusted proxy setup](#logging-client-addresses-behind-a-proxy). |
 | `advertise_host` | string | `""` | Client-facing hostname or `host:port` for `--print-apt-conf`, without a scheme or path. A missing port uses the port from `listen`. Does not change listener binding or request routing. |
 
-`listen_tls`, `tls_cert`, and `tls_key` must be either all set or all empty.
+For file mode, `listen_tls`, `tls_cert`, and `tls_key` must be either all set or all empty.
+Both file and managed certificates require TLS 1.2 or newer and reload without restart.
 These settings secure the client-to-proxy connection; `[tls_mitm]` separately
 controls interception of upstream HTTPS repositories.
 
@@ -66,11 +70,113 @@ case. Omitting the line inherits the HTTP proxy setting, as described in
 [APT's HTTPS options](https://manpages.debian.org/unstable/apt/apt-transport-https.1.en.html#OPTIONS).
 
 The packaged systemd service runs as `apt-cacher-ultra` and permits writes under
-`/var/cache/apt-cacher-ultra`. If moving `cache.dir` or `tls_mitm.ca_storage_dir`,
-give the service user access and add the new writable location through a
-systemd override of `ReadWritePaths`. `ProtectSystem=strict` and `ProtectHome=true`
+`/var/cache/apt-cacher-ultra`. If moving `cache.dir`, `cache.db_dir`, or
+`tls_mitm.ca_storage_dir`, give the service user access and add the new writable
+location through a systemd override of `ReadWritePaths`. `ProtectSystem=strict` and `ProtectHome=true`
 also restrict access; placing cache or key files in a home directory requires
 additional service policy changes. See the [packaged service](../packaging/systemd/apt-cacher-ultra.service).
+
+### Separate database storage
+
+To put SQLite on flash while keeping cached content on bulk storage:
+
+```toml
+[cache]
+dir = "/var/cache/apt-cacher-ultra"
+db_dir = "/mnt/ssd/apt-cacher-ultra-db"
+```
+
+Omitting `db_dir` or setting it to `""` keeps the existing layout. Relative paths
+are relative to the process working directory, just like `cache.dir`; prefer
+absolute paths. The daemon and `packages list` / `packages copy` all use this
+setting. `pool/`, `tmp/`, and `staging/` stay under `cache.dir` on the same
+filesystem, preserving their hard links and atomic renames. MITM CA and ACME
+storage are unaffected. Use a distinct database directory for each cache;
+the daemon locks both storage directories to prevent concurrent use.
+
+Create the database directory before starting, with ownership and permissions
+that let the service user write it. For the packaged service, run
+`sudo systemctl edit apt-cacher-ultra` and add, for example:
+
+```ini
+[Service]
+ReadWritePaths=/mnt/ssd/apt-cacher-ultra-db
+```
+
+If the directory is on a separate mount, add `RequiresMountsFor=` for that
+path under `[Unit]` in the override so systemd waits for the filesystem.
+For Docker, mount the database directory separately, make it writable by
+UID/GID 10001, and set `db_dir` to the path **inside the container**.
+
+**Moving an existing database:** stop the daemon and any package commands,
+back up the database, then move `cache.db` and any remaining `cache.db-wal`
+and `cache.db-shm` together to the new directory. Leave the pool and CA in
+place. Set `db_dir`, update service access as above, and restart. No automatic
+migration between directories occurs. Pointing at an empty directory creates
+a fresh database; existing pool files then have no metadata and can be removed
+by garbage collection. To revert, stop all users of the database and move its
+current files back before clearing `db_dir`. Backups must include the selected
+database directory along with the cache's pool and certificate state.
+
+### Logging client addresses behind a proxy
+
+For HAProxy or another reverse proxy in front of the cache, add only that
+proxy's source IPs (as seen by the cache) to the existing `[cache]` table:
+
+```toml
+[cache]
+# Keep your existing dir/listen settings.
+trusted_proxies = ["192.0.2.10", "192.0.2.11", "2001:db8:1234::/64"]
+```
+
+Restart after changing the list. A nonempty list enables `X-Forwarded-For`;
+there is no separate on/off flag. `[]` restores the default socket-address
+logging. Entries must be literal IPv4/IPv6 addresses or CIDRs, without ports,
+DNS names, zones, or surrounding whitespace. IPv4-mapped IPv6 addresses are
+normalized to IPv4; mapped CIDRs must have at least 96 prefix bits.
+
+The cache first checks the actual connection peer. If it is trusted, the
+header chain is walked **right to left**, stopping at the first untrusted
+address. Repeated header fields are processed as one ordered list. For
+example, with only `192.0.2.10` and `192.0.2.11` trusted, a request from
+`192.0.2.10` with `X-Forwarded-For: 203.0.113.99, 198.51.100.7, 192.0.2.11`
+is logged as `198.51.100.7`; the client cannot impersonate `203.0.113.99` by
+prepending it. If every hop is trusted, the leftmost address is used.
+This follows [Apache mod_remoteip's chain traversal](https://httpd.apache.org/docs/2.4/mod/mod_remoteip.html#remoteipprocessing).
+Private and loopback client addresses are accepted from trusted proxies,
+as with Apache's `RemoteIPInternalProxy`, since apt clients often use LANs.
+Private and loopback **proxies** are never implicitly trusted.
+
+Configure the front proxy to overwrite incoming `X-Forwarded-For` with the
+observed source IP, or to append that source IP after any incoming values.
+Simply passing through a client-supplied header allows impersonation.
+For HAProxy in HTTP mode,
+[`option forwardfor`](https://docs.haproxy.org/2.5/configuration.html#4-option%20forwardfor)
+appends the source address; avoid its `if-none` option on an untrusted
+client-facing listener. Trust only proxies you control and use the narrowest practical ranges. Listing
+client networks or all addresses (`0.0.0.0/0`, `::/0`) defeats the trust boundary.
+This setting does not restrict who can connect; use network access controls.
+
+Header entries must be bare IP addresses, separated by commas and optional
+spaces/tabs. Ports, brackets, zones, hostnames, `unknown`, unspecified,
+multicast, and IPv4 limited broadcast addresses are invalid. A missing header
+or malformed entry in the portion being trusted falls back to the socket
+peer. The walk examines at most 8 KiB (including separators) and 32 entries
+from the right; exhausting either limit before establishing the client also
+falls back to the peer. Entries left of the first untrusted address are
+ignored without scanning them, so a large client-supplied prefix cannot
+hide an address appended by a trusted proxy. The HTTP server's overall
+header-size limit still applies. Requests continue normally in every
+fallback case. Other identity headers,
+including `Forwarded` and `X-Real-IP`, are ignored.
+
+This applies to both cache HTTP and HTTPS listeners, including CONNECT logs.
+A tunneled HTTPS request inherits the outer CONNECT identity; its own
+forwarding headers cannot override it. `client_addr` becomes the resolved
+IP **without a port**, and `peer_addr` records the original socket `IP:port`
+when forwarding is used. Otherwise `client_addr` retains its existing socket
+address format and `peer_addr` is absent. The admin listener and authorization
+policies are unaffected. See [log fields](log-fields.md#client-and-peer-addresses).
 
 ## `[upstream]`: fetching and access policy
 
@@ -220,25 +326,21 @@ whether a changed suite is staged and published as a new coherent snapshot.
 
 ### Tracked suites
 
-A suite is tracked once a client fetches its `InRelease` — or, with adoption
-enabled, its `Release` — and the bytes are what they claim (an `InRelease`
+A suite is tracked once a client fetches its `InRelease` or `Release`
+and the bytes are what they claim (an `InRelease`
 starts with the clearsign line apt requires; a `Release` has a hash block):
 an HTML error page or a stub never tracks a suite, and `Release.gpg` never
-does on its own. A suite whose `InRelease` (with adoption enabled, also
-`Release`) an earlier release cached is tracked on its first cache hit. A
+does on its own. A suite whose `InRelease` or `Release` an earlier release
+cached is tracked on its first cache hit. A
 suite path longer than 1024 bytes is never tracked; its files are served
 untracked.
 
-With adoption disabled only `InRelease` tracks a suite, and a refetched
-`InRelease` (after its cached copy was garbage-collected) still counts as a
-successful check, as before. Two things differ from earlier releases: a
-plain-text "InRelease" (no clearsign line; apt rejects it too) no longer
-tracks a suite, and neither does a repository that publishes only `Release`
-and `Release.gpg` (for example pkg.jenkins.io). Earlier releases tracked
-such a repository from its first `Release` hit; one first seen after the
-upgrade is now served as before but not tracked — not checked for changes
-or shown on the status page — while adoption is disabled, and one an
-earlier release already tracks stays tracked.
+With adoption disabled, either `InRelease` or `Release` tracks a suite.
+A refetched anchor counts as a successful check. A changed anchor invalidates
+its suite's mutable metadata, so subsequent requests fetch current files.
+A plain-text "InRelease" without the clearsign line does not track a suite;
+APT rejects it too. Release-only repositories remain tracked and refreshable.
+Existing adopted snapshots still require adoption to publish an update.
 
 At most `max_suites` suites are tracked and at most `max_suites / 10` per
 host. At the total cap, a new suite makes room by evicting the least
@@ -429,8 +531,9 @@ answered — no file asked for, or every real answer a delete — fails. Such
 a repository has no snapshot: it vouches nothing and never changes its
 host's strict posture; on a strict host whose signed suites are complete
 its `.deb`s are refused like any unvouched package. Its index files are
-served with `Last-Modified` the later of the file's time and its last
-refresh, so apt's `If-Modified-Since` sees a replacement. The check logs
+served with their recorded upstream `Last-Modified` dates and content ETags.
+Date-only conditions receive full bodies, so repeated or backward dates cannot
+hide a replacement. The check logs
 `freshness_check` with `result=anchorless_refreshed` or
 `anchorless_unchanged` and the number of files it replaced and deleted
 (`rows_replaced`, `rows_deleted`), and the repository is adopted at the
@@ -500,7 +603,7 @@ declares.
 
 | Key | Type | Default | Behavior and constraints |
 | --- | --- | --- | --- |
-| `enabled` | boolean | `false` | Enable adoption of new snapshots. When false, freshness differences are recorded without adopting them, so tracked suites lag upstream by design: the status page's SUITES vital then reads "ADOPTION DISABLED — METADATA NOT REFRESHED" (stale, not a fault), rows keep their lag text without warning, and failure records left from a time adoption was enabled are inert (no retries, `acu_adoption_failing_suites` reports 0). The suite reaper still runs (see *Suite reaping* under `[gc]`): a suite no client asked for in `gc.suite_idle_ttl` has its cached index files deleted, so clients that come back to it fetch upstream's current files through the cache, which then stay as fetched. |
+| `enabled` | boolean | `false` | Enable adoption of verified snapshots. When false, changes to an unadopted suite’s `InRelease` or `Release` invalidate its mutable cached metadata; subsequent requests fetch current upstream files. Existing adopted snapshots still require adoption to refresh and a changed snapshot emits `legacy_metadata_refresh_failed` at WARN. Failure records from earlier adoption runs remain inert. The suite reaper still runs. |
 | `require_signature` | boolean | `true` | Allows starting with an empty keyring. It no longer relaxes verification: only a decodable clearsigned `InRelease` is adopted as inline metadata in every mode (plain-text bodies are `missing_signature`, undecodable ones `malformed_clearsign`). Unsigned repositories are adopted in the unsigned form instead (`adopt_unsigned`). |
 | `adopt_unsigned` | boolean | `true` | Adopt a repository that publishes a `Release` with no signature (neither `InRelease` nor `Release.gpg`) as an unsigned snapshot: served coherently, but never trusted — it vouches no `.deb` and never counts for `integrity.refuse_unvouched_debs`. A suite the cache has seen signed is never adopted unsigned. `false` refuses every unsigned `Release` ("refused: unsigned_disabled", a state, not a failed check), so the cache no longer keeps unsigned repositories fresh: an unsigned suite already adopted keeps serving its last snapshot, coherent but frozen — never updated — until the knob is turned back on (it then updates at its next retry, at most 75 minutes later: a restart keeps a refusal's retry time), the suite is forgotten (`POST /forget`), or it is reaped after `gc.suite_idle_ttl` without a client. Forgotten or reaped with the knob still off, it is then a repository not yet adopted, which is worse: the forget or reap deletes its cached index files first, so its next requests fetch upstream's current files, but it stays unadopted and each file then stays as the cache first stored it, never refreshed, so an upstream publish can leave its clients with Hash Sum mismatches. Off also stops the refresh of a flat repository that publishes no `Release` at all (see *Flat repositories* under `[freshness]`): it is served as the cache first stored its files, and the status page shows "refused: unsigned_disabled"; turning the knob on resumes its refresh. Set it to `false` only if you do not serve unsigned repositories through the cache. Either way the suite is asked upstream again only at its retry times (2 minutes, doubling to an hour; for a suite not yet adopted, also once `periodic_refresh` has passed), never at the checks clients trigger in between. See *Anchor forms and unsigned repositories* for the safeguards and the threat notes. |
 | `require_pinned_signer` | boolean | `false` | Reject adoption when no `[[trusted_signer]]` matches the canonical host. Evaluated before `accept_any_signer`. |
@@ -556,7 +659,7 @@ apt fetches a suite's `InRelease` (or `Release`) first and its indexes after, on
 
 A client that received the old `InRelease` therefore either finished receiving it at least `flip_quiet_period` before the switch, or waited and got the new one, so the index requests it sends within that period of its `InRelease` match it — also when many suites share its connection (mirror mode, or more than ten hosts). The period runs from when the cache finished sending, so on a slow link it is slightly shorter for the client. A client that fetches many indexes over a slow link may send some later than that; for a repository whose `Release` declares `Acquire-By-Hash: yes` (most distribution archives) apt asks for those by hash, and they are still served from the snapshot they name (below); many third-party and flat repositories do not declare it, and for them the switch's wait is the only protection. A switch takes at most 60 s + 60 s + 20 s plus its commit; `adoption.max_duration` does not cut it short. A shutdown abandons it at once: at the signal the daemon answers the waiting requests and abandons every switch that has not started its commit (nothing is committed or recorded, the adoption logs INFO `adoption_abandoned_at_shutdown` and is not counted as an adoption outcome, and the change is adopted after the restart). The first adoption of a suite whose `InRelease` (for a detached suite, `Release`) is exactly the one clients were already being served skips the wait, unless the daemon is stopping. Each switch logs `adoption_flip_barrier`; `acu_flip_barrier_active` shows how many switches are waiting or holding now, and the `request` line of an `InRelease`/`Release` request that waited in a hold carries `flip_held_ms`.
 
-Residuals, each with a counter: a hold whose suite is still not quiet 15 s in — an `InRelease`/`Release` response still being sent then, or finished less than `flip_quiet_period` before (a client reading it more than 20 s − 5 s − `flip_quiet_period`, 5 s by default, into the hold: a slow, stalled or vanished client) — commits then; the waiting requests get the new snapshot, but such a late reader may fetch indexes that do not match the `InRelease` it got (`acu_flip_quiet_cut_short_total`); a commit that has not finished 20 s into the hold (very large suites) ends the hold anyway, and the waiting requests are answered from the snapshot still current then, so they may get indexes newer than their `InRelease` (`acu_flip_hold_expired_total`); a switch that waits 60 s for its turn commits without holding (`acu_flip_hold_skipped_total`; it takes three or four long holds ahead of it, so at least four suites switching at once, which needs `freshness.max_concurrent_adoptions` of 4 or more, or `0`); beyond 256 requests waiting in one hold, the next are answered at once (`acu_flip_waiters_over_cap_total`); and `InRelease`/`Release` responses that take 30 s or longer to send (very slow links) are not waited for (`acu_flip_slow_anchor_reads_total`). An alert on `rate(acu_flip_hold_expired_total)` catches commits slower than the hold. apt clients configured with an `Acquire::http::Timeout` below 20 s can time out while held; set `flip_quiet_period = "0s"` if you run such clients. A client still holding an older `InRelease` that asks for indexes by hash is still served: a by-hash file the current snapshot lacks is served from the newest `gc.keep_displaced` + 1 displaced snapshots of its suite (none when `gc.keep_displaced = 0`; `acu_serve_byhash_displaced_total`; the request line carries `snapshot_displaced`). Snapshot `InRelease`, `Release` and `Release.gpg` responses carry the snapshot's adoption time as `Last-Modified`, which grows with every switch — also for two switches in the same second and whatever the clock does — so `If-Modified-Since` never hides a new snapshot.
+Residuals, each with a counter: a hold whose suite is still not quiet 15 s in — an `InRelease`/`Release` response still being sent then, or finished less than `flip_quiet_period` before (a client reading it more than 20 s − 5 s − `flip_quiet_period`, 5 s by default, into the hold: a slow, stalled or vanished client) — commits then; the waiting requests get the new snapshot, but such a late reader may fetch indexes that do not match the `InRelease` it got (`acu_flip_quiet_cut_short_total`); a commit that has not finished 20 s into the hold (very large suites) ends the hold anyway, and the waiting requests are answered from the snapshot still current then, so they may get indexes newer than their `InRelease` (`acu_flip_hold_expired_total`); a switch that waits 60 s for its turn commits without holding (`acu_flip_hold_skipped_total`; it takes three or four long holds ahead of it, so at least four suites switching at once, which needs `freshness.max_concurrent_adoptions` of 4 or more, or `0`); beyond 256 requests waiting in one hold, the next are answered at once (`acu_flip_waiters_over_cap_total`); and `InRelease`/`Release` responses that take 30 s or longer to send (very slow links) are not waited for (`acu_flip_slow_anchor_reads_total`). An alert on `rate(acu_flip_hold_expired_total)` catches commits slower than the hold. apt clients configured with an `Acquire::http::Timeout` below 20 s can time out while held; set `flip_quiet_period = "0s"` if you run such clients. A client still holding an older `InRelease` that asks for indexes by hash is still served: a by-hash file the current snapshot lacks is served from the newest `gc.keep_displaced` + 1 displaced snapshots of its suite (none when `gc.keep_displaced = 0`; `acu_serve_byhash_displaced_total`; the request line carries `snapshot_displaced`). Snapshot `InRelease`, `Release` and `Release.gpg` responses carry their recorded upstream dates as `Last-Modified` and content-based ETags. Date-only conditions receive full bodies, so `If-Modified-Since` cannot hide a new snapshot, even across same-second switches or clock changes.
 
 ### Trust and signer pins
 
@@ -866,9 +969,9 @@ it again every 5 seconds.
 
 On its first start after an upgrade, the daemon audits every metadata snapshot
 adopted by earlier versions before it serves anything (a large cache can take
-a little while; progress is logged per 100 snapshots, and because the
-listeners are already open, connections made meanwhile wait — apt clients may
-time out once). A snapshot whose stored `InRelease` is not a signed, clean
+a little while; progress is logged per 100 snapshots). Application ports remain
+closed during this work; clients connecting directly may see connection refusal
+until startup finishes. A snapshot whose stored `InRelease` is not a signed, clean
 clearsigned message — a plain-text file adopted with `require_signature =
 false`, or one carrying declarations outside its signature — or whose pool
 file is missing or corrupt, is quarantined: it stops serving and vouching,
@@ -912,13 +1015,13 @@ when it holds none of the queued inline snapshots' files and none of a
 sample of the files the current snapshots use, two or more files checked
 (a foreign or unmounted pool; snapshots that share an `InRelease` share
 its one file). Mount or restore it, or, to start empty, stop the daemon
-and remove `cache.db` (with any `cache.db-wal` and `cache.db-shm`) and
-`pool/` from `cache.dir`. Keep `ca/`: unless `tls_mitm.ca_storage_dir` is
-set, it holds the MITM CA the cache generated, and a new one breaks TLS
+and remove `cache.db` (with any `cache.db-wal` and `cache.db-shm`) from
+`cache.db_dir` (or `cache.dir` when unset), and `pool/` from `cache.dir`.
+Keep `ca/`: unless `tls_mitm.ca_storage_dir` is set, it holds the MITM CA the cache generated, and a new one breaks TLS
 for every client that trusts the old one. The rest of `cache.dir`,
 `tmp/` and `staging/`, is scratch space that may go too. The audit then
 changes nothing, but the migration before it has:
-the database is at schema 7, which 1.0.x refuses, so going back to 1.0.x
+the database is at schema 9, which older binaries refuse, so going back to 1.0.x
 means restoring the `cache.db` copied before the upgrade: stop the
 daemon first (a refused start runs again every 5 seconds and would
 migrate the copy again, and a copy put back under a running daemon can be
@@ -1282,12 +1385,144 @@ up to the step early; and a daemon restarted at least once a day
 turns suite reaping off; the reaper then only deletes the year-old
 records of signed paths no suite tracks.
 
+## `[acme]`: automatic server certificates
+
+| Key | Type | Default | Behavior and constraints |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Enable ACME; at least one listener must select `use_acme`. |
+| `directory_url` | string | `""` | Explicit HTTPS authority directory; no credentials, query or fragment. Resource URLs must stay on that origin. |
+| `dns_name` | string | `""` | One ASCII DNS name; normalized to lowercase by the loader. No IP, wildcard or trailing dot. |
+| `challenge_type` | string | `"http-01"` | `http-01` or `dns-01`. DNS-01 requires no inbound challenge listener. |
+| `dns_provider` | string | `""` | Lego provider code, required for DNS-01. List supported codes with `apt-cacher-ultra acme dns-providers`. Credentials use native Lego environment variables/files. `manual` and `exec` are excluded. |
+| `dns_resolvers` | string array | `[]` | DNS-01 recursive resolvers as IP:port, at most eight, nonzero ports. Empty uses system resolvers. Every configured resolver must see the expected TXT value. |
+| `listen` | string | `"127.0.0.1:8080"` | HTTP-01 challenge listener; ignored for DNS-01. Public port 80 must forward here for HTTP-01. No overlap with application listeners. |
+| `accept_terms` | boolean | `false` | Explicit acceptance of the configured authority's terms; must be true when enabled. |
+
+State is private under `cache.dir/acme/`, separated by authority. A valid saved
+certificate allows offline startup. Otherwise issuance must complete before
+application service starts. Renewal follows actual certificate lifetime and
+persists retry deadlines across restarts. A failed renewal retains the previous
+certificate until expiry, then new TLS handshakes fail. Certificate expiry and
+renewal status appear in admin HTML/JSON and metrics.
+
+See [server HTTPS and ACME](server-tls.md) for Certbot migration, staging,
+forwarding, DNS-provider credentials and delegation, systemd privileges, authenticated HTTPS healthchecks, Docker,
+backup and recovery. These certificates do not replace the MITM CA.
+
+## Readiness and load balancers
+
+`GET /healthz` and `HEAD /healthz` on either proxy listener report whether this
+instance is ready for client requests. These probes work even with the admin
+listener disabled. Request the path directly on the backend, for example:
+
+```sh
+curl --fail --max-time 3 http://127.0.0.1:3142/healthz
+```
+
+A successful check returns **200** with `ok\n`; a failed check returns **503**
+with `degraded\n` and `X-Acu-Check-Failed` naming a stable failure category.
+HEAD has no response body. Responses carry `Cache-Control: no-store`.
+
+| Failure category | Meaning |
+| --- | --- |
+| `startup` | At least one configured application listener has not entered its HTTP accept loop yet. |
+| `shutdown` | Shutdown was requested or a listener stopped; this process will not become ready again. |
+| `proxy_tls` | The configured HTTPS proxy certificate is unavailable, expired, or not yet valid. |
+| `mitm_ca` | The configured HTTPS interception CA is outside its validity period. |
+| `cache_dir` | Creating, writing, closing, or removing a probe file in the cache root failed. |
+| `db_dir` | Creating, writing, closing, or removing a probe file in a separate database directory failed. |
+| `db_ping` | The SQLite connection check failed or exceeded its one-second deadline. |
+
+Both proxy and admin probes require all configured application listeners to
+have started. The admin `/healthz` uses the same checks and still requires
+Basic authentication when `admin.htpasswd_file` is configured. Authentication
+has no exemption on the admin port. Proxy `/healthz` intentionally needs no
+credentials and exposes only the status and category above. It provides no
+access to admin status, metrics, configuration or maintenance operations.
+Only origin-form `/healthz` is reserved on the proxy: an absolute-form request
+such as `GET http://repository.example/healthz` still follows normal upstream
+routing and access policy. Other methods on the local probe return 405.
+
+Readiness measures local service availability. It does not fetch from upstream
+mirrors, validate every cached object, or guarantee a particular client trusts
+the configured certificates. Failed renewal/reload with a still-valid retained
+certificate remains ready. Upstream outages do not remove a cache that can
+still serve cached packages. A client timeout is necessary to detect a stuck
+process or filesystem; no in-process check can respond while the process is
+unable to run. A probe describes the instance at the time it runs, so configure
+load-balancer polling and failure thresholds for the failover delay you need.
+
+For an HTTP proxy backend, a TCP-mode HAProxy frontend preserves both ordinary
+proxy requests and CONNECT tunnels while HTTP checks verify readiness:
+
+```haproxy
+frontend apt_proxy
+    bind :3142
+    mode tcp
+    timeout client 5m
+    default_backend apt_caches
+
+backend apt_caches
+    mode tcp
+    timeout connect 5s
+    timeout server 5m
+    option httpchk GET /healthz
+    http-check expect status 200
+    server cache1 10.0.0.11:3142 check inter 2s fall 2 rise 2
+    server cache2 10.0.0.12:3142 check inter 2s fall 2 rise 2
+```
+
+Replace the addresses with your cache hosts. Requiring exactly 200 prevents a
+redirect or authentication failure being treated as ready. The HTTP check
+syntax is documented in [HAProxy's health-check guide](https://www.haproxy.com/documentation/haproxy-configuration-tutorials/reliability/health-checks/).
+For HTTPS backends, also configure backend TLS, certificate verification and
+SNI for the backend name; check the same encrypted service used by clients.
+
+### Startup binding and privileges
+
+Application ports now bind only after startup preparation: admin credential
+loading, MITM CA setup, server certificate loading or ACME issuance, cache open
+and schema migration, the legacy trust audit, startup GC, and construction of
+the proxy and admin handlers. Background maintenance starts afterwards. Once
+the sockets open there can be a brief 503 while the HTTP servers enter their
+accept loops, including the admin server's initial metrics refresh. HTTP checks
+cover this transition; a TCP-only check cannot detect runtime degradation.
+
+This is the default behavior and needs no new configuration. The daemon has no
+bind-then-drop-privileges step or socket activation path. The packaged systemd
+unit starts as `apt-cacher-ultra`, and Docker starts as UID/GID 10001. Delaying
+bind therefore requires no extra privilege or retained root process. Custom
+privileged ports need the same service capability or forwarding arrangement
+as before. The dedicated ACME HTTP-01 challenge listener is the exception: it
+must open during startup to obtain a certificate, and is not a readiness probe.
+DNS-01 needs no challenge listener.
+
+The tradeoff is that occupied ports or insufficient bind permissions are
+reported **after** preparation, which can include schema migration or ACME
+issuance. Ports cannot be reserved with `net.Listen` without appearing open
+to TCP probes. If one application bind fails, earlier binds are closed before
+cleanup. Cancellation during preparation prevents application binding.
+
+A daemon holds an exclusive advisory lock on `cache.dir/daemon.lock` for its
+entire lifetime, including startup and shutdown cleanup. This prevents two
+updated daemons from maintaining the same cache even when their ports differ;
+the lock is released automatically on exit or crash. Leave the file in place
+and do not delete it to bypass a running daemon. Older versions do not honor
+this lock: stop the old daemon before starting this version on its cache.
+The command-line package listing/copy tools remain available.
+
 ## `[admin]`: status, metrics, and maintenance
 
-The separate **HTTP** admin listener serves the status page, `/metrics`, and
+The status page includes [usage statistics](usage-statistics.md): lifetime and
+since-start traffic, cache hits, savings estimates and average effective transfer
+rates, also available under `usage` in `GET /?format=json`. Collection and
+checkpointing continue with admin disabled; existing admin authentication applies
+when viewing the data. No usage-specific configuration is required.
+
+The separate **HTTP or HTTPS** admin listener serves the status page, `/metrics`, and
 `/healthz`, plus the mutating `POST /reconcile` and `POST /forget` maintenance
 endpoints. It is not a read-only interface. Keep access restricted to trusted
-operators; if exposed beyond loopback, protect the network path or place it behind a TLS reverse proxy.
+operators; if exposed beyond loopback, enable HTTPS below or protect the network path with a TLS reverse proxy.
 HTTP Basic authentication does not encrypt credentials in transit.
 
 Both mutating endpoints refuse a request with 403, the body naming the
@@ -1319,6 +1554,9 @@ them.
 | --- | --- | --- | --- |
 | `enabled` | boolean | `true` | Bind the admin listener and run its background refresh work. `false` leaves proxy service running and logs a warning. |
 | `listen` | string | `"127.0.0.1:6789"` | Admin bind address. A non-loopback address without authentication emits a startup warning. Explicit empty string is invalid when enabled. |
+| `tls_cert` | string | `""` | PEM server chain; set with `tls_key` to serve HTTPS on `listen`. Reloaded every minute. |
+| `tls_key` | string | `""` | Matching PEM private key. Partial pairs are rejected. |
+| `use_acme` | boolean | `false` | Serve HTTPS with the shared ACME certificate. Requires enabled admin and ACME, with empty file options. |
 | `htpasswd_file` | string | `""` | Optional readable Apache htpasswd file with at least one user; only bcrypt (`$2a$`, `$2b$`, `$2y$`) entries are accepted. Empty disables authentication. Applies to every admin endpoint. |
 | `pprof_enabled` | boolean | `false` | Enable `GET /debug/pprof/profile`, `/debug/pprof/heap`, and `/debug/pprof/goroutine` on the admin listener, with the same authentication. CPU capture defaults to 30 seconds; `?seconds=N` accepts integers from 1 through 300. Profiles expose process details; enable only for trusted operators. |
 | `gauge_refresh` | duration | `"30s"` | Delay after a completed refresh before recomputing gauges. Values can lag by this delay plus refresh work time. Positive and at most `"1h"`. |
@@ -1571,3 +1809,21 @@ The matched prefix is replaced with the upstream base path. `/corretto` matches
 `/corretto/dists/...` but not `/corretto-extra/...`. A prefix of `/` catches all
 mirror-mode paths and cannot coexist with another prefix. The selected upstream
 still goes through remapping and upstream access policy.
+
+## HTTP response timestamps and validators
+
+The cache preserves a valid upstream `Last-Modified` date for the URL and bytes
+being served. Local pool mtimes and snapshot adoption times are not exposed as
+upstream modification dates. Missing, invalid and future dates are omitted.
+Dates already saved with URL rows and snapshot anchors survive the schema 8
+upgrade; objects whose upstream dates were never recorded have no date until
+fetched again. Schema 9 then adds persistent usage totals. The migrations are
+forward-only; binaries supporting only schema 8 or earlier cannot open schema 9.
+
+Responses carry a strong content-based ETag. Clients using `If-None-Match` can
+receive 304 responses. Date-only conditional requests receive the full body:
+upstream dates can repeat or move backward, and older cache versions issued
+synthetic dates that could otherwise hide an update. Date-based `If-Range`
+also gets the full body; an ETag-based `If-Range` supports resuming. This trades
+some metadata bandwidth for reliable updates, including clients upgrading
+from earlier versions without clearing their APT lists.

@@ -6,11 +6,46 @@ the detail an operator needs before upgrading.
 
 ## Unreleased: 1.1.0
 
+- Preserve upstream Last-Modified dates per URL and content, and use content
+  ETags for conditional responses to prevent stale date-only responses (#17).
+- Refresh mutable repository metadata when snapshot adoption is disabled,
+  including Release-only repositories; fence downloads racing a refresh and
+  warn when an existing adopted snapshot cannot refresh in this mode (#18).
+  Schema 8 migrates stored dates automatically and is forward-only.
+
 Collected until 1.1.0-rc1. The detail, and what to do before upgrading
 from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Added
 
+- Persistent admin usage statistics: data fetched/served, cache hits, estimated
+  net bytes saved and average effective transfer rates, with lifetime and
+  since-start views in HTML and JSON. Includes background downloads and retries;
+  checkpoints every 30 seconds and at graceful shutdown. Schema 9 adds usage
+  storage after schema 8's metadata migration. Requested by @sdh91 in issue #11;
+  see [usage statistics](docs/usage-statistics.md).
+
+- Optional `cache.db_dir` to keep SQLite database files on separate storage
+  from cached content. Empty or omitted preserves the existing layout.
+  Suggested by @grifferz in issue #13; see
+  [separate database storage](docs/configuration.md#separate-database-storage).
+
+- Proxy-port `GET`/`HEAD /healthz` for load balancers, also available with
+  admin disabled. Both proxy and admin health checks now require completed
+  startup, serving listeners and usable proxy TLS/MITM certificates, alongside
+  the existing local cache and database checks. Suggested by Andy Smith;
+  see [readiness and HAProxy setup](docs/configuration.md#readiness-and-load-balancers).
+
+- Optional `cache.trusted_proxies` IP/CIDR allowlist for secure
+  `X-Forwarded-For` logging, with right-to-left chain validation and the
+  original socket peer retained in `peer_addr`. Supports HTTP, HTTPS, and
+  CONNECT. Thanks to @grifferz for requesting this in issue #15.
+- Optional admin HTTPS and a shared server-certificate lifecycle for the cache
+  and admin listeners, including automatic reload of PEM certificates.
+- Automatic ACME issuance and renewal with HTTP-01 or DNS-01, using Lego's full
+  automated DNS provider catalogue, private persistent state, durable retry
+  deadlines, and certificate health reporting. Based on Laurent Corbes's
+  (@lcaflc) PRs #20 and #21; see [server HTTPS setup](docs/server-tls.md).
 - Flat repositories (`deb <uri>/ /`, `deb <uri> ./`, `deb <uri> binary/`)
   are tracked, refreshed and adopted like `dists/` suites, and vouch their
   packages for strict mode. Based on Venkat's (@venkatamutyala) PR #8.
@@ -40,6 +75,14 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Changed
 
+- HTTP, HTTPS and admin ports bind after startup preparation, including
+  certificate setup, database migration, the trust audit and startup GC.
+  A lifetime cache-directory lock prevents concurrent daemon maintenance;
+  bind failures now surface after preparation. ACME HTTP-01 still opens its
+  dedicated challenge port early. Suggested by Andy Smith.
+
+- The systemd service allows six minutes for shutdown and signals the daemon
+  before its DNS worker, allowing bounded record cleanup after listeners stop.
 - The package upgrade restarts a running daemon.
 - The database migrates one way (schema 6 to 7), and a trust audit checks
   the snapshots 1.0.x adopted at the first start.

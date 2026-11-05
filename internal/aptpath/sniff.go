@@ -277,13 +277,13 @@ func hasDistsSegment(p string) bool {
 }
 
 // CreatesRow reports whether a sniff-passing serve of f creates its
-// suite's row (spec C3): InRelease always; Release and flat indexes only
-// with an adopter wired. Release.gpg never does.
+// suite's row: InRelease and Release always (including legacy refresh);
+// flat indexes only with an adopter wired. Release.gpg never does.
 func (f SuiteFile) CreatesRow(adopter bool) bool {
 	switch f {
-	case FileInRelease:
+	case FileInRelease, FileRelease:
 		return true
-	case FileRelease, FileFlatIndex:
+	case FileFlatIndex:
 		return adopter
 	}
 	return false

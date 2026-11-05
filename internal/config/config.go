@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/linsomniac/apt-cacher-ultra/internal/clientaddr"
 	"github.com/linsomniac/apt-cacher-ultra/internal/upstreamproxy"
 )
 
@@ -52,6 +53,7 @@ const MaxArchitecturesEntries = 32
 
 // Config is the top-level structure of config.toml.
 type Config struct {
+	ACME           ACMEConfig         `toml:"acme"`
 	Cache          CacheConfig        `toml:"cache"`
 	Upstream       UpstreamConfig     `toml:"upstream"`
 	Freshness      FreshnessConfig    `toml:"freshness"`
@@ -71,7 +73,9 @@ type Config struct {
 }
 
 type CacheConfig struct {
+	UseACME   bool   `toml:"use_acme"`
 	Dir       string `toml:"dir"`
+	DBDir     string `toml:"db_dir"` // Empty uses Dir; holds cache.db and its WAL/SHM files.
 	Listen    string `toml:"listen"`
 	ListenTLS string `toml:"listen_tls"`
 	TLSCert   string `toml:"tls_cert"`
@@ -85,6 +89,18 @@ type CacheConfig struct {
 	// no path). Useful when Listen binds 0.0.0.0/:: and the snippet
 	// would otherwise emit a non-routable target.
 	AdvertiseHost string `toml:"advertise_host"`
+
+	// TrustedProxies enables X-Forwarded-For for cache request logging only.
+	// Empty trusts nobody. Entries are literal IPs or CIDRs, never hostnames.
+	TrustedProxies []string `toml:"trusted_proxies"`
+}
+
+// DatabaseDir returns DBDir, falling back to Dir when it is empty.
+func (c CacheConfig) DatabaseDir() string {
+	if c.DBDir != "" {
+		return c.DBDir
+	}
+	return c.Dir
 }
 
 type UpstreamConfig struct {
@@ -478,10 +494,12 @@ type GCConfig struct {
 // admin listener: /metrics, /, /healthz endpoints; htpasswd Basic
 // auth; refresher goroutine; per-metric series cap.
 type AdminConfig struct {
+	TLSCert string `toml:"tls_cert"`
+	TLSKey  string `toml:"tls_key"`
+	UseACME bool   `toml:"use_acme"`
 	// Enabled is the master switch. When false, the admin listener
-	// is not bound; /metrics, /, and /healthz are unreachable. The
-	// cache continues to serve proxy traffic normally — the
-	// operator has implicitly opted out of all observability. A
+	// is not bound; admin endpoints are unreachable. The cache
+	// continues to serve proxy traffic and the proxy /healthz probe. A
 	// startup admin_disabled Warn fires when false (parallel to
 	// gc_disabled SPEC4 §10.2). Default true.
 	Enabled bool `toml:"enabled"`
@@ -807,6 +825,13 @@ func Load(path string) (*Config, error) {
 	// ints/durations need IsDefined-gated defaults so an operator's
 	// explicit value (or explicit zero — though zero is invalid for
 	// most of these) survives Defaults().
+	if !md.IsDefined("acme", "challenge_type") {
+		cfg.ACME.ChallengeType = "http-01"
+	}
+	if !md.IsDefined("acme", "listen") {
+		cfg.ACME.Listen = "127.0.0.1:8080"
+	}
+	cfg.ACME.DNSName = strings.ToLower(cfg.ACME.DNSName)
 	if !md.IsDefined("admin", "listen") {
 		cfg.Admin.Listen = "127.0.0.1:6789"
 	}
@@ -944,6 +969,16 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("cache.dir %q: %w", c.Cache.Dir, err))
 	}
 
+	if dir := c.Cache.DBDir; dir != "" && dir != c.Cache.Dir {
+		if st, err := os.Stat(dir); err != nil {
+			errs = append(errs, fmt.Errorf("cache.db_dir %q: %w", dir, err))
+		} else if !st.IsDir() {
+			errs = append(errs, fmt.Errorf("cache.db_dir %q is not a directory", dir))
+		} else if err := checkWritable(dir); err != nil {
+			errs = append(errs, fmt.Errorf("cache.db_dir %q: %w", dir, err))
+		}
+	}
+
 	// AIDEV-NOTE: cache.listen is not "required" because Defaults() fills in
 	// 0.0.0.0:3142. Validate runs *after* defaults, so this only checks the
 	// effective value (user-supplied or default).
@@ -951,20 +986,12 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("cache.listen: %w", err))
 	}
 
-	tlsAnySet := c.Cache.ListenTLS != "" || c.Cache.TLSCert != "" || c.Cache.TLSKey != ""
-	tlsAllSet := c.Cache.ListenTLS != "" && c.Cache.TLSCert != "" && c.Cache.TLSKey != ""
-	if tlsAnySet && !tlsAllSet {
-		errs = append(errs, errors.New("cache.listen_tls / tls_cert / tls_key must all be set or all empty"))
-	} else if tlsAllSet {
-		if err := validateListenAddr(c.Cache.ListenTLS); err != nil {
-			errs = append(errs, fmt.Errorf("cache.listen_tls: %w", err))
-		}
-		if err := checkReadableFile(c.Cache.TLSCert); err != nil {
-			errs = append(errs, fmt.Errorf("cache.tls_cert %q: %w", c.Cache.TLSCert, err))
-		}
-		if err := checkReadableFile(c.Cache.TLSKey); err != nil {
-			errs = append(errs, fmt.Errorf("cache.tls_key %q: %w", c.Cache.TLSKey, err))
-		}
+	if _, err := clientaddr.New(c.Cache.TrustedProxies); err != nil {
+		errs = append(errs, fmt.Errorf("cache.%w", err))
+	}
+
+	if err := c.ValidateServerTLS(); err != nil {
+		errs = append(errs, err)
 	}
 
 	// SPEC6 §14.2 cache.advertise_host: empty default; otherwise must

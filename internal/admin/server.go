@@ -1,12 +1,11 @@
 // Package admin implements the SPEC5 Phase 5 admin HTTP listener:
 // /metrics (Prometheus exposition), / (status page; HTML or JSON),
-// /healthz (liveness probe). The listener is read-only — no
-// mutating endpoints in Phase 5. Optional HTTP Basic auth via
-// htpasswd file.
+// /healthz (readiness probe), plus /reconcile and /forget maintenance.
+// Optional HTTP Basic auth via htpasswd file applies to every endpoint.
 //
-// The package is constructed once by cmd/apt-cacher-ultra/main.go
-// and bound between the proxy/TLS listeners and cache.Open
-// (SPEC5 §9.7.1). Graceful shutdown runs Server.Shutdown FIRST
+// The package is constructed once by cmd/apt-cacher-ultra/main.go,
+// before application listeners bind at the end of startup preparation.
+// Graceful shutdown runs Server.Shutdown FIRST
 // (SPEC5 §9.5) so a scrape mid-shutdown sees Connection: close
 // rather than mid-write race against a closing DB.
 //
@@ -19,6 +18,7 @@ package admin
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"log/slog"
 	"math/rand/v2"
@@ -30,12 +30,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/acme"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/gc"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
+	"github.com/linsomniac/apt-cacher-ultra/internal/servertls"
+	"github.com/linsomniac/apt-cacher-ultra/internal/usage"
 )
 
 // BuildInfo carries the version information that cmd reads from
@@ -52,6 +55,12 @@ type BuildInfo struct {
 // Config wires the admin listener to its dependencies. All fields
 // are required; New returns an error on any nil dependency.
 type Config struct {
+	Usage     *usage.Collector // optional; production also collects with admin disabled
+	TLS       *tls.Config
+	ServerTLS func() map[string]servertls.Snapshot
+	ACME      func() *acme.Status
+	// HealthCheck is the daemon-wide readiness probe. Nil uses local checks.
+	HealthCheck func(context.Context) string
 	Cache       *cache.Cache
 	GC          *gc.GC
 	HostLimiter *hostsem.Sem
@@ -319,6 +328,16 @@ func New(cfg Config) (*Server, error) {
 		return nil, errors.New("admin: AdminAddr is required")
 	}
 
+	if (cfg.Admin.TLSCert == "") != (cfg.Admin.TLSKey == "") {
+		return nil, errors.New("admin: incomplete TLS pair")
+	}
+	if cfg.Admin.UseACME && (cfg.Admin.TLSCert != "" || cfg.Admin.TLSKey != "") {
+		return nil, errors.New("admin: conflicting TLS sources")
+	}
+	if cfg.Admin.TLSEnabled() != (cfg.TLS != nil) {
+		return nil, errors.New("admin: TLS configuration requires a prepared certificate source")
+	}
+
 	s := &Server{
 		cfg:    cfg,
 		logger: logger,
@@ -355,6 +374,7 @@ func New(cfg Config) (*Server, error) {
 	// structured record (the final fix wave's re-review, logging minor 1).
 	s.server = &http.Server{
 		Addr:              cfg.AdminAddr,
+		TLSConfig:         cfg.TLS,
 		Handler:           s.buildHandler(),
 		ReadHeaderTimeout: cfg.Admin.ReadTimeout.Duration,
 		IdleTimeout:       cfg.Admin.IdleTimeout.Duration,
@@ -459,6 +479,13 @@ func (s *Server) buildHandler() http.Handler {
 	return s.requestLogMiddleware(h)
 }
 
+// SetListenerAddresses records the actual bound addresses (including :0 ports).
+// Call only before Serve: startup constructs the admin handler before binding.
+func (s *Server) SetListenerAddresses(proxy, secure, admin string) {
+	s.cfg.ProxyAddr, s.cfg.TLSAddr, s.cfg.AdminAddr = proxy, secure, admin
+	s.server.Addr = admin
+}
+
 // Serve blocks running the admin listener on the given net.Listener.
 // Returns nil on graceful shutdown (http.ErrServerClosed); any
 // other listener error is returned. cmd is responsible for bind
@@ -473,7 +500,13 @@ func (s *Server) buildHandler() http.Handler {
 func (s *Server) Serve(ln net.Listener) error {
 	s.runRefreshOnce(context.Background())
 	s.startRefresher()
-	if err := s.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	var err error
+	if s.cfg.TLS != nil {
+		err = s.server.ServeTLS(ln, "", "")
+	} else {
+		err = s.server.Serve(ln)
+	}
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil

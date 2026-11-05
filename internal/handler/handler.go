@@ -23,6 +23,7 @@ import (
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/clientaddr"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
@@ -30,6 +31,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/usage"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
@@ -78,6 +80,7 @@ type AdoptionWaiter interface {
 // Config carries handler dependencies. All non-pointer fields are
 // optional and defaulted in New.
 type Config struct {
+	Usage  *usage.Collector
 	Parser *proxy.Parser
 	Cache  *cache.Cache
 	Fetch  Fetcher
@@ -165,6 +168,7 @@ type ConnectHandler interface {
 // blocked on. Close cancels that lifecycle ctx and waits on activeWG
 // for currently-running ServeHTTP invocations to complete.
 type Handler struct {
+	usage     *usage.Collector
 	parser    *proxy.Parser
 	cache     *cache.Cache
 	fetch     Fetcher
@@ -286,6 +290,7 @@ func New(cfg Config) (*Handler, error) {
 		logger:                  logger,
 		refuseUnvouchedDebs:     cfg.RefuseUnvouchedDebs,
 		adoptionEnabled:         cfg.AdoptionEnabled,
+		usage:                   cfg.Usage,
 		flipGate:                cfg.FlipGate,
 		keepDisplaced:           cfg.KeepDisplaced,
 		maxSuites:               cfg.MaxSuites,
@@ -458,6 +463,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		h.logRequest(r, "", "", "method_not_allowed", http.StatusMethodNotAllowed, 0, false, 0, start)
 		return
+	}
+
+	// CONNECT framing is excluded; each tunneled GET/HEAD comes back through
+	// this handler. Count actual successful writes, including partial serves.
+	if h.usage != nil {
+		cw := &countingWriter{ResponseWriter: w}
+		w = cw
+		defer func() {
+			status := cw.statusCode()
+			bytes := cw.bytes
+			if r.Method == http.MethodHead || status < 200 || status >= 300 {
+				bytes = 0
+			}
+			cacheStatus := cw.Header().Get(hdrXCache)
+			hit := (status >= 200 && status < 300 || status == http.StatusNotModified) &&
+				(cacheStatus == cacheHit || cacheStatus == cacheHitStale || cacheStatus == cacheCoalesced)
+			h.usage.RecordServe(bytes, time.Since(start), hit)
+		}()
 	}
 
 	req, err := h.parser.Parse(r.RequestURI, r.Host)
@@ -704,16 +727,9 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 		return h.writeFailClosed(w, "snapshot lookup failed"), http.StatusBadGateway, 0, true, false
 	}
 
-	// Spec C8: a snapshot anchor's Last-Modified is its snapshot's
-	// adopted_at, which grows by at least 1 s per flip.
-	var modTime time.Time
-	if isAnchorMember(memberPath) {
-		modTime = h.anchorModTime(r.Context(), snapshotID)
-	}
 	served, status, bytesWritten = h.serveBlobWithHeaders(w, r, req, mem.BlobHash, snapshotMeta{
 		snapshotID:    snapshotID,
 		lastFetchedAt: nil, // snapshot rows don't carry per-blob last-fetched
-		modTime:       modTime,
 	})
 	if !served {
 		// Pool blob is missing for a known snapshot member (operator
@@ -728,7 +744,7 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 			"snapshot_id", snapshotID,
 			"blob_hash", mem.BlobHash,
 		)
-		served, status, bytesWritten = h.serveSnapshotMemberMiss(w, r, req, mem, snapshotID, modTime, start)
+		served, status, bytesWritten = h.serveSnapshotMemberMiss(w, r, req, mem, snapshotID, start)
 		if suites := servedSuite(sr, status); served && suites != nil {
 			go h.touchAsync(req, false, suites)
 		}
@@ -816,6 +832,7 @@ func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *pro
 
 	served, status, bytesWritten = h.serveBlobWithHeaders(w, r, req, *row.BlobHash, snapshotMeta{
 		lastFetchedAt: row.LastFetchedAt,
+		lastModified:  urlLastModified(row),
 	})
 	if !served {
 		return false, "", 0, 0, packageValidation{}
@@ -1268,18 +1285,12 @@ func firstPackageName(rows []cache.DeclaredHash, match string) string {
 	return ""
 }
 
-// snapshotMeta carries the metadata used by serveBlobWithHeaders to set
-// the response headers. snapshotID = 0 marks a Phase 1 / non-snapshot
-// serve (X-Cache-Snapshot suppressed); a positive value emits the
-// header. lastFetchedAt is the source for X-Cache-Age and may be nil; a
-// url_path serve's, it also floors a metadata file's Last-Modified
-// (urlPathModTime). modTime, when set, is the response's Last-Modified
-// instead of the pool file's mtime (spec C8: a snapshot anchor's
-// adopted_at).
+// snapshotMeta carries response metadata. A nil lastModified reads the
+// URL-and-hash-specific record; a non-nil value comes from the served URL row.
 type snapshotMeta struct {
 	snapshotID    int64
 	lastFetchedAt *int64
-	modTime       time.Time
+	lastModified  *string
 }
 
 // serveBlobWithHeaders opens pool/<blobHash>, sets the SPEC2 §3 headers,
@@ -1304,7 +1315,7 @@ func (h *Handler) serveBlobWithHeaders(w http.ResponseWriter, r *http.Request, r
 		return false, 0, 0
 	}
 	defer func() { _ = f.Close() }()
-	st, err := f.Stat()
+	_, err = f.Stat()
 	if err != nil {
 		h.logger.Warn("blob stat failed", "err", err, "hash", blobHash)
 		return false, 0, 0
@@ -1323,7 +1334,7 @@ func (h *Handler) serveBlobWithHeaders(w http.ResponseWriter, r *http.Request, r
 	}
 
 	cw := &countingWriter{ResponseWriter: w}
-	http.ServeContent(cw, r, req.Path, urlPathModTime(req, modTimeOr(meta.modTime, st.ModTime()), meta.lastFetchedAt), f)
+	h.serveContent(cw, r, req, blobHash, meta.lastModified, f)
 	return true, cw.statusCode(), cw.bytes
 }
 
@@ -1342,80 +1353,6 @@ func suiteRelativePath(suitePath, fullPath string) string {
 	// sees a well-defined "not in snapshot" miss rather than a partial
 	// match.
 	return fullPath
-}
-
-// isAnchorMember reports whether a suite-relative member path is a
-// snapshot anchor file: InRelease, Release or Release.gpg (spec C8).
-func isAnchorMember(p string) bool {
-	return p == "InRelease" || p == "Release" || p == "Release.gpg"
-}
-
-// anchorModTime is the spec C8 Last-Modified of a snapshot-served anchor
-// (InRelease, Release, Release.gpg): its snapshot's adopted_at — the
-// snapshot that served it, never the suite's current one, which a flip
-// may have changed since. CommitAdoption keeps adopted_at strictly
-// increasing per suite (A(N+1) ≥ A(N) + 1), and a first adoption's stamp
-// passes every url_path Last-Modified, so a client's If-Modified-Since
-// from the previous anchor always gets a 200 after a flip, whatever the
-// clock or a recovery rewrite of a pool file did. A read failure returns
-// zero: the pool mtime then serves (the pre-C8 behaviour), logged unless
-// the request has ended.
-//
-// AIDEV-NOTE: the pool mtime must not be folded back in (final review,
-// spec I-1): max(pool mtime, adopted_at) let a pool file written before a
-// backward clock step, or rewritten by a snapshot-member recovery, carry a
-// Last-Modified the next flip's stamp did not exceed, so the client got
-// 304s and kept stale lists. Last-Modified can lead the response's Date
-// (by 1 s after two flips in one second, by up to a backward step's
-// length after one); apt only echoes it back.
-func (h *Handler) anchorModTime(ctx context.Context, snapshotID int64) time.Time {
-	snap, err := h.cache.GetSuiteSnapshot(ctx, snapshotID)
-	if err == nil && snap.AdoptedAt != nil {
-		return time.Unix(*snap.AdoptedAt, 0)
-	}
-	if ctx.Err() == nil {
-		h.logger.Warn("snapshot_adopted_at_lookup_failed",
-			"err", err,
-			"snapshot_id", snapshotID,
-		)
-	}
-	return time.Time{}
-}
-
-// urlPathModTime is the Last-Modified of a url_path serve of req (spec
-// C4, plan design note 14): for a metadata file, the later of mtime (its
-// pool file's) and lastFetchedAt (its row's last_fetched_at), so apt's
-// If-Modified-Since on an index sees a replacement whose bytes were
-// already in the pool (the anchorless refresh points the row at an
-// existing pool file and moves last_fetched_at past the previous stamp);
-// a .deb, and a serve with no stamp (lastFetchedAt nil: a snapshot serve
-// or the content-addressed by-hash fallback), keep mtime. A by-hash
-// path's own url_path row (recordByHashURLPath) carries a stamp, so its
-// later hits answer max as any row does: harmless, as its bytes never
-// change.
-//
-// AIDEV-NOTE: ruling R-G3. adoptionStampTx's first-adoption floor is the
-// anchors' MAX(last_fetched_at) + 1, which passes this only while no pool
-// file is newer than its row's last_fetched_at: every writer of a row's
-// stamp (runFetch, cache.RefreshURLPathBlob) reads it after the pool file
-// is final. Blob mtimes are not folded into that floor.
-func urlPathModTime(req *proxy.Request, mtime time.Time, lastFetchedAt *int64) time.Time {
-	if !req.IsMetadata || lastFetchedAt == nil {
-		return mtime
-	}
-	if fetched := time.Unix(*lastFetchedAt, 0); fetched.After(mtime) {
-		return fetched
-	}
-	return mtime
-}
-
-// modTimeOr returns modTime, or the pool file's mtime when modTime is
-// zero.
-func modTimeOr(modTime, mtime time.Time) time.Time {
-	if modTime.IsZero() {
-		return mtime
-	}
-	return modTime
 }
 
 // distinctDeclared collapses a DeclaredHash slice down to its unique
@@ -1765,7 +1702,7 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	}
 	defer func() { _ = f.Close() }()
 
-	st, err := f.Stat()
+	_, err = f.Stat()
 	if err != nil {
 		http.Error(w, "cache stat failed", http.StatusInternalServerError)
 		h.logRequest(r, req.CanonicalHost, req.Path, "cache_write_failed", http.StatusInternalServerError, 0, true, res.status, start)
@@ -1779,7 +1716,7 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	}
 
 	cw := &countingWriter{ResponseWriter: w}
-	http.ServeContent(cw, r, req.Path, urlPathModTime(req, st.ModTime(), &res.fetchedAt), f)
+	h.serveContent(cw, r, req, hash, &res.lastModified, f)
 	v := packageValidation{Validated: res.validatedHash, PackageName: res.packageName, Suites: res.vouchingSuites}
 	if suites := append(servedSuite(sr, cw.statusCode()), vouchedSuites(req, v, cw.statusCode())...); len(suites) > 0 {
 		go h.touchAsync(req, false, suites)
@@ -1809,11 +1746,10 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 // Returns (served, status, bytesWritten) so the trySnapshotHit caller
 // can fold the result into its own return tuple. The access-log line
 // is emitted upstream by ServeHTTP under the existing tryCacheHit
-// path. modTime is the spec C8 Last-Modified of a snapshot anchor (its
-// adopted_at; zero for non-anchors, which keep the pool file's mtime).
+// path.
 func (h *Handler) serveSnapshotMemberMiss(
 	w http.ResponseWriter, r *http.Request, req *proxy.Request,
-	mem *cache.SnapshotMember, snapshotID int64, modTime, start time.Time,
+	mem *cache.SnapshotMember, snapshotID int64, start time.Time,
 ) (served bool, status int, bytesWritten int64) {
 	cw := &countingWriter{ResponseWriter: w}
 
@@ -1865,7 +1801,7 @@ func (h *Handler) serveSnapshotMemberMiss(
 		return true, http.StatusBadGateway, 0
 	}
 	defer func() { _ = f.Close() }()
-	st, err := f.Stat()
+	_, err = f.Stat()
 	if err != nil {
 		h.logger.Warn("post-recovery blob stat failed",
 			"err", err, "hash", res.blobHash)
@@ -1880,7 +1816,7 @@ func (h *Handler) serveSnapshotMemberMiss(
 	if res.status > 0 {
 		cw.Header().Set(hdrXUpstreamStat, strconv.Itoa(res.status))
 	}
-	http.ServeContent(cw, r, req.Path, modTimeOr(modTime, st.ModTime()), f)
+	h.serveContent(cw, r, req, res.blobHash, &res.lastModified, f)
 	return true, cw.statusCode(), cw.bytes
 }
 
@@ -1954,7 +1890,10 @@ func (h *Handler) runSnapshotMemberFetch(ctx context.Context, req *proxy.Request
 	if err := h.cache.PutBlob(dbCtx, hash, fres.ContentLength); err != nil {
 		return sfResult{err: fmt.Errorf("handler: put blob row: %w", err), status: fres.UpstreamStatus()}
 	}
-	return sfResult{blobHash: hash, size: fres.ContentLength, status: fres.UpstreamStatus()}
+	if err := h.cache.PutRepresentation(dbCtx, req.CanonicalScheme, req.CanonicalHost, req.Path, hash, fres.LastModified); err != nil {
+		return sfResult{err: fmt.Errorf("handler: store response metadata: %w", err)}
+	}
+	return sfResult{blobHash: hash, size: fres.ContentLength, status: fres.UpstreamStatus(), lastModified: fres.LastModified}
 }
 
 // respondRecoveryError handles fetch errors from a SPEC2 §6.2 metadata
@@ -2048,6 +1987,14 @@ func (h *Handler) respondRecoveryError(w http.ResponseWriter, r *http.Request, r
 // adopted suite. Metadata on non-adopted suites is the Phase 1 trust-
 // upstream path with no snapshot to validate against.
 func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath.SuiteFile, trackedAtStart bool) sfResult {
+	var generation *cache.MetadataGeneration
+	if !h.adoptionEnabled && req.IsMetadata && req.SuitePath != "" && !strings.Contains(req.Path, "/by-hash/") {
+		g, err := h.cache.MetadataGeneration(ctx, suiteKeyOf(req))
+		if err != nil {
+			return sfResult{err: err}
+		}
+		generation = &g
+	}
 	release, err := h.sem.Acquire(ctx, req.CanonicalHost)
 	if err != nil {
 		return sfResult{err: fmt.Errorf("handler: acquire host slot: %w", err)}
@@ -2291,12 +2238,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 	}
 
 	// AIDEV-NOTE: ruling R-G3. The row's stamp is read here, after the pool
-	// file is final: a metadata serve's Last-Modified is max(pool mtime,
-	// last_fetched_at) (urlPathModTime), and adoptionStampTx's
-	// first-adoption floor (the anchors' MAX(last_fetched_at) + 1) passes it
-	// only while no pool file is newer than its row's stamp. Never read it
-	// before the body is in the pool
-	// (TestServeHTTP_AMissStampsItsRowAfterItsPoolFile).
+	// file is final: record the local fetch time separately from HTTP dates.
 	now := wallclock.Unix()
 	row := cache.URLPath{
 		CanonicalScheme: req.CanonicalScheme,
@@ -2319,7 +2261,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 	}
 	// Spec C3: one writer operation stores the url_path row and, for a
 	// suite file whose body passes its sniff, creates the suite's row
-	// (InRelease always; Release and flat indexes with an adopter wired)
+	// (InRelease and Release always; flat indexes with an adopter wired)
 	// with the markers its cached signed anchors earn (ruling PD-5),
 	// re-stamps it on an adoption-disabled refresh miss (ruling PD-6), and
 	// writes the signed-seen marker of a signed anchor (InRelease,
@@ -2339,9 +2281,8 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 	// decides its marker; any other suite file is stored and served with no
 	// row creation or re-stamp (Task 9 review, ruling a).
 	sr := &suiteReq{key: suiteKeyOf(req), file: file}
-	fetched := cache.FetchedRow{Row: row}
+	fetched := cache.FetchedRow{Row: row, Suite: sr.key, Generation: generation}
 	if file != aptpath.NotSuiteFile {
-		fetched.Suite = sr.key
 		head, herr := readHead(h.cache.BlobPath(hash), file.HeadBytes())
 		if herr != nil {
 			h.logger.Warn("suite_file_head_read_failed",
@@ -2362,7 +2303,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 				create.Cached = h.cachedAnchors(dbCtx, sr.key, req.Path)
 				fetched.Create = &create
 			}
-			if file == aptpath.FileInRelease && !h.adoptionEnabled {
+			if (file == aptpath.FileInRelease || file == aptpath.FileRelease) && !h.adoptionEnabled {
 				fetched.Restamp = seed
 			}
 		}
@@ -2385,7 +2326,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 		suiteTracked:   stored.Tracked,
 		created:        stored.Create.Outcome == cache.SuiteCreated,
 		unproven:       stored.Create.Outcome == cache.SuiteCreated && stored.Create.Unproven,
-		fetchedAt:      now,
+		lastModified:   fres.LastModified,
 	}
 }
 
@@ -2556,6 +2497,12 @@ const releaseSuffix = "/Release"
 // exist) → passthrough. Any other failure → 502.
 func (h *Handler) respondError(w http.ResponseWriter, r *http.Request, req *proxy.Request, res sfResult, start time.Time) {
 	err := res.err
+	if errors.Is(err, cache.ErrMetadataChanged) {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "repository changed during download; retry", http.StatusServiceUnavailable)
+		h.logRequest(r, req.CanonicalHost, req.Path, "bad_gateway", http.StatusServiceUnavailable, 0, true, res.status, start)
+		return
+	}
 	if res.status > 0 {
 		w.Header().Set(hdrXUpstreamStat, strconv.Itoa(res.status))
 	}
@@ -2749,7 +2696,7 @@ func (h *Handler) tryServeStale(w http.ResponseWriter, r *http.Request, req *pro
 		return false
 	}
 	defer func() { _ = f.Close() }()
-	st, err := f.Stat()
+	_, err = f.Stat()
 	if err != nil {
 		return false
 	}
@@ -2764,7 +2711,7 @@ func (h *Handler) tryServeStale(w http.ResponseWriter, r *http.Request, req *pro
 	}
 
 	cw := &countingWriter{ResponseWriter: w}
-	http.ServeContent(cw, r, req.Path, urlPathModTime(req, st.ModTime(), row.LastFetchedAt), f)
+	h.serveContent(cw, r, req, hash, urlLastModified(row), f)
 	// Spec C3: a stale anchor serve records client interest too. Whether
 	// the suite has a row is not known here; TouchSuite is UPDATE-only, so
 	// an untracked suite costs one no-op write per stale serve.
@@ -2858,6 +2805,7 @@ func (h *Handler) logRequest(r *http.Request, canonHost, path, outcome string, s
 // including HIT-STALE (which fired after a fetch failed).
 func (h *Handler) logRequestWithValidation(r *http.Request, canonHost, path, outcome string, status int, bytesWritten int64, fetchAttempted bool, upstreamStatus int, start time.Time, validation packageValidation) {
 	duration := time.Since(start)
+	addr := clientaddr.FromRequest(r)
 	attrs := []any{
 		"method", r.Method,
 		"url", urlForLog(r),
@@ -2867,7 +2815,10 @@ func (h *Handler) logRequestWithValidation(r *http.Request, canonHost, path, out
 		"status", status,
 		"bytes_sent", bytesWritten,
 		"duration_ms", duration.Milliseconds(),
-		"client_addr", r.RemoteAddr,
+		"client_addr", addr.Client,
+	}
+	if addr.Client != addr.Peer {
+		attrs = append(attrs, "peer_addr", addr.Peer)
 	}
 	// SPEC6_5 §2.3: per-request path_class + architecture fields.
 	// Empty path (the pre-canonicalize bad_request / method_not_allowed
@@ -3284,6 +3235,8 @@ type countingWriter struct {
 	status int
 	bytes  int64
 }
+
+func (c *countingWriter) Unwrap() http.ResponseWriter { return c.ResponseWriter }
 
 func (c *countingWriter) WriteHeader(code int) {
 	c.status = code

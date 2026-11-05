@@ -231,7 +231,10 @@ UPDATE suite_freshness SET last_check_at = 7, last_success_at = 7, inrelease_cha
 			t.Fatalf("%s = %d", path, rec.Code)
 		}
 	}
-	for _, suite := range []string{"/r/dists/t", "/r/dists/u", "/r/dists/v", "/r/dists/w"} {
+	if r.suite("/r/dists/t") == nil {
+		t.Fatal("Release did not track its legacy suite")
+	}
+	for _, suite := range []string{"/r/dists/u", "/r/dists/v", "/r/dists/w"} {
 		if r.suite(suite) != nil {
 			t.Errorf("%s: a row was created", suite)
 		}

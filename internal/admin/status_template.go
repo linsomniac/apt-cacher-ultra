@@ -175,6 +175,10 @@ table.data .num{text-align:right;font-family:var(--font-mono)}
 table.data .mono{font-family:var(--font-mono);font-size:12px;color:var(--ink-mid)}
 table.data .host{font-family:var(--font-mono);font-size:12px;color:var(--ink-high);font-weight:500;letter-spacing:0.02em}
 table.data .muted{color:var(--ink-low)}
+table.usage-table tbody th{text-align:left;font-weight:500;padding:9px 16px;border-bottom:1px solid var(--rule)}
+table.usage-table tbody tr:nth-child(even) th{background:var(--bg-row)}
+table.usage-table tbody tr:last-child th{border-bottom:0}
+#usage .table-wrap{margin-bottom:18px}
 table.data .time{font-family:var(--font-mono);font-size:12px;color:var(--ink-mid);letter-spacing:0.02em}
 table.data tbody tr[data-state="warn"] td{background:var(--tint-warn)}
 table.data tbody tr[data-state="crit"] td{background:var(--tint-crit)}
@@ -280,6 +284,7 @@ table.data tbody tr[data-state="warn"]{border-left:3px solid var(--warn)}
 table.data tbody tr[data-state="crit"]{border-left:3px solid var(--crit)}
 table.data tbody td{display:flex;justify-content:space-between;padding:3px 0;white-space:normal;border-bottom:0}
 table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono);font-size:9.5px;letter-spacing:0.14em;text-transform:uppercase;color:var(--ink-low);margin-right:12px;flex-shrink:0}
+table.usage-table tbody th{display:block;padding:3px 0 6px;border-bottom:0}
 }
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:0.01ms !important;transition-duration:0.01ms !important}}
 </style>
@@ -361,7 +366,7 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
         <span class="vital__unit">TRACKED</span>
       </div>
       <div class="vital__sub">
-        {{if not $adopting}}<span>ADOPTION DISABLED &mdash; METADATA NOT REFRESHED</span>{{else}}{{$lagCount := 0}}{{$failCount := 0}}{{$longCount := 0}}{{range .Suites}}{{if .LagWarn}}{{$lagCount = (add1 $lagCount)}}{{end}}{{if .AdoptionFailing}}{{$failCount = (add1 $failCount)}}{{end}}{{if .RefusedLong}}{{$longCount = (add1 $longCount)}}{{end}}{{end}}
+        {{if not $adopting}}<span>ADOPTION DISABLED</span>{{else}}{{$lagCount := 0}}{{$failCount := 0}}{{$longCount := 0}}{{range .Suites}}{{if .LagWarn}}{{$lagCount = (add1 $lagCount)}}{{end}}{{if .AdoptionFailing}}{{$failCount = (add1 $failCount)}}{{end}}{{if .RefusedLong}}{{$longCount = (add1 $longCount)}}{{end}}{{end}}
         <span>{{if eq $lagCount 0}}<b>0 LAGGING</b>{{else}}<b class="accent-warn">{{$lagCount}} LAGGING</b>{{end}} &middot; {{if eq $failCount 0}}0 FAILING{{else}}<b class="accent-warn">{{$failCount}} FAILING</b>{{end}}{{if gt $longCount 0}} &middot; <b class="accent-warn">{{$longCount}} REFUSED 24H+</b>{{end}}</span>{{end}}
       </div>
     </article>
@@ -411,8 +416,9 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
 
   <div class="layout">
     <nav class="rail" aria-label="Section navigation">
-      <div class="rail__head"><span>Detail</span><span>9 panels</span></div>
+      <div class="rail__head"><span>Detail</span><span>{{if .Usage}}10{{else}}9{{end}} panels</span></div>
       <ul>
+        {{if .Usage}}<li><a href="#usage">Usage</a></li>{{end}}
         <li><a href="#suites">Suites</a></li>
         <li><a href="#adoptions">Adoptions</a></li>
         <li><a href="#keyring">Keyring</a></li>
@@ -426,6 +432,28 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
     </nav>
 
     <div class="content">
+
+      {{with .Usage}}
+      <section class="panel" id="usage">
+        <div class="panel__eyebrow"><span>Usage</span><span class="sep">&mdash;</span><span>APPLICATION BODY BYTES</span></div>
+        <h2 class="panel__h">Traffic and cache savings</h2>
+        <p class="panel__desc">Lifetime totals since {{unixTime .Lifetime.SinceUnix}}. Last checkpoint {{unixTime .LastCheckpointUnix}}. Totals update as transfers finish and persist every 30 seconds and at graceful shutdown.</p>
+        {{if .PersistenceError}}<p class="accent-warn" role="status">Usage checkpoint failed. Totals are still collected in memory; unsaved data may be lost on restart. Check the server logs.</p>{{end}}
+        <div class="table-wrap"><table class="data usage-table">
+          <thead><tr><th scope="col">Measurement</th><th scope="col" class="num">Lifetime</th><th scope="col" class="num">Since start</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Data fetched</th><td data-label="Lifetime" class="num mono">{{formatBytes .Lifetime.FetchedBytes}}</td><td data-label="Since start" class="num mono">{{formatBytes .Session.FetchedBytes}}</td></tr>
+            <tr><th scope="row">Data served</th><td data-label="Lifetime" class="num mono">{{formatBytes .Lifetime.ServedBytes}}</td><td data-label="Since start" class="num mono">{{formatBytes .Session.ServedBytes}}</td></tr>
+            <tr><th scope="row">Cache-hit data served</th><td data-label="Lifetime" class="num mono">{{formatBytes .Lifetime.CacheHitBytes}}</td><td data-label="Since start" class="num mono">{{formatBytes .Session.CacheHitBytes}}</td></tr>
+            <tr><th scope="row">Net bytes saved (estimate)</th><td data-label="Lifetime" class="num mono">{{signedBytes .Lifetime.NetSavedBytes}}</td><td data-label="Since start" class="num mono">{{signedBytes .Session.NetSavedBytes}}</td></tr>
+            <tr><th scope="row">Requests / cache hits</th><td data-label="Lifetime" class="num mono">{{.Lifetime.Requests}} / {{.Lifetime.CacheHitRequests}} ({{usagePercent .Lifetime.CacheHitPercent}})</td><td data-label="Since start" class="num mono">{{.Session.Requests}} / {{.Session.CacheHitRequests}} ({{usagePercent .Session.CacheHitPercent}})</td></tr>
+            <tr><th scope="row">Average download rate</th><td data-label="Lifetime" class="num mono">{{usageRate .Lifetime.AverageDownloadBPS}}</td><td data-label="Since start" class="num mono">{{usageRate .Session.AverageDownloadBPS}}</td></tr>
+            <tr><th scope="row">Average upload rate</th><td data-label="Lifetime" class="num mono">{{usageRate .Lifetime.AverageUploadBPS}}</td><td data-label="Since start" class="num mono">{{usageRate .Session.AverageUploadBPS}}</td></tr>
+          </tbody>
+        </table></div>
+        <p class="panel__desc">Fetched data includes background work and retries. Saved bytes = served minus fetched; this estimate can be negative. Rates divide body bytes by summed elapsed transfer/request times, including latency and cache waits; concurrent operations each contribute time. These are effective application rates, not network line speeds. No samples: n/a.</p>
+      </section>
+      {{end}}
 
       <!-- SUITES -->
       <section class="panel" id="suites">
@@ -675,8 +703,29 @@ table.data tbody td::before{content:attr(data-label);font-family:var(--font-mono
 
         <div class="kv" style="margin-bottom:24px">
           <div class="kv__group-head"><span>Listeners</span></div>
-          {{range .Listeners}}<div class="k">{{.Role}}</div><div class="v"><code>{{.Addr}}</code></div>{{end}}
+          {{range .Listeners}}<div class="k">{{.Role}}</div><div class="v"><code>{{.Addr}}</code> {{.Scheme}}</div>{{end}}
         </div>
+
+        {{range $listener, $cert := .ServerTLS}}
+        <div class="kv" style="margin-bottom:24px">
+          <div class="kv__group-head"><span>Server TLS — {{$listener}}</span></div>
+          <div class="k">Source / state</div><div class="v">{{$cert.Source}} / {{$cert.State}}</div>
+          <div class="k">Fingerprint</div><div class="v"><span class="fp">{{$cert.Fingerprint}}</span></div>
+          <div class="k">Expires</div><div class="v">{{unixTime $cert.NotAfter}}</div>
+          {{if $cert.Error}}<div class="k">Error</div><div class="v">{{$cert.Error}}</div>{{end}}
+        </div>
+        {{end}}
+        {{if .ACME}}
+        <div class="kv" style="margin-bottom:24px">
+          <div class="kv__group-head"><span>ACME</span></div>
+          <div class="k">DNS name</div><div class="v">{{.ACME.DNSName}}</div>
+          <div class="k">Challenge</div><div class="v">{{.ACME.ChallengeType}}</div>
+          {{if .ACME.DNSProvider}}<div class="k">DNS provider</div><div class="v">{{.ACME.DNSProvider}}</div>{{end}}
+          <div class="k">Authority</div><div class="v">{{.ACME.DirectoryURL}}</div>
+          <div class="k">Next eligible attempt</div><div class="v">{{unixTime .ACME.NextAttempt}}</div>
+          <div class="k">Last success</div><div class="v">{{unixTime .ACME.LastSuccess}}</div>
+        </div>
+        {{end}}
 
         {{if .TLSMITM.Enabled}}
         <div class="kv" style="margin-bottom:24px">

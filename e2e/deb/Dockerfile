@@ -44,7 +44,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build \
+RUN CGO_ENABLED=0 go build -p 2 \
     -trimpath \
     -ldflags "-s -w -X main.Version=${VERSION}" \
     -o /src/build/apt-cacher-ultra \

@@ -19,8 +19,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/acmedns"
 	"github.com/linsomniac/apt-cacher-ultra/internal/admin"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/clientaddr"
 	"github.com/linsomniac/apt-cacher-ultra/internal/config"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
@@ -28,12 +30,14 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/gc"
 	"github.com/linsomniac/apt-cacher-ultra/internal/gpg"
 	"github.com/linsomniac/apt-cacher-ultra/internal/handler"
+	"github.com/linsomniac/apt-cacher-ultra/internal/health"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
 	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy/tlsmitm"
+	"github.com/linsomniac/apt-cacher-ultra/internal/usage"
 
 	"crypto/tls"
 )
@@ -148,6 +152,20 @@ var (
 )
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == acmedns.WorkerArgument {
+		os.Exit(acmedns.RunWorker())
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "acme" {
+		if len(os.Args) != 3 || os.Args[2] != "dns-providers" {
+			fmt.Fprintln(os.Stderr, "usage: apt-cacher-ultra acme dns-providers")
+			os.Exit(1)
+		}
+		for _, provider := range acmedns.Providers() {
+			fmt.Println(provider)
+		}
+		return
+	}
+
 	// SPEC6 §14.3 subcommand routing. `ca print` is a positional
 	// pre-flag form (matches the established `program subcommand
 	// args` shell idiom and avoids polluting the daemon's flag set).
@@ -216,18 +234,17 @@ func run(configPath string) error {
 // optional TLS server) and blocks until ctx is cancelled or a listener
 // fails. On exit, SPEC §9.5 graceful shutdown is performed.
 //
-// The actual listening sockets are bound here (per cfg.Cache.Listen and
-// cfg.Cache.ListenTLS) before being handed to serveListeners. Tests bypass
-// this and call serveListeners directly with their own listeners — that is
-// the only practical way to learn a `:0`-bound port without racing.
-//
-// SPEC6 §9.5 step 2 mandates CA materialization BEFORE the proxy bind.
-// The bind-then-CA-fail window would otherwise leave :3142 accepting
-// (and 503-ing CONNECT) for the duration of a 30s flock timeout or an
-// unconstrained-CA refusal, surfacing as transient connect/reset
-// behaviour to clients. Failing fast at CA load runs the bind
-// conditionally on the prerequisite working.
+// Application sockets are bound only after all startup preparation succeeds.
+// Tests can supply pre-bound listeners to serveListeners to discover :0 ports.
 func serve(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	unlock, err := lockDaemonStorage(cfg.Cache.Dir, cfg.Cache.DBDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	var preloadedCA *tlsmitm.CA
 	if cfg.TlsMitm.Enabled {
 		ca, err := loadMitmCA(cfg, logger)
@@ -237,37 +254,7 @@ func serve(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 		preloadedCA = ca
 	}
 
-	plainLn, err := net.Listen("tcp", cfg.Cache.Listen)
-	if err != nil {
-		return fmt.Errorf("listen %s: %w", cfg.Cache.Listen, err)
-	}
-
-	var tlsLn net.Listener
-	if cfg.Cache.ListenTLS != "" {
-		tlsLn, err = net.Listen("tcp", cfg.Cache.ListenTLS)
-		if err != nil {
-			_ = plainLn.Close()
-			return fmt.Errorf("listen %s: %w", cfg.Cache.ListenTLS, err)
-		}
-	}
-
-	// SPEC5 §9.7.1: admin listener bound after the proxy/TLS
-	// listeners and before cache.Open, so a bind failure (port in
-	// use, permission denied) fails-fast before we touch the cache
-	// directory. Skipped when admin.enabled = false.
-	var adminLn net.Listener
-	if cfg.Admin.Enabled {
-		adminLn, err = net.Listen("tcp", cfg.Admin.Listen)
-		if err != nil {
-			_ = plainLn.Close()
-			if tlsLn != nil {
-				_ = tlsLn.Close()
-			}
-			return fmt.Errorf("listen %s: %w", cfg.Admin.Listen, err)
-		}
-	}
-
-	return serveListeners(ctx, cfg, logger, plainLn, tlsLn, adminLn, preloadedCA)
+	return serveListeners(ctx, cfg, logger, nil, nil, nil, preloadedCA)
 }
 
 // loadMitmCA performs the SPEC6 §9.5 step 2 pre-bind CA materialization.
@@ -295,8 +282,8 @@ func loadMitmCA(cfg *config.Config, logger *slog.Logger) (*tlsmitm.CA, error) {
 
 // serveListeners is the inner serve loop. It owns its listeners (closing
 // them on shutdown) and runs until ctx is cancelled or a listener errors
-// out. Both production (via serve) and tests construct listeners and hand
-// them in.
+// out. Production passes nil listeners, which are bound after preparation.
+// Tests may pass pre-bound listeners.
 //
 // The wiring order matters: cache.Open before SweepTmp (SweepTmp reads
 // cache.Dir from the open handle); fetch.New before handler.New (handler
@@ -310,22 +297,23 @@ func serveListeners(
 	tlsLn net.Listener,
 	adminLn net.Listener,
 	preloadedCA *tlsmitm.CA,
-) (retErr error) {
-	defer func() {
-		// Defensive: if we error out before the goroutines start serving,
-		// the listeners would otherwise leak — Serve() never runs to
-		// observe the listener and close it. Closing twice is OK; net's
-		// listeners no-op on a second close.
-		if retErr != nil {
-			_ = plainLn.Close()
-			if tlsLn != nil {
-				_ = tlsLn.Close()
-			}
-			if adminLn != nil {
-				_ = adminLn.Close()
+	preparedTLS ...*serverTLS,
+) error {
+	// Close sockets before potentially slow certificate/provider cleanup, on
+	// every startup failure (including partial binding) and cancellation.
+	closeListeners := func() {
+		for _, ln := range []net.Listener{plainLn, tlsLn, adminLn} {
+			if ln != nil {
+				_ = ln.Close()
 			}
 		}
-	}()
+	}
+	defer closeListeners()
+
+	clientAddresses, err := clientaddr.New(cfg.Cache.TrustedProxies)
+	if err != nil {
+		return fmt.Errorf("cache.%w", err)
+	}
 
 	// SPEC5 §10.2: count htpasswd users once up-front so both the
 	// startup config dump and the admin_authenticated Info line carry
@@ -341,6 +329,19 @@ func serveListeners(
 		htpasswdUsers = n
 	}
 
+	var serverCerts *serverTLS
+	if len(preparedTLS) != 0 {
+		serverCerts = preparedTLS[0]
+	} else {
+		var err error
+		serverCerts, err = prepareServerTLS(ctx, cfg, logger, nil)
+		if err != nil {
+			return fmt.Errorf("server TLS: %w", err)
+		}
+	}
+	defer serverCerts.Close()
+	defer closeListeners()
+
 	// SPEC §10 / SPEC2 §10.3: startup config dump. Capture every
 	// operationally-relevant tunable so a single boot log line tells
 	// the operator what policy they're running under (timeouts,
@@ -349,9 +350,11 @@ func serveListeners(
 	// upstream.proxy may contain credentials: log only whether it is set.
 	logger.Info("apt-cacher-ultra starting",
 		"version", Version,
-		"listen", plainLn.Addr().String(),
-		"listen_tls", tlsAddrString(tlsLn),
+		"listen", listenerAddress(plainLn, cfg.Cache.Listen),
+		"cache_trusted_proxies", cfg.Cache.TrustedProxies,
+		"listen_tls", listenerAddress(tlsLn, cfg.Cache.ListenTLS),
 		"cache_dir", cfg.Cache.Dir,
+		"db_dir", cfg.Cache.DatabaseDir(),
 		"upstream_proxy_enabled", cfg.Upstream.Proxy != "",
 		"upstream_connect_timeout", cfg.Upstream.ConnectTimeout.Duration,
 		"upstream_total_timeout", cfg.Upstream.TotalTimeout.Duration,
@@ -392,6 +395,8 @@ func serveListeners(
 		"gc_heartbeat_stale_grace_effective", cfg.HeartbeatStaleGraceEffective(),
 		"gc_url_path_ttl", cfg.GC.URLPathTTL.Duration,
 		"gc_suite_idle_ttl", cfg.GC.SuiteIdleTTL.Duration,
+		"admin_tls_enabled", cfg.Admin.TLSEnabled(),
+		"acme_enabled", cfg.ACME.Enabled,
 		"admin_enabled", cfg.Admin.Enabled,
 		"admin_listen", cfg.Admin.Listen,
 		"admin_htpasswd_file", cfg.Admin.HtpasswdFile,
@@ -447,7 +452,7 @@ func serveListeners(
 	// SPEC5 §5.2 / §10.2: admin-listener startup events.
 	if !cfg.Admin.Enabled {
 		logger.Warn("admin_disabled",
-			"detail", "admin.enabled = false: /metrics, /, /healthz unreachable; the cache still serves proxy traffic but observability is off")
+			"detail", "admin.enabled = false: admin endpoints unreachable; proxy traffic and proxy /healthz remain available")
 	} else {
 		if cfg.Admin.HtpasswdFile == "" && admin.IsNonLoopback(cfg.Admin.Listen) {
 			logger.Warn("admin_unauthenticated_non_loopback",
@@ -463,7 +468,7 @@ func serveListeners(
 		// file that admin.New fails to parse moments later.
 	}
 
-	c, err := cache.Open(ctx, cfg.Cache.Dir, logger)
+	c, err := cache.OpenWithDBDir(ctx, cfg.Cache.Dir, cfg.Cache.DBDir, logger)
 	if err != nil {
 		return fmt.Errorf("open cache: %w", err)
 	}
@@ -549,7 +554,30 @@ func serveListeners(
 		return fmt.Errorf("build proxy parser: %w", err)
 	}
 
+	usageStats, err := usage.New(ctx, c)
+	if err != nil {
+		return fmt.Errorf("initialize usage statistics: %w", err)
+	}
+	usageCtx, usageCancel := context.WithCancel(context.Background())
+	usageDone := make(chan struct{})
+	go func() {
+		defer close(usageDone)
+		usageStats.Run(usageCtx, logger)
+	}()
+	// Registered before producer cleanup defers: the final absolute snapshot
+	// lands after request/adoption drain and before the cache is closed.
+	defer func() {
+		usageCancel()
+		<-usageDone
+		flushCtx, cancel := context.WithTimeout(context.Background(), usage.CheckpointTimeout)
+		defer cancel()
+		if err := usageStats.Flush(flushCtx); err != nil {
+			logger.Warn("usage_final_checkpoint_failed", "err", err)
+		}
+	}()
+
 	fetchClient, err := fetch.New(fetch.Options{
+		Usage:                    usageStats,
 		Proxy:                    cfg.Upstream.Proxy,
 		ConnectTimeout:           cfg.Upstream.ConnectTimeout.Duration,
 		TotalTimeout:             cfg.Upstream.TotalTimeout.Duration,
@@ -611,10 +639,14 @@ func serveListeners(
 		return fmt.Errorf("build suite reaper: %w", err)
 	}
 
-	h, err := handler.New(handlerConfig(cfg, parser, c, fetchClient, hostLimiter, logger, freshChecker, adopter))
+	hcfg := handlerConfig(cfg, parser, c, fetchClient, hostLimiter, logger, freshChecker, adopter)
+	hcfg.Usage = usageStats
+	h, err := handler.New(hcfg)
 	if err != nil {
 		return fmt.Errorf("build handler: %w", err)
 	}
+
+	defer h.Close()
 
 	// SPEC6 §2.2: when tls_mitm.enabled = true, materialize the CA
 	// (load supplied or auto-generate per §4.2), build the leaf-cert
@@ -629,6 +661,89 @@ func serveListeners(
 			return fmt.Errorf("build tls_mitm: %w", err)
 		}
 		mitmHandles = hs
+	}
+
+	scanner, err := integrity.New(integrity.Config{
+		Cache:    c,
+		Interval: cfg.Integrity.ValidateAtRestInterval.Duration,
+		Workers:  cfg.Integrity.ValidateAtRestWorkers,
+		Logger:   logger,
+	})
+	if err != nil {
+		return fmt.Errorf("build integrity scanner: %w", err)
+	}
+	state := &readiness{ctx: ctx, required: 1, certs: serverCerts, mitm: mitmHandles}
+	if tlsLn != nil || cfg.Cache.ListenTLS != "" {
+		state.required++
+	}
+	if cfg.Admin.Enabled {
+		state.required++
+	}
+	probe := health.Check{Cache: c, Ready: state.failure}
+
+	// SPEC5 §9.7 admin listener. Built only when admin.enabled.
+	// BuildInfo is composed here because internal/admin cannot
+	// import main (Go's internal/ rule) — main reads main.Version
+	// + debug.ReadBuildInfo() and passes the value-type bridge.
+	var adminSrv *admin.Server
+	if cfg.Admin.Enabled {
+		adminSrv, err = admin.New(admin.Config{
+			Usage:                   usageStats,
+			Cache:                   c,
+			HealthCheck:             probe.Failure,
+			GC:                      gcsvc,
+			HostLimiter:             hostLimiter,
+			Ring:                    adoptionRing,
+			Registry:                metrics.Default,
+			Logger:                  logger,
+			BuildInfo:               buildInfo(),
+			Admin:                   cfg.Admin,
+			TLS:                     serverCerts.Config("admin"),
+			ServerTLS:               serverCerts.Snapshots,
+			ACME:                    serverCerts.ACMEStatus,
+			StartTime:               time.Now(),
+			ProxyAddr:               listenerAddress(plainLn, cfg.Cache.Listen),
+			TLSAddr:                 listenerAddress(tlsLn, cfg.Cache.ListenTLS),
+			AdminAddr:               listenerAddress(adminLn, cfg.Admin.Listen),
+			TLSMITM:                 &tlsMitmProvider{h: mitmHandles},
+			AdoptionArchitectures:   cfg.Adoption.Architectures,
+			AdoptionAcceptAnySigner: cfg.Adoption.AcceptAnySigner,
+			Keyring:                 &keyringProvider{k: keyring},
+			Reconciler:              freshChecker,
+			Forgetter:               reaper,
+			CheckBackoff:            freshness.CheckBackoff,
+		})
+		if err != nil {
+			return fmt.Errorf("build admin: %w", err)
+		}
+		defer func() {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			_ = adminSrv.Shutdown(cleanupCtx)
+		}()
+		// SPEC5 §10.2: admin_authenticated emits the live user_count
+		// from the post-admin.New authenticator. Skipped when
+		// htpasswd_file is empty (admin is unauthenticated).
+		if cfg.Admin.HtpasswdFile != "" {
+			logger.Info("admin_authenticated",
+				"htpasswd_file", cfg.Admin.HtpasswdFile,
+				"user_count", adminSrv.UserCount())
+		}
+	}
+
+	logger.Info("startup_preparation_complete")
+
+	// All constructors, migrations, audits and startup GC have completed.
+	adminAddr := ""
+	if cfg.Admin.Enabled {
+		adminAddr = cfg.Admin.Listen
+	}
+	if err := bindApplicationListeners(ctx, &plainLn, &tlsLn, &adminLn, cfg.Cache.Listen, cfg.Cache.ListenTLS, adminAddr); err != nil {
+		closeListeners()
+		return fmt.Errorf("listen: %w", err)
+	}
+	if adminSrv != nil {
+		adminSrv.SetListenerAddresses(plainLn.Addr().String(), tlsAddrString(tlsLn), adminLn.Addr().String())
 	}
 
 	// SPEC §7.4: start the periodic refresh scheduler. The scheduler
@@ -652,15 +767,6 @@ func serveListeners(
 	// the freshness scheduler — neither must outlive the cache. A zero
 	// interval disables the scan; Scanner.Run returns immediately and
 	// the WaitGroup completes without doing anything.
-	scanner, err := integrity.New(integrity.Config{
-		Cache:    c,
-		Interval: cfg.Integrity.ValidateAtRestInterval.Duration,
-		Workers:  cfg.Integrity.ValidateAtRestWorkers,
-		Logger:   logger,
-	})
-	if err != nil {
-		return fmt.Errorf("build integrity scanner: %w", err)
-	}
 	var scannerWG sync.WaitGroup
 	scannerWG.Add(1)
 	go func() {
@@ -713,63 +819,27 @@ func serveListeners(
 		}()
 	}
 
-	// SPEC5 §9.7 admin listener. Built only when admin.enabled.
-	// BuildInfo is composed here because internal/admin cannot
-	// import main (Go's internal/ rule) — main reads main.Version
-	// + debug.ReadBuildInfo() and passes the value-type bridge.
-	var adminSrv *admin.Server
-	if cfg.Admin.Enabled {
-		adminSrv, err = admin.New(admin.Config{
-			Cache:                   c,
-			GC:                      gcsvc,
-			HostLimiter:             hostLimiter,
-			Ring:                    adoptionRing,
-			Registry:                metrics.Default,
-			Logger:                  logger,
-			BuildInfo:               buildInfo(),
-			Admin:                   cfg.Admin,
-			StartTime:               time.Now(),
-			ProxyAddr:               plainLn.Addr().String(),
-			TLSAddr:                 tlsAddrString(tlsLn),
-			AdminAddr:               adminLn.Addr().String(),
-			TLSMITM:                 &tlsMitmProvider{h: mitmHandles},
-			AdoptionArchitectures:   cfg.Adoption.Architectures,
-			AdoptionAcceptAnySigner: cfg.Adoption.AcceptAnySigner,
-			Keyring:                 &keyringProvider{k: keyring},
-			Reconciler:              freshChecker,
-			Forgetter:               reaper,
-			CheckBackoff:            freshness.CheckBackoff,
-		})
-		if err != nil {
-			return fmt.Errorf("build admin: %w", err)
-		}
-		// SPEC5 §10.2: admin_authenticated emits the live user_count
-		// from the post-admin.New authenticator. Skipped when
-		// htpasswd_file is empty (admin is unauthenticated).
-		if cfg.Admin.HtpasswdFile != "" {
-			logger.Info("admin_authenticated",
-				"htpasswd_file", cfg.Admin.HtpasswdFile,
-				"user_count", adminSrv.UserCount())
-		}
-	}
-
-	plainSrv := newHTTPServer(h, logger)
+	cacheHandler := probe.ProxyHandler(clientAddresses.Wrap(h))
+	plainSrv := newHTTPServer(cacheHandler, logger)
 	var tlsSrv *http.Server
 	if tlsLn != nil {
-		tlsSrv = newHTTPServer(h, logger)
+		tlsSrv = newHTTPServer(cacheHandler, logger)
+		tlsSrv.TLSConfig = serverCerts.Config("cache")
 	}
 
 	// AIDEV-NOTE: errCh is buffered to (number of servers) so a goroutine
 	// can always deliver its terminal error without blocking even if the
 	// main goroutine has already moved on to shutdown.
+	serverCerts.Start()
 	errCh := make(chan error, 3)
 	var wg sync.WaitGroup
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		logger.Info("http listener accepting", "addr", plainLn.Addr().String())
-		err := plainSrv.Serve(plainLn)
+		logger.Info("http listener accepting", "addr", listenerAddress(plainLn, cfg.Cache.Listen))
+		err := plainSrv.Serve(state.listener(plainLn))
+		state.stopped.Store(true)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("http: %w", err)
 			return
@@ -782,7 +852,8 @@ func serveListeners(
 		go func() {
 			defer wg.Done()
 			logger.Info("https listener accepting", "addr", tlsLn.Addr().String())
-			err := tlsSrv.ServeTLS(tlsLn, cfg.Cache.TLSCert, cfg.Cache.TLSKey)
+			err := tlsSrv.ServeTLS(state.listener(tlsLn), "", "")
+			state.stopped.Store(true)
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- fmt.Errorf("https: %w", err)
 				return
@@ -795,8 +866,9 @@ func serveListeners(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			logger.Info("admin listener accepting", "addr", adminLn.Addr().String())
-			err := adminSrv.Serve(adminLn)
+			logger.Info("admin listener accepting", "addr", listenerAddress(adminLn, cfg.Admin.Listen))
+			err := adminSrv.Serve(state.listener(adminLn))
+			state.stopped.Store(true)
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- fmt.Errorf("admin: %w", err)
 				return
@@ -812,12 +884,20 @@ func serveListeners(
 	select {
 	case <-ctx.Done():
 		logger.Info("shutdown signal received")
+	case err := <-serverCerts.err:
+		listenerErr = err
 	case err := <-errCh:
 		if err != nil {
 			listenerErr = err
 			logger.Error("listener exited unexpectedly", "err", err)
 		}
 	}
+
+	state.stopped.Store(true)
+
+	// DNS cleanup can take minutes. Stop accepting application traffic first;
+	// Close joins certificate workers after the listeners drain.
+	serverCerts.Stop()
 
 	// Spec C8 (phase C plan, design note 18): close the flip barrier
 	// before anything drains. An adoption waiting in it abandons its commit
@@ -960,7 +1040,7 @@ func serveListeners(
 	// their upstream work, and an adoption that has not reached its
 	// commit skips it; a commit already running is not cancelled (spec C4)
 	// and can hold this Wait for up to the 5-minute commit timeout
-	// (the packaged unit's TimeoutStopSec=35 may SIGKILL first; SQLite
+	// (a supervisor stop timeout may SIGKILL first; SQLite
 	// rolls the transaction back). This Wait makes the shutdown
 	// deterministic before the cache is closed by the deferred
 	// c.Close(); past adoptionDrainNotice it is explained in the journal.
@@ -969,6 +1049,7 @@ func serveListeners(
 	waitAdoptionDrain(freshChecker.WaitForAdoptions, adoptionDrainNotice, logger)
 
 	wg.Wait()
+	serverCerts.Close()
 	logger.Info("apt-cacher-ultra stopped")
 	return listenerErr
 }
@@ -1397,6 +1478,7 @@ type tlsMitmHandles struct {
 	// so the snapshot copies them rather than holding the *CA.
 	CASource            string
 	CAFingerprintSHA256 string
+	CANotBeforeUnixTime int64
 	CANotAfterUnixTime  int64
 	EffectiveAllowlist  string
 	CertCacheCapacity   int
@@ -1599,6 +1681,7 @@ func wireTlsMitm(ctx context.Context, cfg *config.Config, parser *proxy.Parser, 
 		CertCacheSize:       leafCache.Size,
 		CASource:            ca.Source.String(),
 		CAFingerprintSHA256: ca.FingerprintSHA256,
+		CANotBeforeUnixTime: ca.Cert.NotBefore.Unix(),
 		CANotAfterUnixTime:  ca.Cert.NotAfter.Unix(),
 		EffectiveAllowlist:  tmCfg.AllowedHostRegex,
 		CertCacheCapacity:   tmCfg.CertCacheSize,

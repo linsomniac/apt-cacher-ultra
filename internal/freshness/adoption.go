@@ -1032,6 +1032,7 @@ type adoptionPayload struct {
 	// releaseBytes and releaseHash alone.
 	releaseBytes   []byte
 	sigBytes       []byte
+	sigLastmod     string
 	releaseHash    string // sha256 of releaseBytes (set in step 2)
 	releaseGPGHash string // sha256 of sigBytes (set in step 2)
 
@@ -1098,6 +1099,7 @@ func (a *Adopter) runRequest(ctx context.Context, req *adoptionRequest, hooks ru
 		p.inlineBytes = req.bytes
 	case adoptionFormDetached:
 		p.releaseBytes, p.sigBytes = req.releaseBytes, req.sigBytes
+		p.sigLastmod = req.sigLastmod
 	case adoptionFormUnsigned:
 		p.releaseBytes = req.releaseBytes
 	}
@@ -1253,6 +1255,20 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	if p.form == adoptionFormUnsigned {
 		if err := unsignedCap(len(members)); err != nil {
 			return err
+		}
+	}
+
+	// Record headers only after the anchor bytes passed verification.
+	anchorPath, anchorHash := "Release", p.releaseHash
+	if p.form == adoptionFormInline {
+		anchorPath, anchorHash = "InRelease", p.inlineHash
+	}
+	if err := a.cache.PutRepresentation(ctx, suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath+"/"+anchorPath, anchorHash, lastmod); err != nil {
+		return fmt.Errorf("%w: anchor response metadata: %v", ErrAdoptionDBFailed, err)
+	}
+	if p.form == adoptionFormDetached {
+		if err := a.cache.PutRepresentation(ctx, suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath+"/Release.gpg", p.releaseGPGHash, p.sigLastmod); err != nil {
+			return fmt.Errorf("%w: signature response metadata: %v", ErrAdoptionDBFailed, err)
 		}
 	}
 
@@ -2276,7 +2292,8 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 		return "", fmt.Errorf("%w: NewTempBlob %s: %v", ErrAdoptionDBFailed, byHashRelPath, err)
 	}
 	defer func() { _ = w.Abort() }() // no-op once a Finalize* wins
-	if _, err := a.fetcher.Fetch(ctx, target, w); err != nil {
+	res, err := a.fetcher.Fetch(ctx, target, w)
+	if err != nil {
 		return "", err // by-hash 404 (pruned), transport, etc. — silent fallback
 	}
 	hashHex, err := verifyMember(w, m, m.Size, a.rehashPooledBlob(suite, m))
@@ -2285,6 +2302,13 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 	}
 	if err := a.cache.PutBlob(ctx, hashHex, w.Written()); err != nil {
 		return "", fmt.Errorf("%w: PutBlob %s: %v", ErrAdoptionDBFailed, hashHex, err)
+	}
+	if err := a.cache.PutRepresentation(ctx, suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath+"/"+byHashRelPath, hashHex, res.LastModified); err != nil {
+		return "", fmt.Errorf("%w: member response metadata: %v", ErrAdoptionDBFailed, err)
+	}
+	// The verified by-hash object also supplies the declared member bytes.
+	if err := a.cache.PutRepresentation(ctx, suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath+"/"+m.Path, hashHex, res.LastModified); err != nil {
+		return "", fmt.Errorf("%w: member response metadata: %v", ErrAdoptionDBFailed, err)
 	}
 	return hashHex, nil
 }
@@ -2389,6 +2413,8 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 	// member here when it came chunked, and was refused when it came with a
 	// Content-Length. A correct member is exactly m.Size bytes; m.Size 0 (a
 	// member declared empty) still skips the check, its hash deciding.
+	// Use the Release's size: an empty 204 or an unknown response length
+	// must not disable verification of a declared nonzero member size.
 	hashHex, err := verifyMember(w, m, m.Size, a.rehashPooledBlob(suite, m))
 	var mm *memberHashMismatch
 	switch {
@@ -2418,6 +2444,9 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 	}
 	if err := a.cache.PutBlob(ctx, hashHex, w.Written()); err != nil {
 		return "", fmt.Errorf("%w: PutBlob %s: %v", ErrAdoptionDBFailed, hashHex, err)
+	}
+	if err := a.cache.PutRepresentation(ctx, suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath+"/"+relPath, hashHex, res.LastModified); err != nil {
+		return "", fmt.Errorf("%w: member response metadata: %v", ErrAdoptionDBFailed, err)
 	}
 	return hashHex, nil
 }

@@ -62,7 +62,7 @@ func runPackagesCopy(args []string, stdout, stderr io.Writer) int {
 	}
 
 	ctx := context.Background()
-	c, err := openReadOnlyCache(ctx, cfg.Cache.Dir)
+	c, err := openReadOnlyCache(ctx, cfg.Cache)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "packages copy: open cache %q: %v\n", cfg.Cache.Dir, err)
 		return 2
