@@ -44,7 +44,10 @@ classes (or `--record` wrote them), 1 when apt changed, a container failed
 or an error class and apt's words disagree, and 2 for a usage or setup
 error: an image that is not a column of the set's file (`verdicts.txt`, or
 `verdicts-old.txt` with `--old`), `--record` with only some of the set's
-images, a corpus file missing.
+images, a corpus file missing, or the generator's round trip failing:
+before any container starts, `gen_shapes.py --from-controls` on a copy of
+the corpus (no key made, python3 only) must exit 0 and give it back byte
+for byte.
 
 ## The corpus
 

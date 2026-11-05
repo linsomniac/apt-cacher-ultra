@@ -134,6 +134,32 @@ trap cleanup EXIT
 trap 'echo "[e2e-apt-oracle] interrupted"; exit 130' INT
 trap 'echo "[e2e-apt-oracle] terminated"; exit 143' TERM
 
+# The generator's round trip (the Task 9e re-review's 9e-R1-M1), before any
+# container: gen_shapes.py --from-controls on a copy of the corpus makes no
+# key and must exit 0 and leave the copy byte for byte the corpus. A file
+# the generator does not know (Task 9e's verdicts-old.txt broke every mode
+# so, unseen) or a cut batch drifted from the committed fixtures fails here
+# as a setup error. python3 only; the copy goes with $work (cleanup).
+if ! command -v python3 > /dev/null; then
+    echo "[e2e-apt-oracle] python3 is not installed (the generator's round trip needs it)"
+    exit 2
+fi
+cp -R "$CORPUS" "$work/roundtrip"
+if ! python3 -I -B e2e/apt-oracle/gen_shapes.py --from-controls "$work/roundtrip" \
+    > "$work/roundtrip.out" 2>&1; then
+    echo "[e2e-apt-oracle] FAIL (setup): gen_shapes.py --from-controls fails on a" \
+        "copy of $CORPUS; its output's tail:"
+    tail -n 5 "$work/roundtrip.out"
+    exit 2
+fi
+if ! diff -r "$CORPUS" "$work/roundtrip" > "$work/roundtrip.diff"; then
+    echo "[e2e-apt-oracle] FAIL (setup): gen_shapes.py --from-controls does not" \
+        "give $CORPUS back byte for byte; the first differences:"
+    head -n 20 "$work/roundtrip.diff"
+    exit 2
+fi
+echo "[e2e-apt-oracle] the generator's round trip (--from-controls on a copy): identical"
+
 # The corpus's shape names, sorted as every list below is (LC_ALL=C).
 shopt -s nullglob
 shape_files=("$CORPUS"/*.InRelease "$CORPUS"/*.Release.gpg)
