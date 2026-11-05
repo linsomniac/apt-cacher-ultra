@@ -550,8 +550,8 @@ func TestParseKeyring_MarksWhatItCannotRead(t *testing.T) {
 			}
 			continue
 		}
-		why := kf.uncountable[want].why
-		if len(kf.uncountable) != 1 || why == nil || !errors.Is(why, row.want) || !strings.Contains(why.Error(), typ) {
+		why := kf.uncountable[want].at(time.Now())
+		if len(kf.uncountable) != 1 || len(kf.uncountable[want]) != 1 || why == nil || !errors.Is(why, row.want) || !strings.Contains(why.Error(), typ) {
 			t.Errorf("%s: marks %v; want %s alone marked %v, naming %s", row.name, kf.uncountable, want, row.want, typ)
 		}
 	}
@@ -779,6 +779,73 @@ func TestVerifier_AReadableDirectKeyExpiryIsHonoured(t *testing.T) {
 			t.Errorf("%s: K's good signature: %v; want it adopted", tc.name, err)
 		case tc.want != nil && (!errors.Is(err, tc.want) || !strings.Contains(err.Error(), "direct-key signature")):
 			t.Errorf("%s: K's good signature: %v; want %v, the mark naming the direct-key signature", tc.name, err, tc.want)
+		}
+		if _, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, aGood, kBad)); !errors.Is(err, ErrBadSignature) {
+			t.Errorf("%s: A's good signature and K's bad one: %v; want ErrBadSignature (S1 knows K)", tc.name, err)
+		}
+	}
+}
+
+// TestVerifier_EveryMarkOnAKeyIsKept: the closure check's V-R9I1 (a
+// regression of round 8), the controller's ruling: never pick one mark, keep
+// them all; the key is not counted while any holds. Copy A of P carries a
+// readable direct-key signature expiring P in 2035 (a mark that holds from
+// then); copy B carries P's own revocation the cache cannot read (a mark
+// that holds now). Loaded in either order, from two files of a keyring
+// directory or two blocks of one, K's good signature is refused
+// (kr28_xcopy_a_first_signedby_b: REVKEYSIG in the five gpgv-based apt,
+// which round 8's "first mark wins" adopted with A loaded first; its
+// mirror). Two copies with a past and a future direct-key expiry are
+// refused too, and a copy with a future expiry alone counts until it and
+// is refused after; the reason reports a revocation before an expiry.
+func TestVerifier_EveryMarkOnAKeyIsKept(t *testing.T) {
+	kk := newKR14Keys(t)
+	a := newTestEntity(t, "A", "a@example.com")
+	kGood, kBad := signedBy(t, kk.k, fakeReleasePlaintext), signedBy(t, kk.k, "Origin: Other\n")
+	aGood := signaturePacketsOf(t, clearsignWith(t, a, []byte(fakeReleasePlaintext)))
+	pMaterial := keyMaterial(t, kk.p.PrimaryKey)
+	lifetime := func(secs uint32) []byte { return subpacket(t, 9, binary.BigEndian.AppendUint32(nil, secs)) }
+	dk := func(when time.Time, extra ...[]byte) []byte {
+		return rsaKeySig(t, kk.p, byte(packet.SigTypeDirectSignature), crypto.SHA256, hashSHA256, joined(createdAt(t, when), issuerFpr(t, kk.p.PrimaryKey), joined(extra...)), pMaterial)
+	}
+	t0, t1 := time.Date(2024, 1, 3, 0, 0, 0, 0, time.UTC), time.Date(2024, 1, 4, 0, 0, 0, 0, time.UTC)
+	const day, year = 86400, 365 * 86400
+	copyA := kk.ring(t, [][]byte{dk(t1, lifetime(11*year))}, nil) // P expires in 2035
+	copyB := kk.ring(t, [][]byte{rsaKeySig(t, kk.p, byte(packet.SigTypeKeyRevocation), crypto.RIPEMD160, hashRIPEMD160, joined(createdAt(t, t1), issuerFpr(t, kk.p.PrimaryKey), subpacket(t, 29, []byte("\x02compromised"))), pMaterial)}, nil)
+	copyPast := kk.ring(t, [][]byte{dk(t0, lifetime(day))}, nil) // P expired on 2024-01-02
+	later := time.Date(2036, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name  string
+		files map[string][]byte
+		at    time.Time
+		want  error // nil: K's good signature adopted
+	}{
+		{"kr28_xcopy_a_first_signedby_b: A (expiring 2035) loaded first, B (revoked unreadably) second: refused, as revoked", map[string][]byte{"10-a.gpg": copyA, "20-b.gpg": copyB}, time.Time{}, pgperrors.ErrKeyRevoked},
+		{"kr28_xcopy_a_last_signedby_b: B first, A second: refused, as revoked", map[string][]byte{"10-b.gpg": copyB, "20-a.gpg": copyA}, time.Time{}, pgperrors.ErrKeyRevoked},
+		{"A and B in one file, A first: refused", map[string][]byte{"p.gpg": joined(copyA, copyB)}, time.Time{}, pgperrors.ErrKeyRevoked},
+		{"a copy expiring in 2035 and a copy expired in 2024, the future one first: refused", map[string][]byte{"10-a.gpg": copyA, "20-past.gpg": copyPast}, time.Time{}, pgperrors.ErrKeyExpired},
+		{"the same, the past one first: refused", map[string][]byte{"10-past.gpg": copyPast, "20-a.gpg": copyA}, time.Time{}, pgperrors.ErrKeyExpired},
+		{"a copy expiring in 2035 alone, at the wall clock: counts", map[string][]byte{"a.gpg": copyA}, time.Time{}, nil},
+		// K carries a mark of its own (a newer unreadable binding: expired) and
+		// P's revocation reaches it too: both are kept, and the revocation is
+		// the reason reported.
+		{"K's own expiry mark and P's revocation reaching K: refused, reported as revoked", map[string][]byte{"p.gpg": kk.ring(t, [][]byte{rsaKeySig(t, kk.p, byte(packet.SigTypeKeyRevocation), crypto.RIPEMD160, hashRIPEMD160, joined(createdAt(t, t1), issuerFpr(t, kk.p.PrimaryKey), subpacket(t, 29, []byte("\x02compromised"))), pMaterial)}, [][]byte{kk.binding(t, crypto.RIPEMD160, hashRIPEMD160, kr14Created, nil)})}, time.Time{}, pgperrors.ErrKeyRevoked},
+		{"the same, at a clock in 2036: refused", map[string][]byte{"a.gpg": copyA}, later, pgperrors.ErrKeyExpired},
+	} {
+		files := map[string][]byte{"00-a.gpg": binaryKey(t, a)}
+		for name, b := range tc.files {
+			files[name] = b
+		}
+		v := kr14Verifier(t, files)
+		if !tc.at.IsZero() {
+			v.now = func() time.Time { return tc.at }
+		}
+		_, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, kGood))
+		switch {
+		case tc.want == nil && err != nil:
+			t.Errorf("%s: K's good signature: %v; want it adopted", tc.name, err)
+		case tc.want != nil && !errors.Is(err, tc.want):
+			t.Errorf("%s: K's good signature: %v; want %v", tc.name, err, tc.want)
 		}
 		if _, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, aGood, kBad)); !errors.Is(err, ErrBadSignature) {
 			t.Errorf("%s: A's good signature and K's bad one: %v; want ErrBadSignature (S1 knows K)", tc.name, err)

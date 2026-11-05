@@ -24,24 +24,73 @@ import (
 // does not read, and nor did this reading (readKeyring); LoadKeyring warns.
 type keyFile struct {
 	entities    openpgp.EntityList
-	uncountable map[string]keyMark
+	uncountable map[string]keyMarks
 	broken      error
 }
 
 // keyMark is S2's mark on a key or subkey: why it is not counted, and from
 // when (from: zero for a mark that always holds; a direct-key expiry's is
-// the moment the key expires, judged at the verifier's clock: keyMark.at).
+// the moment the key expires, judged at the verifier's clock: keyMarks.at).
 type keyMark struct {
 	why  error
 	from time.Time
 }
 
-// at returns the mark's reason when it holds at now, nil before its time.
-func (m keyMark) at(now time.Time) error {
-	if m.from.IsZero() || !now.Before(m.from) {
-		return m.why
+// keyMarks are every mark a fingerprint carries, from any component, copy
+// or reading of the key: a union, never a choice. The key or subkey is not
+// counted at a moment when any of them holds.
+//
+// AIDEV-NOTE: the controller's ruling for Task 9b's fix round 9 (the
+// closure check's V-R9I1, a regression of round 8): never pick one mark;
+// keep them all. Round 4 to 8 kept the first mark on a fingerprint, which
+// lost nothing while every mark held at once; round 8's direct-key expiry
+// holds from a future time, and a copy of a key with one, loaded first,
+// then cancelled a later copy's revocation that holds now
+// (kr28_xcopy_a_first_signedby_b: REVKEYSIG in the five gpgv-based apt,
+// which 60d26f1 adopted). An "earliest wins" comparison would be one more
+// rule that can be wrong; a union cannot drop a mark. The cost, Minor and
+// Open under ruling R3: with two copies of a key in the operator's
+// directories, the cache refuses where gpgv, reading the first keyblock
+// that holds the key, accepts (kr28_xcopy_both_a_first, ok in all six
+// images), and two copies with a past and a future direct-key expiry are
+// refused where gpg's merge would take the newest.
+type keyMarks []keyMark
+
+// add appends m unless an equal mark (the same reason and start) is held.
+func (ms keyMarks) add(m keyMark) keyMarks {
+	for _, have := range ms {
+		if have.from.Equal(m.from) && have.why.Error() == m.why.Error() {
+			return ms
+		}
 	}
-	return nil
+	return append(ms, m)
+}
+
+// union adds every mark of o.
+func (ms keyMarks) union(o keyMarks) keyMarks {
+	for _, m := range o {
+		ms = ms.add(m)
+	}
+	return ms
+}
+
+// at returns the reason of a mark that holds at now (a mark holds from its
+// start, or always when it has none), a revocation's before any other, nil
+// when none holds.
+func (ms keyMarks) at(now time.Time) error {
+	var holding error
+	for _, m := range ms {
+		if !m.from.IsZero() && now.Before(m.from) {
+			continue
+		}
+		if errors.Is(m.why, pgperrors.ErrKeyRevoked) {
+			return m.why
+		}
+		if holding == nil {
+			holding = m.why
+		}
+	}
+	return holding
 }
 
 // addEntity adds e to kf's keys, merged into the key of its primary
@@ -56,15 +105,14 @@ func (kf *keyFile) addEntity(e *openpgp.Entity) {
 	kf.entities = append(kf.entities, e)
 }
 
-// addMarks adds marks to kf's, the first mark on a fingerprint kept.
-func (kf *keyFile) addMarks(marks map[string]keyMark) {
-	for fp, m := range marks {
+// addMarks adds marks to kf's: the union, every mark on a fingerprint kept
+// (keyMarks).
+func (kf *keyFile) addMarks(marks map[string]keyMarks) {
+	for fp, ms := range marks {
 		if kf.uncountable == nil {
-			kf.uncountable = make(map[string]keyMark)
+			kf.uncountable = make(map[string]keyMarks)
 		}
-		if _, dup := kf.uncountable[fp]; !dup {
-			kf.uncountable[fp] = m
-		}
+		kf.uncountable[fp] = kf.uncountable[fp].union(ms)
 	}
 }
 
@@ -1282,22 +1330,19 @@ func supersedes(typ byte) byte {
 // such signature before the marks were made, and round 5's version 3
 // revocation rule, precise about the version, the type and the issuer, was
 // still under-strict twice.
-func (kb *keyBlock) marks() map[string]keyMark {
-	var out map[string]keyMark
+func (kb *keyBlock) marks() map[string]keyMarks {
+	var out map[string]keyMarks
 	markFrom := func(fp string, err error, from time.Time) {
 		if out == nil {
-			out = make(map[string]keyMark)
+			out = make(map[string]keyMarks)
 		}
-		if _, dup := out[fp]; !dup {
-			out[fp] = keyMark{why: err, from: from}
-		}
+		out[fp] = out[fp].add(keyMark{why: err, from: from})
 	}
 	mark := func(fp string, err error) { markFrom(fp, err, time.Time{}) }
 	key := upperFP(kb.key.Fingerprint)
-	// Revocations first, over every component, then superseding signatures:
-	// a component both revoked and expired is reported revoked, as gpgv
-	// reports REVKEYSIG before EXPKEYSIG (the first mark on a fingerprint
-	// stands).
+	// Every mark is kept (keyMarks); a component both revoked and expired
+	// is reported revoked, as gpgv reports REVKEYSIG before EXPKEYSIG
+	// (keyMarks.at).
 	for _, c := range kb.components {
 		fp, what := key, "the key"
 		if c.kind == onSubkey {
