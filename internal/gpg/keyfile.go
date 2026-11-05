@@ -620,6 +620,25 @@ type keySig struct {
 	created time.Time // its creation time; zero when it cannot be read
 	ok      bool
 	why     string
+	// kept: go-crypto verified it as the key's own and every issuer
+	// subpacket it carries names the key (none: by the verification alone).
+	// The only signatures that may suppress a mark (marks: "newest kept").
+	//
+	// AIDEV-NOTE: the controller's principle for Task 9b's fix round 8 (the
+	// closure check's V-R8I1, a regression of round 7, and V-R8I2): a
+	// decision that adds a mark, reads revokers or keeps an unreadable
+	// revocation matches when EITHER issuer reading names the key (self);
+	// a decision that suppresses, supersedes or cancels a mark counts only
+	// a signature verified as the key's own whose issuer readings ALL name
+	// the key (kept). So a disagreement between the fingerprint and the key
+	// ID fails closed both ways: gpgv 2.2 reads the key ID, gpgv 2.4 the
+	// fingerprint, and the apt that takes the signature as another key's
+	// still honours the older one it would have superseded
+	// (kr26_dk_rmd_exp_then_fprmis: EXPKEYSIG in apt 2.8.3 and 3.2.0 where
+	// round 7 adopted). Another key's certification of a user ID is kept
+	// by go-crypto but never counted here (kr27_uid_rmd_exp_then_tpcert,
+	// EXPKEYSIG in the five gpgv-based apt).
+	kept bool
 }
 
 // readKeyBlocks reads the keys of a joined keyring, key by key, so that a
@@ -1039,6 +1058,10 @@ func (s *keySig) read(kb *keyBlock, c *keyComponent) {
 		return
 	}
 	s.ok = true
+	s.kept = s.self && s.issuer.allName(kb.key)
+	if !s.kept && s.self {
+		s.why = "its issuer subpackets disagree, so an apt may take it as another key's"
+	}
 }
 
 // issuerOf is sig's issuer key ID, 0 when it names none.
@@ -1088,6 +1111,14 @@ func (r rawSig) name() string {
 		return fmt.Sprintf("%X", r.fpr)
 	}
 	return "an unnamed key"
+}
+
+// allName reports whether every issuer subpacket the signature carries
+// names key (none: true). With issuerIs's either rule it is the principle
+// of fix round 8 (keySig.kept): either to add a mark, all to suppress one.
+func (r rawSig) allName(key *packet.PublicKey) bool {
+	return (r.fpr == nil || bytes.Equal(r.fpr, key.Fingerprint)) &&
+		(r.keyID == nil || binary.BigEndian.Uint64(r.keyID) == key.KeyId)
 }
 
 // rawSigInfo reads a v4 (or v6) signature packet's body for rawSig: the
@@ -1283,14 +1314,22 @@ func (kb *keyBlock) marks() map[string]error {
 		if c.kind == onSubkey {
 			fp, what = upperFP(c.key.Fingerprint), "the subkey"
 		}
+		// The bar a superseding signature must reach: the newest the cache
+		// kept (keySig.kept: verified as the key's own, its issuers all
+		// naming the key; never another key's certification, never one
+		// whose issuers disagree). Under it, every signature the key's own
+		// by either issuer that the cache did not keep: unreadable, not
+		// verifying, or verifying with disagreeing issuers (go-crypto keeps
+		// the last as another key's, unused; an apt reading the key ID uses
+		// it).
 		newest := make(map[byte]time.Time)
 		for _, s := range c.sigs {
-			if cls := supersedes(s.typ); s.ok && cls != 0 && s.created.After(newest[cls]) {
+			if cls := supersedes(s.typ); s.kept && cls != 0 && s.created.After(newest[cls]) {
 				newest[cls] = s.created
 			}
 		}
 		for _, s := range c.sigs {
-			if cls := supersedes(s.typ); !s.ok && !s.legacy && cls != 0 && s.self && (s.created.IsZero() || !s.created.Before(newest[cls])) {
+			if cls := supersedes(s.typ); !s.kept && !s.legacy && cls != 0 && s.self && (s.created.IsZero() || !s.created.Before(newest[cls])) {
 				mark(fp, fmt.Errorf("%w: a signature of type 0x%02x by the key on %s, newer than the one the cache kept, stands on it that %s; gpgv takes the newest, and it may expire or unbind the component", pgperrors.ErrKeyExpired, s.typ, what, s.why))
 			}
 		}

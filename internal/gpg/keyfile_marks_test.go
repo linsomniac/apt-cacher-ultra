@@ -659,6 +659,77 @@ func TestVerifier_ThirdPartyRevocationsMarkOnlyWhenDesignated(t *testing.T) {
 	}
 }
 
+// TestVerifier_NewestKeptIsTheKeysOwnAlone: the closure check's V-R8I1 (a
+// regression of round 7) and V-R8I2 (since main), under the controller's
+// principle for fix round 8: a signature suppresses a mark (the superseding
+// rule's "newest kept") only when go-crypto verified it as the key's own
+// and every issuer subpacket it carries names the key; one that adds a mark
+// needs either. P's unreadable (RIPEMD-160) direct-key signature at T0
+// expires P; a newer readable one by P with agreeing issuers suppresses the
+// mark (kr26_dk_rmd_exp_then_self: ok in all six images), one naming Y by
+// fingerprint and P by key ID does not (kr26_dk_rmd_exp_then_fprmis: gpgv
+// 2.4 takes it as Y's, EXPKEYSIG in apt 2.8.3 and 3.2.0), nor does the
+// expiring one alone go unmarked (kr26_dk_rmd_exp_ctl). On P's user ID,
+// P's unreadable self-certification at T0 expires P, and neither X's newer
+// certification (kr27_uid_rmd_exp_then_tpcert: EXPKEYSIG in the five
+// gpgv-based apt) nor P's newer readable self-certification with
+// disagreeing issuers (kr27_uid_rmd_exp_then_fprmis: EXPKEYSIG in apt 2.8.3
+// and 3.2.0) suppresses the mark; P's with agreeing issuers does. A
+// readable self-certification with disagreeing issuers that itself expires
+// P is marked (go-crypto keeps it as another key's, unused; gpgv 2.2 reads
+// its key ID; unmeasured, failing closed).
+func TestVerifier_NewestKeptIsTheKeysOwnAlone(t *testing.T) {
+	kk := newKR14Keys(t)
+	x := newTestEntity(t, "X", "x@example.com")
+	y := newTestEntity(t, "Y", "y@example.com")
+	a := newTestEntity(t, "A", "a@example.com")
+	kGood, kBad := signedBy(t, kk.k, fakeReleasePlaintext), signedBy(t, kk.k, "Origin: Other\n")
+	aGood := signaturePacketsOf(t, clearsignWith(t, a, []byte(fakeReleasePlaintext)))
+	pMaterial := keyMaterial(t, kk.p.PrimaryKey)
+	uid := firstUID(kk.p)
+	uidMat := joined(pMaterial, uidMaterial(uid))
+	t0, t1 := kr14Created, time.Date(2024, 7, 1, 0, 0, 0, 0, time.UTC)
+	oneDay := subpacket(t, 9, binary.BigEndian.AppendUint32(nil, 86400)) // P expired on 2024-01-02
+	dk := func(hash crypto.Hash, hashID byte, when time.Time, fpr *openpgp.Entity, extra ...[]byte) []byte {
+		return rsaKeySig(t, kk.p, byte(packet.SigTypeDirectSignature), hash, hashID, joined(createdAt(t, when), issuerFpr(t, fpr.PrimaryKey), joined(extra...)), pMaterial)
+	}
+	cert := func(signer *openpgp.Entity, typ packet.SignatureType, hash crypto.Hash, hashID byte, when time.Time, fpr *openpgp.Entity, extra ...[]byte) []byte {
+		return rsaKeySig(t, signer, byte(typ), hash, hashID, joined(createdAt(t, when), issuerFpr(t, fpr.PrimaryKey), joined(extra...)), uidMat)
+	}
+	tags, pkts := rawPacketList(t, binaryKey(t, kk.p))
+	if tags[1] != 13 || tags[2] != 2 {
+		t.Fatalf("test premise: P's packets have tags %v", tags)
+	}
+	onUID := func(sigs ...[]byte) []byte { return joined(joined(pkts[:3]...), joined(sigs...), joined(pkts[3:]...)) }
+	rmdExpDK := dk(crypto.RIPEMD160, hashRIPEMD160, t0, kk.p, oneDay)
+	rmdExpCert := cert(kk.p, packet.SigTypePositiveCert, crypto.RIPEMD160, hashRIPEMD160, t0, kk.p, oneDay)
+	for _, tc := range []struct {
+		name string
+		ring []byte
+		want error // nil: K's good signature adopted
+	}{
+		{"kr26_dk_rmd_exp_ctl: P's unreadable 0x1f expiring P: refused", kk.ring(t, [][]byte{rmdExpDK}, nil), pgperrors.ErrKeyExpired},
+		{"kr26_dk_rmd_exp_then_fprmis: then P's readable 0x1f naming Y by fingerprint and P by key ID: still refused", kk.ring(t, [][]byte{rmdExpDK, dk(crypto.SHA256, hashSHA256, t1, y)}, nil), pgperrors.ErrKeyExpired},
+		{"kr26_dk_rmd_exp_then_self: then P's readable 0x1f with agreeing issuers: suppressed, K counts", kk.ring(t, [][]byte{rmdExpDK, dk(crypto.SHA256, hashSHA256, t1, kk.p)}, nil), nil},
+		{"kr27_uid_rmd_exp_then_tpcert: P's unreadable self-certification expiring P, then X's certification: refused", onUID(rmdExpCert, cert(x, packet.SigTypeGenericCert, crypto.SHA256, hashSHA256, t1, x)), pgperrors.ErrKeyExpired},
+		{"kr27_uid_rmd_exp_then_fprmis: then P's readable self-certification naming Y by fingerprint and P by key ID: refused", onUID(rmdExpCert, cert(kk.p, packet.SigTypePositiveCert, crypto.SHA256, hashSHA256, t1, y)), pgperrors.ErrKeyExpired},
+		{"the same, the newer self-certification's issuers agreeing: suppressed, K counts", onUID(rmdExpCert, cert(kk.p, packet.SigTypePositiveCert, crypto.SHA256, hashSHA256, t1, kk.p)), nil},
+		{"P's readable self-certification naming Y by fingerprint and P by key ID, expiring P (unmeasured; fails closed): refused", onUID(cert(kk.p, packet.SigTypePositiveCert, crypto.SHA256, hashSHA256, t1, y, oneDay)), pgperrors.ErrKeyExpired},
+	} {
+		v := kr14Verifier(t, map[string][]byte{"00-a.gpg": binaryKey(t, a), "20-p.gpg": tc.ring})
+		_, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, kGood))
+		switch {
+		case tc.want == nil && err != nil:
+			t.Errorf("%s: K's good signature: %v; want it adopted", tc.name, err)
+		case tc.want != nil && !errors.Is(err, tc.want):
+			t.Errorf("%s: K's good signature: %v; want %v", tc.name, err, tc.want)
+		}
+		if _, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, aGood, kBad)); !errors.Is(err, ErrBadSignature) {
+			t.Errorf("%s: A's good signature and K's bad one: %v; want ErrBadSignature (S1 knows K)", tc.name, err)
+		}
+	}
+}
+
 // TestVerifier_V3RevocationsAreMarked: version 2 and 3 signatures fail
 // closed (the fifth re-review's V-R5I1, the sixth's V-R6I1 and V-R6I2, the
 // controller's design ruling for fix round 6: one broad rule, not a copy of
