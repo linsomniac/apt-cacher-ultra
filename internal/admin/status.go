@@ -1106,15 +1106,20 @@ func statusTemplateFuncMap() template.FuncMap {
 // surface without a code change (just less helpful hover text until
 // the table is extended).
 //
-// AIDEV-TODO(9c): signer_downgrade (the hardening plan's Task 9d) has no
-// text here yet and passes through as the bare tag: add its tooltip, and
-// add "signer_downgrade" to TestReasonTooltip_PhaseBOutcomes'
-// (suites_status_test.go) list so that a missing one fails (the Task 9d
-// review's 9d-M4; ruling G5 gives tooltips to Task 9c).
+// AIDEV-NOTE: signer_downgrade (the hardening plan's Task 9d) has its text
+// here since Task 9c, and TestReasonTooltip_PhaseBOutcomes
+// (suites_status_test.go) lists it, so that a missing one fails (the Task
+// 9d review's 9d-M4; ruling G5 gave tooltips to Task 9c). Unlike
+// rollback_refused it is not in refusalKeepsCurrent: the suite really is
+// behind upstream, so its lag shows. The verifier's texts (Task 9c, the
+// final review's D-M1) claim no "apt refuses it" for the malformed_*
+// reasons: the cache's canonical grammar refuses some shapes every apt
+// accepts (the strict deviations, internal/gpg/aptshape_test.go), and
+// sqv accepts a bad signature beside a good one. Keep them so.
 func reasonTooltip(reason string) string {
 	switch reason {
 	case "untrusted_signer":
-		return "The InRelease signature's issuer key is not in the host keyring. Install the upstream's signing key under /usr/share/keyrings/ or /etc/apt/keyrings/."
+		return "The InRelease signature's issuer key is not in the host keyring. Install the upstream's signing key under /usr/share/keyrings/ or /etc/apt/keyrings/ and restart; if it is installed, the start's keyring WARN lines name a key file the cache skipped or read only in part."
 	case "short_keyid":
 		return "Signature lacks the long-form IssuerFingerprint subpacket and adoption.allow_short_keyid is false."
 	case "no_usable_signature":
@@ -1122,15 +1127,15 @@ func reasonTooltip(reason string) string {
 	case "missing_signature":
 		return "InRelease body is not clearsigned. Plain-text InRelease files are never adopted as signed metadata, whatever adoption.require_signature says."
 	case "malformed_clearsign":
-		return "InRelease starts like a clearsigned message but is not one in the shape apt accepts: its signature frame does not decode, or a line follows the signature, its armor checksum is forged, its armor is damaged, or it carries packets apt refuses."
+		return "InRelease starts like a clearsigned message but is not in the shape the cache accepts: apt's own text checks refuse it (a line after the signature, a dash line not escaped), or its armor or signature packets are outside the cache's canonical grammar (a forged checksum, damaged armor, a packet some apt refuses or that the cache cannot check), which refuses some shapes every apt would read. Any current snapshot keeps serving; the adoption_gpg_failed log line names the layer and the rule."
 	case "malformed_signature":
-		return "The upstream Release.gpg is not one ASCII-armored signature block as apt requires — bytes around it, a binary signature, a damaged armor, or packets apt refuses."
+		return "The upstream Release.gpg is not one ASCII-armored signature block in the shape the cache accepts: bytes before or after its armor, a binary signature, damaged armor, or a signature packet some apt refuses or that the cache cannot check (a version 3 signature, say), which refuses some shapes every apt would read. Any current snapshot keeps serving; the adoption_gpg_failed log line names the layer and the rule."
 	case "bad_signature":
-		return "The upstream anchor carries a signature from a key the cache knows that fails verification, which apt rejects: a Release.gpg out of step with its Release (a mirror caught mid-update), or tampering on the path."
+		return "The upstream anchor carries a signature from a key in the cache's keyring that fails verification, which apt with gpgv refuses even beside a good signature (debian:13's sqv refuses only a lone one): a Release.gpg out of step with its Release (a mirror caught mid-update), or tampering on the path. Any current snapshot keeps serving; retried on the backoff schedule; the adoption_gpg_failed log line names the key ID."
 	case "ambiguous_keyid":
 		return "Two or more keys in the trust set share the same 8-byte keyid; the short-keyid fallback refuses to guess."
 	case "crypto_verify_failed":
-		return "The signature's issuer was trusted but the cryptographic verification itself failed."
+		return "A trusted signature was found but none counts: its key or the signature has expired or been revoked in the cache's keyring (install the vendor's current key file and restart), the keyring marks its key as not countable, its key may not sign, it is SHA-1 (never counted), or apt or debian:13's sqv would not count it. Any current snapshot keeps serving; the adoption_gpg_failed log line has the cause."
 	case "unpinned_suite":
 		return "adoption.require_pinned_signer is true and no [[trusted_signer]] block matches this canonical host."
 	case "parse_failed":
@@ -1149,6 +1154,8 @@ func reasonTooltip(reason string) string {
 		return "The upstream Release's Date is older than the current snapshot's, or missing after a dated one: apt would refuse it too. Refused, not failed."
 	case "rollback_refused":
 		return "Upstream serves content identical to an older snapshot the cache already replaced (a flapping mirror). Refused, not failed."
+	case "signer_downgrade":
+		return "The new anchor has lost the strong signer the suite's current anchor has (a key debian:13, ubuntu:24.04 and ubuntu:26.04 all accept): the shape of an on-path strip of a strong signature beside a weak one. Refused, not failed: the current snapshot keeps serving and the suite falls behind upstream. If the vendor really dropped its strong key, remove that key from the keyring and restart, or POST /forget the suite; the adoption_signer_downgrade log line names both signers."
 	case "release_date_in_future":
 		return "The Release's Date is more than 10 s ahead of the cache's clock (apt's Acquire::Max-FutureTime). Check the cache host's clock."
 	case "timed_out":

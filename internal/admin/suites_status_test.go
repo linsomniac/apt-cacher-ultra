@@ -76,7 +76,7 @@ func TestOutcomeBadgeClass_Refused(t *testing.T) {
 // discipline) rather than "the next freshness tick".
 func TestReasonTooltip_PhaseBOutcomes(t *testing.T) {
 	for _, tag := range []string{
-		"refused", "upstream_older", "rollback_refused",
+		"refused", "upstream_older", "rollback_refused", "signer_downgrade",
 		"release_date_in_future", "timed_out", "panic", "panicked",
 	} {
 		got := reasonTooltip(tag)
