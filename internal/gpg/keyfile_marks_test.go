@@ -565,10 +565,16 @@ func TestParseKeyring_MarksWhatItCannotRead(t *testing.T) {
 // self-certifications, readable or not (an unreadable one fails closed; one
 // whose subpackets cannot be walked at all makes any third party a
 // revoker). Undesignated, the revocation is ignored, as every supported
-// apt ignores it (kr17_tp_keyrev: ok in all six images); designated, the
-// five gpgv-based apt honour it when they hold X's key (the round's kr19
-// rows: REVKEYSIG with X's key in the keyring, ok without; sqv ok), so the
-// cache's mark, made whether or not X's key is loaded, fails closed. A
+// apt ignores it (kr17_tp_keyrev: ok in all six images). Designated, what
+// was measured (round 5's kr19, the sixth re-review's kr21): the five
+// gpgv-based apt honour X's revocation of the key (0x20), and only with X's
+// key in the keyring (REVKEYSIG; ok without; sqv ok); they ignore X's
+// revocation of a subkey (0x28); gpg reads designations only from P's own
+// direct-key signatures that verify. The cache marks wider, to fail closed
+// (the sixth re-review's V-R6M1, over-strict, Minor and Open under ruling
+// R3): without X's key loaded, X's 0x28 of K, a designation in a
+// self-certification or in a direct-key signature the cache cannot read,
+// and a forged designated revocation, which the cache never verifies. A
 // designation of another key, Y, is no designation of X. S1 knows K
 // throughout.
 func TestVerifier_ThirdPartyRevocationsMarkOnlyWhenDesignated(t *testing.T) {

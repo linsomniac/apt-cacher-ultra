@@ -1149,10 +1149,18 @@ func supersedes(typ byte) byte {
 // of the key's own direct-key signatures or self-certifications, read or
 // not; the fifth re-review's V-R5M1, the controller's ruling: a third party
 // the key never designated is ignored, as every supported apt ignores it,
-// kr17_tp_keyrev ok in all six images; a designated revoker's is REVKEYSIG
-// in the five gpgv-based apt when they hold the revoker's key and ignored
-// when they do not, the round's kr19 rows, so the cache's mark without that
-// key fails closed); the key's own revocation
+// kr17_tp_keyrev ok in all six images. Measured of a designated revoker
+// (fix round 5's kr19, the sixth re-review's kr21): the five gpgv-based apt
+// honour its revocation of the key, 0x20, REVKEYSIG, and only with the
+// revoker's key in the keyring; they ignore its revocation of a subkey,
+// 0x28; and gpg reads designations only from the key's own direct-key
+// signatures that verify. The cache marks wider, to fail closed: a
+// designated 0x20 without the revoker's key, a designated 0x28, a
+// designation in a direct-key signature that does not verify or in a
+// user-ID self-certification, and a forged designated revocation, which it
+// never verifies; each ok in all six images, each over-strict, Minor and
+// Open under ruling R3, the sixth re-review's V-R6M1, needing an unusual
+// operator key file and touching no real one); the key's own revocation
 // of a user ID (0x30); or the key's own binding, direct-key signature or
 // self-certification made no earlier than the newest one the cache kept of
 // that class on the component (gpgv takes the newest; it may carry an
