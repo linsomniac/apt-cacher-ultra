@@ -2,7 +2,7 @@
 # older client images (verdicts.txt has the current ones), one row per
 # shape: ok (apt-get update succeeded and, on apt 1.0, left the
 # repository authenticated) or REJ (it did not), in each image.
-# Measured 2026-11-05 17:43 UTC by bash e2e/apt-oracle/run.sh --old --record
+# Measured 2026-11-05 18:30 UTC by bash e2e/apt-oracle/run.sh --old --record
 # (e2e/apt-oracle/README.md, "The older images"); the fixtures, this
 # file and classes-old.txt are one measurement. The columns, after the
 # shape's name:
@@ -611,6 +611,14 @@ rd_hdr_trail_tab ok ok ok ok ok
 rd_hdrterm_cr ok ok ok ok ok
 rd_hdrterm_sp ok ok ok ok ok
 rd_hdrterm_tab ok ok ok ok ok
+rx_d_expT_then_good512 ok ok ok REJ REJ
+rx_d_good512_then_expT ok ok ok ok ok
+rx_d_revR_then_good512 ok ok ok REJ REJ
+rx_expT_then_good ok ok ok ok ok
+rx_expT_then_good512 ok ok ok REJ REJ
+rx_good512_then_expT ok ok ok ok ok
+rx_good_then_good512 ok ok ok ok ok
+rx_revR_then_good512 ok ok ok REJ REJ
 s_crc_qp_3d ok ok ok REJ REJ
 s_d_hdr_colon_space_only ok ok ok ok ok
 s_d_hdr_cr_in_key ok ok ok ok ok

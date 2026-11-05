@@ -1,6 +1,6 @@
 # apt's verdicts on the shapes of internal/gpg/testdata/aptshapes, one
 # row per shape: ok (apt-get update succeeded) or REJ (it failed), in
-# each client image. Measured 2026-11-05 17:41 UTC by
+# each client image. Measured 2026-11-05 18:28 UTC by
 # bash e2e/apt-oracle/run.sh --record (e2e/apt-oracle/README.md); the
 # fixtures, this file and classes.txt are one measurement. The columns,
 # after the shape's name:
@@ -610,6 +610,14 @@ rd_hdr_trail_tab ok ok ok ok ok ok
 rd_hdrterm_cr ok ok ok ok ok ok
 rd_hdrterm_sp ok ok ok ok ok ok
 rd_hdrterm_tab ok ok ok ok ok ok
+rx_d_expT_then_good512 ok ok ok ok ok ok
+rx_d_good512_then_expT ok ok ok ok ok ok
+rx_d_revR_then_good512 ok ok ok ok ok ok
+rx_expT_then_good ok ok ok ok ok ok
+rx_expT_then_good512 ok ok ok ok ok ok
+rx_good512_then_expT ok ok ok ok ok ok
+rx_good_then_good512 ok ok ok ok ok ok
+rx_revR_then_good512 ok ok ok ok ok ok
 s_crc_qp_3d ok ok ok ok REJ ok
 s_d_hdr_colon_space_only ok ok ok ok ok ok
 s_d_hdr_cr_in_key ok ok ok ok ok ok

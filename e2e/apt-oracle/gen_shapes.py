@@ -67,8 +67,11 @@ and ``keys.gpg`` is checked to hold public packets only.
   with any secret key (agent_packet). No client's keys.gpg holds U, X1 or
   X2: each fx21 shape has U's public key alone as its own signed-by (X1 and
   X2 are keys it lacks), and ``--usage-keys`` makes the batch again alone.
+  T (expired: made and signing as E is) and R (revoked after it signs),
+  RSA-3072, sign: fx21's ``rx_`` keys, each rx_ shape's signed-by U's, T's
+  and R's public keys, R's revocation included.
 
-896 shapes, in 22 batches. The first 135 are the planning measurement's
+904 shapes, in 22 batches. The first 135 are the planning measurement's
 (2026-10-28; DN-2 and Appendix A of
 docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md), by the
 same names and built as its throwaway generators built them (the plan's
@@ -138,14 +141,16 @@ key policies: the shared Release clearsigned by each POLICY_KEYS key alone,
 and by POLICY_PAIRS' pairs (an Ed25519 key's signature and a weak key's),
 whose strip is the weak key's own shape.
 
-Batch fx21, 17 (``us_``), is Task 9e's fix round's: packets by a known key
+Batch fx21, 25 (``us_``, ``rx_``), is Task 9e's fix round's: packets by a known key
 outside its signing usage (a certify-only primary, an encryption subkey),
 bad or good, beside a good packet of its signing subkey, alone, and inline
 and detached, which gpgv 2.2.4 and 1.4 check against that key and later
 gpgv skip; and a good packet beside two by keys the client lacks
 (debian-buster-archive's layout, which apt 1.2 refuses). Task 8's verifier
 fix adds six: such a first packet before a packet of another hash, and an
-issuer fingerprint, critical or not, added to a BSN-layout packet.
+issuer fingerprint, critical or not, added to a BSN-layout packet; its fix
+round 2 eight (``rx_``): a good first packet by an expired or a revoked key
+before one of another hash, which gpgv 1.4 checks alone, and controls.
 
 Batch fx22, 14 (``mh_``, ``cr_``, ``mi_``), is Task 8's verifier fix's (the second
 final review's lens V2), cut without a key from committed fixtures: an
@@ -242,6 +247,11 @@ SUBKEYS_KEY_UID = "Apt-shape K <k@example.invalid>"
 # Batch fx21's keys: U, whose primary only certifies, and X1 and X2, keys
 # the clients lack.
 USAGE_KEY_UID = "Apt-shape U <u@example.invalid>"
+# And T, expired (made and signing as E is), and R, revoked after it signs:
+# keys the clients hold whose good packet gpgv 1.4 reports EXPKEYSIG or
+# REVKEYSIG for.
+EXPIRED_KEY_UID = "Apt-shape T <t@example.invalid>"
+REVOKED_KEY_UID = "Apt-shape R <r@example.invalid>"
 UNKNOWN_KEY_UIDS = (
     "Apt-shape X1 <x1@example.invalid>",
     "Apt-shape X2 <x2@example.invalid>",
@@ -905,11 +915,17 @@ class GnuPG:
         )
 
     def detach_sign(
-        self, key: str, text: bytes, textmode: bool = False, digest: str = "SHA256"
+        self,
+        key: str,
+        text: bytes,
+        textmode: bool = False,
+        digest: str = "SHA256",
+        faked: str = "",
     ) -> bytes:
         """key's binary detached signature of text: type 0x00, or with
         textmode 0x01 (a text signature, over text's canonical form)."""
         mode = ["--textmode"] if textmode else []
+        mode += ["--faked-system-time", faked] if faked else []
         return self.run(
             "--local-user",
             key,
@@ -919,6 +935,17 @@ class GnuPG:
             "--detach-sign",
             inp=text,
         )
+
+    def revoke(self, fpr: str) -> None:
+        """Revokes key fpr with the revocation certificate gpg made with it
+        (openpgp-revocs.d), its BEGIN line's guarding colon removed."""
+        cert = (self.home / "openpgp-revocs.d" / f"{fpr}.rev").read_bytes()
+        cert = cert.replace(
+            b":-----BEGIN PGP PUBLIC KEY BLOCK-----",
+            b"-----BEGIN PGP PUBLIC KEY BLOCK-----",
+            1,
+        )
+        self.run("--import", inp=cert)
 
     def export(self, *fprs: str) -> bytes:
         """The binary export of the public keys fprs."""
@@ -3884,6 +3911,12 @@ class UsageMaterial:
     unknown: tuple[bytes, bytes]  # X1's and X2's text-mode packets
     good512: bytes  # the signing subkey's text-mode SHA-512 packet (gpg's)
     bsn: bytes  # the signing subkey's packet in BSN's layout (bsn_packet)
+    d_good512: bytes  # the signing subkey's binary-mode SHA-512 packet (gpg's)
+    others: bytes  # T's and R's public keys (R's revocation included)
+    exp_good: bytes  # T's text-mode SHA-256 packet, made in its valid year
+    d_exp_good: bytes  # T's binary-mode one
+    rev_good: bytes  # R's text-mode SHA-256 packet, made before R was revoked
+    d_rev_good: bytes  # R's binary-mode one
 
 
 def make_usage_material(g: GnuPG) -> UsageMaterial:
@@ -3913,6 +3946,27 @@ def make_usage_material(g: GnuPG) -> UsageMaterial:
         raise RuntimeError(
             "the signing subkey's SHA-512 signature: another key or hash"
         )
+    d_good512 = g.detach_sign(sign + "!", RELEASE, digest="SHA512")
+    if issuer_fingerprint(d_good512) != sign or one_signature(d_good512)[3] != 10:
+        raise RuntimeError(
+            "the signing subkey's detached SHA-512 signature: another key or hash"
+        )
+    t = g.gen_key(EXPIRED_KEY_UID, "sign", "1y", faked=E_MADE)
+    exp_good = sig_packets(g.clearsign(t + "!", RELEASE, faked=E_SIGNS))
+    d_exp_good = g.detach_sign(t + "!", RELEASE, faked=E_SIGNS)
+    r = g.gen_key(REVOKED_KEY_UID, "sign", "never")
+    rev_good = sig_packets(g.clearsign(r + "!", RELEASE))
+    d_rev_good = g.detach_sign(r + "!", RELEASE)
+    g.revoke(r)
+    for fpr, pkt in ((t, exp_good), (t, d_exp_good), (r, rev_good), (r, d_rev_good)):
+        if issuer_fingerprint(pkt) != fpr or one_signature(pkt)[3] != 8:
+            raise RuntimeError(
+                f"gpg signed with another key than {fpr}, or another hash"
+            )
+    others = g.export(t, r)
+    check_keyring(others, {t, r})
+    if not any(body[1] == 0x20 for tag, body in split_packets(others) if tag == 2):
+        raise RuntimeError(f"{r}: its export holds no key revocation")
     unknown: list[bytes] = []
     for uid in UNKNOWN_KEY_UIDS:
         x = g.gen_key(uid, "sign", "never")
@@ -3934,6 +3988,12 @@ def make_usage_material(g: GnuPG) -> UsageMaterial:
         unknown=(unknown[0], unknown[1]),
         good512=good512,
         bsn=bsn_packet(g, good, public, sign, text),
+        d_good512=d_good512,
+        others=others,
+        exp_good=exp_good,
+        d_exp_good=d_exp_good,
+        rev_good=rev_good,
+        d_rev_good=d_rev_good,
     )
 
 
@@ -3949,8 +4009,14 @@ def batch_fx21(um: UsageMaterial) -> Batch:
     subkey's SHA-512 one (V2-C1: gpgv 1.4 checks the first packet only when
     the hashes differ), and a packet in BSN's layout (no issuer
     fingerprint) with an issuer fingerprint added to its unhashed area,
-    critical or not (V2-C2: gpgv 1.4 has no critical 33). Each shape's
-    signed-by is U's public key alone (keyrings_fx21)."""
+    critical or not (V2-C2: gpgv 1.4 has no critical 33). Its fix round 2
+    (V2-R1-M1, ``rx_``) adds a good packet by T (expired) or R (revoked)
+    first before the signing subkey's SHA-512 one, which gpgv 1.4 alone
+    checks (EXPKEYSIG, REVKEYSIG), inline and detached, and the controls:
+    T's packet second, or of the same hash, and an unexpired first key
+    (the signing subkey's SHA-256 packet) before its SHA-512 one. Each
+    shape's signed-by is U's public key alone, and an rx_ shape's U's, T's
+    and R's (keyrings_fx21)."""
     h = um.head
     issuer33 = b"\x04" + bytes.fromhex(issuer_fingerprint(um.good))
     inline = {
@@ -3972,8 +4038,16 @@ def batch_fx21(um: UsageMaterial) -> Batch:
         + armor_parts(add_unhashed(um.bsn, (33, True, issuer33))),
         "us_bsn_unh_noncrit33": h
         + armor_parts(add_unhashed(um.bsn, (33, False, issuer33))),
+        "rx_expT_then_good512": h + armor_parts(um.exp_good + um.good512),
+        "rx_revR_then_good512": h + armor_parts(um.rev_good + um.good512),
+        "rx_good512_then_expT": h + armor_parts(um.good512 + um.exp_good),
+        "rx_expT_then_good": h + armor_parts(um.exp_good + um.good),
+        "rx_good_then_good512": h + armor_parts(um.good + um.good512),
     }
     detached = {
+        "rx_d_expT_then_good512": armor_parts(um.d_exp_good + um.d_good512),
+        "rx_d_revR_then_good512": armor_parts(um.d_rev_good + um.d_good512),
+        "rx_d_good512_then_expT": armor_parts(um.d_good512 + um.d_exp_good),
         "us_d_bad_enc_plus_good": armor_parts(um.d_enc_bad + um.d_good),
         "us_d_good_enc_plus_good": armor_parts(um.d_enc_good + um.d_good),
     }
@@ -3982,10 +4056,16 @@ def batch_fx21(um: UsageMaterial) -> Batch:
 
 def keyrings_fx21(um: UsageMaterial) -> Shapes:
     """The own signed-by (<name>.keys.asc) of every batch fx21 shape: key
-    U's public key, alone, in one armor block."""
+    U's public key, alone, in one armor block; an rx_ shape's U's, T's and
+    R's, one block each."""
     asc = armored_keys(um.public, USAGE_KEY_UID.encode())
+    rx = asc + armored_keys(
+        um.others, EXPIRED_KEY_UID.encode(), REVOKED_KEY_UID.encode()
+    )
     inline, detached, _ = batch_fx21(um)
-    return {name: asc for name in (*inline, *detached)}
+    return {
+        name: rx if name.startswith("rx_") else asc for name in (*inline, *detached)
+    }
 
 
 def batch_fx22_from(c: Controls) -> Batch:

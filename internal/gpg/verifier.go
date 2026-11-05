@@ -482,7 +482,7 @@ func (v *Verifier) checkSignatures(suite freshness.SuiteRef, trust suiteTrust, s
 		return freshness.Signers{}, err
 	}
 	if every := everyGpgvChecks(checked); len(every) < len(checked) {
-		if err := v.requireKnownSignerEveryGpgvChecks(every); err != nil {
+		if err := v.requireKnownSignerEveryGpgvChecks(signed, every); err != nil {
 			return freshness.Signers{}, err
 		}
 	}
@@ -540,11 +540,13 @@ func everyGpgvChecks(checked []sigPacket) []sigPacket {
 }
 
 // requireKnownSignerEveryGpgvChecks refuses an anchor whose packets every
-// gpgv checks (everyGpgvChecks) hold none by a key in the host keyring: some
-// supported gpgv then sees no good signature and its apt refuses the anchor.
-// A packet by a known key there has passed S1, so it is good. It runs only
-// where everyGpgvChecks narrows the set (gpgv 1.4's first-only): where every
-// gpgv checks every packet, S2's count implies it, and S2's reasons stand.
+// gpgv checks (everyGpgvChecks) hold none by a key in the host keyring that
+// is live for it (liveSigner: the packet good by that key, the key neither
+// expired nor revoked at the verifier's clock, nor marked by the key reader):
+// some supported gpgv then sees no good signature (NO_PUBKEY, EXPKEYSIG,
+// REVKEYSIG) and its apt refuses the anchor. It runs only where
+// everyGpgvChecks narrows the set (gpgv 1.4's first-only): where every gpgv
+// checks every packet, S2's count implies it, and S2's reasons stand.
 //
 // AIDEV-NOTE: V2-C1 (the second final review's lens V2, Task 8's verifier
 // fix; a format rule over every generation, HD-19). gpgv 1.4 (ubuntu:16.04,
@@ -560,20 +562,92 @@ func everyGpgvChecks(checked []sigPacket) []sigPacket {
 // us_good_enc_then_good512, mh_good_then_unkB384, mh_d_good_then_unkB512:
 // every image accepts), and refuses a bad one (S1 refuses it here:
 // g5_bad512_then_good256, us_bad_primary_then_good512). So the rule asks
-// for a known key, not for a packet S2 counts: S2's crypto policy (no SHA-1)
-// is not intersected, and a first packet by a known key that S2 does not
-// count (SHA-1, an expired key's) is the vendor's own, never an attacker's
-// edit. Host keyring, as S1: the parity caveat of docs/open-decisions.md's
-// "S1 covers only the keys the cache holds" applies. No surveyed anchor
-// mixes hashes. The accept_any_signer bypass reads no S (DN-8).
-func (v *Verifier) requireKnownSignerEveryGpgvChecks(every []sigPacket) error {
+// for a live known key, not for a packet S2 counts: S2's crypto policy (no
+// SHA-1) is not intersected.
+//
+// AIDEV-NOTE: V2-R1-M1 (lens V2's re-review 1; the controller's ruling: class
+// R2 for those clients, fixed narrowly). A good first packet by a known key
+// that is expired or revoked, before one of another hash, is refused by gpgv
+// 1.4 (ubuntu:16.04, 14.04: "The following signatures were invalid:
+// KEYEXPIRED", REVKEYSIG) and accepted by every other image: fx21's
+// rx_expT_then_good512, rx_revR_then_good512 and their detached twins; the
+// same key's packet second (rx_good512_then_expT) or of the same hash
+// (rx_expT_then_good), and a live first key (rx_good_then_good512), every
+// image accepts. Such a packet is not key-free: it needs the private half of
+// an expired or revoked key the clients still hold (a vendor's retired key,
+// or a compromised one revoked for that reason), so it is no edit any
+// on-path party can make, but whoever holds such a key can. The key's state
+// is go-crypto's at the verifier's clock (the signing path's
+// checkMessageSignatureDetails; keyLive for a key that cannot sign) and the
+// key reader's marks (Keyring.uncountableKey). Host keyring, as S1: the
+// parity caveat of docs/open-decisions.md's "S1 covers only the keys the
+// cache holds" applies. No surveyed anchor mixes hashes. The
+// accept_any_signer bypass reads no S (DN-8).
+func (v *Verifier) requireKnownSignerEveryGpgvChecks(signed []byte, every []sigPacket) error {
 	keyring := v.keyring.EntityList()
+	now := time.Now()
+	if v.now != nil {
+		now = v.now()
+	}
+	known := false
 	for _, p := range every {
-		if len(keyring.KeysById(p.issuer)) > 0 {
-			return nil
+		keys := keyring.KeysById(p.issuer)
+		known = known || len(keys) > 0
+		for _, k := range keys {
+			if v.liveSigner(k, signed, p, now) {
+				return nil
+			}
 		}
 	}
+	if known {
+		return fmt.Errorf("%w: packet %d, issuer %016X, is the only one gpgv 1.4 checks (the packets' hashes differ), and its key is expired, revoked or marked at the verifier's clock", ErrNoUsableSignature, every[0].n, every[0].issuer)
+	}
 	return fmt.Errorf("%w: packet %d, issuer %016X, is the only one gpgv 1.4 checks (the packets' hashes differ), and no key in the host keyring has its ID", ErrNoUsableSignature, every[0].n, every[0].issuer)
+}
+
+// liveSigner reports whether p is k's good signature over signed and k is
+// live at now: a signing key by go-crypto's verification at now (no expiry,
+// revocation or expired signature: checkMessageSignatureDetails), any other
+// key by verifiesDirectly and keyLive; and, either way, unmarked by the key
+// reader (Keyring.uncountableKey). What gpgv 1.4 needs for a GOODSIG.
+func (v *Verifier) liveSigner(k openpgp.Key, signed []byte, p sigPacket, now time.Time) bool {
+	if why := v.keyring.uncountableKey(upperFP(k.PublicKey.Fingerprint), now); why != nil {
+		return false
+	}
+	signing := openpgp.EntityList{k.Entity}.KeysByIdUsage(p.issuer, packet.KeyFlagSign)
+	for _, s := range signing {
+		if s.PublicKey == k.PublicKey {
+			got, _, verr := openpgp.VerifyDetachedSignature(openpgp.EntityList{k.Entity},
+				bytes.NewReader(signed), bytes.NewReader(p.raw), &packet.Config{Time: func() time.Time { return now }})
+			return got != nil && verr == nil
+		}
+	}
+	return verifiesDirectly(k.PublicKey, signed, p.raw) && keyLive(k, p.raw, now)
+}
+
+// keyLive reports whether k, a key that cannot sign (verifiesDirectly's), is
+// live at now as go-crypto's checkMessageSignatureDetails judges a signing
+// key: neither its primary, its primary identity nor (a subkey) itself
+// revoked, neither its primary nor itself expired, and the packet raw not
+// expired.
+func keyLive(k openpgp.Key, raw []byte, now time.Time) bool {
+	e := k.Entity
+	selfSig, identity := e.PrimarySelfSignature()
+	sub := k.PublicKey != e.PrimaryKey
+	switch {
+	case e.Revoked(now), identity != nil && identity.Revoked(now), sub && k.Revoked(now):
+		return false
+	case selfSig != nil && e.PrimaryKey.KeyExpired(selfSig, now):
+		return false
+	case sub && k.SelfSignature != nil && k.PublicKey.KeyExpired(k.SelfSignature, now):
+		return false
+	}
+	pkt, err := packet.Read(bytes.NewReader(raw))
+	if err != nil {
+		return false
+	}
+	sig, ok := pkt.(*packet.Signature)
+	return ok && !sig.SigExpired(now)
 }
 
 // suiteTrust is a suite's trust set (resolveTrustSet).
