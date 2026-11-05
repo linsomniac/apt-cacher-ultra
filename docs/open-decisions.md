@@ -957,8 +957,13 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   warns on it rather than going crit, so the page reads WATCHING, not
   DEGRADED (the controller's ruling, 2026-11-05; `admin-ui-spec.md`
   §9.1). Part (3) makes the first 1.1.0 start delete the
-  snapshots the upgrade's trust audit quarantined, so the 1.1.0 release
-  notes' way back now loses their pool files even within the first hour.
+  snapshots the upgrade's trust audit quarantined, so a way back to 1.0.x
+  after a second 1.1.0 start loses their pool files even within the first
+  hour, and a suite whose current snapshot was quarantined can then answer
+  502 (`Retry-After: 30`) on 1.0.x until 1.0.x re-adopts it, whenever
+  upstream has changed since (1.0.x's hash-validated member refetch fails
+  closed); the maintainer, 2026-11-05, kept part (3) at that cost, and the
+  1.1.0 release notes say so.
   Pinned by `TestPassDeadlines_SplitTheBudget`,
   `TestRunTick_ASnapshotDeadlineDoesNotDeferTheBlobPass`,
   `TestRunTick_AURLPathDeadlineDoesNotDeferTheLaterPasses`,

@@ -65,7 +65,12 @@ type snapshotPassResult struct {
 // ones" in the task's brief was an over-reach, not the maintainer's
 // decision). Like every C it never deletes a snapshot that is not
 // retired, such as a displaced one the audit still holds queued (B never
-// ranks those: ruling R-H1). What a
+// ranks those: ruling R-H1). The downgrade cost, accepted by the
+// maintainer, 2026-11-05: after a second 1.1.0 start, a 1.0.x restored from
+// the pre-upgrade copy may miss a quarantined current snapshot's pool files
+// and answer 502 to its suite's index requests until it re-adopts the suite
+// (its member refetch fails closed when upstream has changed); the 1.1.0
+// release notes say so. What a
 // start leaves, the periodic ticks and retiredRun delete: hourly while a
 // backlog lasts (Run). Retired rows never serve meanwhile.
 //
