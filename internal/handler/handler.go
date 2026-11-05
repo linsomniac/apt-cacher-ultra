@@ -1891,7 +1891,7 @@ func (h *Handler) runSnapshotMemberFetch(ctx context.Context, req *proxy.Request
 		return sfResult{err: fmt.Errorf("handler: put blob row: %w", err), status: fres.UpstreamStatus()}
 	}
 	if err := h.cache.PutRepresentation(dbCtx, req.CanonicalScheme, req.CanonicalHost, req.Path, hash, fres.LastModified); err != nil {
-		return sfResult{err: fmt.Errorf("handler: store response metadata: %w", err)}
+		return sfResult{err: fmt.Errorf("handler: store response metadata: %w", err), status: fres.UpstreamStatus()}
 	}
 	return sfResult{blobHash: hash, size: fres.ContentLength, status: fres.UpstreamStatus(), lastModified: fres.LastModified}
 }
