@@ -350,7 +350,8 @@ func loadAptShapes(t *testing.T) []aptShape {
 	for _, e := range entries {
 		file := e.Name()
 		switch {
-		case file == "Release" || file == "keys.gpg" || file == "verdicts.txt" || file == "classes.txt":
+		case file == "Release" || file == "keys.gpg" || file == "verdicts.txt" || file == "classes.txt" ||
+			file == "verdicts-old.txt" || file == "classes-old.txt":
 			continue
 		case e.IsDir():
 			t.Fatalf("%s: unexpected directory in the corpus", file)

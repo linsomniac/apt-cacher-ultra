@@ -7,7 +7,8 @@
 # when the shape has none of its own), and an empty Packages — and runs
 # apt-get update against that repository alone, signed-by=/fx/keys.gpg, or
 # signed-by=/fx/<name>.keys.asc when the shape has a key file of its own
-# (an armored keyring: batch fx16's ka_* rows).
+# (an armored keyring: batch fx16's ka_* rows); on an apt too old for that,
+# with the adaptations below.
 #
 # Prints "# apt <version> <verifier> <version>" (gpgv, or debian:13's sqv:
 # whichever the image has installed), then one line per shape:
@@ -33,10 +34,50 @@
 # only once apt's checks (the clearsign sniff, SplitClearSignedFile,
 # VerifyDetachedSignatureFile) have passed the file on. The verdict and the
 # line come from the first run, made as it always was.
+#
+# AIDEV-NOTE: the older images (the hardening plan's Task 9e;
+# e2e/apt-oracle/README.md, "The older images") need three adaptations,
+# each gated on the image's apt version, so that the six current images
+# run exactly as before:
+# - apt before 1.4 cannot read an armored keyring in signed-by (1.0 has no
+#   signed-by at all, and ignores it): the image's own keyrings are removed
+#   and the shape's keys, dearmored by the image's gpg, are the one file of
+#   /etc/apt/trusted.gpg.d, the sources line naming no signed-by. apt 1.0
+#   runs gpgv itself on /etc/apt/trusted.gpg and that directory's files,
+#   apt 1.2 through apt-key, which finds the same two by apt-config, not by
+#   apt-get's -o options: so the image's own files, never -o
+#   Dir::Etc::TrustedParts;
+# - apt before 1.5 treats a repository it cannot authenticate as unsigned,
+#   a warning, and exits 0, unless Acquire::AllowInsecureRepositories is
+#   false (apt 1.1 to 1.4), which makes it an error;
+# - apt 1.0 has no such option: it exits 0 whatever gpgv said, so its
+#   status here is 100 when it exited 0 yet its lists hold no verified
+#   InRelease or Release.gpg. apt keeps either only once gpgv has passed
+#   it (debReleaseIndex::IsTrusted reads the same file). Measured: on all
+#   865 corpus rows (2026-11-05) this verdict is the gpgv method's own
+#   answer (Debug::pkgAcquire::Worker, "gpgv:201 URI Done" or "gpgv:400
+#   URI Failure"), where apt-get's exit status alone missed 116 refusals.
 set -uo pipefail
 shopt -s nullglob
 
 apt_ver=$(dpkg-query -W -f '${Version}' apt)
+# The adaptations above (the AIDEV-NOTE), by apt's version.
+trusted_parts=0
+insecure=()
+lists_trust=0
+if dpkg --compare-versions "$apt_ver" lt 1.4; then
+    trusted_parts=1
+    if ! command -v gpg > /dev/null; then
+        echo "in-container.sh: apt $apt_ver needs gpg to dearmor the keys, and the image has none" >&2
+        exit 2
+    fi
+    rm -f /etc/apt/trusted.gpg /etc/apt/trusted.gpg.d/*
+fi
+if dpkg --compare-versions "$apt_ver" lt 1.1; then
+    lists_trust=1
+elif dpkg --compare-versions "$apt_ver" lt 1.5; then
+    insecure=(-o Acquire::AllowInsecureRepositories=false)
+fi
 verifier=
 for pkg in gpgv sqv; do
     if st=$(dpkg-query -W -f '${db:Status-Abbrev} ${Version}' "$pkg" 2> /dev/null) &&
@@ -51,12 +92,23 @@ repo=$work/repo
 list=$work/sources.list
 
 # apt-get update on the shape's repository alone, its lists emptied first;
-# extra options after it ("$@"), the output on stdout, its status returned.
+# extra options after it ("$@"), the output on stdout, its status returned
+# (on apt 1.0, 100 for a repository it left unauthenticated: the AIDEV-NOTE
+# above).
 update() {
+    local rc=0 verified
     rm -rf /var/lib/apt/lists/*
     mkdir -p /var/lib/apt/lists/partial
     apt-get update -o Dir::Etc::SourceList="$list" \
-        -o Dir::Etc::SourceParts=/dev/null -o APT::Sandbox::User=root "$@" 2>&1
+        -o Dir::Etc::SourceParts=/dev/null -o APT::Sandbox::User=root \
+        ${insecure[@]+"${insecure[@]}"} "$@" 2>&1 || rc=$?
+    if ((rc == 0 && lists_trust)); then
+        verified=(/var/lib/apt/lists/*_InRelease /var/lib/apt/lists/*_Release.gpg)
+        if ((${#verified[@]} == 0)); then
+            rc=100
+        fi
+    fi
+    return "$rc"
 }
 
 for shape in /fx/*.InRelease /fx/*.Release.gpg; do
@@ -83,7 +135,21 @@ for shape in /fx/*.InRelease /fx/*.Release.gpg; do
     if [[ -f /fx/$name.keys.asc ]]; then
         keys=/fx/$name.keys.asc
     fi
-    echo "deb [signed-by=$keys] file:$repo/ ./" > "$list"
+    if ((trusted_parts)); then
+        rm -f /etc/apt/trusted.gpg.d/*
+        case $keys in
+        *.asc)
+            if ! gpg --dearmor < "$keys" > /etc/apt/trusted.gpg.d/apt-oracle.gpg; then
+                echo "in-container.sh: $name: gpg could not dearmor $keys" >&2
+                exit 2
+            fi
+            ;;
+        *) cp "$keys" /etc/apt/trusted.gpg.d/apt-oracle.gpg ;;
+        esac
+        echo "deb file:$repo/ ./" > "$list"
+    else
+        echo "deb [signed-by=$keys] file:$repo/ ./" > "$list"
+    fi
     if out=$(update); then
         rc=0
     else

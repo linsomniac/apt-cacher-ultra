@@ -10,13 +10,18 @@
 # checks.
 #
 #   E2E_APT_ORACLE_IMAGES  client images, whitespace-separated (default: the
-#                          six columns of verdicts.txt, in its order); any of
-#                          them, each compared with its own column
+#                          six columns of verdicts.txt, in its order, or with
+#                          --old the five of verdicts-old.txt); any of them,
+#                          each compared with its own column
 #
-#   make e2e-apt-oracle
-#   bash e2e/apt-oracle/run.sh            # measure and compare
-#   bash e2e/apt-oracle/run.sh --record   # measure and rewrite verdicts.txt
-#                                         # and classes.txt
+#   make e2e-apt-oracle                         # the six current images
+#   make e2e-apt-oracle-old                     # the five older ones
+#   bash e2e/apt-oracle/run.sh                  # measure and compare
+#   bash e2e/apt-oracle/run.sh --record         # measure and rewrite
+#                                               # verdicts.txt and classes.txt
+#   bash e2e/apt-oracle/run.sh --old [--record] # the same for the older
+#                                               # images: verdicts-old.txt and
+#                                               # classes-old.txt
 #
 # Exit status: 0 apt gives the recorded verdicts and error classes (or
 # --record wrote them), 1 apt changed, a container failed or an error class
@@ -25,21 +30,37 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 # verdicts.txt's columns, in its order (the hardening plan's DN-2: e2e/flat's
-# six client images): --record measures exactly these.
+# six client images): --record measures exactly these. OLD_COLUMNS are
+# verdicts-old.txt's (the plan's Task 9e: the older clients that still have
+# upstream support, ruling HD-19), which --old --record measures.
 COLUMNS="debian:11 ubuntu:22.04 ubuntu:24.04 debian:12 debian:13 ubuntu:26.04"
+OLD_COLUMNS="debian:10 ubuntu:20.04 ubuntu:18.04 ubuntu:16.04 ubuntu:14.04"
 CORPUS=internal/gpg/testdata/aptshapes
-VERDICTS=$CORPUS/verdicts.txt
-CLASSES=$CORPUS/classes.txt
 
 record=0
-case "$#:${1-}" in
-0:) ;;
-1:--record) record=1 ;;
-*)
-    echo "usage: bash e2e/apt-oracle/run.sh [--record]"
+old=0
+for arg in "$@"; do
+    case $arg in
+    --record) record=$((record + 1)) ;;
+    --old) old=$((old + 1)) ;;
+    *) record=2 ;;
+    esac
+done
+if ((record > 1 || old > 1)); then
+    echo "usage: bash e2e/apt-oracle/run.sh [--old] [--record]"
     exit 2
-    ;;
-esac
+fi
+if ((old)); then
+    COLUMNS=$OLD_COLUMNS
+    VERDICTS=$CORPUS/verdicts-old.txt
+    CLASSES=$CORPUS/classes-old.txt
+    oldflag=" --old"
+else
+    VERDICTS=$CORPUS/verdicts.txt
+    CLASSES=$CORPUS/classes.txt
+    oldflag=
+fi
+vname=${VERDICTS##*/}
 
 # Whitespace-split the whole value (e2e/deb/run.sh says why read -d '').
 IFS=$' \t\n' read -r -d '' -a columns < <(printf '%s\0' "$COLUMNS")
@@ -67,13 +88,13 @@ for i in "${!images[@]}"; do
         fi
     done
     if [[ -z $field ]]; then
-        echo "[e2e-apt-oracle] ${images[$i]} is not a column of verdicts.txt ($COLUMNS)"
+        echo "[e2e-apt-oracle] ${images[$i]} is not a column of $vname ($COLUMNS)"
         exit 2
     fi
     fields+=("$field")
 done
 if ((record)) && [[ "${images[*]}" != "${columns[*]}" ]]; then
-    echo "[e2e-apt-oracle] --record measures every column of verdicts.txt:" \
+    echo "[e2e-apt-oracle] --record measures every column of $vname:" \
         "unset E2E_APT_ORACLE_IMAGES"
     exit 2
 fi
@@ -86,7 +107,7 @@ for f in "$CORPUS/keys.gpg" "$CORPUS/Release"; do
 done
 for f in "$VERDICTS" "$CLASSES"; do
     if ((!record)) && [[ ! -f $f ]]; then
-        echo "[e2e-apt-oracle] $f is missing: record it with --record"
+        echo "[e2e-apt-oracle] $f is missing: record it with$oldflag --record"
         exit 2
     fi
 done
@@ -171,9 +192,9 @@ if ((failed)); then
     exit 1
 fi
 
-# classify IMAGE OUT: "<shape> <class>" for every line of in-container.sh's
-# output OUT, unsorted; fails, naming each, when a class and apt's words
-# disagree.
+# classify IMAGE OUT LEGACY: "<shape> <class>" for every line of
+# in-container.sh's output OUT, unsorted; fails, naming each, when a class and
+# apt's words disagree. LEGACY is 1 for an apt before 1.6 (below).
 #
 # AIDEV-NOTE: the classes (e2e/apt-oracle/README.md, "Error classes"): "-"
 # accepted; split, apt's own checks of the file refused it before its
@@ -186,12 +207,14 @@ fi
 # binary, unclosed and stray-line messages, or its "got 'NODATA'" for a
 # Release.gpg without a BEGIN line — accepted for a detached shape only, the
 # names in $work/detached: an InRelease refused before the verifier ran with
-# no more than NODATA is a changed apt, the Task 9a review's 9A-M2), and a
+# no more than NODATA is a changed apt, the Task 9a review's 9A-M2, but on
+# an apt before 1.6, whose gpgv method words SplitClearSignedFile's failure
+# so: apt 1.0's and 1.2's, ubuntu:14.04's and 16.04's, Task 9e), and a
 # verifier's refusal none of them. Task 9b's layer-T test
 # (TestAptTextLayer_RefusesExactlyTheSplitRows) holds the cache's port of
 # apt's splitter to the split rows of classes.txt.
 classify() {
-    awk -v img="$1" -v detached="$work/detached" '
+    awk -v img="$1" -v detached="$work/detached" -v legacy="$3" '
     BEGIN {
         while ((getline name < detached) > 0) isdetached[name] = 1
         close(detached)
@@ -217,7 +240,7 @@ classify() {
             if ($3 != "-") fail("accepted, yet asked whether apt ran its verifier")
             print $1, "-"
         } else if ($3 == "n") {
-            if (!textlayer(line) && !(isdetached[$1] && line ~ /got .NODATA./))
+            if (!textlayer(line) && !((isdetached[$1] || legacy) && line ~ /got .NODATA./))
                 fail("refused before apt ran its verifier, with no text-layer message")
             print $1, "split"
         } else if ($3 == "y") {
@@ -267,7 +290,12 @@ for i in "${!images[@]}"; do
         cut -d ' ' -f 1 "$work/verdicts.$i" | diff "$work/shapes" - | head -n 20 || true
         exit 1
     fi
-    if ! classify "${images[$i]}" "$work/out.$i" | LC_ALL=C sort > "$work/classes.$i"; then
+    legacy=0
+    if [[ ${versions[$i]} =~ ^apt\ ([0-9]+)\.([0-9]+) ]] &&
+        ((BASH_REMATCH[1] < 1 || (BASH_REMATCH[1] == 1 && BASH_REMATCH[2] < 6))); then
+        legacy=1
+    fi
+    if ! classify "${images[$i]}" "$work/out.$i" "$legacy" | LC_ALL=C sort > "$work/classes.$i"; then
         echo "[e2e-apt-oracle] FAIL: ${images[$i]}: an error class that apt's" \
             "words do not bear out (above); e2e/apt-oracle/README.md, \"Error" \
             "classes\", says what to check"
@@ -311,29 +339,42 @@ echo
 # too. Lines starting with "#" are comments; every other line is "<name>"
 # and one field per COLUMNS entry, in COLUMNS' order, single spaces between
 # them: ok/REJ in verdicts.txt; in classes.txt, "-" where the verdict is ok,
-# else split, nodata, badsig or other.
+# else split, nodata, badsig or other. verdicts-old.txt and classes-old.txt
+# (--old, OLD_COLUMNS) have the same format, and the table test reads them
+# too (Task 9e, ruling E2).
 if ((record)); then
     measured_at=$(date -u '+%Y-%m-%d %H:%M')
     {
-        echo "# apt's verdicts on the shapes of internal/gpg/testdata/aptshapes, one"
-        echo "# row per shape: ok (apt-get update succeeded) or REJ (it failed), in"
-        echo "# each client image. Measured $measured_at UTC by"
-        echo "# bash e2e/apt-oracle/run.sh --record (e2e/apt-oracle/README.md); the"
-        echo "# fixtures, this file and classes.txt are one measurement. The columns,"
-        echo "# after the shape's name:"
+        if ((old)); then
+            echo "# apt's verdicts on the shapes of internal/gpg/testdata/aptshapes in the"
+            echo "# older client images (verdicts.txt has the current ones), one row per"
+            echo "# shape: ok (apt-get update succeeded and, on apt 1.0, left the"
+            echo "# repository authenticated) or REJ (it did not), in each image."
+            echo "# Measured $measured_at UTC by bash e2e/apt-oracle/run.sh --old --record"
+            echo "# (e2e/apt-oracle/README.md, \"The older images\"); the fixtures, this"
+            echo "# file and classes-old.txt are one measurement. The columns, after the"
+            echo "# shape's name:"
+        else
+            echo "# apt's verdicts on the shapes of internal/gpg/testdata/aptshapes, one"
+            echo "# row per shape: ok (apt-get update succeeded) or REJ (it failed), in"
+            echo "# each client image. Measured $measured_at UTC by"
+            echo "# bash e2e/apt-oracle/run.sh --record (e2e/apt-oracle/README.md); the"
+            echo "# fixtures, this file and classes.txt are one measurement. The columns,"
+            echo "# after the shape's name:"
+        fi
         for i in "${!images[@]}"; do
             printf '#   %-13s %s\n' "${images[$i]}" "${versions[$i]}"
         done
         cat "$work/measured"
     } > "$work/verdicts.txt"
     {
-        echo "# apt's error class of each refusal in verdicts.txt, the same rows and"
+        echo "# apt's error class of each refusal in $vname, the same rows and"
         echo "# columns: \"-\" where apt accepted the shape; where it refused it, split"
         echo "# (apt's own checks of the file refused it before its verifier ran),"
         echo "# nodata (the verifier found no signature data: gpgv's NODATA), badsig"
         echo "# (a signature failed its check: gpgv's BADSIG, sqv's \"Message has been"
         echo "# manipulated\") or other (anything else the verifier said). Measured"
-        echo "# $measured_at UTC with verdicts.txt; e2e/apt-oracle/README.md,"
+        echo "# $measured_at UTC with $vname; e2e/apt-oracle/README.md,"
         echo "# \"Error classes\", says how each is derived."
         cat "$work/measured_classes"
     } > "$work/classes.txt"
@@ -403,7 +444,7 @@ same=1
 compare "$VERDICTS" "$work/measured" verdict || same=0
 compare "$CLASSES" "$work/measured_classes" class || same=0
 if ((!same)); then
-    echo "[e2e-apt-oracle] FAIL: apt changed, or verdicts.txt or classes.txt does" \
+    echo "[e2e-apt-oracle] FAIL: apt changed, or $vname or ${CLASSES##*/} does" \
         "not match the corpus ($((SECONDS - start)) s); e2e/apt-oracle/README.md," \
         "\"When apt changes\", says what to update"
     exit 1

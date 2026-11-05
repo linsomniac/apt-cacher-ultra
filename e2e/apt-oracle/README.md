@@ -12,7 +12,8 @@ on, and the oracle that measures apt on it:
 - `run.sh`, with `in-container.sh`, runs the real apt of six client images
   on every shape and compares its verdicts, and the error class of each
   refusal, with those the corpus records in `verdicts.txt` and
-  `classes.txt`.
+  `classes.txt`; with `--old`, the apt of five older client images, with
+  `verdicts-old.txt` and `classes-old.txt` (*The older images*).
 
 The oracle is manual, like `make e2e-live`, and never runs in CI.
 
@@ -20,27 +21,34 @@ The oracle is manual, like `make e2e-live`, and never runs in CI.
 
 ```sh
 make e2e-apt-oracle                                    # all six images, compared
+make e2e-apt-oracle-old                                # the five older images, compared
 E2E_APT_ORACLE_IMAGES=debian:13 make e2e-apt-oracle    # some of them
+E2E_APT_ORACLE_IMAGES=ubuntu:14.04 make e2e-apt-oracle-old
 bash e2e/apt-oracle/run.sh --record                    # all six: rewrite verdicts.txt and classes.txt
+bash e2e/apt-oracle/run.sh --old --record              # all five: rewrite verdicts-old.txt and classes-old.txt
 ```
 
-It needs Docker and GNU `timeout`, and the six images (pulled on first
-use; the containers themselves run with `--network none`). The images run
-in parallel, one `apt-get update` per shape in each and a second one for
-each shape apt refuses (*Error classes*); with the images cached a run
-takes about 50 seconds on a 12-core machine. To measure today's apt,
-`docker pull` the six images first: `docker run` never refreshes a cached
+It needs Docker and GNU `timeout`, and the images (pulled on first use;
+the containers themselves run with `--network none`). The images of a set
+run in parallel, one `apt-get update` per shape in each and a second one
+for each shape apt refuses (*Error classes*); with the images cached a run
+of the six takes about 85 seconds on a 12-core machine, and one of the five
+older ones about 95. The two sets are two runs, and two make targets: one
+after the other they take about three minutes (the hardening plan's Task
+9e), and a release runs both (*When to run it*). To measure today's apt,
+`docker pull` the images first: `docker run` never refreshes a cached
 tag, and the version lines a run prints show which apt it measured.
 
 The exit status is 0 when apt gives the recorded verdicts and error
 classes (or `--record` wrote them), 1 when apt changed, a container failed
 or an error class and apt's words disagree, and 2 for a usage or setup
-error: an image that is not a column of `verdicts.txt`, `--record` with
-only some of the images, a corpus file missing.
+error: an image that is not a column of the set's file (`verdicts.txt`, or
+`verdicts-old.txt` with `--old`), `--record` with only some of the set's
+images, a corpus file missing.
 
 ## The corpus
 
-`internal/gpg/testdata/aptshapes/` holds 938 files, about 1.1 MiB:
+`internal/gpg/testdata/aptshapes/` holds 940 files, about 1.2 MiB:
 
 | File | What it is |
 |---|---|
@@ -52,6 +60,7 @@ only some of the images, a corpus file missing.
 | `keys.gpg` | the public keys A, E, S and O, in binary: the clients' `signed-by` here, and the host keyring of the verifier's table test (the hardening plan's Task 6), which loads the file whole, so every key in it is a trusted signer there |
 | `verdicts.txt` | apt's verdicts: a `#` header naming the measurement's date and each image's apt and verifier versions, then one row per shape, `<name>` and one verdict per image in the order of *The images* below, `ok` (`apt-get update` exited 0) or `REJ` |
 | `classes.txt` | apt's error class of each refusal, the same rows and columns: `-` where the verdict is `ok`, else `split`, `nodata`, `badsig` or `other` (*Error classes*) |
+| `verdicts-old.txt`, `classes-old.txt` | the same for the five older images (*The older images*), in the same format, one column per older image |
 
 The repository's `.gitattributes` marks every file here `-text`, so no
 checkout or commit converts their line ends, whatever `core.autocrlf`
@@ -350,19 +359,22 @@ its subkey.
    changes (the key-free batches are cut from the new controls, byte
    surgery the same); `verdicts.txt` and `classes.txt` are left in place,
    and are now stale.
-3. Re-measure: `bash e2e/apt-oracle/run.sh --record`.
+3. Re-measure, both sets: `bash e2e/apt-oracle/run.sh --record` and
+   `bash e2e/apt-oracle/run.sh --old --record`.
 4. Review `git diff --no-ext-diff internal/gpg/testdata/aptshapes/verdicts.txt
-   internal/gpg/testdata/aptshapes/classes.txt`: the new rows, and no
+   internal/gpg/testdata/aptshapes/classes.txt
+   internal/gpg/testdata/aptshapes/verdicts-old.txt
+   internal/gpg/testdata/aptshapes/classes-old.txt`: the new rows, and no
    other row changed. An old row that changed is apt changing or a broken
    builder: find out which before going on.
 5. Run the verifier's table test (`go test ./internal/gpg`): it holds the
    cache to the new row, or the shape goes in its deviations, with a
    reason.
-6. Commit the generator, the fixtures, `verdicts.txt` and `classes.txt`
-   together.
+6. Commit the generator, the fixtures and the four verdict and class
+   files together.
 
-Never edit a fixture by hand: the fixtures, `verdicts.txt` and
-`classes.txt` are one measurement.
+Never edit a fixture by hand: the fixtures and the four files are one
+measurement.
 
 ## What the oracle checks
 
@@ -444,7 +456,13 @@ whose exit status differs from the first's, fails the run. The messages
 are the same in the six apt versions (their `gpgv.cc`, `methods/gpgv.cc`
 and `methods/sqv.cc`; the final review's `PE/final-review/A/src-apt/`), and
 so is the text layer: a row is `split` in every column or in none (64 rows
-are, all six), which `TestAptShapeClasses_AgreeWithTheVerdicts` checks.
+are, all six), which `TestAptShapeClasses_AgreeWithTheVerdicts` checks. Not
+so in the older images (*The older images*): `debian:10`'s and
+`ubuntu:20.04`'s text layer is the six's (a row is `split` there exactly
+when it is in `classes.txt`: `TestAptShapeOldClasses_AgreeWithTheVerdicts`),
+`ubuntu:18.04`'s, `16.04`'s and `14.04`'s is not, and apt 1.0 and 1.2 word some of
+an InRelease's split refusals `Clearsigned file isn't valid, got 'NODATA'`,
+which `run.sh` accepts as `split` from an apt before 1.6 only.
 
 ## The images
 
@@ -466,10 +484,64 @@ compared with its own column; `--record` measures all six, since
 set of columns: change `COLUMNS`, record, and check what reads the
 columns (the table test).
 
+## The older images
+
+The cache supports every client that still has upstream support, Ubuntu
+14.04 (through Ubuntu Pro, until May 2029) included (the hardening plan's
+addendum of 2026-11-03, ruling HD-19). `verdicts-old.txt`'s columns, in
+their order (`OLD_COLUMNS` in `run.sh`), as measured on 2026-11-05 (every
+image pulled and ran):
+
+| Image | apt | Verifier |
+|---|---|---|
+| `debian:10` | 1.8.2.3 | gpgv 2.2.12-1+deb10u2 |
+| `ubuntu:20.04` | 2.0.10 | gpgv 2.2.19-3ubuntu2.4 |
+| `ubuntu:18.04` | 1.6.17 | gpgv 2.2.4-1ubuntu1.6 |
+| `ubuntu:16.04` | 1.2.35 | gpgv 1.4.20-1ubuntu3.3 |
+| `ubuntu:14.04` | 1.0.1ubuntu2.24 | gpgv 1.4.16-1ubuntu2.6 |
+
+`in-container.sh` adapts to an older apt three ways, each by the image's
+apt version, so that the six current images run exactly as before:
+
+- **apt before 1.4** (`ubuntu:16.04`, `14.04`) cannot read an armored key
+  file in `signed-by` (apt 1.0 has no `signed-by` at all and ignores it):
+  the image's own keyrings are removed, and the shape's keys, dearmored by
+  the image's gpg (every block: gpg 1.4's `--dearmor` keeps both of a
+  `ka_*` file's), are the one file of `/etc/apt/trusted.gpg.d`, the
+  sources line naming no `signed-by`. The image's own directory, not
+  `-o Dir::Etc::TrustedParts`: apt 1.2's `apt-key` reads its configuration
+  by `apt-config`, never by `apt-get`'s options.
+- **apt before 1.5** (`ubuntu:16.04`) treats a repository it cannot
+  authenticate as unsigned, a warning, and exits 0:
+  `-o Acquire::AllowInsecureRepositories=false` makes that an error.
+- **apt 1.0** (`ubuntu:14.04`) has no such option and exits 0 whatever
+  gpgv said, so its status is taken as 100 when apt exited 0 but its lists
+  hold no verified `InRelease` or `Release.gpg`, which apt keeps only once
+  gpgv has passed it (`debReleaseIndex::IsTrusted` reads the same file).
+  Measured on all 865 rows: the verdict this gives is the gpgv method's
+  own answer (`-o Debug::pkgAcquire::Worker=1`: `gpgv:201 URI Done` or
+  `gpgv:400 URI Failure`), where the exit status alone missed 116
+  refusals.
+
+What they measure: `debian:10` and `ubuntu:20.04` give `debian:11`'s
+verdict on every row. `ubuntu:18.04`'s gpgv 2.2.4 also checks a packet
+whose issuer is a known primary key that only certifies, against that key
+(`t7g5_s_primary`: BADSIG), and its apt reads some layouts the newer text
+layer refuses. `ubuntu:16.04`'s apt 1.2 refuses an InRelease with any byte
+after the clearsign marker on line 1, a CR or a blank (`i_crlf_all`,
+`n_i_nginx_crlf`, `i_begin_trailing_ws`: nginx's real InRelease is CRLF).
+gpgv 1.4 (`ubuntu:16.04`, `14.04`) cannot verify EdDSA or ECDSA (the `pk_`
+rows of those keys), reads past base64 that needs no padding into the END
+line when no CRC line follows it (`i_crc_missing`, `d_crc_missing`:
+syncthing's real InRelease is so), and refuses a v6 packet or a 10 kB
+unhashed area beside a good signature.
+
 ## When to run it
 
 - Before a release, on the tree you tag (`docs/open-decisions.md`, the
-  list before the 1.1.0 release candidate), adding a row to *Results*.
+  list before the 1.1.0 release candidate), both sets (`make
+  e2e-apt-oracle` and `make e2e-apt-oracle-old`), adding a row to
+  *Results*.
 - After a go-crypto upgrade, and after a change to `internal/gpg`'s armor
   or signature checks: the table test shows what the cache does, the
   oracle that apt still does what the table says.
@@ -513,3 +585,4 @@ together (*Adding a shape*).
 | 2026-11-01, 21:23 UTC (the plan's Task 9b, its fix round) | the commit that adds batches fx15 to fx17 | `--from-controls` wrote fx15 to fx17's 232 shapes and fx16's 6 key files (fx8 to fx12's and fx14's 348 again, byte for byte), the re-review's 226 files byte for byte as its generators wrote them; `--record`: 730 shapes in 6 images, the 498 earlier rows and their error classes unchanged, the 220 rows the re-review measured as it measured them, the 12 `sq_` rows as the table predicts; then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 68 s and 68 s, images cached |
 | 2026-11-01, 23:41 UTC (the plan's Task 9b, its second fix round) | the commit that adds batches fx18 and fx19 | `--from-controls` wrote fx18's 76 shapes (fx8 to fx12's and fx14 to fx17's 580 again, byte for byte), the second re-review's 76 files byte for byte as its generator wrote them; `--subkeys-key` fx19's 17 shapes and their 17 key files, signed by a new key K; `--record`: 823 shapes in 6 images, the 730 earlier rows and their error classes unchanged, the 93 new rows as the second re-review measured them (fx19's with K for its K3); then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 84 s and 77 s, images cached |
 | 2026-11-05, 08:21 UTC (the plan's Task 9d) | the commit that adds batch fx20 | `--policy-keys` wrote fx20's 42 shapes and their 42 key files, signed by new throwaway keys (three earlier runs of the same batch, at 07:32, 07:35 and 07:51 UTC, each with other keys and fewer rows, gave the same verdict on every row they shared); `--record`: 865 shapes in 6 images, the 823 earlier rows and their error classes unchanged, the 42 new rows as *Batch fx20* above describes them; then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 82 s, images cached |
+| 2026-11-05, 09:31 UTC (the plan's Task 9e) | the commit that adds the older images, on 0d7b103 | `bash e2e/apt-oracle/run.sh --old --record`: 865 shapes in the five older images (*The older images*), every image pulled and ran; then `make e2e-apt-oracle-old`: PASS, every verdict and class as recorded, and `make e2e-apt-oracle`: PASS with the adapted `in-container.sh`. apt 1.8.2.3, 2.0.10, 1.6.17, 1.2.35 and 1.0.1ubuntu2.24 | 93 s and 94 s (the five), 82 s (the six), images cached |
