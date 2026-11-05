@@ -799,8 +799,11 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   lens's probe `o3_good_unkB_unkB`, [A good][B][B], refused by
   `ubuntu:16.04`: "Invalid message from method gpgv: NO_PUBKEY
   2628FEC1C3054C2B"); the cache adopts such an anchor and keeps serving it
-  to the 16.04 and 14.04 clients, which then fail `apt update` for the
-  suite. That residual is class R2 for those clients, accepted by the (b)
+  to the clients that refuse it, which then fail `apt update` for the
+  suite: the stripped CRC breaks 16.04 and 14.04 clients (gpgv 1.4), the
+  CRLF conversion and the two unknown-key packets 16.04 clients alone (apt
+  1.2; 14.04's apt 1.0 accepts both: lens V2's re-review, V2-R1-M2). That
+  residual is class R2 for those clients, accepted by the (b)
   rulings (E3, E4): a fold would refuse nginx, syncthing or
   debian-buster-archive. Recommendation: leave them; a vendor's to fix,
   and the residual stays recorded here.
