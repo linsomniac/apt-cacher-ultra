@@ -1135,7 +1135,7 @@ func reasonTooltip(reason string) string {
 	case "ambiguous_keyid":
 		return "Two or more keys in the trust set share the same 8-byte keyid; the short-keyid fallback refuses to guess."
 	case "crypto_verify_failed":
-		return "A trusted signature was found but none counts: its key or the signature has expired or been revoked in the cache's keyring (install the vendor's current key file and restart), the keyring marks its key as not countable, its key may not sign, it is SHA-1 (never counted), or apt or debian:13's sqv would not count it. Any current snapshot keeps serving; the adoption_gpg_failed log line has the cause."
+		return "A trusted signature was found but none counts: its key or the signature has expired or been revoked in the cache's keyring (install the vendor's current key file and restart), the keyring marks its key as not countable (a revocation, expiry or binding it cannot read, which gpgv honours: install the vendor's current key file too, or ask the vendor about its key's status), its key may not sign, it is SHA-1 (never counted), or apt or debian:13's sqv would not count it. Any current snapshot keeps serving; the adoption_gpg_failed log line has the cause."
 	case "unpinned_suite":
 		return "adoption.require_pinned_signer is true and no [[trusted_signer]] block matches this canonical host."
 	case "parse_failed":
@@ -1155,7 +1155,7 @@ func reasonTooltip(reason string) string {
 	case "rollback_refused":
 		return "Upstream serves content identical to an older snapshot the cache already replaced (a flapping mirror). Refused, not failed."
 	case "signer_downgrade":
-		return "The new anchor has lost the strong signer the suite's current anchor has (a key debian:13, ubuntu:24.04 and ubuntu:26.04 all accept): the shape of an on-path strip of a strong signature beside a weak one. Refused, not failed: the current snapshot keeps serving and the suite falls behind upstream. If the vendor really dropped its strong key, remove that key from the keyring and restart, or POST /forget the suite; the adoption_signer_downgrade log line names both signers."
+		return "The new anchor has lost the strong signer the suite's current anchor has (a key debian:13, ubuntu:24.04 and ubuntu:26.04 all accept): the shape of an on-path strip of a strong signature beside a weak one. Refused, not failed: the current snapshot keeps serving and the suite falls behind upstream. First confirm with the vendor, out of band, that it really dropped its strong signer: both recourses adopt the anchor the guard refused. Then remove that key from the keyring and restart (every suite it signs loses it; a bundled key cannot be removed), or POST /forget the suite; see docs/configuration.md, Trust and signer pins. The adoption_signer_downgrade log line names both signers."
 	case "release_date_in_future":
 		return "The Release's Date is more than 10 s ahead of the cache's clock (apt's Acquire::Max-FutureTime). Check the cache host's clock."
 	case "timed_out":
