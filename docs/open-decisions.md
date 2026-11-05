@@ -447,28 +447,28 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   and never adopts a bad one. Recommendation: if it is ever met,
   verify S2's fingerprint path against the single entity that owns the
   issuer fingerprint, with a test.
-- **Displaced snapshots a periodic tick retired but did not delete wait**
-  (raised 2026-10-28, the hardening plan's DN-7). When a periodic tick's
-  snapshot pass stops before its sub-job C has deleted what its sub-job B
-  retired — at its deadline, at a shutdown, or on a batch or chunk that
-  failed or panicked — those snapshots, which have `retired_at`, are no
-  longer B's to delete at the next start: they wait for a later periodic
-  tick's snapshot pass or the retired run an hour after a start, so a daemon
-  that never lives that long keeps them, as it keeps a reaped suite's (the
-  H3 final review's R3 #2 residual; `runSnapshotPass`'s AIDEV-NOTE,
-  `internal/gc/snapshot.go`). They never serve meanwhile. And sub-job C
-  deletes the oldest retired snapshot first (`RunRetiredSnapshotGCChunk`,
-  `internal/cache/gc.go`), so one whose chunk fails at every call stops the
-  deletion of every later retired snapshot, B's displaced ones included,
-  with their rows and the blobs they keep, until it is fixed, where a
-  periodic B used to delete them itself whatever C did (the hardening
-  plan's final review, G-M1: probed with a trigger standing in for a fault
-  confined to one snapshot's rows, the only cause the review found; WARN
-  `gc_tick_failed` with `retired snapshot gc chunk:` shows it). Class
-  none: disk only, since a retired snapshot never serves. Recommendation:
-  leave it; look again if a daemon that restarts often is
-  seen to keep them, and if a chunk is seen to fail at every call, let C
-  step past a snapshot whose chunk failed for the rest of its pass.
+- **A retired snapshot whose sub-job C chunk fails at every call blocks
+  the later ones** (raised 2026-10-28, the hardening plan's DN-7, as
+  *Displaced snapshots a periodic tick retired but did not delete wait*;
+  narrowed 2026-11-05). The entry's first half, that retired snapshots a
+  pass left wait, was wrong in class and premise (the hardening plan's
+  final review 2, G2-I2): it assumed a later tick catches up, and under a
+  sustained displacement rate none did, so the backlog grew without bound;
+  it is decided under *Decided*, issue #14 (the startup pass runs C, and
+  the retired run repeats hourly while a backlog lasts). What stays open:
+  sub-job C deletes the oldest retired snapshot first
+  (`RunRetiredSnapshotGCChunk`, `internal/cache/gc.go`), so one whose chunk
+  fails at every call stops the deletion of every later retired snapshot,
+  B's displaced ones included, with their rows and the blobs they keep,
+  until it is fixed, where a periodic B used to delete them itself whatever
+  C did (the hardening plan's final review, G-M1: probed with a trigger
+  standing in for a fault confined to one snapshot's rows, the only cause
+  the review found; WARN `gc_tick_failed` with `retired snapshot gc
+  chunk:` shows it). A failing retired run is not repeated hourly (no
+  retry storm); the next periodic tick retries. Class none: disk only,
+  since a retired snapshot never serves. Recommendation: leave it; if a
+  chunk is seen to fail at every call, let C step past a snapshot whose
+  chunk failed for the rest of its pass.
 - **Sub-job C's chunk size** (raised 2026-10-28, the hardening plan's
   Task 2; ruling HD-11). Sub-job C deletes 10,000 rows a writer transaction
   (spec C9; `retiredChunkRows`, `internal/cache/gc.go`), and a chunk holds
@@ -899,6 +899,77 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
 
 ## Decided
 
+- **Issue #14: GC frees disk again on a busy cache, and the retired backlog
+  stays bounded** (the maintainer, 2026-11-05: worked for 1.1.0, all three
+  parts of a consult's design; raised 2026-09-28 as GitHub issue #14, and
+  2026-11-05 by the hardening plan's final review 2, G2-I1, present since
+  1.0.x, and G2-I2, a regression of the hardening plan's DN-7). G2-I1: a
+  pass that reached `gc.max_tick_duration` ended the tick with the rotation
+  at it, so while the snapshot pass had more work than one budget every
+  tick ended there and the blob pass, the only one that frees disk, never
+  ran (the reporter's 1.0.2 status page: a tick that deleted 90 displaced
+  snapshots in 5 m, flagged degraded, then a full disk that took two
+  restarts to clear); at a start a url_path scan longer than the budget did the same
+  to every start, its cursor living in memory. G2-I2: since DN-7 a periodic
+  B only retires the displaced snapshots and chunked sub-job C, 1.6–2.3×
+  slower than main's one-transaction delete, deletes them once a tick and
+  once an hour after a start, while the startup pass ran no C (ruling
+  PF-15), so the retired backlog grew without bound and a restart no
+  longer cleared it. The three parts, each its own commit:
+  (1) every pass gets a turn — the tick's budget T splits into deadlines
+  with f = T/5, the url-path pass ending by T−2f, the snapshot pass by T−f,
+  the blob pass by T (`passDeadlines`, `internal/gc/gc.go`), and a url-path
+  or snapshot pass that hits its deadline moves the rotation on and the tick
+  goes on, as ruling HD-15 does for a failed pass, at a start and in a tick
+  (commit d170dd6); (2) the retired run (`retiredRun`) is re-armed an hour
+  later whenever it, or a periodic tick's snapshot pass, stops at its
+  deadline with work left, never after a failure or a panic and not when
+  `gc.interval` is an hour or less: up to 24 bounded, chunked budgets a day
+  while a backlog lasts, with no new key, goroutine or schema change
+  (commit 9d0e8ad); (3) ruling PF-15 is re-ruled: the startup pass runs C
+  after A ∪ B within its snapshot deadline and its blob pass reclaims their
+  blobs, so a start with a retired backlog may wait up to
+  `max_tick_duration` before the listeners open, the bound HD-7 accepts
+  for B; C deletes every retired snapshot, the trust audit's quarantined
+  ones included (spec C9), and none that is not retired, such as a
+  displaced one the audit still holds queued (R-H1) (commit 13a999e).
+  Measured with the lens's probe P3 (the 2026-11-03 scaled repro: 70,000
+  `package_hash` rows a snapshot, 1 MiB members, two suites, four
+  adoptions a day, a 3 s budget, 50 expired blobs; serial; four days), on
+  an archive of 13a999e with the hourly runs simulated back to back after
+  each tick: ticks of 2.5–2.9 s, `deadline_reached=true` and
+  `blobs_reaped` 53, 24, 10 and 6; retired 11, 3, 2 and 3 after each tick
+  and 0 after its hourly runs (5, 1, 1 and 2 runs); a restart then reaps 5
+  blobs, leaving 16 (8 MiB) and no retired snapshot. The lens measured
+  `blobs_reaped=0` at every tick on both 7f276ee and main's 276bfa2, the
+  retired count growing 11, 14, 18, 21 on 7f276ee (a restart left 57 blobs,
+  28 MiB, and the 21 retired) and main leaving 16 blobs after a restart
+  that reaped 98. With ticks alone (no hourly runs) 13a999e reaps blobs at
+  every tick (53, 2, 2, 4) but the retired count grows (11, 14, 17, 19),
+  which the hourly runs bound. Under contention (adoptions during the tick)
+  a batch queued behind them can overrun the budget and use the blob
+  pass's share (ticks of 4.9 and 6.5 s); the blob pass then runs first at
+  the next tick, which reaped 66 and 16. A busy cache's runs may now end
+  with `deadline_reached=true` while they free disk, a healthy steady
+  state (`docs/configuration.md`, `[gc]`, which also gives 1.0.x users the
+  interim workaround); the status page's *Deadline reached* badge is warn,
+  not crit, with a tooltip saying so (commit d7e9c8a), while the GC vital
+  still goes crit on it. Part (3) makes the first 1.1.0 start delete the
+  snapshots the upgrade's trust audit quarantined, so the 1.1.0 release
+  notes' way back now loses their pool files even within the first hour.
+  Pinned by `TestPassDeadlines_SplitTheBudget`,
+  `TestRunTick_ASnapshotDeadlineDoesNotDeferTheBlobPass`,
+  `TestRunTick_AURLPathDeadlineDoesNotDeferTheLaterPasses`,
+  `TestRunTick_ASnapshotDeadlineMovesTheRotationToTheBlobPass` (was
+  `TestRunTick_SnapshotDeadlineDefersBlobPass`, which pinned the
+  starvation), `TestRun_RepeatsTheRetiredRunHourlyWhileABacklogRemains`,
+  `TestPeriodicTick_ASnapshotDeadlineArmsTheRetiredRun`,
+  `TestRun_AFailedRetiredRunIsNotRepeatedHourly`,
+  `TestRun_TheRetiredBacklogStaysBoundedUnderASustainedDisplacementRate`,
+  `TestStartupPass_RunsSubJobCWithinItsSnapshotDeadline` and
+  `TestStartupPass_DeletesRetiredSnapshotsAndReapsTheirBlobs`. Not done:
+  making C's delete cheaper (the consult measured no gain from a larger
+  page cache; the rest is schema work).
 - **A GC pass that fails at every tick no longer starves the passes after
   it** (the maintainer, 2026-10-28: worked for 1.1.0; raised 2026-10-27, the
   H3 final review R3 #5, and again 2026-10-29, the hardening plan's final

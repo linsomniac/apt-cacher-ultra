@@ -1048,7 +1048,7 @@ unvouched package.
 | `interval` | duration | `"24h"` | Delay after a GC tick completes before the next periodic tick. Must be positive; disable through `enabled`. |
 | `batch_size` | integer | `100` | Maximum URL-path/blob rows processed per GC batch. At least `1`. |
 | `snapshot_batch_size` | integer | `10` | Maximum snapshots one GC batch handles: abandoned adoption candidates are deleted; displaced snapshots beyond `keep_displaced` are deleted by the startup pass and retired by the periodic runs, whose retired snapshots' rows are then deleted 10,000 rows a transaction, so a large suite never holds the database for long while the cache serves. At least `1`. |
-| `max_tick_duration` | duration | `"5m"` | Budget for startup/periodic GC passes, checked between batches; remaining work resumes later. The startup pass, which runs before the listeners serve, leaves the retired snapshots (of a reaped, evicted or forgotten suite, or one the upgrade's trust audit quarantined, and the displaced snapshots a periodic run retired beyond `keep_displaced`) to a run an hour after the start, when `interval` is longer than an hour, and to the periodic passes (see *Suite reaping*); it deletes only a retired one never adopted whose heartbeat went stale, as it does any abandoned adoption candidate. That run deletes only retired snapshots, within this budget too (INFO `gc_retired_run_complete`). Must be positive. |
+| `max_tick_duration` | duration | `"5m"` | Budget for one startup or periodic GC run, checked between batches; remaining work resumes later. The run splits it so every pass gets a turn: the URL-path pass stops by three fifths of it, the snapshot pass by four fifths, the blob pass at its end, and a pass that runs out of its share leaves its rest to a later run while the passes after it still run (1 m each, at least, at the default). The startup pass, which runs before the listeners serve, deletes the retired snapshots too (of a reaped, evicted or forgotten suite, one the upgrade's trust audit quarantined, and the displaced snapshots a periodic run retired beyond `keep_displaced`), within its snapshot pass's share, so a start with many of them may keep the listeners closed for up to this budget; what it leaves, a run of that work alone deletes an hour after the start, and again every hour while a run ends with some left, when `interval` is longer than an hour (INFO `gc_retired_run_complete`, within this budget too), as do the periodic passes (see *Suite reaping*). Must be positive. |
 | `blob_grace` | duration | `"5m"` | Grace after a blob's reference count reaches zero before deletion. At least `"1s"`, and greater than twice `heartbeat_interval`. |
 | `keep_displaced` | integer | `3` | Recent displaced snapshots kept per suite for inspection. `0` retains none; must be nonnegative. A displaced snapshot the upgrade's trust audit has not judged yet (one whose pool file it could not read: see *Upgrading an existing cache*) is kept, and takes none of the `keep_displaced` places, until the audit decides it: it may be the suite's only evidence of a signature. Does not by itself retain superseded package binaries. Also bounds retained by-hash: a by-hash request the current snapshot lacks is served from the newest `keep_displaced` + 1 displaced snapshots of its suite, and `0` turns that off (see *Flip consistency*). |
 | `pool_scan_workers` | integer | `4` | Workers for the startup orphan-file scan. At least `1`. |
@@ -1064,9 +1064,43 @@ immediate catch-up run. Existing configuration files that explicitly set
 Less frequent collection retains eligible data longer and can require more disk
 space. The interval controls cleanup only: freshness checks, integrity checks,
 adoption heartbeats, and offline serving remain independent. GC resumes unfinished
-work across ticks in URL-path, snapshot, then blob order; a large backlog can take
-several intervals to drain. `max_tick_duration` is checked between batches and
-does not interrupt a running batch or bound the startup orphan-file scan.
+work across ticks in URL-path, snapshot, then blob order. A pass that reaches its
+share of `max_tick_duration` no longer ends the run: the passes after it still
+run under their own shares, so the blob pass, the one that frees disk, runs at
+every tick whatever the backlog before it, and the retired snapshots left are
+deleted hourly until none is left (when `interval` is longer than an hour; at
+`"1h"` or less the periodic ticks come that often anyway). So a run that ends
+with `deadline_reached=true` (its `gc_run_complete` line,
+`acu_gc_deadline_reached_total`, the status page's *Deadline reached*) is a
+healthy steady state for a busy cache while a backlog drains; look further only
+when `acu_gc_blobs_reaped_total` also stays flat run after run, or the
+`gc_retired_run_complete` lines' `retired_reaped` stop adding up to what the
+periodic runs' `displaced_reaped` retire. `max_tick_duration` is checked
+between batches and does not interrupt a running batch or bound the startup
+orphan-file scan: a batch that waits long for the database (behind adoptions,
+say) can use up a later pass's share, which then runs first at the next tick.
+
+**Before 1.1.0 (1.0.x): a cache that keeps growing (issue #14).** In 1.0.x a
+run that reached `max_tick_duration` in its snapshot pass ended there, and the
+next run resumed that pass first, so while the displaced snapshots outran one
+run's budget the blob pass never ran and nothing was freed. The sign:
+`acu_gc_deadline_reached_total` rising while `acu_gc_blobs_reaped_total` stays
+flat (on the status page, *Deadline reached* `true` beside *Blobs reaped* `0`,
+run after run). Until you upgrade:
+
+1. Set `gc.interval = "1h"`. The snapshot pass then gets 24 budgets a day,
+   and once a run drains it, the same run's blob pass frees the disk.
+2. If a run still ends with `deadline_reached=true` and `blobs_reaped=0`,
+   raise `gc.max_tick_duration` (to `"30m"`, say) until a run ends with
+   `deadline_reached=false`, then lower it again. A 1.0.x batch's delete holds
+   the database for seconds whatever the budget, so this lengthens a run, not
+   a transaction.
+3. A restart runs the startup pass with no other writer, which helps, but it
+   may take two restarts: the first can still run out of time before its blob
+   pass.
+
+`keep_displaced` does not help: it changes how many displaced snapshots are
+kept, not how fast they are deleted.
 
 Both heartbeat conditions must hold:
 
@@ -1114,16 +1148,14 @@ snapshots only; a package another suite's snapshot lists keeps that
 one's): with `enabled = true` and a nonzero `url_path_ttl`, GC deletes
 those no client asked for within `url_path_ttl`, after
 `hold_packages.window`, and their pool files after `blob_grace`. GC
-deletes the retired snapshots an hour after each start (when `interval`
-is longer than an hour: a run of that work alone, INFO
-`gc_retired_run_complete`, so a daemon restarted more often than
-`interval` still deletes them) and at each periodic pass, but not in the
-pass at startup, which deletes only a never-adopted one whose heartbeat
-went stale, as it does any abandoned adoption candidate, so a restart
-after many reaps does not keep the listeners closed while they are
-deleted. The pool files nothing else uses then go at the next blob pass
-(the next start's, or the next periodic pass's), once `blob_grace` has
-passed. With `enabled = false` suites are still reaped, but their
+deletes the retired snapshots in the pass at startup, within its share of
+`max_tick_duration` (so a restart after many reaps may keep the listeners
+closed for up to that budget while they are deleted), at each periodic
+pass, and an hour after each start, again every hour while a run ends
+with some left (when `interval` is longer than an hour: a run of that work
+alone, INFO `gc_retired_run_complete`). The pool files nothing else uses
+then go at the same pass's blob pass, or for the hourly runs at the next
+periodic pass's or the next start's, once `blob_grace` has passed. With `enabled = false` suites are still reaped, but their
 snapshots and pool files stay until GC runs again.
 
 A reaped suite whose clients come back is tracked again at their first
