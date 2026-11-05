@@ -119,17 +119,18 @@ func rsaKeySig(t *testing.T, signer *openpgp.Entity, sigType byte, hash crypto.H
 	return newPacket(tagSignature, body)
 }
 
-// rsaKeySigV3 crafts a version 3 signature packet (RFC 4880 §5.2.2) of
-// sigType by signer's primary RSA key over material, SHA-256, made at
-// kr14Created: the type and time hashed after the material, the issuer's
-// key ID in the clear. As V's mkkr17.py makes them.
-func rsaKeySigV3(t *testing.T, signer *openpgp.Entity, sigType byte, material []byte) []byte {
+// rsaKeySigLegacy crafts a version 2 or 3 signature packet (RFC 4880
+// §5.2.2; gpg reads both alike) of sigType by signer's primary RSA key over
+// material, SHA-256, made at when: the type and time hashed after the
+// material, the issuer's key ID in the clear. As V's mkkr17.py and
+// mkkr20.py make them.
+func rsaKeySigLegacy(t *testing.T, version byte, signer *openpgp.Entity, sigType byte, when time.Time, material []byte) []byte {
 	t.Helper()
 	priv, ok := signer.PrivateKey.PrivateKey.(*rsa.PrivateKey)
 	if !ok {
 		t.Fatalf("test premise: %T is no RSA key", signer.PrivateKey.PrivateKey)
 	}
-	hashed := binary.BigEndian.AppendUint32([]byte{sigType}, uint32(kr14Created.Unix()))
+	hashed := binary.BigEndian.AppendUint32([]byte{sigType}, uint32(when.Unix()))
 	h := crypto.SHA256.New()
 	h.Write(material)
 	h.Write(hashed)
@@ -138,10 +139,16 @@ func rsaKeySigV3(t *testing.T, signer *openpgp.Entity, sigType byte, material []
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := joined([]byte{3, 5}, hashed, binary.BigEndian.AppendUint64(nil, signer.PrimaryKey.KeyId),
+	body := joined([]byte{version, 5}, hashed, binary.BigEndian.AppendUint64(nil, signer.PrimaryKey.KeyId),
 		[]byte{byte(packet.PubKeyAlgoRSA), hashSHA256}, digest[:2])
 	body = binary.BigEndian.AppendUint16(body, uint16(priv.N.BitLen()))
 	return newPacket(tagSignature, append(body, sig...))
+}
+
+// rsaKeySigV3 is rsaKeySigLegacy for version 3, made at kr14Created.
+func rsaKeySigV3(t *testing.T, signer *openpgp.Entity, sigType byte, material []byte) []byte {
+	t.Helper()
+	return rsaKeySigLegacy(t, 3, signer, sigType, kr14Created, material)
 }
 
 // serializedSig is sig as a packet.
@@ -586,10 +593,11 @@ func TestVerifier_ThirdPartyRevocationsMarkOnlyWhenDesignated(t *testing.T) {
 	}{
 		{"X's 0x20 of P, X never designated (kr17_tp_keyrev): K counts", kk.ring(t, [][]byte{xRevP}, nil), nil},
 		{"X's 0x28 of K, X never designated: K counts", kk.ring(t, nil, [][]byte{xRevK}), nil},
-		{"X's v3 0x20 of P, X never designated: K counts", kk.ring(t, [][]byte{xRevPv3}, nil), nil},
+		{"kr21_tp_v3rev_xin: X's v3 0x20 of P, X never designated: refused (version 2 and 3 fail closed whoever the issuer; ok in all six apt: over-strict, R3)", kk.ring(t, [][]byte{xRevPv3}, nil), pgperrors.ErrKeyRevoked},
+		{"kr21_dr_v2rev_xin: P designates X (0x1f), X's v2 0x20 of P: P marked", kk.ring(t, [][]byte{designating(x, crypto.SHA256, hashSHA256), rsaKeySigLegacy(t, 2, x, byte(packet.SigTypeKeyRevocation), kr14Created, pMaterial)}, nil), pgperrors.ErrKeyRevoked},
 		{"P designates X (0x1f), X's 0x20 of P (kr19_dr_rev): P marked", kk.ring(t, [][]byte{designating(x, crypto.SHA256, hashSHA256), xRevP}, nil), pgperrors.ErrKeyRevoked},
 		{"P designates X (0x1f), X's 0x28 of K: K marked", kk.ring(t, [][]byte{designating(x, crypto.SHA256, hashSHA256)}, [][]byte{xRevK}), pgperrors.ErrKeyRevoked},
-		{"P designates X (0x1f), X's v3 0x20 of P: P marked (by key ID)", kk.ring(t, [][]byte{designating(x, crypto.SHA256, hashSHA256), xRevPv3}, nil), pgperrors.ErrKeyRevoked},
+		{"kr21_dr_v3rev_xin: P designates X (0x1f), X's v3 0x20 of P: P marked", kk.ring(t, [][]byte{designating(x, crypto.SHA256, hashSHA256), xRevPv3}, nil), pgperrors.ErrKeyRevoked},
 		{"P designates X in a newer self-certification of its user ID, X's 0x20 of P: P marked", withCert(designatingCert, xRevP), pgperrors.ErrKeyRevoked},
 		{"P designates X in a 0x1f the cache cannot read (RIPEMD-160), X's 0x20 of P: P marked", kk.ring(t, [][]byte{designating(x, crypto.RIPEMD160, hashRIPEMD160), xRevP}, nil), pgperrors.ErrKeyRevoked},
 		{"a 0x1f by P whose subpackets cannot be walked, X's 0x20 of P: P marked (any third party may be designated)", kk.ring(t, [][]byte{garbled, xRevP}, nil), pgperrors.ErrKeyRevoked},
@@ -601,8 +609,8 @@ func TestVerifier_ThirdPartyRevocationsMarkOnlyWhenDesignated(t *testing.T) {
 		switch {
 		case tc.want == nil && err != nil:
 			t.Errorf("%s: K's good signature: %v; want it adopted", tc.name, err)
-		case tc.want != nil && (!errors.Is(err, tc.want) || !strings.Contains(err.Error(), "designated revoker")):
-			t.Errorf("%s: K's good signature: %v; want %v, the reader's mark naming a designated revoker", tc.name, err, tc.want)
+		case tc.want != nil && (!errors.Is(err, tc.want) || !strings.Contains(err.Error(), "designated revoker") && !strings.Contains(err.Error(), "whoever its issuer")):
+			t.Errorf("%s: K's good signature: %v; want %v, the reader's mark naming a designated revoker (or a version 2 or 3 signature, marked whoever its issuer)", tc.name, err, tc.want)
 		}
 		if _, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, aGood, kBad)); !errors.Is(err, ErrBadSignature) {
 			t.Errorf("%s: A's good signature and K's bad one: %v; want ErrBadSignature (S1 knows K)", tc.name, err)
@@ -610,17 +618,25 @@ func TestVerifier_ThirdPartyRevocationsMarkOnlyWhenDesignated(t *testing.T) {
 	}
 }
 
-// TestVerifier_V3RevocationsAreMarked: the fifth re-review's V-R5I1. A
-// version 3 revocation by the key itself, of the key (0x20) or of a subkey
-// (0x28), is honoured by every supported apt (kr17_v3_keyrev,
-// kr17_v3_subrev: REVKEYSIG in the five gpgv-based apt, refused by sqv too),
-// and fix round 4 dropped every v3 signature before the marks were made, so
-// S2 counted the key. The revocation now marks its component; S1 still
-// knows K. A v3 binding or certification is still passed over, as go-crypto
-// passes it over and gpg takes none as a v4 key's self-signature: a newer
-// v3 binding of K that would expire it changes nothing, another key's v3
-// certification of P's user ID changes nothing, and a subkey bound by a v3
-// binding alone is dropped (never counted), the rest of the key read.
+// TestVerifier_V3RevocationsAreMarked: version 2 and 3 signatures fail
+// closed (the fifth re-review's V-R5I1, the sixth's V-R6I1 and V-R6I2, the
+// controller's design ruling for fix round 6: one broad rule, not a copy of
+// gpgv). A version 3 or 2 revocation by the key itself, of the key (0x20)
+// or of a subkey (0x28), is honoured by every supported apt
+// (kr17_v3_keyrev, kr17_v3_subrev, kr20_v2_keyrev, kr20_v2_subrev:
+// REVKEYSIG in the five gpgv-based apt); a newer v3 or v2 binding of the
+// signing subkey makes them refuse its signatures (kr21_v3_bind_newer,
+// kr21_v2_bind_newer: gpgv takes the newest binding, which carries no
+// back-signature, ERRSIG "not cross-certified"). Fix round 4 dropped every
+// such signature before the marks were made; round 5 marked v3
+// revocations alone. Now every v2 or v3 binding, back-signature, direct-key
+// signature or revocation of the key or a subkey marks the component it
+// stands on, whoever its issuer and whatever its age (an older binding too:
+// over-strict, Minor under R3, costing no real file, since none holds a v2
+// or v3 signature); S1 still knows K. A v2 or v3 certification is still
+// passed over (kr21_v3_cert_newer: ok in all six images), a v3 0x30 follows
+// the self rule, and a subkey bound by a v3 binding alone is dropped (never
+// counted), the rest of the key read.
 func TestVerifier_V3RevocationsAreMarked(t *testing.T) {
 	kk := newKR14Keys(t)
 	x := newTestEntity(t, "X", "x@example.com")
@@ -648,8 +664,15 @@ func TestVerifier_V3RevocationsAreMarked(t *testing.T) {
 	}{
 		{"kr17_v3_keyrev: P revoked by a v3 0x20 by P", kk.ring(t, [][]byte{rsaKeySigV3(t, kk.p, byte(packet.SigTypeKeyRevocation), pMaterial)}, nil), pgperrors.ErrKeyRevoked},
 		{"kr17_v3_subrev: K revoked by a v3 0x28 by P", kk.ring(t, nil, [][]byte{rsaKeySigV3(t, kk.p, byte(packet.SigTypeSubkeyRevocation), pkMaterial)}), pgperrors.ErrKeyRevoked},
-		{"a newer v3 binding of K by P: passed over, K counts", kk.ring(t, nil, [][]byte{v3Binding}), nil},
-		{"another key's v3 certification of P's user ID: passed over, K counts", joined(joined(pkts[:3]...), rsaKeySigV3(t, x, byte(packet.SigTypeGenericCert), joined(pMaterial, uidMaterial(uid))), joined(pkts[3:]...)), nil},
+		{"kr20_v2_keyrev: P revoked by a v2 0x20 by P", kk.ring(t, [][]byte{rsaKeySigLegacy(t, 2, kk.p, byte(packet.SigTypeKeyRevocation), kr14Created, pMaterial)}, nil), pgperrors.ErrKeyRevoked},
+		{"kr20_v2_subrev: K revoked by a v2 0x28 by P", kk.ring(t, nil, [][]byte{rsaKeySigLegacy(t, 2, kk.p, byte(packet.SigTypeSubkeyRevocation), kr14Created, pkMaterial)}), pgperrors.ErrKeyRevoked},
+		{"kr21_v3_bind_newer: a newer v3 binding of K by P: gpgv takes it, ERRSIG; refused", kk.ring(t, nil, [][]byte{v3Binding}), pgperrors.ErrKeyExpired},
+		{"kr21_v2_bind_newer: the same, version 2; refused", kk.ring(t, nil, [][]byte{rsaKeySigLegacy(t, 2, kk.p, byte(packet.SigTypeSubkeyBinding), kr14Created, pkMaterial)}), pgperrors.ErrKeyExpired},
+		{"an older v3 binding of K by P: refused too (over-strict, R3)", kk.ring(t, nil, [][]byte{rsaKeySigLegacy(t, 3, kk.p, byte(packet.SigTypeSubkeyBinding), time.Date(2023, 12, 1, 0, 0, 0, 0, time.UTC), pkMaterial)}), pgperrors.ErrKeyExpired},
+		{"a v3 back-signature (0x19) by K on K: refused", kk.ring(t, nil, [][]byte{rsaKeySigV3(t, &openpgp.Entity{PrimaryKey: kk.k.PublicKey, PrivateKey: kk.k.PrivateKey}, byte(packet.SigTypePrimaryKeyBinding), pkMaterial)}), pgperrors.ErrKeyExpired},
+		{"a v3 direct-key signature (0x1f) on P: refused", kk.ring(t, [][]byte{rsaKeySigV3(t, kk.p, byte(packet.SigTypeDirectSignature), pMaterial)}, nil), pgperrors.ErrKeyExpired},
+		{"another key's v3 certification of P's user ID (kr21_v3_cert_newer's kin): passed over, K counts", joined(joined(pkts[:3]...), rsaKeySigV3(t, x, byte(packet.SigTypeGenericCert), joined(pMaterial, uidMaterial(uid))), joined(pkts[3:]...)), nil},
+		{"P's own newer v2 certification of its user ID: passed over, K counts", joined(joined(pkts[:3]...), rsaKeySigLegacy(t, 2, kk.p, byte(packet.SigTypePositiveCert), kr14Created, joined(pMaterial, uidMaterial(uid))), joined(pkts[3:]...)), nil},
 		{"another key's v3 revocation of its certification (0x30) of P's user ID: not the key's own, not marked, K counts", joined(joined(pkts[:3]...), rsaKeySigV3(t, x, byte(packet.SigTypeCertificationRevocation), joined(pMaterial, uidMaterial(uid))), joined(pkts[3:]...)), nil},
 		{"P's own v3 revocation of its user ID (0x30): marked, as an unreadable v4 one is", joined(joined(pkts[:3]...), rsaKeySigV3(t, kk.p, byte(packet.SigTypeCertificationRevocation), joined(pMaterial, uidMaterial(uid))), joined(pkts[3:]...)), pgperrors.ErrKeyRevoked},
 		{"K2 bound by a v3 binding alone after K: K2 dropped, K counts", kk.ring(t, nil, [][]byte{k2Pkt.Bytes(), k2Binding}), nil},
@@ -659,8 +682,8 @@ func TestVerifier_V3RevocationsAreMarked(t *testing.T) {
 		switch {
 		case tc.want == nil && err != nil:
 			t.Errorf("%s: K's good signature: %v; want it adopted", tc.name, err)
-		case tc.want != nil && (!errors.Is(err, tc.want) || !strings.Contains(err.Error(), "version 3")):
-			t.Errorf("%s: K's good signature: %v; want %v, the reader's mark naming the version 3 signature", tc.name, err, tc.want)
+		case tc.want != nil && (!errors.Is(err, tc.want) || !strings.Contains(err.Error(), "version ")):
+			t.Errorf("%s: K's good signature: %v; want %v, the reader's mark naming the signature's version", tc.name, err, tc.want)
 		}
 		if _, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, aGood, kBad)); !errors.Is(err, ErrBadSignature) {
 			t.Errorf("%s: A's good signature and K's bad one: %v; want ErrBadSignature (S1 knows K)", tc.name, err)

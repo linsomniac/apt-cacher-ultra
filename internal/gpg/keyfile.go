@@ -614,7 +614,7 @@ type keyComponent struct {
 type keySig struct {
 	raw     rawPacket
 	typ     byte
-	v3      bool      // a version 3 revocation, kept for marks alone (never handed to go-crypto)
+	legacy  bool      // a version 2 or 3 signature, kept for marks alone (never handed to go-crypto)
 	self    bool      // its issuer is the key itself, or cannot be read
 	issuer  rawSig    // its issuer's fingerprint and key ID as read (keyBlock.designated)
 	created time.Time // its creation time; zero when it cannot be read
@@ -736,8 +736,8 @@ func keyBlocksOf(pkts []rawPacket) []*keyBlock {
 			}
 			if t, ok := sigTypeOf(p, kb.key.Version); ok && sigFits(kb.components[at].kind, t) {
 				kb.components[at].sigs = append(kb.components[at].sigs, keySig{raw: p, typ: t})
-			} else if t, ok := v3RevocationType(p); ok && sigFits(kb.components[at].kind, t) {
-				kb.components[at].sigs = append(kb.components[at].sigs, keySig{raw: p, typ: t, v3: true})
+			} else if t, ok := legacySigType(p); ok && legacyFits(kb.components[at].kind, t) {
+				kb.components[at].sigs = append(kb.components[at].sigs, keySig{raw: p, typ: t, legacy: true})
 			}
 		case tagUserAttribute:
 			at = -1
@@ -795,9 +795,9 @@ func newPacket(tag byte, body []byte) []byte {
 
 // sigTypeOf returns the signature type of p, a signature packet whose
 // version is the key's (go-crypto reads a v4 key's v4 signatures, a v6
-// key's v6 ones; a v3 signature it passes over: an UnsupportedError its
-// packet reader skips; v3RevocationType keeps the revocations among them
-// for marks).
+// key's v6 ones; a version 2 or 3 signature it passes over: an
+// UnsupportedError its packet reader skips; legacySigType keeps those the
+// reader marks for).
 func sigTypeOf(p rawPacket, version int) (byte, bool) {
 	if len(p.body) < 2 || int(p.body[0]) != version {
 		return 0, false
@@ -805,26 +805,56 @@ func sigTypeOf(p rawPacket, version int) (byte, bool) {
 	return p.body[1], true
 }
 
-// v3RevocationType returns the signature type of p when p is a version 3
-// revocation, of a key (0x20), a subkey (0x28) or a user ID (0x30): RFC 4880
-// §5.2.2, a body of the version, the hashed material's length (5), the type,
-// a four-octet creation time, the issuer's eight-octet key ID, the
-// algorithms, two octets of the digest and the signature. Every supported
-// apt honours such a revocation by the key itself (the fifth re-review's
-// kr17_v3_keyrev and kr17_v3_subrev, REJ in all six images); go-crypto
-// passes it over, so the reader keeps it for marks alone (keySig.v3): it is
-// never handed to go-crypto, and never counts as a binding or a
-// self-signature. Any other v3 signature (a binding, a certification) is
-// dropped, as before.
-func v3RevocationType(p rawPacket) (byte, bool) {
-	if len(p.body) < 19 || p.body[0] != 3 || p.body[1] != 5 {
+// legacySigType returns the signature type of p when p is a version 2 or 3
+// signature packet (RFC 4880 §5.2.2: the version, the hashed material's
+// length (5), the type, a four-octet creation time, the issuer's eight-octet
+// key ID, the algorithms, two octets of the digest and the signature; gpg
+// reads version 2 as version 3) of a type the reader marks for: a subkey
+// binding (0x18) or its back-signature (0x19), a direct-key signature (0x1f),
+// a revocation of a key (0x20), of a subkey (0x28) or of a user ID (0x30).
+// go-crypto passes every such packet over (an UnsupportedError its reader
+// skips), so the reader keeps it for marks alone (keySig.legacy): it is never
+// handed to go-crypto, and never counts as a binding or a self-signature. A
+// legacy certification (0x10 to 0x13) is dropped: measured harmless
+// (kr21_v3_cert_newer, ok in all six images).
+//
+// AIDEV-NOTE: the controller's design ruling for Task 9b's fix round 6
+// (the sixth re-review's V-R6I1 and V-R6I2): fewer, broader fail-closed
+// rules for version 2 and 3 signatures, not a closer copy of gpgv. Rounds
+// 4, 5 and 6 each found another hand-built legacy shape gpgv honours and
+// the reader passed over (a v3 self-revocation; a v2 one; a newer v3 or v2
+// binding, which gpgv takes as the subkey's and refuses as not
+// cross-certified, ERRSIG in the five gpgv-based apt). No real file holds
+// a version 2 or 3 signature (V's v23scan over debian-keyring,
+// debian-maintainers and the 70 surveyed vendor files), so over-strictness
+// here costs nothing real: a legacy signature of these types marks the
+// component it stands on whoever its issuer and whatever its age (marks),
+// with no issuer or time parsing. The rows that makes over-strict, each
+// Minor and Open under ruling R3: a third party's legacy 0x20 or 0x28 the
+// key never designated (kr21_tp_v3rev_xin, ok ×6), and a legacy binding
+// older than the one kept (unmeasured). A legacy 0x30 keeps round 5's rule
+// (the key's own marks the key).
+func legacySigType(p rawPacket) (byte, bool) {
+	if len(p.body) < 19 || p.body[0] != 3 && p.body[0] != 2 || p.body[1] != 5 {
 		return 0, false
 	}
 	switch t := packet.SignatureType(p.body[2]); t {
-	case packet.SigTypeKeyRevocation, packet.SigTypeSubkeyRevocation, packet.SigTypeCertificationRevocation:
+	case packet.SigTypeSubkeyBinding, packet.SigTypePrimaryKeyBinding, packet.SigTypeDirectSignature,
+		packet.SigTypeKeyRevocation, packet.SigTypeSubkeyRevocation, packet.SigTypeCertificationRevocation:
 		return byte(t), true
 	}
 	return 0, false
+}
+
+// legacyFits reports whether a legacy signature of type t (legacySigType)
+// is kept on a component of kind: any but a user-ID revocation on the
+// primary key or a subkey (it marks whatever stands there), a user-ID
+// revocation on a user ID.
+func legacyFits(kind int, t byte) bool {
+	if t == byte(packet.SigTypeCertificationRevocation) {
+		return kind == onUserID
+	}
+	return kind == onPrimary || kind == onSubkey
 }
 
 // sigFits reports whether go-crypto reads a signature of type t on a
@@ -863,7 +893,7 @@ func (kb *keyBlock) packets(strict bool) []byte {
 		var sigs []byte
 		bound := false
 		for _, s := range c.sigs {
-			if s.v3 || strict && !s.ok {
+			if s.legacy || strict && !s.ok {
 				continue
 			}
 			bound = bound || s.typ == byte(packet.SigTypeSubkeyBinding)
@@ -890,7 +920,7 @@ func (kb *keyBlock) classify() {
 			// self-certifications, read or not (gpg reads them from the
 			// hashed area; a self-signature whose subpackets cannot be
 			// walked may name any key: anyRevoker).
-			if s.self && !s.v3 && (c.kind == onPrimary && s.typ == byte(packet.SigTypeDirectSignature) ||
+			if s.self && !s.legacy && (c.kind == onPrimary && s.typ == byte(packet.SigTypeDirectSignature) ||
 				c.kind == onUserID && supersedes(s.typ) == byte(packet.SigTypePositiveCert)) {
 				r := rawSigInfo(s.raw.body)
 				kb.revokers = append(kb.revokers, r.revokers...)
@@ -936,13 +966,13 @@ func (kb *keyBlock) designated(s *keySig) bool {
 // (addUserID); on a subkey a binding or revocation that verifies by the
 // primary key, whoever its issuer says (addSubkey).
 func (s *keySig) read(kb *keyBlock, c *keyComponent) {
-	if s.v3 {
-		// go-crypto reads no v3 signature; its issuer key ID stands at
-		// body[7:15], its creation time at body[3:7] (v3RevocationType).
+	if s.legacy {
+		// go-crypto reads no version 2 or 3 signature; its issuer key ID
+		// stands at body[7:15] (legacySigType), which only a user-ID
+		// revocation's mark consults (marks).
 		s.issuer = rawSig{keyID: s.raw.body[7:15]}
 		s.self = s.issuer.issuerIs(kb.key)
-		s.created = time.Unix(int64(binary.BigEndian.Uint32(s.raw.body[3:7])), 0)
-		s.why = "it is a version 3 signature, which go-crypto does not read"
+		s.why = fmt.Sprintf("it is a version %d signature, which go-crypto does not read", s.raw.body[0])
 		return
 	}
 	p, err := packet.Read(bytes.NewReader(s.raw.raw))
@@ -1140,13 +1170,19 @@ func supersedes(typ byte) byte {
 // (TestVerifier_UnreadableRevocationsAndBindingsAreNotCounted,
 // TestParseKeyring_MarksWhatItCannotRead). Not marked: a signature by
 // another key that gpgv ignores too (its certification of a user ID, a
-// binding it did not make), and a v3 binding or certification (sigTypeOf
-// passes it over, as go-crypto does; gpg takes no v3 self-signature as a
-// v4 key's binding or self-certification). A v3 revocation by the key
-// itself IS marked (the fifth re-review's V-R5I1): every supported apt
-// honours it (kr17_v3_keyrev, kr17_v3_subrev: REJ in all six images), and
-// fix round 4 dropped it with every v3 signature before the marks were
-// made; v3RevocationType keeps it for marks alone.
+// binding it did not make), and a version 2 or 3 certification (sigTypeOf
+// and legacySigType pass it over; kr21_v3_cert_newer, ok in all six
+// images). A version 2 or 3 binding, back-signature, direct-key signature
+// or revocation of the key or a subkey IS marked, whoever its issuer and
+// whatever its age (legacySigType's note: the fifth re-review's V-R5I1 and
+// the sixth's V-R6I1 and V-R6I2; every supported apt honours a key's own
+// v3 or v2 revocation, kr17_v3_keyrev, kr17_v3_subrev, kr20_v2_keyrev,
+// kr20_v2_subrev, REJ in the five gpgv-based apt, and gpgv takes a newer v3
+// or v2 binding as the subkey's and refuses it as not cross-certified,
+// kr21_v3_bind_newer, kr21_v2_bind_newer, ERRSIG); fix round 4 dropped every
+// such signature before the marks were made, and round 5's version 3
+// revocation rule, precise about the version, the type and the issuer, was
+// still under-strict twice.
 func (kb *keyBlock) marks() map[string]error {
 	var out map[string]error
 	mark := func(fp string, err error) {
@@ -1172,6 +1208,14 @@ func (kb *keyBlock) marks() map[string]error {
 				continue
 			}
 			switch t := packet.SignatureType(s.typ); {
+			case s.legacy && t == packet.SigTypeCertificationRevocation:
+				if s.self {
+					mark(key, fmt.Errorf("%w: the key's revocation of its user ID %q (signature type 0x30) stands on it that %s; gpgv honours it", pgperrors.ErrKeyRevoked, c.uid, s.why))
+				}
+			case s.legacy && (t == packet.SigTypeKeyRevocation || t == packet.SigTypeSubkeyRevocation):
+				mark(fp, fmt.Errorf("%w: a revocation of %s (signature type 0x%02x) stands on it that %s; gpgv honours it whoever its issuer, so the cache fails closed", pgperrors.ErrKeyRevoked, what, s.typ, s.why))
+			case s.legacy:
+				mark(fp, fmt.Errorf("%w: a signature of type 0x%02x stands on %s that %s; gpgv may take it as the newest binding or direct-key signature and refuse the component, so the cache fails closed whoever its issuer and whatever its age", pgperrors.ErrKeyExpired, s.typ, what, s.why))
 			case (t == packet.SigTypeKeyRevocation || t == packet.SigTypeSubkeyRevocation) && !s.self:
 				if kb.designated(&s) {
 					mark(fp, fmt.Errorf("%w: a revocation of %s (signature type 0x%02x) by a designated revoker, %X, stands on it, which the cache cannot verify; gpgv honours it when it holds that key", pgperrors.ErrKeyRevoked, what, s.typ, s.issuer.keyID))
@@ -1195,7 +1239,7 @@ func (kb *keyBlock) marks() map[string]error {
 			}
 		}
 		for _, s := range c.sigs {
-			if cls := supersedes(s.typ); !s.ok && cls != 0 && s.self && (s.created.IsZero() || !s.created.Before(newest[cls])) {
+			if cls := supersedes(s.typ); !s.ok && !s.legacy && cls != 0 && s.self && (s.created.IsZero() || !s.created.Before(newest[cls])) {
 				mark(fp, fmt.Errorf("%w: a signature of type 0x%02x by the key on %s, newer than the one the cache kept, stands on it that %s; gpgv takes the newest, and it may expire or unbind the component", pgperrors.ErrKeyExpired, s.typ, what, s.why))
 			}
 		}
