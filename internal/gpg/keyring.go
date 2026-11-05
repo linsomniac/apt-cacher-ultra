@@ -308,15 +308,17 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 			// /usr/share/keyrings is full of them) is read.
 			fi, err := os.Stat(path)
 			if err != nil {
-				logger.Warn("keyring: stat failed; skipping file",
+				logger.Warn("keyring_file_skipped",
 					"path", path,
+					"reason", "stat_failed",
 					"err", err,
 				)
 				continue
 			}
 			if !fi.Mode().IsRegular() {
-				logger.Warn("keyring: not a regular file; skipping",
+				logger.Warn("keyring_file_skipped",
 					"path", path,
+					"reason", "not_regular_file",
 					"mode", fi.Mode().String(),
 				)
 				continue
@@ -330,7 +332,9 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 				continue
 			}
 			if parsed.broken != nil {
-				logger.Warn("keyring: the file's packets are not whole to its end; the key they run into, and what follows, is skipped, as gpgv skips it",
+				// The key the junk interrupts, and what follows, is not
+				// read, as gpgv does not read it (readKeyring).
+				logger.Warn("keyring_file_truncated",
 					"path", path,
 					"err", parsed.broken,
 				)
@@ -349,7 +353,7 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 			continue
 		}
 		if parsed.broken != nil {
-			logger.Warn("keyring: the embedded source's packets are not whole to its end; the key they run into, and what follows, is skipped, as gpgv skips it",
+			logger.Warn("keyring_file_truncated",
 				"name", es.Name,
 				"err", parsed.broken,
 			)

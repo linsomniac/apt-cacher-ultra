@@ -24,7 +24,8 @@ import (
 // a symlink to another (as /usr/share/keyrings holds them): both keys are
 // loaded, each special path is skipped with a WARN naming it, and the load
 // returns (a FIFO is never opened: a goroutine that opens it for reading
-// waits until the test, in its cleanup, opens it for writing).
+// waits until the test, in its cleanup, opens it for writing). The WARN is
+// keyring_file_skipped with its reason (docs/log-fields.md).
 func TestLoadKeyring_SkipsWhatIsNotARegularFile(t *testing.T) {
 	a := newTestEntity(t, "A", "a@example.com")
 	b := newTestEntity(t, "B", "b@example.com")
@@ -85,7 +86,9 @@ func TestLoadKeyring_SkipsWhatIsNotARegularFile(t *testing.T) {
 			t.Errorf("a WARN names the regular key file %s:\n%s", name, logs.String())
 		}
 	}
-	if !strings.Contains(logs.String(), "not a regular file") {
-		t.Errorf("no WARN says why the special files are skipped:\n%s", logs.String())
+	for _, want := range []string{"keyring_file_skipped", "reason=not_regular_file", "reason=stat_failed"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("no WARN says %s:\n%s", want, logs.String())
+		}
 	}
 }

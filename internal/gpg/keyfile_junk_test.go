@@ -202,9 +202,10 @@ func TestVerifier_KeysBeforeJunkAreKnownToS1(t *testing.T) {
 }
 
 // TestLoadKeyring_WarnsOfAKeyLostToJunk: a key file whose packets run into
-// junk loads the keys before it and logs the loss at WARN, naming the file
-// and the junk, so the operator learns a key they installed is not read; a
-// whole file logs nothing.
+// junk loads the keys before it and logs the loss at WARN
+// (keyring_file_truncated, docs/log-fields.md), naming the file and the
+// junk, so the operator learns a key they installed is not read; a whole
+// file logs nothing.
 func TestLoadKeyring_WarnsOfAKeyLostToJunk(t *testing.T) {
 	a := newTestEntity(t, "A", "a@example.com")
 	b := newTestEntity(t, "B", "b@example.com")
@@ -224,7 +225,7 @@ func TestLoadKeyring_WarnsOfAKeyLostToJunk(t *testing.T) {
 		if err != nil || !keyring.HasFingerprint(upperFP(a.PrimaryKey.Fingerprint)) {
 			t.Fatalf("%s: LoadKeyring: %d keys, %v; want A read", tc.name, keyring.Size(), err)
 		}
-		got := strings.Contains(logs.String(), "is skipped, as gpgv skips it") && strings.Contains(logs.String(), "keys.gpg")
+		got := strings.Contains(logs.String(), "keyring_file_truncated") && strings.Contains(logs.String(), "keys.gpg")
 		if got != tc.warn || tc.warn && !strings.Contains(logs.String(), "offset") {
 			t.Errorf("%s: WARN logged %v, want %v:\n%s", tc.name, got, tc.warn, logs.String())
 		}
