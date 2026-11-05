@@ -4,7 +4,7 @@
 # nodata (the verifier found no signature data: gpgv's NODATA), badsig
 # (a signature failed its check: gpgv's BADSIG, sqv's "Message has been
 # manipulated") or other (anything else the verifier said). Measured
-# 2026-11-05 10:52 UTC with verdicts.txt; e2e/apt-oracle/README.md,
+# 2026-11-05 17:41 UTC with verdicts.txt; e2e/apt-oracle/README.md,
 # "Error classes", says how each is derived.
 a_aftercrc_cr_sp - - - - - -
 a_aftercrc_nbsp - - - - other -
@@ -191,6 +191,12 @@ c_text_hashline_cr_sp - - - - - -
 c_text_origin_crcr_sp - - - - badsig -
 c_text_origin_sp_cr_sp badsig badsig badsig badsig badsig badsig
 c_text_sha256hdr_cr_sp - - - - - -
+cr_d_good_unh_crit29 - - - - - -
+cr_d_good_unh_crit38v0 - - - - - -
+cr_good_unh_crit29 - - - - - -
+cr_good_unh_crit38v0 - - - - - -
+cr_good_unh_noncrit29 - - - - - -
+cr_good_unh_noncrit38v0 - - - - - -
 d_badsig_badfirst badsig badsig badsig badsig - badsig
 d_badsig_goodfirst badsig badsig badsig badsig - badsig
 d_begin_trailing_ws - - - - - -
@@ -357,6 +363,14 @@ m_i_t01good_t00unknownB_t01good - - - - - -
 m_i_t01good_t01good_t00badA - - - - - -
 m_i_t01unknownB_t00good other other other other - other
 m_i_t01unknownB_t01good_t00good other other other other - other
+mh_d_good_then_unkB512 - - - - - -
+mh_d_unkB512_then_good - - - - - -
+mh_good_then_unkB384 - - - - - -
+mh_unkB384_then_good - - - - - -
+mh_unkB_good_unkB512 - - - - - -
+mh_unkBsha1_then_good - - - - - -
+mi_d_good_unh16B other other - other - -
+mi_good_unh16B other other - other - -
 n_clearhdr_junk_hdr - - - - - -
 n_clearhdr_nul - - - - - -
 n_d_b64_pad_bits - - - - other -
@@ -671,15 +685,21 @@ u_i_unknown_bad_good badsig badsig badsig badsig - badsig
 u_i_unknown_good_bad badsig badsig badsig badsig - badsig
 us_bad_enc_plus_good - - - - - -
 us_bad_primary_plus_good - - - - - -
+us_bad_primary_then_good512 - - - - - -
+us_bsn_control - - - - - -
+us_bsn_unh_crit33 - - - - - -
+us_bsn_unh_noncrit33 - - - - - -
 us_d_bad_enc_plus_good - - - - - -
 us_d_good_enc_plus_good - - - - - -
 us_good_control - - - - - -
 us_good_enc_alone other other other other other other
 us_good_enc_plus_good - - - - - -
+us_good_enc_then_good512 - - - - - -
 us_good_plus_bad_enc - - - - - -
 us_good_plus_two_unknown - - - - - -
 us_good_primary_alone other other other other other other
 us_good_primary_plus_good - - - - - -
+us_good_primary_then_good512 - - - - - -
 v4_i_ed25519unknown_plus_good - - - - - -
 v4_i_ed448unknown_plus_good - - - - - -
 v6_d_good_plus_v6unknown - - - - - -

@@ -68,7 +68,7 @@ and ``keys.gpg`` is checked to hold public packets only.
   X2: each fx21 shape has U's public key alone as its own signed-by (X1 and
   X2 are keys it lacks), and ``--usage-keys`` makes the batch again alone.
 
-876 shapes, in 21 batches. The first 135 are the planning measurement's
+896 shapes, in 22 batches. The first 135 are the planning measurement's
 (2026-10-28; DN-2 and Appendix A of
 docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md), by the
 same names and built as its throwaway generators built them (the plan's
@@ -138,12 +138,22 @@ key policies: the shared Release clearsigned by each POLICY_KEYS key alone,
 and by POLICY_PAIRS' pairs (an Ed25519 key's signature and a weak key's),
 whose strip is the weak key's own shape.
 
-Batch fx21, 11 (``us_``), is Task 9e's fix round's: packets by a known key
+Batch fx21, 17 (``us_``), is Task 9e's fix round's: packets by a known key
 outside its signing usage (a certify-only primary, an encryption subkey),
 bad or good, beside a good packet of its signing subkey, alone, and inline
 and detached, which gpgv 2.2.4 and 1.4 check against that key and later
 gpgv skip; and a good packet beside two by keys the client lacks
-(debian-buster-archive's layout, which apt 1.2 refuses).
+(debian-buster-archive's layout, which apt 1.2 refuses). Task 8's verifier
+fix adds six: such a first packet before a packet of another hash, and an
+issuer fingerprint, critical or not, added to a BSN-layout packet.
+
+Batch fx22, 14 (``mh_``, ``cr_``, ``mi_``), is Task 8's verifier fix's (the second
+final review's lens V2), cut without a key from committed fixtures: an
+unknown key's packet of another hash before a good one, which gpgv 1.4
+checks alone (V2-C1), and the critical subpackets 29 and 38 in a good
+packet's unhashed area, which gpgv 1.4 (and, for 38, every gpgv before
+2.2.27) cannot handle (V2-C2); and the mirror sweep's shape (V2-M2): A's
+good packet naming B by its unhashed key ID.
 
 AIDEV-NOTE: the fixtures, verdicts.txt and classes.txt are one
 measurement. Each run makes new keys, new signatures and new random bytes
@@ -155,7 +165,7 @@ files together. Never edit a fixture by hand. Two modes write some of the
 corpus and leave every other file's bytes as they are, so that --record
 must leave every other row as it was: ``--from-controls`` makes no key and
 writes only the batches cut from OUT's committed fixtures (FROM_CONTROLS:
-fx8 to fx12 and fx14 to fx18, from CONTROL_FILES, with the key files of
+fx8 to fx12, fx14 to fx18 and fx22, from CONTROL_FILES, with the key files of
 KEYRINGS_FROM_CONTROLS); ``--own-key`` makes key O alone and writes batch
 fx13 and O's public key in keys.gpg (the other keys' packets keep their
 bytes), then cuts the FROM_CONTROLS batches again (fx18's ``e8_`` shapes
@@ -3813,12 +3823,44 @@ def agent_packet(
         raise ValueError(
             f"agent_packet: {seen[33]} issuer fingerprints in the template"
         )
+    return agent_signed(g, partial, keyring, fpr, data)
+
+
+def agent_signed(
+    g: GnuPG, partial: bytes, keyring: bytes, fpr: str, data: bytes
+) -> bytes:
+    """partial (a v4 RSA SHA-256 signature body up to its hash's left 16
+    bits) completed by key fpr's signature over data, made by the home's
+    gpg-agent; checked against fpr's public key in keyring; in gpg's
+    framing."""
     digest = signed_digest(partial, data, sha256)
     value = g.agent_sign(g.keygrip(fpr), GCRY_MD_SHA256, digest)
     out = old_frame(partial + digest[:2] + mpi(value), 2)
     if not rsa_verifies(keyring, fpr, out, data):
-        raise RuntimeError(f"agent_packet: {fpr}'s signature does not verify")
+        raise RuntimeError(f"agent_signed: {fpr}'s signature does not verify")
     return out
+
+
+def bsn_packet(
+    g: GnuPG, template: bytes, keyring: bytes, fpr: str, data: bytes
+) -> bytes:
+    """Key fpr's text-mode SHA-256 packet over data in BSN's layout, the
+    survey's Docker and Microsoft anchors': a hashed area holding the
+    creation time alone (template's, a gpg-made packet), an unhashed area
+    holding the issuer key ID alone (no issuer fingerprint anywhere)."""
+    head, hashed, _, _ = v4_parts(one_signature(template))
+    created = [d for t, _, d in subpackets(hashed) if t == 2]
+    if len(created) != 1 or head[1] != 0x01:
+        raise ValueError(
+            "bsn_packet: the template is no text-mode packet with one creation time"
+        )
+    partial = v4_build(
+        bytes([4, 0x01, 1, 8]),
+        build_subpackets([(2, False, created[0])]),
+        build_subpackets([(16, False, bytes.fromhex(fpr)[-8:])]),
+        b"",
+    )
+    return agent_signed(g, partial, keyring, fpr, data)
 
 
 @dataclass(frozen=True)
@@ -3840,6 +3882,8 @@ class UsageMaterial:
     d_enc_good: bytes
     d_enc_bad: bytes
     unknown: tuple[bytes, bytes]  # X1's and X2's text-mode packets
+    good512: bytes  # the signing subkey's text-mode SHA-512 packet (gpg's)
+    bsn: bytes  # the signing subkey's packet in BSN's layout (bsn_packet)
 
 
 def make_usage_material(g: GnuPG) -> UsageMaterial:
@@ -3864,6 +3908,11 @@ def make_usage_material(g: GnuPG) -> UsageMaterial:
         raise RuntimeError(
             "the signing subkey's detached signature: another key or text"
         )
+    good512 = sig_packets(g.clearsign(sign + "!", RELEASE, digest="SHA512"))
+    if issuer_fingerprint(good512) != sign or one_signature(good512)[3] != 10:
+        raise RuntimeError(
+            "the signing subkey's SHA-512 signature: another key or hash"
+        )
     unknown: list[bytes] = []
     for uid in UNKNOWN_KEY_UIDS:
         x = g.gen_key(uid, "sign", "never")
@@ -3883,6 +3932,8 @@ def make_usage_material(g: GnuPG) -> UsageMaterial:
         d_enc_good=agent_packet(g, d_good, public, enc, RELEASE),
         d_enc_bad=agent_packet(g, d_good, public, enc, OTHER_TEXT),
         unknown=(unknown[0], unknown[1]),
+        good512=good512,
+        bsn=bsn_packet(g, good, public, sign, text),
     )
 
 
@@ -3893,9 +3944,15 @@ def batch_fx21(um: UsageMaterial) -> Batch:
     subkey (gpgv 2.2.4 and 1.4 check it against that key, later gpgv skip
     it), or alone (no apt counts it); and a good packet beside X1's and
     X2's, keys the client lacks (debian-buster-archive's layout, which apt
-    1.2 refuses). Each shape's signed-by is U's public key alone
-    (keyrings_fx21)."""
+    1.2 refuses). Task 8's verifier fix (final review 2, lens V2) adds the
+    first packet by a non-signing key, good or bad, before the signing
+    subkey's SHA-512 one (V2-C1: gpgv 1.4 checks the first packet only when
+    the hashes differ), and a packet in BSN's layout (no issuer
+    fingerprint) with an issuer fingerprint added to its unhashed area,
+    critical or not (V2-C2: gpgv 1.4 has no critical 33). Each shape's
+    signed-by is U's public key alone (keyrings_fx21)."""
     h = um.head
+    issuer33 = b"\x04" + bytes.fromhex(issuer_fingerprint(um.good))
     inline = {
         "us_good_control": h + armor_parts(um.good),
         "us_bad_primary_plus_good": h + armor_parts(um.primary_bad + um.good),
@@ -3907,6 +3964,14 @@ def batch_fx21(um: UsageMaterial) -> Batch:
         "us_good_enc_alone": h + armor_parts(um.enc_good),
         "us_good_plus_two_unknown": h
         + armor_parts(um.good + um.unknown[0] + um.unknown[1]),
+        "us_good_primary_then_good512": h + armor_parts(um.primary_good + um.good512),
+        "us_bad_primary_then_good512": h + armor_parts(um.primary_bad + um.good512),
+        "us_good_enc_then_good512": h + armor_parts(um.enc_good + um.good512),
+        "us_bsn_control": h + armor_parts(um.bsn),
+        "us_bsn_unh_crit33": h
+        + armor_parts(add_unhashed(um.bsn, (33, True, issuer33))),
+        "us_bsn_unh_noncrit33": h
+        + armor_parts(add_unhashed(um.bsn, (33, False, issuer33))),
     }
     detached = {
         "us_d_bad_enc_plus_good": armor_parts(um.d_enc_bad + um.d_good),
@@ -3921,6 +3986,70 @@ def keyrings_fx21(um: UsageMaterial) -> Shapes:
     asc = armored_keys(um.public, USAGE_KEY_UID.encode())
     inline, detached, _ = batch_fx21(um)
     return {name: asc for name in (*inline, *detached)}
+
+
+def batch_fx22_from(c: Controls) -> Batch:
+    """Task 8's verifier fix (the second final review's lens V2: V2-C1 and
+    V2-C2), cut without a key from committed fixtures, inline and detached.
+
+    V2-C1, gpgv 1.4's first-only rule (``mh_``): when the packets' hash
+    algorithms differ, gpgv 1.4 (ubuntu:16.04, 14.04) checks the first only
+    ("multiple signatures detected.  Only the first will be checked"), where
+    gpgv 2.x checks every one. B's packet, its hash octet rewritten (SHA-1,
+    SHA-384 or SHA-512: B is a key no client has, so its packet is never
+    checked against a key), before A's good one, or after it (the controls,
+    which every apt accepts), or third after both.
+
+    V2-C2, the critical subpackets gpgv 1.4 cannot handle (``cr_``): a
+    reason for revocation (29) and a key block of version 0 (38), critical or
+    not, in A's good packet's unhashed area (key-free: the unhashed area is
+    not signed). An issuer fingerprint (33) needs a packet without a hashed
+    one: batch fx21's ``us_bsn_*``.
+
+    The mirror sweep (V2-M2, ``mi_``): A's good packet, its unhashed issuer
+    key ID (16) rewritten to B's, its hashed fingerprint (33) A's: the
+    mirror of xi_badsig_issuer_rewritten, which ubuntu:18.04, 16.04 and
+    14.04 accept (their gpgv looks the key up otherwise), the same lookup
+    hiding A's good signature."""
+    head, sig_a, det_a = c.head, c.sig_a, c.det_a
+    whole = sig_packets(c.read("i_unknown_unknownfirst.InRelease"))
+    sig_b = whole[: len(whole) - len(sig_a)]
+    dwhole = sig_packets(c.read("d_unknown_goodfirst.Release.gpg"))
+    det_b = dwhole[len(det_a) :]
+    if whole[len(sig_b) :] != sig_a or dwhole[: len(det_a)] != det_a:
+        raise ValueError("the unknown-key controls do not hold A's good packet")
+    if one_signature(sig_b)[3] != 8 or one_signature(det_b)[3] != 8:
+        raise ValueError("B's packets are not SHA-256")
+
+    def hashed_as(pkt: bytes, algo: int) -> bytes:
+        return body_edit(pkt, 3, algo)
+
+    b16 = [d for t, _, d in subpackets(unhashed_of(sig_b)) if t == 16]
+    if len(b16) != 1:
+        raise ValueError("B's packet holds no one unhashed issuer key ID")
+    crit29 = (29, True, b"\x00")
+    crit38 = (38, True, b"\x00\x01")
+    inline = {
+        "mh_unkBsha1_then_good": head + armor(hashed_as(sig_b, 2) + sig_a),
+        "mh_unkB384_then_good": head + armor(hashed_as(sig_b, 9) + sig_a),
+        "mh_unkB_good_unkB512": head + armor(sig_b + sig_a + hashed_as(sig_b, 10)),
+        "mh_good_then_unkB384": head + armor(sig_a + hashed_as(sig_b, 9)),
+        "cr_good_unh_crit29": head + armor(add_unhashed(sig_a, crit29)),
+        "cr_good_unh_noncrit29": head
+        + armor(add_unhashed(sig_a, (29, False, b"\x00"))),
+        "cr_good_unh_crit38v0": head + armor(add_unhashed(sig_a, crit38)),
+        "cr_good_unh_noncrit38v0": head
+        + armor(add_unhashed(sig_a, (38, False, b"\x00\x01"))),
+        "mi_good_unh16B": head + armor(rewrite_issuer(sig_a, b16[0])),
+    }
+    detached = {
+        "mh_d_unkB512_then_good": armor(hashed_as(det_b, 10) + det_a),
+        "mh_d_good_then_unkB512": armor(det_a + hashed_as(det_b, 10)),
+        "cr_d_good_unh_crit29": armor(add_unhashed(det_a, crit29)),
+        "cr_d_good_unh_crit38v0": armor(add_unhashed(det_a, crit38)),
+        "mi_d_good_unh16B": armor(rewrite_issuer(det_a, b16[0])),
+    }
+    return inline, detached, {}
 
 
 # The batches cut from Material, in a run that makes keys.
@@ -3948,6 +4077,7 @@ FROM_CONTROLS: list[Callable[[Controls], Batch]] = [
     batch_fx16_from,
     batch_fx17_from,
     batch_fx18_from,
+    batch_fx22_from,
 ]
 
 # The own signed-by key files (<name>.keys.asc) of shapes the batches above

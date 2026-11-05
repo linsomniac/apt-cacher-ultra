@@ -2,7 +2,7 @@
 # older client images (verdicts.txt has the current ones), one row per
 # shape: ok (apt-get update succeeded and, on apt 1.0, left the
 # repository authenticated) or REJ (it did not), in each image.
-# Measured 2026-11-05 10:53 UTC by bash e2e/apt-oracle/run.sh --old --record
+# Measured 2026-11-05 17:43 UTC by bash e2e/apt-oracle/run.sh --old --record
 # (e2e/apt-oracle/README.md, "The older images"); the fixtures, this
 # file and classes-old.txt are one measurement. The columns, after the
 # shape's name:
@@ -196,6 +196,12 @@ c_text_hashline_cr_sp ok ok ok ok ok
 c_text_origin_crcr_sp ok ok ok ok ok
 c_text_origin_sp_cr_sp REJ REJ ok ok ok
 c_text_sha256hdr_cr_sp ok ok ok ok ok
+cr_d_good_unh_crit29 ok ok ok REJ REJ
+cr_d_good_unh_crit38v0 REJ REJ REJ REJ REJ
+cr_good_unh_crit29 ok ok ok REJ REJ
+cr_good_unh_crit38v0 REJ REJ REJ REJ REJ
+cr_good_unh_noncrit29 ok ok ok ok ok
+cr_good_unh_noncrit38v0 ok ok ok ok ok
 d_badsig_badfirst REJ REJ REJ REJ REJ
 d_badsig_goodfirst REJ REJ REJ REJ REJ
 d_begin_trailing_ws ok ok ok ok ok
@@ -362,6 +368,14 @@ m_i_t01good_t00unknownB_t01good ok ok ok ok ok
 m_i_t01good_t01good_t00badA ok ok ok ok ok
 m_i_t01unknownB_t00good REJ REJ REJ REJ REJ
 m_i_t01unknownB_t01good_t00good REJ REJ REJ REJ REJ
+mh_d_good_then_unkB512 ok ok ok ok ok
+mh_d_unkB512_then_good ok ok ok REJ REJ
+mh_good_then_unkB384 ok ok ok ok ok
+mh_unkB384_then_good ok ok ok REJ REJ
+mh_unkB_good_unkB512 ok ok ok REJ REJ
+mh_unkBsha1_then_good ok ok ok REJ REJ
+mi_d_good_unh16B REJ REJ REJ REJ REJ
+mi_good_unh16B REJ REJ REJ REJ REJ
 n_clearhdr_junk_hdr ok ok ok ok ok
 n_clearhdr_nul ok ok ok ok ok
 n_d_b64_pad_bits ok ok ok ok ok
@@ -676,15 +690,21 @@ u_i_unknown_bad_good REJ REJ REJ REJ REJ
 u_i_unknown_good_bad REJ REJ REJ REJ REJ
 us_bad_enc_plus_good ok ok REJ REJ REJ
 us_bad_primary_plus_good ok ok REJ REJ REJ
+us_bad_primary_then_good512 ok ok REJ REJ REJ
+us_bsn_control ok ok ok ok ok
+us_bsn_unh_crit33 ok ok ok REJ REJ
+us_bsn_unh_noncrit33 ok ok ok ok ok
 us_d_bad_enc_plus_good ok ok REJ REJ REJ
 us_d_good_enc_plus_good ok ok ok ok ok
 us_good_control ok ok ok ok ok
 us_good_enc_alone REJ REJ REJ ok ok
 us_good_enc_plus_good ok ok ok ok ok
+us_good_enc_then_good512 ok ok ok ok ok
 us_good_plus_bad_enc ok ok REJ REJ REJ
 us_good_plus_two_unknown ok ok ok REJ ok
 us_good_primary_alone REJ REJ ok ok ok
 us_good_primary_plus_good ok ok ok ok ok
+us_good_primary_then_good512 ok ok ok ok ok
 v4_i_ed25519unknown_plus_good ok ok ok ok ok
 v4_i_ed448unknown_plus_good ok ok ok ok ok
 v6_d_good_plus_v6unknown ok ok ok REJ REJ
