@@ -844,9 +844,15 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   3 of 3 times, in a clean race re-run, and 10 of 10 under `-race` at
   light load (the V lens's re-review 7). The release workflow runs
   `-race`, and a teardown flake failed the 1.0.3 release run twice. Class
-  none: a test's timing, a release-process risk. Recommendation: look at
-  it before 1.1.0-rc1 (what the shutdown waits on past the bound), and
-  loosen the bound only with the reason.
+  none: a test's timing, a release-process risk. **Closed** (2026-11-05,
+  the hardening plan's Task 8, the final review 2's D2-M7): measured under
+  `-race -count=8` at light load, every run took 0.91–0.96 s, the whole
+  test; the regression the bound's comment names (the lifecycle context
+  no longer ending the fetch, so the 30 s `TotalTimeout` fires) is caught
+  by the test's 15 s `Fatalf`, and the 5 s `Errorf` added only a failure
+  under load between 5 and 15 s, while the test's claims (`pool/` and
+  `tmp/` empty) do not depend on it. The bound is 12 s now, with that
+  reason in its comment.
 - **The key reader reads more than some apt reads** (raised 2026-11-01 to
   03, Task 9b's fix rounds 2 and 3: the V lens's V-R2M3 and V-R3M1;
   rulings R1 and R3). By R1 the cache reads every key that any supported
