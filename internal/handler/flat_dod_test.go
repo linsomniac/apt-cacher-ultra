@@ -172,7 +172,10 @@ func testMintedFlatSuitesAtScale(t *testing.T) {
 	// freshness_check_panicked, adoption_panicked and
 	// handler_goroutine_panicked are ERROR lines — and no WARN or ERROR line
 	// but suite_seed_rejected, the caps' refusal this simulation makes by
-	// design (rate-limited: the bubble's time never advances).
+	// design (rate-limited: the bubble's time never advances), and
+	// adoption_signer_guard_unavailable, its plain verifier's construction
+	// line (the downgrade guard is off for a verifier that reports no
+	// signers: Task 9d fix 1).
 	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
 		var m map[string]any
 		if line == "" {
@@ -181,7 +184,7 @@ func testMintedFlatSuitesAtScale(t *testing.T) {
 		if err := json.Unmarshal([]byte(line), &m); err != nil {
 			t.Fatalf("log line %q: %v", line, err)
 		}
-		if m["msg"] != "suite_seed_rejected" {
+		if m["msg"] != "suite_seed_rejected" && m["msg"] != "adoption_signer_guard_unavailable" {
 			t.Errorf("unexpected %v line %v: the simulation must run pristine", m["level"], m["msg"])
 		}
 	}

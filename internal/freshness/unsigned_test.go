@@ -600,7 +600,10 @@ func unsignedRefusedInsideTheCommit(t *testing.T, suite, served string) {
 		for _, logs := range []*lockedBuffer{r.logs, checkLogs} {
 			for _, line := range strings.Split(logs.String(), "\n") {
 				var m map[string]any
-				if line != "" && json.Unmarshal([]byte(line), &m) == nil && (m["level"] == "WARN" || m["level"] == "ERROR") {
+				// The rig's construction WARN (its pass-through verifier
+				// turns the guard off, Task 9d fix 1) is not the refusal's.
+				if line != "" && json.Unmarshal([]byte(line), &m) == nil && (m["level"] == "WARN" || m["level"] == "ERROR") &&
+					m["msg"] != "adoption_signer_guard_unavailable" {
 					t.Errorf("a refusal logged %v at %v", m["msg"], m["level"])
 				}
 			}

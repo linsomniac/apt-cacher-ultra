@@ -551,7 +551,9 @@ func TestAdoption_ShutdownInOptionalMembersSkipsNoMember(t *testing.T) {
 		chk.WaitForAdoptions()
 		for _, level := range []string{"WARN", "ERROR"} {
 			for _, line := range strings.Split(logs.String(), "\n") {
-				if strings.Contains(line, `"level":"`+level+`"`) {
+				// The pass-through verifier's construction WARN (the guard is
+				// off, Task 9d fix 1) is not the shutdown's.
+				if strings.Contains(line, `"level":"`+level+`"`) && !strings.Contains(line, `"msg":"adoption_signer_guard_unavailable"`) {
 					t.Errorf("logged at %s during a shutdown: %s", level, line)
 				}
 			}

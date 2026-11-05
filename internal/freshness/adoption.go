@@ -798,7 +798,17 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 			required[arch] = struct{}{}
 		}
 	}
-	signers, _ := cfg.Verifier.(SignerVerifier)
+	// AIDEV-NOTE: the task review's 9d-M2. A Verifier that reports no
+	// signers (not a SignerVerifier: a decorator around internal/gpg's, a
+	// test fake) turns the signer downgrade guard off; it stands down
+	// rather than fail, and says so once, here, so that a wiring change
+	// cannot switch it off unseen.
+	signers, isSignerVerifier := cfg.Verifier.(SignerVerifier)
+	if !isSignerVerifier {
+		logger.Warn("adoption_signer_guard_unavailable",
+			"verifier", fmt.Sprintf("%T", cfg.Verifier),
+		)
+	}
 	return &Adopter{
 		cache:                   cfg.Cache,
 		fetcher:                 cfg.Fetcher,

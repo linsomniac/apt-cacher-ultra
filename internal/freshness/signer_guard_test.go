@@ -272,6 +272,31 @@ func TestSignerGuard_StandsDownWithoutWhatItCompares(t *testing.T) {
 	}
 }
 
+// TestSignerGuard_SaysWhenItIsOff (the task review's 9d-M2): an Adopter
+// whose Verifier is not a SignerVerifier logs WARN
+// adoption_signer_guard_unavailable, naming the verifier's type, once, at
+// construction, and still constructs (the guard stands down); one whose
+// Verifier is one logs nothing of the kind.
+func TestSignerGuard_SaysWhenItIsOff(t *testing.T) {
+	env := newAdoptionTestEnv(t)
+	for _, c := range []struct {
+		v    Verifier
+		warn bool
+	}{{passThroughVerifier{}, true}, {&signersVerifier{}, false}} {
+		var logs bytes.Buffer
+		ad, err := NewAdopter(AdoptionConfig{Cache: env.cache, Fetcher: env.fetcher, Verifier: c.v,
+			HostLimiter: hostsem.New(8), Logger: slog.New(slog.NewJSONHandler(&logs, nil))})
+		if err != nil || (ad.signers == nil) != c.warn {
+			t.Fatalf("%T: NewAdopter %v, signers %v", c.v, err, ad.signers)
+		}
+		line := `"level":"WARN","msg":"adoption_signer_guard_unavailable","verifier":"freshness.passThroughVerifier"`
+		if got := strings.Count(logs.String(), `"msg":"adoption_signer_guard_unavailable"`); got != map[bool]int{true: 1, false: 0}[c.warn] ||
+			(c.warn && !strings.Contains(logs.String(), line)) {
+			t.Fatalf("%T: logged %q; want the WARN %v", c.v, logs.String(), c.warn)
+		}
+	}
+}
+
 // TestSignerGuard_TheRefusalIsARefusalState (ruling G5): signer_downgrade
 // is a refusal reason like rollback_refused's: outcome refused, reason
 // signer_downgrade, cache.IsRefusalReason.
