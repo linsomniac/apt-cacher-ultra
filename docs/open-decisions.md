@@ -53,12 +53,14 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
 3. **`make e2e-live`** on the tree you tag (`e2e/live/README.md`; add its
    row to that file's *Results*): the H3 plan ran it during planning and
    again on its final tree.
-4. **`make e2e-apt-oracle`** on the tree you tag
-   (`e2e/apt-oracle/README.md`; add its row to that file's *Results*):
-   the real apt of the six client images must still give the verdicts
-   recorded for the verifier's 490 signature-shape fixtures; about 50
-   seconds with the images cached. The GC and upstream hardening plan
-   recorded them (2026-10-29).
+4. **`make e2e-apt-oracle`** and **`make e2e-apt-oracle-old`** on the
+   tree you tag (`e2e/apt-oracle/README.md`; add their row to that file's
+   *Results*): the real apt of the six client images, and of the five
+   older ones (debian:10, ubuntu:20.04, 18.04, 16.04 and 14.04), must
+   still give the verdicts recorded for the verifier's 865 signature-shape
+   fixtures; about 85 and 95 seconds with the images cached. The GC and
+   upstream hardening plan recorded them (2026-10-29; the older images
+   2026-11-05, its Task 9e).
 5. **Run the release candidate once on a copy of a production 1.0.x
    cache** (raised 2026-10-27, the H3 final review R5 #5): every test
    builds its 1.0.x database by hand, so only a real `cache.db` and
