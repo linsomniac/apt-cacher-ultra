@@ -509,7 +509,7 @@ That guarantee — the cache adopts no anchor a supported apt refuses, but
 for crypto policy (the 20 `aptShapeKeyPolicy` rows, and 14 of
 `aptShapeOldExempt`'s) and an older image's refusal of a real signer's
 layout (the other 6 of `aptShapeOldExempt`'s, *The older images* below)
-— is only as wide as the corpus: it holds for the 876
+— is only as wide as the corpus: it holds for the 904
 shapes the table test runs, not for a shape the corpus lacks: an anchor
 shaped otherwise is unmeasured, and the cache may adopt it while some apt
 refuses it (the hybrid verifier's canonical grammar makes that unlikely:

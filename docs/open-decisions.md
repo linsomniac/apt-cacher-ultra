@@ -87,9 +87,10 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
    by construction): the real apt of the six client images, and of the
    five older ones (debian:10, ubuntu:20.04, 18.04, 16.04 and 14.04),
    must still give the verdicts and error classes recorded for the
-   verifier's 876 signature-shape fixtures; about 85 and 95 seconds with
-   the images cached. A difference blocks the tag until it is recorded
-   and the table test agrees (the README's *When apt changes*). The GC
+   verifier's 904 signature-shape fixtures; about 87 and 98 seconds with
+   the images cached (measured 2026-11-05). A difference blocks the tag
+   until it is recorded and the table test agrees (the README's *When apt
+   changes*). The GC
    and upstream hardening plan recorded them (2026-10-29; the older
    images 2026-11-05, its Task 9e). This item outlives the section: the
    oracle runs before every release (*Decided*, below).
@@ -355,16 +356,18 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   `InRelease`, which the check prefers. Class none: fail-safe.
   Recommendation: leave it.
 - **The cache is stricter than `debian:13`'s apt** (raised 2026-10-28, the
-  hardening plan's DN-2 and DN-3; counts of 2026-11-05, Task 9c).
-  `debian:13`'s apt 3.0.3 verifies with Sequoia's `sqv` (the image has no
-  gpgv) and accepts 92 of the corpus' 876 shapes that every gpgv-based apt
-  refuses, among them a forged CRC line, a bad signature from a known key
-  beside a good one and an expired key's signature alone (`verdicts.txt`).
-  The cache refuses all 92 (ruling HD-2: what any supported apt refuses is
-  refused; 22 `bad_signature`, 55 `malformed_*`, 10
-  `crypto_verify_failed`, 5 `untrusted_signer`), so it does not adopt such
-  an anchor — the suite keeps its previous snapshot, if it has one — where
-  a `debian:13` client fetching directly accepts it: stricter than that
+  hardening plan's DN-2 and DN-3; counts of 2026-11-05, Task 9c, recounted
+  for the 904-shape corpus by its Task 8). `debian:13`'s apt 3.0.3
+  verifies with Sequoia's `sqv` (the image has no gpgv) and accepts 92 of
+  the corpus' 904 shapes that every gpgv-based apt refuses, among them a
+  forged CRC line, a bad signature from a known key beside a good one and
+  an expired key's signature alone (`verdicts.txt`). The cache refuses all
+  92 (ruling HD-2: what any supported apt refuses is refused; 22
+  `bad_signature`, 55 `malformed_*`, 9 `crypto_verify_failed`, 1
+  `no_usable_signature` (`e2_unknownB_good_sha1A`, since gpgv 1.4's
+  first-packet rule), 5 `untrusted_signer`), so it does not adopt such an
+  anchor — the suite keeps its previous snapshot, if it has one — where a
+  `debian:13` client fetching directly accepts it: stricter than that
   client, never looser. The other way round, `debian:13` alone refuses 132
   shapes; the cache refuses 119 of them and accepts 13, each a key only
   sqv's policy refuses (brainpool, secp256k1, SHA-1- or SHA-224-bound,
@@ -530,44 +533,45 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   do not match it, so it adds no flood of refusals.
 - **What `crypto_verify_failed` still means** (raised 2026-10-29, the
   hardening plan's Task 6 review, Minor 4; the final review's D-M1 and
-  D-M6; rewritten 2026-11-05, its Task 9c). The shape refusals that used to
-  land here are `malformed_*` since the hybrid verifier (*Decided*): a
+  D-M6; rewritten 2026-11-05, its Task 9c). The shape refusals that used
+  to land here are `malformed_*` since the hybrid verifier (*Decided*): a
   base64 error in the armor (`x4i_b64_invalid_char`,
   `x4d_b64_invalid_char`: layer A's A4), an armor that holds no packet
   (`a_b64_empty_body`: A4, on the bypass too) and a signature over 64 KiB
   (A4). What falls to `ClassifyVerifyErr`'s default now is S2 finding a
-  trusted packet and counting none — 65 of the corpus' 876 rows, measured
+  trusted packet and counting none — 64 of the corpus' 904 rows, measured
   2026-11-05 (`PE/task9c/reasons-a7d0d72.tsv`, by
-  `PE/task9c/zz_reasons_test.go`, planning evidence, not in the tree): a
-  packet sqv does
-  not read (52 rows: a subpacket Sequoia's parser refuses, the
-  re-review's A-RC1), a good signature apt erases at a later SHA-1 packet
-  by the same key (9: A-RC2), a SHA-1 packet alone (`x3i_sha1_only`, ruling
-  HD-18), a packet by a known key that cannot sign (`us_good_primary_alone`,
-  `us_good_enc_alone`), and an expired key's signature alone
-  (`i_expired_only`: "openpgp: key expired", in the field the cache's copy
-  of a vendor key whose expiry the vendor has since extended); and outside
-  the corpus a revoked key, a key the keyring marks (ruling R2), S2's
-  key-ID collision quirk (above) and the detached form's empty inputs. The
-  log line's `err` says which; since Task 9c the status page's tooltip
-  lists these causes, and `ClassifyVerifyErr`'s comment too; for a key
-  the keyring marks, the log line names the key and the mark (a revocation,
-  an expiry or a binding the cache cannot read), and the operator's action
-  is the vendor's current key file (`docs/configuration.md`, *Trust and
-  signer pins*). The detached refusals' own text no longer claims an apt
-  verdict: it read "Release.gpg is not one ASCII-armored signature block
-  apt accepts" for every layer's refusal, the deviations included, and
-  reads "… block in the shape the cache accepts" since Task 9c's fix round
-  (the controller's ruling R-9c-1;
-  `TestMalformedSentinels_ClaimNoAptVerdict`). Class none: reporting only;
-  the verdicts are right. Recommendation: leave the reason; if operators
-  meet the expired-key case often, give it a reason of its own
-  (`key_expired`), with a `TestClassifyVerifyErr` row.
+  `PE/task9c/zz_reasons_test.go`, planning evidence, not in the tree; 65
+  of 876 then, recounted at 729e666 by the plan's Task 8, where
+  `e2_unknownB_good_sha1A` is `no_usable_signature` since gpgv 1.4's
+  first-packet rule): a packet sqv does not read (52 rows: a subpacket
+  Sequoia's parser refuses, the re-review's A-RC1), a good signature apt
+  erases at a later SHA-1 packet by the same key (8: A-RC2), a SHA-1
+  packet alone (`x3i_sha1_only`, ruling HD-18), a packet by a known key
+  that cannot sign (`us_good_primary_alone`, `us_good_enc_alone`), and an
+  expired key's signature alone (`i_expired_only`: "openpgp: key expired",
+  in the field the cache's copy of a vendor key whose expiry the vendor
+  has since extended); and outside the corpus a revoked key, a key the
+  keyring marks (ruling R2), S2's key-ID collision quirk (above) and the
+  detached form's empty inputs. The log line's `err` says which; since
+  Task 9c the status page's tooltip lists these causes, and
+  `ClassifyVerifyErr`'s comment too; for a key the keyring marks, the log
+  line names the key and the mark (a revocation, an expiry or a binding
+  the cache cannot read), and the operator's action is the vendor's
+  current key file (`docs/configuration.md`, *Trust and signer pins*). The
+  detached refusals' own text no longer claims an apt verdict: it read
+  "Release.gpg is not one ASCII-armored signature block apt accepts" for
+  every layer's refusal, the deviations included, and reads "… block in
+  the shape the cache accepts" since Task 9c's fix round (the controller's
+  ruling R-9c-1; `TestMalformedSentinels_ClaimNoAptVerdict`). Class none:
+  reporting only; the verdicts are right. Recommendation: leave the
+  reason; if operators meet the expired-key case often, give it a reason
+  of its own (`key_expired`), with a `TestClassifyVerifyErr` row.
 - **What the hybrid verifier leaves** (raised 2026-10-29, the hardening
   plan's Tasks 6 and 7, as "anchor shapes beyond the corpus are
   unmeasured"; rewritten 2026-11-05, its Task 9c, for the residual risk of
   the approach decision, `PE/approach-decision.md` §6). The table test
-  runs every one of the corpus' 876 shapes, none skipped
+  runs every one of the corpus' 904 shapes, none skipped
   (`TestVerifier_FollowsTheAptShapeTable`), against the six current images'
   verdicts and the five older ones', and the cache adopts no shape any
   measured apt refuses but the crypto-policy rows a newest image alone
@@ -1289,9 +1293,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   comes after T, A and P. No runtime override (ruling HD-17): an anchor
   outside the grammar is refused with its reason, the previous snapshot
   keeps serving, and widening the grammar is a code change with a measured
-  corpus row. apt's verdicts are measured on 876 byte-exact shapes in the
+  corpus row. apt's verdicts are measured on 904 byte-exact shapes in the
   six client images and the five older ones (`internal/gpg/testdata/aptshapes`,
-  `e2e/apt-oracle/README.md`; batches fx to fx21), which
+  `e2e/apt-oracle/README.md`; batches fx to fx22), which
   `TestVerifier_FollowsTheAptShapeTable` runs every one of, none skipped,
   with each refused row pinned to the rule that refuses it
   (`TestVerifier_RefusesEachRowByItsRule`), the text layer held to apt's
