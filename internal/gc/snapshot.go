@@ -56,11 +56,16 @@ type snapshotPassResult struct {
 // start. The cost: a start with a retired backlog may wait up to
 // max_tick_duration before the listeners open, the bound ruling HD-7
 // already accepts for B's one-transaction deletes at a start; C only
-// fills the budget B leaves. C deletes every retired snapshot, a startup
-// trust audit's quarantined ones included (spec C9: the audit runs before
-// the startup pass, and a quarantined snapshot never serves or vouches
-// again), and never one that is not retired, such as a displaced snapshot
-// the audit still holds queued (B never ranks those: ruling R-H1). What a
+// fills the budget B leaves. The startup C deletes the snapshots the
+// startup trust audit quarantined, as the periodic C does under spec C9
+// (a quarantine retires its snapshot; the audit runs before the startup
+// pass, so they now go at the start that quarantined them; a quarantined
+// snapshot never serves or vouches again): the same outcome, earlier, with
+// no new rule (the controller's ruling of 2026-11-05: "leaves quarantined
+// ones" in the task's brief was an over-reach, not the maintainer's
+// decision). Like every C it never deletes a snapshot that is not
+// retired, such as a displaced one the audit still holds queued (B never
+// ranks those: ruling R-H1). What a
 // start leaves, the periodic ticks and retiredRun delete: hourly while a
 // backlog lasts (Run). Retired rows never serve meanwhile.
 //
