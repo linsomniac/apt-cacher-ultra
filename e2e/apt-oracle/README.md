@@ -36,8 +36,16 @@ of the six takes about 85 seconds on a 12-core machine, and one of the five
 older ones about 95. The two sets are two runs, and two make targets: one
 after the other they take about three minutes (the hardening plan's Task
 9e), and a release runs both (*When to run it*). To measure today's apt,
-`docker pull` the images first: `docker run` never refreshes a cached
-tag, and the version lines a run prints show which apt it measured.
+pull the images first: `docker run` never refreshes a cached tag, and the
+version lines a run prints show which apt it measured. The eleven, as
+`COLUMNS` and `OLD_COLUMNS` in `run.sh` name them:
+
+```sh
+for i in debian:11 ubuntu:22.04 ubuntu:24.04 debian:12 debian:13 ubuntu:26.04 \
+         debian:10 ubuntu:20.04 ubuntu:18.04 ubuntu:16.04 ubuntu:14.04; do
+  docker pull "$i" || exit 1
+done
+```
 
 The exit status is 0 when apt gives the recorded verdicts and error
 classes (or `--record` wrote them), 1 when apt changed, a container failed
@@ -451,7 +459,10 @@ port of apt's text layer refuses exactly the `split` rows
 `verdicts.txt`.
 
 That guarantee — the cache adopts no anchor a supported apt refuses, but
-for crypto policy — is only as wide as the corpus: it holds for the 876
+for crypto policy (the 20 `aptShapeKeyPolicy` rows, and 14 of
+`aptShapeOldExempt`'s) and an older image's refusal of a real signer's
+layout (the other 6 of `aptShapeOldExempt`'s, *The older images* below)
+— is only as wide as the corpus: it holds for the 876
 shapes the table test runs, not for a shape the corpus lacks: an anchor
 shaped otherwise is unmeasured, and the cache may adopt it while some apt
 refuses it (the hybrid verifier's canonical grammar makes that unlikely:

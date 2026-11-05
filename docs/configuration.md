@@ -558,23 +558,37 @@ is read as apt reads it: every armor block, the keys before any junk, and
 a revocation or expiry the cache cannot read stops that key from counting,
 as gpgv honours it; a file the cache skips, or reads only in part, is
 named at start by WARN `keyring_file_skipped`, `keyring_file_truncated`
-or `keyring: parse failed; skipping file`.
+or `keyring: parse failed; skipping file`. A key that does not count is
+reported as `crypto_verify_failed`, and the `adoption_gpg_failed` line
+names the key and why (`its key … is not counted: …`, or go-crypto's
+"key expired" or "signature made by revoked key"): a revoked or expired
+key needs the vendor's current key file (check the vendor's key status:
+most vendors publish a renewed or replacement key where they published
+the first), and a key marked for a revocation, expiry or binding the
+cache cannot read needs the same, since every gpgv-based apt refuses that
+key too; install it and restart.
 
-The verifier refuses what any supported apt refuses — the six current
-client images and the five older ones its corpus is measured on
-(`e2e/apt-oracle/README.md`) — and, beyond that, any anchor outside the
-canonical shape real signers write: a second armor block, armor lines over
+The verifier refuses an anchor whose format any supported apt refuses —
+the six current client images and the five older ones its corpus is
+measured on (`e2e/apt-oracle/README.md`), an older client's refusal
+counting only for a shape no real signer writes — and, beyond that, any
+anchor outside the canonical shape real signers write: a second armor block, armor lines over
 76 characters, bytes left inside a signature packet, a packet of an
 algorithm it does not read (SHA-224, SHA3-256), among others, refused as
 `malformed_clearsign` (an `InRelease`) or `malformed_signature` (a
 `Release.gpg`) even where apt would accept them; the status page's reason
 and the `adoption_gpg_failed` log line name the rule. No setting widens
-it. A signature hashed with SHA-1 never counts, as apt does not count it.
-An anchor signed only with a version 3 signature packet is refused
-(`debian:13`'s apt refuses it too; older OBS-built repositories, such as
+it. A signature hashed with SHA-1 never counts, as every measured apt
+from 1.6 on (Ubuntu 18.04, Debian 10 and later) does not count it (apt 1.2
+and 1.0, on Ubuntu 16.04 and 14.04, still do). An anchor that holds a
+version 3 signature packet is refused, even beside a version 4 one
+(`debian:13`'s apt refuses one too; older OBS-built repositories, such as
 pkgs.k8s.io's v1.30, publish one). Key strength is not judged: the cache
 counts what the gpgv-based apt count, an RSA-1024, DSA or SHA-1-bound key
-included, which `debian:13`'s sqv and the newer Ubuntu releases refuse.
+included, which `debian:13`'s sqv and the newer Ubuntu releases refuse,
+and an EdDSA or ECDSA key, which gpgv 1.4 (Ubuntu 16.04 and 14.04)
+cannot use; only the signer downgrade guard below follows the newest
+clients' key policy.
 
 The signer downgrade guard covers the strip of a strong signature beside
 a weak one: when the suite's current anchor, verified again with the same
@@ -585,10 +599,22 @@ and a new anchor has none, the new anchor is refused (refusal
 `signer_downgrade`, WARN `adoption_signer_downgrade`) and the current
 snapshot keeps serving, its lag showing. It cannot see a strip at a
 suite's first adoption, and stands down for a suite whose current anchor
-has no strong signer. If a vendor really drops its strong key, the vendor
-signing again with a strong key clears it; otherwise remove the strong key
-from the keyring and restart, or `POST /forget` the suite, which adopts
-the new anchor as a first adoption.
+has no strong signer. The refusal clears by itself when the vendor signs
+again with a strong key. Before anything else, confirm out of band that
+the vendor really dropped its strong signer — its announcement, its site,
+or its key-rotation notice — because both of the operator's recourses
+adopt the very anchor the guard refused, which an on-path strip also
+produces. Then either remove the strong key from the keyring, or
+`POST /forget` the suite, which adopts the new anchor as a first adoption
+(the recourse for a bundled key). Removing the key has costs: the cache
+reads the host's own apt key directories, so the host's own apt loses the
+key too, and a key file a package installed comes back at the package's
+next upgrade; the bundled Debian, Ubuntu and Ubuntu Pro keys cannot be
+removed; every other suite that key signs stops counting it
+(`untrusted_signer` there); the keyring is read only at start, so it
+needs a restart; and the refusal keeps its retry time across the restart,
+so the suite adopts at that retry (at most 75 minutes later), not at the
+restart.
 
 `accept_any_signer = true` makes client-side apt verification the trust boundary
 for unpinned suites: the cache continues serving the original signed bytes, but

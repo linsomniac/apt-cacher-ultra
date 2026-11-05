@@ -86,9 +86,12 @@ e2e-live:
 # client images, each in a container without network, on the verifier's
 # signature-shape corpus (internal/gpg/testdata/aptshapes), compared with the
 # verdicts recorded beside it; a difference is "apt changed" and fails.
-# About 85 seconds on 12 cores with the images cached. Run by hand before a
-# release, after a go-crypto upgrade and after a change to internal/gpg's
-# armor or signature checks, never in CI. E2E_APT_ORACLE_IMAGES picks some
+# About 85 seconds on 12 cores with the images cached. Run by hand before
+# every release, after `docker pull` of the eleven images (the README's
+# "Running it" gives the loop: a cached tag is never refreshed, so without
+# it the run measures the old images and passes by construction), after a
+# go-crypto upgrade and after a change to internal/gpg's armor or
+# signature checks, never in CI. E2E_APT_ORACLE_IMAGES picks some
 # of the six; bash e2e/apt-oracle/run.sh --record re-records the verdicts.
 # e2e-apt-oracle-old is the same for the five older client images
 # (debian:10, ubuntu:20.04, 18.04, 16.04 and 14.04: verdicts-old.txt), about

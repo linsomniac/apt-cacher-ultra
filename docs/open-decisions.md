@@ -23,6 +23,27 @@ Task 9b) and G1 to G6 (the guard, its Task 9d) were made while those
 tasks were carried out. The *Decided* entries of its work say what each
 decided.
 
+Evidence is cited by what a reader of the repository can reach: a corpus
+row (`internal/gpg/testdata/aptshapes/verdicts.txt`), a test, a commit or
+a doc section. `PE/` is the hardening plan's planning evidence (its
+line 13): the directory
+`.superpowers/sdd/2026-10-28-gc-and-upstream-hardening/planning-evidence/`,
+with the plan's task reports and ledger beside it, kept on the
+maintainer's machine under the git-ignored `.superpowers/` and not
+shipped; a citation of `PE/` is planning evidence, not in the tree. The
+final review's measurement rows that no tree file holds (the key-file
+rows `kr*` of its V lens, for one) are in `PE/final-review/V/rr5/` to
+`rr10/` (each round's generator, `meas/` and `allkr*.txt`). Each *Open*
+entry states its severity class: R2 (integrity: the cache counts or
+adopts what some supported apt treats as revoked, expired, unbound or
+bad), R3 (availability: the cache refuses what apt accepts, or a gap that
+needs a malformed or unusual operator file; the content is still
+authenticated by a trusted key's good signature), or none (the cache
+agrees with apt, or the item is operational); the entries before the
+hardening plan's (CI, packaging, tests and logs, from `govulncheck` to the
+packaging loose ends) are all class none, operational: none touches what
+the cache trusts or serves.
+
 ## Before the 1.1.0 release candidate
 
 Steps only the maintainer can take, since they need a push or a tag (delete
@@ -100,7 +121,16 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
    `Verify no e2e test seam` step runs first on the tag: check it there.
 7. **The release notes** (`docs/release-notes/1.1.0.md`): bring them up
    to date with what `Changelog.md` collected since this branch, then
-   paste them into the GitHub release. Their links name the `1.1.0` tag;
+   paste them into the GitHub release. The notes say nothing yet of the
+   GC and upstream hardening plan's verifier work, which is
+   upgrade-relevant (its Changelog entries wait in that plan's Task 9c
+   draft for the maintainer): name in them the hybrid verifier and its
+   reasons (`malformed_clearsign`, the new `malformed_signature`,
+   `bad_signature`; suites whose anchors it refuses keep their snapshot
+   and stop adopting), the signer downgrade guard (`signer_downgrade`)
+   and its recourse, the six vendors with no strong signer, the SHA-1
+   refusal, the key reader's changes, and the older-client oracle (`make
+   e2e-apt-oracle-old`). Their links name the `1.1.0` tag;
    for a release
    candidate, paste them with that tag replaced by the candidate's:
    `sed 's|/blob/1\.1\.0/|/blob/1.1.0-rc1/|g' docs/release-notes/1.1.0.md`.
@@ -126,6 +156,7 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   `go` line turns on Go 1.26's GODEBUG defaults (among them
   `urlstrictcolons`, for a cache whose paths hold colons, as
   pkgs.k8s.io's do), so it is a change of its own, with the full gate.
+  Class none: a process item; no vulnerability the code reaches.
   Recommendation: add a `govulncheck` step to CI (a failure on a
   vulnerability the code reaches); move to `go 1.26.0` and those
   releases in the next release, after checking each GODEBUG change. The
@@ -141,7 +172,8 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   member `adoption.architectures` filters out. Both are on 1.0.x already,
   so changing their level is a behaviour change; the 1.1.0 release notes
   tell operators who page on WARN to exclude them and say the level
-  change is open. Recommendation: INFO in the next minor release, the
+  change is open. Class none: log levels only.
+  Recommendation: INFO in the next minor release, the
   counters (`acu_adoption_members_skipped_total`,
   `acu_adoption_sources_parsed_total`) as the signal.
 - **Delete a cached `Release.gpg` that fails its check in the refresh
@@ -153,13 +185,15 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   prints a signature error until the cache adopts it
   (`docs/configuration.md`, *Flat repositories*; pinned by
   `TestServeHTTP_AnUnsignedSnapshotNeverServesACachedPortalPage`).
+  Class none: fail-safe; harmless until the repository changes form.
   Recommendation: do it after 1.1.0 — the anchors' delete loop takes a
   third name, judged by the existing `Release.gpg` check
   (`aptpath.SniffReleaseGPG`).
 - **A `concurrency` group in `ci.yaml`** (raised 2026-10-26, the H2 final
   review): `ci.yaml` has no `concurrency:` key, so a superseded
   pull-request push keeps all its jobs running, the two long-wait
-  `e2e-flat` rows included. Recommendation:
+  `e2e-flat` rows included. Class none: CI cost only.
+  Recommendation:
   `group: ci-${{ github.event.pull_request.number || github.ref }}` with
   `cancel-in-progress` for pull requests only, so `main` is never
   cancelled.
@@ -167,15 +201,18 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   10-second job, after fixing the one finding it reports today,
   shellcheck's SC2035 in `release.yaml`'s *Stage release artifacts* step
   (`sha256sum * > SHA256SUMS`; `sha256sum -- *` keeps the names).
+  Class none: CI only.
   Recommendation: add it.
 - **One nfpm version** (raised 2026-10-26, the H2 final review):
   `e2e/deb/Dockerfile` packages with nfpm 2.40.0 (`nfpm@v2.40.0`), the
   release with 2.43.0 (`release.yaml`'s `NFPM_VERSION`), while `ci.yaml`
   calls `deb-test` the check that the release artifact works.
+  Class none: packaging tests only.
   Recommendation: move e2e/deb to 2.43.0.
 - **e2e/deb's fixed image name** (raised 2026-10-26, the H2 final
   review): `e2e/deb/run.sh` tags and runs `aculan-deb-test:<ver>`, so two
-  runs on one host retag each other's image. Recommendation: an
+  runs on one host retag each other's image. Class none: tests only.
+  Recommendation: an
   `E2E_DEB_NAME`, validated as `E2E_FLAT_NAME` is; CI is unaffected (one
   VM per job).
 - **The `timeout -s INT` wrapper's two gaps** (raised 2026-10-26, the H2
@@ -183,6 +220,7 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   `timeout -s INT -k 60 "${E2E_STEP_MINUTES}m" bash e2e/flat/run.sh`;
   locally `docker run` relayed the test's last output in 6 of 7 trials,
   and a command stuck for good never reaches the test's INT trap.
+  Class none: CI diagnostics only.
   Recommendation: `e2e/flat/run.sh` falls back to `docker logs` when a
   run is interrupted; an in-container watchdog only if a stuck command is
   ever seen.
@@ -202,7 +240,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   tree (2026-10-28, load 1.8) the slowest were
   `TestServeHTTP_MintedSuitesAtScale` 3.93–4.05 s,
   `TestDoD_NinetyDaysOfReapingWithRestarts` 3.79–3.89 s and
-  `TestSimRetry_LongRunDateRulesAndClockSteps` 3.64–3.82 s. Recommendation:
+  `TestSimRetry_LongRunDateRulesAndClockSteps` 3.64–3.82 s.
+  Class none: test timing only.
+  Recommendation:
   coarsen one, every assertion kept, as phase H1 did the 500-suite
   simulation, if it crosses 4.5 s on a quiet machine or makes CI flaky.
 - **A refused client check waits behind an old failure record** (raised
@@ -214,20 +254,24 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   later client check that wins a slot (spec C4 states this bound;
   `TestSuiteDue`'s "pending change with a record waits for its retry").
   Trust and what is served are unaffected; only adoption latency under
-  slot contention. Recommendation: leave it; if it is ever reported, an
+  slot contention.
+  Class none: adoption latency only; trust and serving unaffected.
+  Recommendation: leave it; if it is ever reported, an
   in-memory mark set by a queued client check (like `absentAnswered`)
   makes the suite due at the next tick.
 - **CI keeps e2e/flat's full logs** (raised 2026-10-27, the H3 final
   review R8 #3). A failed `e2e-flat` job leaves only the harness's
   80-line tail (now without `admin_request` lines): `e2e/flat/run.sh`
   runs the container with `--rm` and the job uploads nothing.
+  Class none: CI diagnostics only.
   Recommendation: copy the daemon and apt logs out of the container on
   failure and upload them with `actions/upload-artifact`.
 - **`internal/freshness` under `-race` takes about 5 minutes on 4 CPUs**
   (raised 2026-10-27, the H3 final review R8 I-1). The overview's Global
   Constraint asked for each package under 5 minutes under `-race`; the
   package took 297 s on 4 CPUs and 261–280 s on 12. `make test-race` and
-  CI now allow 10 minutes. Recommendation: keep the 10-minute bound; split
+  CI now allow 10 minutes. Class none: test time only.
+  Recommendation: keep the 10-minute bound; split
   the package's simulations into their own test binary if it nears it.
 - **Packaging and test loose ends** (raised 2026-10-27, the H3 execution
   and its reviews; each harmless today):
@@ -242,7 +286,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   it); `TestServe_GracefulShutdown_DrainsInflight` can hang in
   `defer upstream.Close()` on one failure path; the list of daemon starts
   in `serve_until_cleanup_test.go`'s `AIDEV-NOTE` is checked by the H3
-  plan's census, not by a test. Recommendation: fix the first three with
+  plan's census, not by a test.
+  Class none: packaging and tests, each harmless today.
+  Recommendation: fix the first three with
   the next packaging change; the rest when their code is next touched.
 - **Downloads with no declared size have no byte limit** (raised 2026-10-28,
   the hardening plan's DN-1). Adoption stops a member's download at its
@@ -255,6 +301,8 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   match, and by `upstream.total_timeout` (5 minutes by default), which
   alone bounds a chunked body. A cap needs a size per
   file, which `snapshot_member` and `package_hash` lack: a schema change.
+  Class none: a resource bound (time and disk), not a trust question; what
+  is served is still checked against its hash where one is declared.
   Recommendation: keep `Content-Length` and `upstream.total_timeout` as
   their bounds; `runSnapshotMemberFetch` could take a cap from the blob
   row's size when that row survives.
@@ -269,7 +317,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   `internal/gpg/verifier.go`; `docs/configuration.md`, *Trust and signer
   pins*). The cache can then adopt an anchor that a client holding the key
   refuses. Nor does the signer downgrade guard ever fire on the bypass: it
-  counts no signer (ruling G1). Recommendation: leave it, since the bypass
+  counts no signer (ruling G1). Class none, by configuration: the operator
+  who sets the bypass chooses the clients' verification as the boundary.
+  Recommendation: leave it, since the bypass
   makes the clients' own verification the trust boundary, as
   `docs/configuration.md` says.
 - **The `Release.gpg` sniff still passes a binary signature** (raised
@@ -285,7 +335,8 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   Both only keep the suite from adopting unsigned, the fail-safe direction,
   and the four vendors in the vendor survey of the hardening plan's security
   review (2026-10-28) that publish a binary `Release.gpg` all publish an
-  `InRelease`, which the check prefers. Recommendation: leave it.
+  `InRelease`, which the check prefers. Class none: fail-safe.
+  Recommendation: leave it.
 - **The cache is stricter than `debian:13`'s apt** (raised 2026-10-28, the
   hardening plan's DN-2 and DN-3; counts of 2026-11-05, Task 9c).
   `debian:13`'s apt 3.0.3 verifies with Sequoia's `sqv` (the image has no
@@ -302,7 +353,8 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   sqv's policy refuses (brainpool, secp256k1, SHA-1- or SHA-224-bound,
   bound after the signature, or a weak primary under an Ed25519 subkey:
   `aptShapeKeyPolicy`), since crypto policy is not intersected across
-  client generations (ruling HD-19, *Decided*). Recommendation: keep the
+  client generations (ruling HD-19, *Decided*). Class none: stricter than
+  one client, never looser than the strictest. Recommendation: keep the
   rule.
 - **127 anchor shapes every apt accepts are refused, in four families**
   (raised 2026-10-28, the hardening plan's DN-6 and ruling HD-9, fourteen
@@ -336,7 +388,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   shapes HD-13 and HD-14 had added stopped being strict with the hybrid,
   and Task 9e took out three that gpgv 1.4 refuses
   (`q_good_plus_bigunh_dup`, `v6_i_good_plus_v6unknown`,
-  `v6_d_good_plus_v6unknown`). Recommendation: keep them; widen the
+  `v6_d_good_plus_v6unknown`). Class R3: availability — the cache refuses
+  what every apt accepts, though only an edit no real signer makes.
+  Recommendation: keep them; widen the
   grammar for a family only when a real vendor's anchor needs it, with
   that anchor as a vendor fixture.
 - **Weak keys (C-3's key half), and the rest of C-1** (raised 2026-09-08,
@@ -357,7 +411,11 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   anchor after its first adoption, but nothing checks `Valid-Until`, and a
   replaying man in the middle can choose a suite's first snapshot (the
   flat-repositories spec, §10 item 5), as it can strip a strong signer
-  before the first adoption (the guard's entry below). Recommendation: take
+  before the first adoption (the guard's entry below). Class none for the
+  key half (the ruled policy: the cache counts what the gpgv-based apt
+  count); R2 for C-1 (integrity: a replayed or stripped first snapshot is
+  adopted), open since 1.0.x and needing a man in the middle at a suite's
+  first adoption. Recommendation: take
   up the spec's §10 item 5 (`Valid-Until` and per-suite identity pinning)
   in a later release; re-measure the key policies (`make e2e-apt-oracle`)
   before each date to come in `internal/gpg/strength.go`'s rules (RSA-2048
@@ -371,8 +429,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   keyring lacks (gpgv's NO_PUBKEY); a client that trusts such a key still
   refuses the anchor, so the cache adopts what that client refuses.
   `docs/configuration.md` (*Trust and signer pins*) asks the operator to
-  install in the cache every key the clients' `signed-by` names.
-  Recommendation: leave it (inherent: the cache checks the keys it holds).
+  install in the cache every key the clients' `signed-by` names. Class
+  none: inherent, and the operator's install closes it. Recommendation:
+  leave it (inherent: the cache checks the keys it holds).
 - **S2's key-ID collision quirk** (raised 2026-10-28, the hardening plan's
   ruling HD-10; unchanged by the hybrid verifier, checked 2026-11-05). S2
   (`verifyAnyTrusted`, `internal/gpg/verifier.go`) verifies a packet whose
@@ -384,7 +443,8 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   (`crypto_verify_failed`), as before the hardening plan. S1 tries each
   entity alone
   (`TestRequireKnownSignaturesVerify_AKeyIDCollisionDoesNotFailAValidSignature`,
-  which notes that S2 still refuses). Recommendation: if it is ever met,
+  which notes that S2 still refuses). Class R3: it refuses a valid anchor
+  and never adopts a bad one. Recommendation: if it is ever met,
   verify S2's fingerprint path against the single entity that owns the
   issuer fingerprint, with a test.
 - **Displaced snapshots a periodic tick retired but did not delete wait**
@@ -404,8 +464,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   periodic B used to delete them itself whatever C did (the hardening
   plan's final review, G-M1: probed with a trigger standing in for a fault
   confined to one snapshot's rows, the only cause the review found; WARN
-  `gc_tick_failed` with `retired snapshot gc chunk:` shows it).
-  Recommendation: leave it; look again if a daemon that restarts often is
+  `gc_tick_failed` with `retired snapshot gc chunk:` shows it). Class
+  none: disk only, since a retired snapshot never serves. Recommendation:
+  leave it; look again if a daemon that restarts often is
   seen to keep them, and if a chunk is seen to fail at every call, let C
   step past a snapshot whose chunk failed for the rest of its pass.
 - **Sub-job C's chunk size** (raised 2026-10-28, the hardening plan's
@@ -415,7 +476,8 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   149–191 ms; no `-race`, a loaded 12-thread laptop, 700,000 `package_hash`
   rows), where the plan had expected under 200 ms and phase F had measured
   about 80 ms. Ruling HD-11 kept 10,000 rows: the aim was that GC never
-  holds the writer for seconds, which this meets. Recommendation: re-measure
+  holds the writer for seconds, which this meets. Class none: performance.
+  Recommendation: re-measure
   on a staging host before deciding; a chunk under 10,000 rows is a change
   to spec C9 (pinned by
   `TestRunRetiredSnapshotGCChunk_TheChunkIsTenThousandRows`).
@@ -432,7 +494,7 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   "no GC run yet" (the final review's G re-review, RR-M1). Since ruling
   HD-15 the passes after a failed one run (*Decided*,
   below), but the failed pass's own work waits until its fault is fixed.
-  Recommendation: a counter,
+  Class none: operability. Recommendation: a counter,
   `acu_gc_pass_failures_total{pass}`, and an alert line on it in the
   release notes, in a later release.
 - **A vouched `.deb` is stored unchecked when the read after its download
@@ -443,7 +505,10 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   `package_hash validate lookup failed` and stores and serves the file with
   no hash constraint (`Finalize`), on any host: it fails open, as the hit
   path does, so that a database fault does not refuse every package. The
-  hash the first read found is not kept. Recommendation: keep it, and
+  hash the first read found is not kept. Class R2, by a deliberate
+  fail-open: on a database fault a vouched `.deb` is served without its
+  hash check, so that the fault does not refuse every package.
+  Recommendation: keep it, and
   finalize with it (`FinalizeExpectingHash`), which refuses only bytes that
   do not match it, so it adds no flood of refusals.
 - **What `crypto_verify_failed` still means** (raised 2026-10-29, the
@@ -455,7 +520,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   (`a_b64_empty_body`: A4, on the bypass too) and a signature over 64 KiB
   (A4). What falls to `ClassifyVerifyErr`'s default now is S2 finding a
   trusted packet and counting none — 65 of the corpus' 876 rows, measured
-  2026-11-05 (Task 9c's scratch `reasons-a7d0d72.tsv`): a packet sqv does
+  2026-11-05 (`PE/task9c/reasons-a7d0d72.tsv`, by
+  `PE/task9c/zz_reasons_test.go`, planning evidence, not in the tree): a
+  packet sqv does
   not read (52 rows: a subpacket Sequoia's parser refuses, the
   re-review's A-RC1), a good signature apt erases at a later SHA-1 packet
   by the same key (9: A-RC2), a SHA-1 packet alone (`x3i_sha1_only`, ruling
@@ -466,14 +533,19 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   the corpus a revoked key, a key the keyring marks (ruling R2), S2's
   key-ID collision quirk (above) and the detached form's empty inputs. The
   log line's `err` says which; since Task 9c the status page's tooltip
-  lists these causes, and `ClassifyVerifyErr`'s comment too.
-  Recommendation: leave the reason; if operators meet the expired-key case
-  often, give it a reason of its own (`key_expired`), with a
-  `TestClassifyVerifyErr` row. (The verifier's own error text for a
-  detached refusal still begins "Release.gpg is not one ASCII-armored
-  signature block apt accepts" for every layer's refusal, a deviation
-  included, which overstates in the same way the tooltips did: a code
-  change, left with this entry.)
+  lists these causes, and `ClassifyVerifyErr`'s comment too; for a key
+  the keyring marks, the log line names the key and the mark (a revocation,
+  an expiry or a binding the cache cannot read), and the operator's action
+  is the vendor's current key file (`docs/configuration.md`, *Trust and
+  signer pins*). The detached refusals' own text no longer claims an apt
+  verdict: it read "Release.gpg is not one ASCII-armored signature block
+  apt accepts" for every layer's refusal, the deviations included, and
+  reads "… block in the shape the cache accepts" since Task 9c's fix round
+  (the controller's ruling R-9c-1;
+  `TestMalformedSentinels_ClaimNoAptVerdict`). Class none: reporting only;
+  the verdicts are right. Recommendation: leave the reason; if operators
+  meet the expired-key case often, give it a reason of its own
+  (`key_expired`), with a `TestClassifyVerifyErr` row.
 - **What the hybrid verifier leaves** (raised 2026-10-29, the hardening
   plan's Tasks 6 and 7, as "anchor shapes beyond the corpus are
   unmeasured"; rewritten 2026-11-05, its Task 9c, for the residual risk of
@@ -505,8 +577,10 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   secure since 2021-02-01"); layer P refuses it (`malformed_clearsign`,
   `malformed_signature`: "a version 3 signature (the cache reads version 4
   only)"), as the cache refused it on 1.0.x (`no_usable_signature` there),
-  and gpg makes no version 3 signature to build a corpus row from.
-  Recommendation: add each shape a search, a review or a vendor turns up
+  and gpg makes no version 3 signature to build a corpus row from. Class
+  R2 for what is unmeasured (a shape the corpus lacks could be adopted
+  while some apt refuses it), none for what is measured. Recommendation:
+  add each shape a search, a review or a vendor turns up
   to the corpus with its measured row, and then fix the verifier or list
   the shape in its family.
 - **A go-crypto upgrade can move the verifier's and the key reader's
@@ -521,15 +595,19 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   v1.5.2 changed and what it skips — v3 signatures, RIPEMD-160, v4
   direct-key expiry), and the downgrade guard reads its self-signature in
   use (`strongSigner`). The bump to v1.5.2 (Task 9b, commit 4fa21be) gave
-  identical verdicts on the suite, the corpus and the vendor survey.
-  Recommendation: at every go-crypto upgrade run the table test and the
-  key reader's tests (`go test ./internal/gpg`), both oracles
-  (`e2e/apt-oracle/README.md`, *When to run it*) and the vendor re-run of
+  identical verdicts on the suite, the corpus and the vendor survey. Class
+  none: a process item; an upgrade could move verdicts either way, which
+  the gates below would show. Recommendation: at every go-crypto upgrade
+  run the table test and the key reader's tests (`go test
+  ./internal/gpg`), both oracles (`e2e/apt-oracle/README.md`, *When to run
+  it*) and the vendor re-run of
   the hardening plan's Task 8 gate, and re-read the AIDEV-NOTEs that cite
   go-crypto's lines (`grep -n 'go-crypto v1' internal/gpg/*.go`).
 - **A copy of a key that go-crypto cannot read is dropped with its marks**
   (raised 2026-11-05, the final review's V lens, its re-review 10:
-  V-R10I1; class R2, under-strict; on `main` and 1.0.x too). The key
+  V-R10I1; on `main` and 1.0.x too). Class R2, under-strict: the cache
+  counts a key every apt that reads its first copy treats as revoked. The
+  key
   reader skips a key block that go-crypto reads in neither of its two
   readings, and the loader a file that holds no key go-crypto reads
   (`readKeyBlocks`, `internal/gpg/keyfile.go`; `LoadKeyringWithEmbedded`,
@@ -541,7 +619,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   treats the key as revoked: `kr29_unread_b_signedby_a_too` (copy B holds
   the key's own revocation and a RIPEMD-160 self-certification alone) is
   refused in all six images and adopted by the cache at every commit,
-  `main` included (V's `rr10/meas/kr29.*`). Not key-free: it needs two
+  `main` included (`PE/final-review/V/rr10/`: `mkkr29.py`,
+  `meas/kr29.*`, `kr29-cache.txt`; planning evidence, not in the tree).
+  Not key-free: it needs two
   copies of one key in the operator's directories, one of them unreadable
   to go-crypto; no real keyring has one (debian-keyring, debian-maintainers
   and the 70 survey files hold no key twice with differing marks: Task 9b's
@@ -551,14 +631,19 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   and keep a dropped block's or file's marks in the union — with
   `kr29_unread_b_signedby_a_too` as its test.
 - **Key files and anchors the cache refuses where every apt accepts them**
-  (raised 2026-11-03 to 05, Task 9b's fix rounds 5 to 9 and Task 9e; class
-  R3, over-strict, or none). Ruling R3 bounds an S1 or S2 gap that needs a
+  (raised 2026-11-03 to 05, Task 9b's fix rounds 5 to 9 and Task 9e).
+  Class R3 for the key-file rows (availability: an unusual operator file
+  is refused where apt reads it; ruling R3), R3 for Task 9e's rows that
+  every image accepts (the deviations), none for its rows a current image
+  refuses. Ruling R3 bounds an S1 or S2 gap that needs a
   malformed or unusual operator key file as availability-class (the
   content is still authenticated by a good signature from a trusted, valid
   key); the rulings of those rounds chose to fail closed, and these rows,
   each `ok` in all six images, are refused by the cache (the final
-  review's V re-reviews 5 to 10, `rr5` to `rr10`; Task 9b's fix round
-  reports 6 to 9, their over-strict tables):
+  review's V re-reviews 5 to 10, `PE/final-review/V/rr5/` to `rr10/`,
+  each round's generators, `meas/` and `allkr*.txt`; Task 9b's fix round
+  reports 6 to 9, their over-strict tables; planning evidence, not in the
+  tree):
   - **legacy (version 2 and 3) signatures, one fail-closed rule** (round
     6): a third party's legacy key or subkey revocation
     (`kr21_tp_v3rev_xin`, `kr25_tp_v3subrev`), a legacy binding older
@@ -589,10 +674,17 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   debian-maintainers (761) and the 70 survey files (201) count exactly as
   before those rounds (Task 9b's fix round 9). And 322 corpus rows are
   accepted by some older image and refused by the cache (Task 9e, counted
-  again 2026-11-05): 127 are the strict deviations every image accepts
-  (their entry above), and 195 some current image refuses; by the rule
-  that refuses them (Task 9e's count at 28c72ea, 315 rows) layer T's T1
-  to T6 and F0 56, layer A 117, layer P 71, S1 10 and S2 61, where an old
+  again by script at HEAD, Task 9c's fix round): 127 are the strict
+  deviations every image accepts (their entry above), 184 are rows some
+  current image refuses, and 11 are rows only an older image refuses,
+  which the cache folds in (Task 9e's class (c): T6's
+  `i_begin_trailing_ws`, `a_msgbegin_sp_cr` and `q_msgbegin_sp_tab_crcr`;
+  S1's every-key rows `t7g5_s_primary`, `us_bad_primary_plus_good`,
+  `us_bad_enc_plus_good`, `us_good_plus_bad_enc` and
+  `us_d_bad_enc_plus_good`; and P's `q_good_plus_bigunh_dup`,
+  `v6_i_good_plus_v6unknown` and `v6_d_good_plus_v6unknown`, which yet
+  another older image accepts). By the rule that refuses them: layer T
+  (F0 included) 56, layer A 117, layer P 71, S1 15 and S2 63, where an old
   image's lenient parser or older crypto reads the shape. Strict is safe:
   the cache stays strict. Recommendation: leave them; narrow a rule only
   if a real key file or anchor meets it, with a measured row.
@@ -612,7 +704,8 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   by one of these keys unless its owner renews the direct-key signature
   itself (`gpg --quick-set-expire` does). A fourth key,
   `4D14050653A402D73687049D2404C9546E145360`, expired on 2026-04-27 for
-  go-crypto too. Recommendation: nothing in the cache; a suite signed by
+  go-crypto too. Class none: the cache agrees with every apt.
+  Recommendation: nothing in the cache; a suite signed by
   one of them that turns `crypto_verify_failed` needs the key renewed
   upstream.
 - **Six vendors have no strong signer** (raised 2026-11-05, Task 9d; a
@@ -627,12 +720,15 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   survey's 137 anchors the cache accepts were measured in the three
   newest images, and the cache's strong flag equals "all three accept" on
   every one: 125 strong, these 12 not (Task 9d; the vendor re-run of
-  2026-11-05 at a7d0d72 gives the same flags; mongodb's vendor fixture is
+  2026-11-05 at a7d0d72 gives the same flags, `PE/task9c/strong.txt`;
+  mongodb's vendor fixture is
   pinned with none, `TestVerifier_PinsTheVendorAnchorsStrongSigners`).
   `debian:13` clients of these suites fail with or without the cache:
   the vendor's to fix, by binding its key again with SHA-256 (ceph: with
-  a self-signature older than its signatures). Recommendation: nothing in
-  the cache; the release notes can name them.
+  a self-signature older than its signatures). Class none: the cache
+  agrees with the gpgv-based apt, and `debian:13`'s refusal is the
+  vendor's to fix. Recommendation: nothing in the cache; the release notes
+  can name them.
 - **The signer downgrade guard cannot see a strip at a suite's first
   adoption** (raised 2026-11-03, the plan's addendum, HD-19; ruling G6,
   Task 9d). The guard compares a candidate with the suite's current
@@ -645,15 +741,31 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   `adoption_signer_guard_skipped`). A man in the middle at that moment can
   strip a vendor's strong signature beside a weak one, and the cache
   adopts what `debian:13` clients then refuse, until upstream changes and
-  the next adoption brings the strong signer back. The recourse for a
-  vendor that really downgrades (ruling G4; `adoption_signer_downgrade`'s
-  row in `docs/log-fields.md`): the vendor signs again with a strong key;
-  the operator removes the strong key from the keyring and restarts (the
-  keyring is read at start), after which the current anchor has no strong
-  signer; or `POST /forget`, which adopts the candidate as a first
-  adoption — no override and no configuration key (ruling HD-17).
-  Per-client tracking by User-Agent was considered and not taken (the
-  plan's addendum). Recommendation: leave it; the per-suite identity
+  the next adoption brings the strong signer back. Class R2 (integrity,
+  for the newest clients): at that moment a strip goes through; open by
+  ruling G6. The recourse for a refusal (ruling G4;
+  `adoption_signer_downgrade`'s row in `docs/log-fields.md`;
+  `docs/configuration.md`, *Trust and signer pins*): first confirm out of
+  band that the vendor really dropped its strong signer — its
+  announcement, its site or its key-rotation notice — since both of the
+  operator's recourses adopt the very anchor the guard refused, which an
+  on-path strip also produces. Then: the vendor signs again with a strong
+  key, which clears the refusal by itself; or the operator removes the
+  strong key from the keyring, at these costs — the cache reads the host's
+  own apt key directories (`/etc/apt/trusted.gpg.d`, `/etc/apt/keyrings`,
+  `/usr/share/keyrings`: `keyringDirs` in `cmd/apt-cacher-ultra/main.go`),
+  so the host's own apt loses the key too, and a file a package owns comes
+  back at its next upgrade; the bundled Debian, Ubuntu and Ubuntu Pro keys
+  (`internal/gpg/embedded/`) cannot be removed; every other suite that key
+  signs stops counting it (`untrusted_signer` there); the keyring is read
+  only at start, so it needs a restart; and the refusal keeps its retry
+  time across the restart (`rescheduleFailingAdoptions` leaves refusal
+  states alone), so the suite adopts at that retry, not at the restart —
+  or the operator sends `POST /forget`, which adopts the candidate as a
+  first adoption and is the recourse for a bundled key. No override and no
+  configuration key (ruling HD-17). Per-client tracking by User-Agent was
+  considered and not taken (the plan's addendum). Recommendation: leave
+  it; the per-suite identity
   pinning of the flat-repositories spec's §10 item 5 (the C-3 entry above)
   would close it with the first-snapshot problem.
 - **Older clients refuse real vendors' layouts that the cache accepts**
@@ -675,8 +787,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   rows of EdDSA and ECDSA keys; class (a), crypto policy, not intersected:
   HD-19). `aptShapeOldExempt` lists the 20 corpus rows and
   `aptShapeOldRefusals` pins each class to its measured refusal. Those
-  clients fail fetching directly too. Recommendation: leave them; a
-  vendor's to fix.
+  clients fail fetching directly too. Class none: the cache agrees with
+  the current clients, and the older ones refuse the vendor directly.
+  Recommendation: leave them; a vendor's to fix.
 - **Three S1 cases Task 9e left unmeasured** (raised 2026-11-05, the Task
   9e review's re-review 1). S1 checks a packet by a known key that cannot
   sign directly (`verifiesDirectly`, *Decided*), which reads no usage,
@@ -687,7 +800,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   packet passes, as before Task 9e (the older gpgv unmeasured); (3) a
   packet naming an ElGamal or ECDH subkey can never verify, so S1 always
   refuses an anchor that holds one (strict; no real signer emits one).
-  Class none (S1 is integrity; no vendor anchor changed). Recommendation:
+  Class R3 for (3), an attacker's edit refused where the newer apt accept
+  it; (1) and (2) unmeasured, each toward the older gpgv; no vendor anchor
+  changed. Recommendation:
   measure them in a corpus batch when the generator next makes keys
   (`--usage-keys` makes key U).
 - **Two layouts the guard calls not strong where every image accepts
@@ -702,17 +817,19 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   choice). The guard then stands down for such a current anchor (it fails
   open), and could refuse such a candidate only after a strong current
   anchor signed later than the candidate. No surveyed vendor has either
-  layout. Recommendation: leave it (defence in depth, ruling G2's
-  direction).
+  layout. Class none: the guard is defence in depth and fails open here;
+  R3 only for that unlikely refusal of an earlier-signed candidate.
+  Recommendation: leave it (defence in depth, ruling G2's direction).
 - **A shutdown test that failed once under load** (raised 2026-11-03, Task
   9b's fix round 6). `TestServe_GracefulShutdown_FetchMidStream_NoOrphanBlob`
   (`cmd/apt-cacher-ultra/shutdown_orphan_blob_test.go`) took 5.44 s to shut
   down once, against its 5 s bound, on a loaded machine; it passed alone
   3 of 3 times, in a clean race re-run, and 10 of 10 under `-race` at
   light load (the V lens's re-review 7). The release workflow runs
-  `-race`, and a teardown flake failed the 1.0.3 release run twice.
-  Recommendation: look at it before 1.1.0-rc1 (what the shutdown waits on
-  past the bound), and loosen the bound only with the reason.
+  `-race`, and a teardown flake failed the 1.0.3 release run twice. Class
+  none: a test's timing, a release-process risk. Recommendation: look at
+  it before 1.1.0-rc1 (what the shutdown waits on past the bound), and
+  loosen the bound only with the reason.
 - **The key reader reads more than some apt reads** (raised 2026-11-01 to
   03, Task 9b's fix rounds 2 and 3: the V lens's V-R2M3 and V-R3M1;
   rulings R1 and R3). By R1 the cache reads every key that any supported
@@ -725,9 +842,19 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   merged (`mergeEntity`): a copy holding a signing subkey with its primary
   expired, beside a renewed copy without the subkey, verifies an anchor by
   the subkey that all six apt refuse (V-R3M1, `kr10_mixed_*`; the
-  AIDEV-NOTE in `LoadKeyringWithEmbedded`). Neither is an attacker's
-  lever: the first needs the operator's own file, the second the vendor's
-  own signature. Class R3. Recommendation: leave them.
+  AIDEV-NOTE in `LoadKeyringWithEmbedded`); and where an older copy read
+  first has the primary expired and a later copy renews it, gpgv, which
+  reads only the first keyblock holding the key ID, refuses an anchor that
+  the cache and sqv accept (`kr10_renew_old_first`; the merge ruling of
+  Task 9b's fix round 2, in the plan's ledger `progress.md` beside `PE/`;
+  the V lens's re-review 3, `PE/final-review/V-report-rereviews.txt`, its
+  kr10 table: "copy1, then
+  copy2", refused in the five gpgv images and adopted by the cache, its
+  generator in `PE/final-review/V/rr3/`). None is an attacker's
+  lever: the first needs the operator's own file, the others the vendor's
+  own signature. Class R3: availability for the clients that read less, or
+  read the first copy only; each such client fails with or without the
+  cache. Recommendation: leave them.
 - **A skipped key file shows only in the start's log** (raised 2026-11-01,
   the V lens's re-review 2; parked for Task 9c). A key file the loader
   skips or reads only in part logs WARN once at start
@@ -735,7 +862,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   failed; skipping file`), and nothing on the status page or in the
   metrics names it; the suite then shows `untrusted_signer`, and a skipped
   file is also a key S1 does not know. Since Task 9c the `untrusted_signer`
-  tooltip points at those lines. Recommendation: list skipped files on the
+  tooltip points at those lines. Class R3 (a skipped file is an S1 gap
+  that needs an operator's unreadable file; ruling R3), otherwise
+  operability. Recommendation: list skipped files on the
   status page's keyring panel, or count them in a gauge, in a later
   release.
 - **Two reconcile WARNs still repeat** (raised 2026-11-01, the V lens's
@@ -745,8 +874,26 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   the heal stage's `adoption_reconcile_failed`
   and each member's `adoption_reconcile_member_failed` still log WARN at
   every attempt, on every unchanged check of a snapshot that cannot heal.
-  Recommendation: the same once-per-snapshot memo for both, with the
-  counter as the signal, when that code is next touched.
+  Class none: log noise. Recommendation: the same once-per-snapshot memo
+  for both, with the counter as the signal, when that code is next
+  touched.
+- **Three optional items Task 9c left** (raised 2026-11-05, the hardening
+  plan's final review, D-M1, D-M5 and D-M12; recorded by Task 9c's fix
+  round). (1) The status page's aggregate `gpg_failed` notice
+  (`internal/admin/status_template.go`, mirrored in
+  `docs/admin-ui-spec.md`) still says "Likely cause: upstream repository
+  key changed or the matching archive key isn't loaded", and after an
+  upgrade it will show beside waves of `malformed_*` refusals, where it
+  misleads: recommendation, a hint that names the shape refusals too
+  (hover a row's reason; the `adoption_gpg_failed` line names the rule),
+  in a later release. (2) CI runs neither ruff nor mypy on
+  `e2e/apt-oracle/gen_shapes.py`, and no scheduled workflow runs the apt
+  oracle to see apt drift between releases: recommendation, both in
+  `make lint` and a weekly workflow, when CI is next touched. (3)
+  `docs/configuration.md`'s strict-mode prose does not say that a refusal
+  can come after a whole download (502, `Retry-After: 60`, the request
+  line carrying `upstream_status`): recommendation, one sentence. Class
+  none: operability and docs.
 
 ## Decided
 
@@ -959,7 +1106,8 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   only new refusals the binary `Release.gpg` of nginx, steam and syncthing,
   each beside an `InRelease` the check prefers; since Task 9b's fix round
   1 `InRelease` ok 69 and `Release.gpg` ok 68 (yarn's key in a later
-  armor block, read now), unchanged to a7d0d72; no vendor anchor is
+  armor block, read now), unchanged to a7d0d72
+  (`PE/task9c/vendorscan.txt`); no vendor anchor is
   refused `bad_signature`, and pkgs.k8s.io v1.30's version 3 packet is
   refused as on 1.0.x (*Open*, the residual entry). The upgrade's trust
   audit classifies 1.0.x snapshots with its own checks, not the verifier
@@ -969,10 +1117,11 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   (Task 9b's fix round 2, commit 4fa21be: identical verdicts on the suite,
   the corpus and the survey), and the verifier no longer calls its
   clearsign or armor decoders or its packet reader, so I-1's panic cannot
-  reach it. Two of the plan's statements are corrected here (the plan
+  reach it. Three of the plan's statements are corrected here (the plan
   stays as written): the deviations were fourteen, not eleven, before the
   hybrid made them families; key E expired on 2020-12-31, not in 2021
-  (DN-2). Done in the hardening plan's Tasks 5 to 7 (commits dc6c8ee,
+  (DN-2); and of the survey's 158 anchors 152, not all, lie inside the
+  canonical grammar (HD-16; the deviations' entry under *Open*). Done in the hardening plan's Tasks 5 to 7 (commits dc6c8ee,
   3c54a22, 80af12b, b51ee0e, 132ebe6, 8d2900d, fdfa2b0, 40d3614, 276d60d
   and a900dbd), its Task 9a (9efa08d, the corpus to 490 shapes) and its
   Task 9b (7701e7b, 2552ebf, 5d881fb, 5899af8, e819372; fix round 1
