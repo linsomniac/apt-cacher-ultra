@@ -739,8 +739,11 @@ func TestVerifier_NewestKeptIsTheKeysOwnAlone(t *testing.T) {
 // verifier's clock: an expiry that has passed refuses, one in the future
 // counts now and refuses at a later clock, one by another key is ignored,
 // and the newest one governs (an older expiring one under a newer one
-// without expiry: counts). By the controller's ruling a newer user-ID
-// self-signature does not cancel the direct-key expiry (over-strict, R3).
+// without expiry: counts). A newer user-ID self-signature does not cancel
+// the direct-key expiry, which is exact: gpg lets a direct-key expiry take
+// precedence over the user-ID self-signatures' (the ninth re-review's
+// kr28_dk_exp_then_uid_later and kr28_dk_exp_then_uid_none, refused in all
+// six images).
 func TestVerifier_AReadableDirectKeyExpiryIsHonoured(t *testing.T) {
 	kk := newKR14Keys(t)
 	x := newTestEntity(t, "X", "x@example.com")

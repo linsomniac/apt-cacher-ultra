@@ -702,7 +702,12 @@ type keySig struct {
 	// (kr26_dk_rmd_exp_then_fprmis: EXPKEYSIG in apt 2.8.3 and 3.2.0 where
 	// round 7 adopted). Another key's certification of a user ID is kept
 	// by go-crypto but never counted here (kr27_uid_rmd_exp_then_tpcert,
-	// EXPKEYSIG in the five gpgv-based apt).
+	// EXPKEYSIG in the five gpgv-based apt). The cost: a verifying
+	// self-signature with disagreeing issuers and no expiry marks its
+	// component where every apt accepts it (the ninth re-review's
+	// kr28_dk_fprmis_noexp and kr28_uid_fprmis_newer_noexp, ok in all six
+	// images): over-strict, Minor and Open under ruling R3, accepted under
+	// the principle.
 	kept bool
 }
 
@@ -1404,16 +1409,18 @@ func (kb *keyBlock) marks() map[string]keyMarks {
 	// gpgv-based apt, refused by sqv). The newest kept direct-key signature
 	// (its issuers agreeing, as "newest kept" above) that sets a key
 	// expiration marks the key from that moment, judged at the verifier's
-	// clock (keyMark.at). Kept at that, by the controller's ruling: gpg's
-	// merge of the direct-key and user-ID self-signatures is not modelled,
-	// so a newer user-ID self-signature does not cancel it (over-strict,
-	// Minor and Open under R3; unmeasured). Measured over debian-keyring's
-	// four v4 keys with a direct-key expiry (V's dk-gwolf.txt): the one
-	// whose direct-key expiry has passed, 4D14050653A402D73687049D2404C9546E145360
+	// clock (keyMarks.at). A newer user-ID self-signature does not cancel
+	// it, and that is exact, not over-strict: gpg lets a direct-key
+	// expiry take precedence over the user-ID self-signatures' (the ninth
+	// re-review's kr28_dk_exp_then_uid_later and kr28_dk_exp_then_uid_none,
+	// refused in all six images). Measured over debian-keyring's four v4
+	// keys with a direct-key expiry (V's dk-gwolf.txt): the one whose
+	// direct-key expiry has passed, 4D14050653A402D73687049D2404C9546E145360
 	// (2026-04-27), go-crypto takes as expired by its user-ID
-	// self-signatures too, so the mark changes no verdict; the other
-	// three expire in the future. After the unconditional marks: the first
-	// mark on a fingerprint stands.
+	// self-signatures too, so the mark changes no verdict; the other three
+	// expire in 2027 and will then be refused by every apt unless their
+	// owners renew the direct-key signature itself, which the cache then
+	// follows. Every mark is kept beside the others (keyMarks).
 	var newestDK *keySig
 	for i := range kb.components[0].sigs {
 		s := &kb.components[0].sigs[i]
