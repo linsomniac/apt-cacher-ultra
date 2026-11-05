@@ -87,8 +87,8 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
    by construction): the real apt of the six client images, and of the
    five older ones (debian:10, ubuntu:20.04, 18.04, 16.04 and 14.04),
    must still give the verdicts and error classes recorded for the
-   verifier's 904 signature-shape fixtures; about 87 and 98 seconds with
-   the images cached (measured 2026-11-05). A difference blocks the tag
+   verifier's 904 signature-shape fixtures; about 90 and 100 seconds with
+   the images cached (87 to 92 s and 98 to 101 s, 2026-11-05). A difference blocks the tag
    until it is recorded and the table test agrees (the README's *When apt
    changes*). The GC
    and upstream hardening plan recorded them (2026-10-29; the older

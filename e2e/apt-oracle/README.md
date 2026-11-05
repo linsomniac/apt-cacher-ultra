@@ -33,8 +33,9 @@ the images (pulled on first use;
 the containers themselves run with `--network none`). The images of a set
 run in parallel, one `apt-get update` per shape in each and a second one
 for each shape apt refuses (*Error classes*); with the images cached a run
-of the six takes about 85 seconds on a 12-core machine, and one of the five
-older ones about 95. The two sets are two runs, and two make targets: one
+of the six takes about 90 seconds on a 12-core machine, and one of the five
+older ones about 100 (87 to 92 s and 98 to 101 s at 904 shapes, *Results*).
+The two sets are two runs, and two make targets: one
 after the other they take about three minutes (the hardening plan's Task
 9e), and a release runs both (*When to run it*). To measure today's apt,
 pull the images first: `docker run` never refreshes a cached tag, and the
@@ -72,7 +73,7 @@ for byte.
 | `<name>.InRelease` | an inline shape (642 of them): the whole `InRelease`, its signed text included |
 | `<name>.Release.gpg` | a detached shape (262): a `Release.gpg` that signs the shared `Release`, or its own |
 | `<name>.Release` | a detached shape's own `Release` (4: `a_d_release_crlf`, `a_d_release_extra_nl`, `a_d_release_no_final_nl`, `o2_textmode_detached_release_crlf`), which `in-container.sh` serves in the shared one's place |
-| `<name>.keys.asc` | a shape's own `signed-by` (82: batch fx16's `ka_*`, the keys A and E in one block each; fx19's `e7_*`, key K; fx20's `pk_*`, its keys; fx21's `us_*`, key U, and `rx_*`, keys U, T and R): an armored key file, which `in-container.sh` names in `keys.gpg`'s place and the table test loads as that shape's host keyring, as `LoadKeyring` reads a `.asc` file (every block) |
+| `<name>.keys.asc` | a shape's own `signed-by` (90: batch fx16's 6 `ka_*`, the keys A and E in one block each; fx19's 17 `e7_*`, key K; fx20's 42 `pk_*`, its keys; fx21's 25, its 17 `us_*`, key U, and 8 `rx_*`, keys U, T and R): an armored key file, which `in-container.sh` names in `keys.gpg`'s place and the table test loads as that shape's host keyring, as `LoadKeyring` reads a `.asc` file (every block) |
 | `Release` | the shared `Release`, a flat repository's: the SHA256 line of an empty `Packages`, a fixed `Date:` in the past (2026-10-01), no `Valid-Until` |
 | `keys.gpg` | the public keys A, E, S and O, in binary: the clients' `signed-by` here, and the host keyring of the verifier's table test (the hardening plan's Task 6), which loads the file whole, so every key in it is a trusted signer there |
 | `verdicts.txt` | apt's verdicts: a `#` header naming the measurement's date and each image's apt and verifier versions, then one row per shape, `<name>` and one verdict per image in the order of *The images* below, `ok` (`apt-get update` exited 0) or `REJ` |
