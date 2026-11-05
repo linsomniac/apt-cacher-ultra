@@ -689,6 +689,12 @@ func TestVerifier_V3RevocationsAreMarked(t *testing.T) {
 		t.Fatalf("test premise: P's packets have tags %v", tags)
 	}
 	v3Binding := rsaKeySigV3(t, kk.p, byte(packet.SigTypeSubkeyBinding), pkMaterial)
+	md5len4 := rsaKeySigV3(t, kk.p, byte(packet.SigTypeKeyRevocation), pMaterial)
+	if pk, err := packetsOf(md5len4); err != nil || len(pk) != 1 || pk[0].body[0] != 3 || pk[0].body[1] != 5 {
+		t.Fatalf("test premise: a v3 packet's body does not open 03 05 (%v)", err)
+	} else {
+		pk[0].body[1] = 4 // the hashed-material length octet, as V's kr25_v3_keyrev_md5len4 sets it (the body shares md5len4's octets)
+	}
 	// K2, a subkey with a v3 binding alone, after K's packets.
 	k2 := signingSubkey(t, newTestEntity(t, "Q", "q@example.com"), time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC))
 	var k2Pkt bytes.Buffer
@@ -704,6 +710,9 @@ func TestVerifier_V3RevocationsAreMarked(t *testing.T) {
 		{"kr17_v3_keyrev: P revoked by a v3 0x20 by P", kk.ring(t, [][]byte{rsaKeySigV3(t, kk.p, byte(packet.SigTypeKeyRevocation), pMaterial)}, nil), pgperrors.ErrKeyRevoked},
 		{"kr17_v3_subrev: K revoked by a v3 0x28 by P", kk.ring(t, nil, [][]byte{rsaKeySigV3(t, kk.p, byte(packet.SigTypeSubkeyRevocation), pkMaterial)}), pgperrors.ErrKeyRevoked},
 		{"kr20_v2_keyrev: P revoked by a v2 0x20 by P", kk.ring(t, [][]byte{rsaKeySigLegacy(t, 2, kk.p, byte(packet.SigTypeKeyRevocation), kr14Created, pMaterial)}, nil), pgperrors.ErrKeyRevoked},
+		{"kr25_v3_keyrev_md5len4: P's v3 0x20 with its hashed-material length octet 4 (gpg ignores it): refused", kk.ring(t, [][]byte{md5len4}, nil), pgperrors.ErrKeyRevoked},
+		{"a v3 signature packet too short to hold a type, after P: refused", kk.ring(t, [][]byte{newPacket(tagSignature, []byte{3, 5})}, nil), pgperrors.ErrKeyExpired},
+		{"a v2 signature packet of one octet, after K: K refused", kk.ring(t, nil, [][]byte{newPacket(tagSignature, []byte{2})}), pgperrors.ErrKeyExpired},
 		{"kr20_v2_subrev: K revoked by a v2 0x28 by P", kk.ring(t, nil, [][]byte{rsaKeySigLegacy(t, 2, kk.p, byte(packet.SigTypeSubkeyRevocation), kr14Created, pkMaterial)}), pgperrors.ErrKeyRevoked},
 		{"kr21_v3_bind_newer: a newer v3 binding of K by P: gpgv takes it, ERRSIG; refused", kk.ring(t, nil, [][]byte{v3Binding}), pgperrors.ErrKeyExpired},
 		{"kr21_v2_bind_newer: the same, version 2; refused", kk.ring(t, nil, [][]byte{rsaKeySigLegacy(t, 2, kk.p, byte(packet.SigTypeSubkeyBinding), kr14Created, pkMaterial)}), pgperrors.ErrKeyExpired},

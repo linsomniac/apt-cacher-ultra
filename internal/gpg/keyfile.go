@@ -807,9 +807,10 @@ func sigTypeOf(p rawPacket, version int) (byte, bool) {
 
 // legacySigType returns the signature type of p when p is a version 2 or 3
 // signature packet (RFC 4880 §5.2.2: the version, the hashed material's
-// length (5), the type, a four-octet creation time, the issuer's eight-octet
-// key ID, the algorithms, two octets of the digest and the signature; gpg
-// reads version 2 as version 3) of a type the reader marks for: a subkey
+// length octet, which gpg reads and ignores, the type, a four-octet creation
+// time, the issuer's eight-octet key ID, the algorithms, two octets of the
+// digest and the signature; gpg reads version 2 as version 3) of a type the
+// reader marks for (or legacyTypeUnread, a body too short to hold one): a subkey
 // binding (0x18) or its back-signature (0x19), a direct-key signature (0x1f),
 // a revocation of a key (0x20), of a subkey (0x28) or of a user ID (0x30).
 // go-crypto passes every such packet over (an UnsupportedError its reader
@@ -835,8 +836,11 @@ func sigTypeOf(p rawPacket, version int) (byte, bool) {
 // older than the one kept (unmeasured). A legacy 0x30 keeps round 5's rule
 // (the key's own marks the key).
 func legacySigType(p rawPacket) (byte, bool) {
-	if len(p.body) < 19 || p.body[0] != 3 && p.body[0] != 2 || p.body[1] != 5 {
+	if len(p.body) == 0 || p.body[0] != 3 && p.body[0] != 2 {
 		return 0, false
+	}
+	if len(p.body) < 3 {
+		return legacyTypeUnread, true // too short to read a type: it marks
 	}
 	switch t := packet.SignatureType(p.body[2]); t {
 	case packet.SigTypeSubkeyBinding, packet.SigTypePrimaryKeyBinding, packet.SigTypeDirectSignature,
@@ -845,6 +849,15 @@ func legacySigType(p rawPacket) (byte, bool) {
 	}
 	return 0, false
 }
+
+// legacyTypeUnread stands for the type of a legacy signature packet whose
+// body is too short to hold one (legacySigType): no signature type, so it
+// marks the primary key or subkey it stands on as any legacy signature does
+// (the seventh re-review's V-R7I2: a legacy signature needs no parsing to
+// mark; gpg reads the hashed-material length octet, body[1], and ignores
+// its value, so round 6's test of it for 5 passed over a revocation gpgv
+// honours, kr25_v3_keyrev_md5len4).
+const legacyTypeUnread = 0xff
 
 // legacyFits reports whether a legacy signature of type t (legacySigType)
 // is kept on a component of kind: any but a user-ID revocation on the
@@ -968,8 +981,11 @@ func (s *keySig) read(kb *keyBlock, c *keyComponent) {
 	if s.legacy {
 		// go-crypto reads no version 2 or 3 signature; its issuer key ID
 		// stands at body[7:15] (legacySigType), which only a user-ID
-		// revocation's mark consults (marks).
-		s.issuer = rawSig{keyID: s.raw.body[7:15]}
+		// revocation's mark consults (marks); a body too short to hold one
+		// names no issuer.
+		if len(s.raw.body) >= 15 {
+			s.issuer = rawSig{keyID: s.raw.body[7:15]}
+		}
 		s.self = s.issuer.issuerIs(kb.key)
 		s.why = fmt.Sprintf("it is a version %d signature, which go-crypto does not read", s.raw.body[0])
 		return
