@@ -679,3 +679,16 @@ func TestVerifyDetached_AcceptAnySigner_WithMatchingPin_StillEnforced(t *testing
 // detachSignWith, etc. — keep imports honest.
 var _ = openpgp.NewEntity
 var _ = filepath.Join
+
+// TestMalformedSentinels_ClaimNoAptVerdict: the malformed_* sentinels'
+// texts begin every structural refusal's log line, deviations included
+// (shapes every apt accepts and the cache's canonical grammar refuses), so
+// they must name what the cache refuses and claim nothing of apt (the Task
+// 9c review's 9c-M10; the controller's ruling R-9c-1).
+func TestMalformedSentinels_ClaimNoAptVerdict(t *testing.T) {
+	for _, err := range []error{ErrMalformedClearsign, ErrMalformedSignature} {
+		if regexp.MustCompile(`\bapt\b`).MatchString(err.Error()) {
+			t.Errorf("%q claims an apt verdict; name what the cache refuses", err.Error())
+		}
+	}
+}

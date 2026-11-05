@@ -219,8 +219,11 @@ var (
 	// forged armor checksum, packets apt refuses or that some apt parses
 	// otherwise). The detached twin of ErrMalformedClearsign. Its text
 	// starts with the file's name, capital R and all (the hardening plan's
-	// DN-4), hence the ST1005 exemption.
-	ErrMalformedSignature = errors.New("Release.gpg is not one ASCII-armored signature block apt accepts") //nolint:staticcheck // ST1005: starts with the file name Release.gpg
+	// DN-4), hence the ST1005 exemption. It claims nothing of apt: it heads
+	// every detached refusal, the strict deviations every apt accepts
+	// included (Task 9c's fix round, ruling R-9c-1; it read "… block apt
+	// accepts" until then; TestMalformedSentinels_ClaimNoAptVerdict).
+	ErrMalformedSignature = errors.New("Release.gpg is not one ASCII-armored signature block in the shape the cache accepts") //nolint:staticcheck // ST1005: starts with the file name Release.gpg
 
 	// ErrShortKeyID means the signature lacks the long-form
 	// IssuerFingerprint subpacket. SPEC2 §7.6.3 rejects short-keyid-
