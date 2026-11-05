@@ -137,6 +137,12 @@ for shape in /fx/*.InRelease /fx/*.Release.gpg; do
     fi
     if ((trusted_parts)); then
         rm -f /etc/apt/trusted.gpg.d/*
+        # The shape's keys alone: the image's own keyring is gone (above),
+        # as signed-by would leave it unread.
+        if [[ -e /etc/apt/trusted.gpg ]]; then
+            echo "in-container.sh: /etc/apt/trusted.gpg is still there" >&2
+            exit 2
+        fi
         case $keys in
         *.asc)
             if ! gpg --dearmor < "$keys" > /etc/apt/trusted.gpg.d/apt-oracle.gpg; then

@@ -39,14 +39,15 @@ CORPUS=internal/gpg/testdata/aptshapes
 
 record=0
 old=0
+bad=0
 for arg in "$@"; do
     case $arg in
     --record) record=$((record + 1)) ;;
     --old) old=$((old + 1)) ;;
-    *) record=2 ;;
+    *) bad=1 ;;
     esac
 done
-if ((record > 1 || old > 1)); then
+if ((bad || record > 1 || old > 1)); then
     echo "usage: bash e2e/apt-oracle/run.sh [--old] [--record]"
     exit 2
 fi
