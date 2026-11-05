@@ -63,8 +63,9 @@ shutdown paths completed before implementation. The review resolved these risks:
 ## Validation
 
 Exercise deterministic arithmetic, empty samples, saturation, concurrent updates,
-checkpoint failures/retries, restart recovery, migration from schema 7, and final
-flush. Cover upstream short reads, restart/resume, redirects and conditional GET;
+checkpoint failures/retries, restart recovery, migration from schemas 7 and 8,
+and final flush. Cover upstream short reads, restart/resume, redirects and
+conditional GET;
 client miss/hit/coalescing, range, HEAD/304, disconnects and CONNECT. Verify admin
 HTML/JSON and authentication, existing render budgets and JSON compatibility.
 Run focused race tests, the repository Go test suite and applicable lint/build
@@ -93,15 +94,18 @@ additional findings:
   panel fits its container. Pre-existing overflow in other dashboard sections
   remains outside this change.
 
-## Integration note
+## Migration integration
 
-This branch starts at `693885b` and introduces usage storage as schema 8.
-Concurrent, uncommitted work in the original checkout independently introduces a
-different schema-8 migration for representation metadata. Those changes have not
-been included or modified here. Before combining or deploying both features,
-reconcile their migration order and version numbers so one schema version never
-identifies two different database layouts; update the release/configuration docs
-and rerun both migration test sets on the combined branch.
+Main commit `0c6d2c0` is merged into this branch. Its schema-8 migration for
+representation metadata and refresh generations is preserved unchanged. Usage
+storage follows as schema 9. Fresh databases run the whole sequence; schema-7
+databases run 7 → 8 → 9; schema-8 databases run only 8 → 9.
+
+Migration tests cover both existing schema versions, including preservation of
+origin dates, cached blob records and schema-8 refresh generations, followed by
+usage checkpoint/restart persistence. The combined handler retains main's ETag
+conditional-response policy; the usage regression test exercises 304 through
+If-None-Match.
 
 ## Validation results
 
@@ -129,3 +133,19 @@ Validated locally on 2026-11-03 with Go 1.26.8:
 - `git diff --check` passed. Docker-based real-APT suites were not run; the local
   daemon, HTTP, TLS/CONNECT, storage and concurrency suites provide this change's
   integration coverage.
+
+### Schema reconciliation validation
+
+Validated locally on 2026-11-04 after merging main:
+
+- Compared the schema source with main: schemas 0 through 8 are unchanged; usage
+  storage is the sole new migration, from 8 to 9.
+- Focused migration, representation-metadata, validator, legacy-refresh and usage
+  tests passed with the race detector. Upgrade fixtures for schemas 7 and 8
+  preserve existing metadata and verify usage checkpoint/restart persistence.
+- `go vet ./...`, `golangci-lint run ./...` and
+  `golangci-lint run --build-tags e2ehooks ./cmd/...` passed.
+- `GOMAXPROCS=4 GOFLAGS=-p=2 go test -race -timeout 20m ./...` passed
+  across the combined tree, including cache, freshness, handler, daemon and
+  admin integration tests.
+- `git diff --check` and the staged equivalent passed.

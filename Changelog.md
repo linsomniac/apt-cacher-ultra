@@ -6,6 +6,13 @@ the detail an operator needs before upgrading.
 
 ## Unreleased: 1.1.0
 
+- Preserve upstream Last-Modified dates per URL and content, and use content
+  ETags for conditional responses to prevent stale date-only responses (#17).
+- Refresh mutable repository metadata when snapshot adoption is disabled,
+  including Release-only repositories; fence downloads racing a refresh and
+  warn when an existing adopted snapshot cannot refresh in this mode (#18).
+  Schema 8 migrates stored dates automatically and is forward-only.
+
 Collected until 1.1.0-rc1. The detail, and what to do before upgrading
 from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
@@ -14,8 +21,9 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 - Persistent admin usage statistics: data fetched/served, cache hits, estimated
   net bytes saved and average effective transfer rates, with lifetime and
   since-start views in HTML and JSON. Includes background downloads and retries;
-  checkpoints every 30 seconds and at graceful shutdown. Requested by @sdh91 in
-  issue #11; see [usage statistics](docs/usage-statistics.md).
+  checkpoints every 30 seconds and at graceful shutdown. Schema 9 adds usage
+  storage after schema 8's metadata migration. Requested by @sdh91 in issue #11;
+  see [usage statistics](docs/usage-statistics.md).
 
 - Optional `cache.db_dir` to keep SQLite database files on separate storage
   from cached content. Empty or omitted preserves the existing layout.

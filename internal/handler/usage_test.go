@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/usage"
 )
@@ -23,23 +22,33 @@ func TestUsageServeRangesHeadErrorsAndPartialWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.usage = u
+	var etag string
 	for _, tc := range []struct {
-		method, rangeHeader, modified string
-		status                        int
-		served, hits                  int64
+		method, rangeHeader string
+		conditional         bool
+		status              int
+		served, hits        int64
 	}{
-		{"GET", "", "", 200, 6, 0},
-		{"GET", "", "", 200, 12, 1},
-		{"GET", "bytes=1-3", "", 206, 15, 2},
-		{"HEAD", "", "", 200, 15, 3},
-		{"GET", "", time.Now().Add(time.Hour).UTC().Format(http.TimeFormat), 304, 15, 4},
-		{"GET", "bytes=100-200", "", 416, 15, 4},
+		{"GET", "", false, 200, 6, 0},
+		{"GET", "", false, 200, 12, 1},
+		{"GET", "bytes=1-3", false, 206, 15, 2},
+		{"HEAD", "", false, 200, 15, 3},
+		{"GET", "", true, 304, 15, 4},
+		{"GET", "bytes=100-200", false, 416, 15, 4},
 	} {
 		r := proxyReq(tc.method, upstream.URL, "/pool/example.deb")
 		r.Header.Set("Range", tc.rangeHeader)
-		r.Header.Set("If-Modified-Since", tc.modified)
+		if tc.conditional {
+			r.Header.Set("If-None-Match", etag)
+		}
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, r)
+		if etag == "" {
+			etag = w.Header().Get("ETag")
+			if etag == "" {
+				t.Fatal("missing content ETag")
+			}
+		}
 		s := u.Snapshot().Lifetime
 		if w.Code != tc.status || s.ServedBytes != tc.served || s.CacheHitRequests != tc.hits {
 			t.Fatalf("%+v: status %d, stats %+v", tc, w.Code, s)

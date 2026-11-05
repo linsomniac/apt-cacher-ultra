@@ -15,6 +15,8 @@ import (
 // marker.
 type FetchedRow struct {
 	Row URLPath
+	// Generation, when set, must still match before publishing this miss.
+	Generation *MetadataGeneration
 	// Suite is the suite the path belongs to; zero when it has none.
 	Suite SuiteKey
 	// Create, when set, creates Suite's row (Create.SuiteKey must equal
@@ -107,6 +109,11 @@ func (c *Cache) StoreFetched(ctx context.Context, m FetchedRow, caps SuiteCaps, 
 // storeFetchedTx is one StoreFetched attempt's transaction body
 // (creationAttempt runs it on the writer, with the held candidate).
 func storeFetchedTx(ctx context.Context, tx *sql.Tx, m FetchedRow, caps SuiteCaps, held *heldSuite) (FetchedResult, error) {
+	if m.Generation != nil {
+		if err := checkMetadataGenerationTx(ctx, tx, m.Suite, *m.Generation); err != nil {
+			return FetchedResult{}, err
+		}
+	}
 	isMD := int64(0)
 	if m.Row.IsMetadata {
 		isMD = 1
@@ -117,6 +124,15 @@ func storeFetchedTx(ctx context.Context, tx *sql.Tx, m FetchedRow, caps SuiteCap
 		isMD, u.LastRequestedAt, u.RequestCount, u.LastFetchedAt,
 		u.UpstreamETag, u.UpstreamLastMod); err != nil {
 		return FetchedResult{}, fmt.Errorf("StoreFetched: url_path: %w", err)
+	}
+	if u.BlobHash != nil {
+		date := ""
+		if u.UpstreamLastMod != nil {
+			date = HTTPDate(*u.UpstreamLastMod)
+		}
+		if _, err := tx.ExecContext(ctx, putRepresentationSQL, u.CanonicalScheme, u.CanonicalHost, u.Path, *u.BlobHash, date, nowUnix()); err != nil {
+			return FetchedResult{}, fmt.Errorf("StoreFetched: representation: %w", err)
+		}
 	}
 	var r FetchedResult
 	if m.Create != nil {

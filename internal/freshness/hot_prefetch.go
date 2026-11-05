@@ -348,5 +348,9 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 		)
 		return "", hotFetchFailed
 	}
+	if err := a.cache.PutRepresentation(ctx, suite.CanonicalScheme, suite.CanonicalHost, entry.path, hashHex, res.LastModified); err != nil {
+		a.logger.Warn("hot_prefetch_deb_failed", "canonical_host", suite.CanonicalHost, "path", entry.path, "err", err)
+		return "", hotFetchFailed
+	}
 	return hashHex, hotFetchOK
 }

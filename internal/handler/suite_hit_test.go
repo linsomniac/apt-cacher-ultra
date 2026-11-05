@@ -94,7 +94,7 @@ func TestServeHTTP_HitOnboardsALegacyAnchor(t *testing.T) {
 		r.cacheAnchor("/r/dists/d/Release", rowRelease, 1_700_000_000)
 		r.cacheAnchor("/r/dists/d/Release.gpg", rowGPG, 1_700_000_100)
 		r.get("/r/dists/d/Release")
-		if got := r.suite("/r/dists/d") != nil; got != adoption {
+		if got := r.suite("/r/dists/d") != nil; !got {
 			t.Fatalf("adoption=%v: Release hit created a row = %v", adoption, got)
 		}
 		if adoption {
@@ -113,7 +113,7 @@ func TestServeHTTP_HitOnboardsALegacyAnchor(t *testing.T) {
 		}
 		r.h.Close() // drains the T1 goroutines
 		for _, c := range r.fresh.snapshot() {
-			if c.suitePath == "/r/dists/p" || (!adoption && c.suitePath == "/r/dists/d") {
+			if c.suitePath == "/r/dists/p" {
 				t.Errorf("adoption=%v: T1 fired for the untracked suite %s", adoption, c.suitePath)
 			}
 		}

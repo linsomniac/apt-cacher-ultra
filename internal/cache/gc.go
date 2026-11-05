@@ -97,6 +97,9 @@ SELECT hash FROM blob
 			return fmt.Errorf("RunBlobGCBatch: begin: %w", err)
 		}
 		defer func() { _ = tx.Rollback() }()
+		if err := pruneRepresentationMetadataTx(ctx, tx, now, batchSize); err != nil {
+			return fmt.Errorf("RunBlobGCBatch: response metadata: %w", err)
+		}
 
 		// Step 1: SELECT candidate hashes inside the tx — the DELETE
 		// re-applies the same predicate atomically, but doing the

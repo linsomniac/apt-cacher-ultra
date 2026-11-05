@@ -212,7 +212,7 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 // AIDEV-NOTE: the final review's R5 #2 / R7 #2. main runs the audit after
 // cache.Open, which has already committed the v7 migration, so a refusal
 // changes nothing of the audit's own but the database is no longer one
-// 1.0.x opens ("schema version 7 is newer than this binary supports"): an
+// 1.0.x opens ("schema version 8 is newer than this binary supports"): an
 // operator who rolls the package back needs the cache.db copy the release
 // notes tell them to take before upgrading. The R5 re-review: the way back
 // starts by stopping the daemon — a refused start runs again every 5 s

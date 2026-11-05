@@ -311,25 +311,21 @@ whether a changed suite is staged and published as a new coherent snapshot.
 
 ### Tracked suites
 
-A suite is tracked once a client fetches its `InRelease` — or, with adoption
-enabled, its `Release` — and the bytes are what they claim (an `InRelease`
+A suite is tracked once a client fetches its `InRelease` or `Release`
+and the bytes are what they claim (an `InRelease`
 starts with the clearsign line apt requires; a `Release` has a hash block):
 an HTML error page or a stub never tracks a suite, and `Release.gpg` never
-does on its own. A suite whose `InRelease` (with adoption enabled, also
-`Release`) an earlier release cached is tracked on its first cache hit. A
+does on its own. A suite whose `InRelease` or `Release` an earlier release
+cached is tracked on its first cache hit. A
 suite path longer than 1024 bytes is never tracked; its files are served
 untracked.
 
-With adoption disabled only `InRelease` tracks a suite, and a refetched
-`InRelease` (after its cached copy was garbage-collected) still counts as a
-successful check, as before. Two things differ from earlier releases: a
-plain-text "InRelease" (no clearsign line; apt rejects it too) no longer
-tracks a suite, and neither does a repository that publishes only `Release`
-and `Release.gpg` (for example pkg.jenkins.io). Earlier releases tracked
-such a repository from its first `Release` hit; one first seen after the
-upgrade is now served as before but not tracked — not checked for changes
-or shown on the status page — while adoption is disabled, and one an
-earlier release already tracks stays tracked.
+With adoption disabled, either `InRelease` or `Release` tracks a suite.
+A refetched anchor counts as a successful check. A changed anchor invalidates
+its suite's mutable metadata, so subsequent requests fetch current files.
+A plain-text "InRelease" without the clearsign line does not track a suite;
+APT rejects it too. Release-only repositories remain tracked and refreshable.
+Existing adopted snapshots still require adoption to publish an update.
 
 At most `max_suites` suites are tracked and at most `max_suites / 10` per
 host. At the total cap, a new suite makes room by evicting the least
@@ -520,8 +516,9 @@ answered — no file asked for, or every real answer a delete — fails. Such
 a repository has no snapshot: it vouches nothing and never changes its
 host's strict posture; on a strict host whose signed suites are complete
 its `.deb`s are refused like any unvouched package. Its index files are
-served with `Last-Modified` the later of the file's time and its last
-refresh, so apt's `If-Modified-Since` sees a replacement. The check logs
+served with their recorded upstream `Last-Modified` dates and content ETags.
+Date-only conditions receive full bodies, so repeated or backward dates cannot
+hide a replacement. The check logs
 `freshness_check` with `result=anchorless_refreshed` or
 `anchorless_unchanged` and the number of files it replaced and deleted
 (`rows_replaced`, `rows_deleted`), and the repository is adopted at the
@@ -591,7 +588,7 @@ declares.
 
 | Key | Type | Default | Behavior and constraints |
 | --- | --- | --- | --- |
-| `enabled` | boolean | `false` | Enable adoption of new snapshots. When false, freshness differences are recorded without adopting them, so tracked suites lag upstream by design: the status page's SUITES vital then reads "ADOPTION DISABLED — METADATA NOT REFRESHED" (stale, not a fault), rows keep their lag text without warning, and failure records left from a time adoption was enabled are inert (no retries, `acu_adoption_failing_suites` reports 0). The suite reaper still runs (see *Suite reaping* under `[gc]`): a suite no client asked for in `gc.suite_idle_ttl` has its cached index files deleted, so clients that come back to it fetch upstream's current files through the cache, which then stay as fetched. |
+| `enabled` | boolean | `false` | Enable adoption of verified snapshots. When false, changes to an unadopted suite’s `InRelease` or `Release` invalidate its mutable cached metadata; subsequent requests fetch current upstream files. Existing adopted snapshots still require adoption to refresh and a changed snapshot emits `legacy_metadata_refresh_failed` at WARN. Failure records from earlier adoption runs remain inert. The suite reaper still runs. |
 | `require_signature` | boolean | `true` | Allows starting with an empty keyring. It no longer relaxes verification: only a decodable clearsigned `InRelease` is adopted as inline metadata in every mode (plain-text bodies are `missing_signature`, undecodable ones `malformed_clearsign`). Unsigned repositories are adopted in the unsigned form instead (`adopt_unsigned`). |
 | `adopt_unsigned` | boolean | `true` | Adopt a repository that publishes a `Release` with no signature (neither `InRelease` nor `Release.gpg`) as an unsigned snapshot: served coherently, but never trusted — it vouches no `.deb` and never counts for `integrity.refuse_unvouched_debs`. A suite the cache has seen signed is never adopted unsigned. `false` refuses every unsigned `Release` ("refused: unsigned_disabled", a state, not a failed check), so the cache no longer keeps unsigned repositories fresh: an unsigned suite already adopted keeps serving its last snapshot, coherent but frozen — never updated — until the knob is turned back on (it then updates at its next retry, at most 75 minutes later: a restart keeps a refusal's retry time), the suite is forgotten (`POST /forget`), or it is reaped after `gc.suite_idle_ttl` without a client. Forgotten or reaped with the knob still off, it is then a repository not yet adopted, which is worse: the forget or reap deletes its cached index files first, so its next requests fetch upstream's current files, but it stays unadopted and each file then stays as the cache first stored it, never refreshed, so an upstream publish can leave its clients with Hash Sum mismatches. Off also stops the refresh of a flat repository that publishes no `Release` at all (see *Flat repositories* under `[freshness]`): it is served as the cache first stored its files, and the status page shows "refused: unsigned_disabled"; turning the knob on resumes its refresh. Set it to `false` only if you do not serve unsigned repositories through the cache. Either way the suite is asked upstream again only at its retry times (2 minutes, doubling to an hour; for a suite not yet adopted, also once `periodic_refresh` has passed), never at the checks clients trigger in between. See *Anchor forms and unsigned repositories* for the safeguards and the threat notes. |
 | `require_pinned_signer` | boolean | `false` | Reject adoption when no `[[trusted_signer]]` matches the canonical host. Evaluated before `accept_any_signer`. |
@@ -646,7 +643,7 @@ apt fetches a suite's `InRelease` (or `Release`) first and its indexes after, on
 
 A client that received the old `InRelease` therefore either finished receiving it at least `flip_quiet_period` before the switch, or waited and got the new one, so the index requests it sends within that period of its `InRelease` match it — also when many suites share its connection (mirror mode, or more than ten hosts). The period runs from when the cache finished sending, so on a slow link it is slightly shorter for the client. A client that fetches many indexes over a slow link may send some later than that; for a repository whose `Release` declares `Acquire-By-Hash: yes` (most distribution archives) apt asks for those by hash, and they are still served from the snapshot they name (below); many third-party and flat repositories do not declare it, and for them the switch's wait is the only protection. A switch takes at most 60 s + 60 s + 20 s plus its commit; `adoption.max_duration` does not cut it short. A shutdown abandons it at once: at the signal the daemon answers the waiting requests and abandons every switch that has not started its commit (nothing is committed or recorded, the adoption logs INFO `adoption_abandoned_at_shutdown` and is not counted as an adoption outcome, and the change is adopted after the restart). The first adoption of a suite whose `InRelease` (for a detached suite, `Release`) is exactly the one clients were already being served skips the wait, unless the daemon is stopping. Each switch logs `adoption_flip_barrier`; `acu_flip_barrier_active` shows how many switches are waiting or holding now, and the `request` line of an `InRelease`/`Release` request that waited in a hold carries `flip_held_ms`.
 
-Residuals, each with a counter: a hold whose suite is still not quiet 15 s in — an `InRelease`/`Release` response still being sent then, or finished less than `flip_quiet_period` before (a client reading it more than 20 s − 5 s − `flip_quiet_period`, 5 s by default, into the hold: a slow, stalled or vanished client) — commits then; the waiting requests get the new snapshot, but such a late reader may fetch indexes that do not match the `InRelease` it got (`acu_flip_quiet_cut_short_total`); a commit that has not finished 20 s into the hold (very large suites) ends the hold anyway, and the waiting requests are answered from the snapshot still current then, so they may get indexes newer than their `InRelease` (`acu_flip_hold_expired_total`); a switch that waits 60 s for its turn commits without holding (`acu_flip_hold_skipped_total`; it takes three or four long holds ahead of it, so at least four suites switching at once, which needs `freshness.max_concurrent_adoptions` of 4 or more, or `0`); beyond 256 requests waiting in one hold, the next are answered at once (`acu_flip_waiters_over_cap_total`); and `InRelease`/`Release` responses that take 30 s or longer to send (very slow links) are not waited for (`acu_flip_slow_anchor_reads_total`). An alert on `rate(acu_flip_hold_expired_total)` catches commits slower than the hold. apt clients configured with an `Acquire::http::Timeout` below 20 s can time out while held; set `flip_quiet_period = "0s"` if you run such clients. A client still holding an older `InRelease` that asks for indexes by hash is still served: a by-hash file the current snapshot lacks is served from the newest `gc.keep_displaced` + 1 displaced snapshots of its suite (none when `gc.keep_displaced = 0`; `acu_serve_byhash_displaced_total`; the request line carries `snapshot_displaced`). Snapshot `InRelease`, `Release` and `Release.gpg` responses carry the snapshot's adoption time as `Last-Modified`, which grows with every switch — also for two switches in the same second and whatever the clock does — so `If-Modified-Since` never hides a new snapshot.
+Residuals, each with a counter: a hold whose suite is still not quiet 15 s in — an `InRelease`/`Release` response still being sent then, or finished less than `flip_quiet_period` before (a client reading it more than 20 s − 5 s − `flip_quiet_period`, 5 s by default, into the hold: a slow, stalled or vanished client) — commits then; the waiting requests get the new snapshot, but such a late reader may fetch indexes that do not match the `InRelease` it got (`acu_flip_quiet_cut_short_total`); a commit that has not finished 20 s into the hold (very large suites) ends the hold anyway, and the waiting requests are answered from the snapshot still current then, so they may get indexes newer than their `InRelease` (`acu_flip_hold_expired_total`); a switch that waits 60 s for its turn commits without holding (`acu_flip_hold_skipped_total`; it takes three or four long holds ahead of it, so at least four suites switching at once, which needs `freshness.max_concurrent_adoptions` of 4 or more, or `0`); beyond 256 requests waiting in one hold, the next are answered at once (`acu_flip_waiters_over_cap_total`); and `InRelease`/`Release` responses that take 30 s or longer to send (very slow links) are not waited for (`acu_flip_slow_anchor_reads_total`). An alert on `rate(acu_flip_hold_expired_total)` catches commits slower than the hold. apt clients configured with an `Acquire::http::Timeout` below 20 s can time out while held; set `flip_quiet_period = "0s"` if you run such clients. A client still holding an older `InRelease` that asks for indexes by hash is still served: a by-hash file the current snapshot lacks is served from the newest `gc.keep_displaced` + 1 displaced snapshots of its suite (none when `gc.keep_displaced = 0`; `acu_serve_byhash_displaced_total`; the request line carries `snapshot_displaced`). Snapshot `InRelease`, `Release` and `Release.gpg` responses carry their recorded upstream dates as `Last-Modified` and content-based ETags. Date-only conditions receive full bodies, so `If-Modified-Since` cannot hide a new snapshot, even across same-second switches or clock changes.
 
 ### Trust and signer pins
 
@@ -908,7 +905,7 @@ Keep `ca/`: unless `tls_mitm.ca_storage_dir` is set, it holds the MITM CA the ca
 for every client that trusts the old one. The rest of `cache.dir`,
 `tmp/` and `staging/`, is scratch space that may go too. The audit then
 changes nothing, but the migration before it has:
-the database is at schema 8, which 1.0.x refuses, so going back to 1.0.x
+the database is at schema 9, which older binaries refuse, so going back to 1.0.x
 means restoring the `cache.db` copied before the upgrade: stop the
 daemon first (a refused start runs again every 5 seconds and would
 migrate the copy again, and a copy put back under a running daemon can be
@@ -1649,3 +1646,21 @@ The matched prefix is replaced with the upstream base path. `/corretto` matches
 `/corretto/dists/...` but not `/corretto-extra/...`. A prefix of `/` catches all
 mirror-mode paths and cannot coexist with another prefix. The selected upstream
 still goes through remapping and upstream access policy.
+
+## HTTP response timestamps and validators
+
+The cache preserves a valid upstream `Last-Modified` date for the URL and bytes
+being served. Local pool mtimes and snapshot adoption times are not exposed as
+upstream modification dates. Missing, invalid and future dates are omitted.
+Dates already saved with URL rows and snapshot anchors survive the schema 8
+upgrade; objects whose upstream dates were never recorded have no date until
+fetched again. Schema 9 then adds persistent usage totals. The migrations are
+forward-only; binaries supporting only schema 8 or earlier cannot open schema 9.
+
+Responses carry a strong content-based ETag. Clients using `If-None-Match` can
+receive 304 responses. Date-only conditional requests receive the full body:
+upstream dates can repeat or move backward, and older cache versions issued
+synthetic dates that could otherwise hide an update. Date-based `If-Range`
+also gets the full body; an ETag-based `If-Range` supports resuming. This trades
+some metadata bandwidth for reliable updates, including clients upgrading
+from earlier versions without clearing their APT lists.

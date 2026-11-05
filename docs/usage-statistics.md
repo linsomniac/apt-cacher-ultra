@@ -67,9 +67,12 @@ without discarding in-memory totals. Final-flush failure logs
 when retrying after an ambiguous database commit result. Loading invalid or
 unreadable saved statistics stops startup rather than silently resetting them.
 
-This feature upgrades the database from schema 7 to **schema 8**. Older binaries
-refuse the newer schema. Before upgrading, stop the daemon and retain a backup
-of the database and any adjacent WAL file if rollback is needed; see
+This feature upgrades the database from schema 8 to **schema 9**. Upgrades from
+schema 7 first apply the existing schema-8 representation-metadata migration,
+then add usage totals. Existing origin dates and refresh generations are preserved.
+Binaries supporting only schema 8 or earlier refuse the newer schema. Before
+upgrading, stop the daemon and retain a backup of the database and any adjacent
+WAL file if rollback is needed; see
 [upgrading an existing cache](configuration.md#upgrading-an-existing-cache).
 Statistics survive garbage collection, suite forgetting and package eviction.
 Replacing the database starts a new measurement period. There is no reset API.

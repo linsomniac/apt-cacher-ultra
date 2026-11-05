@@ -289,6 +289,9 @@ func TestGate_IgnoredWithoutAnAdopter(t *testing.T) {
 	fc := newFakeCache()
 	seedFakeAnchor(fc)
 	anchorTag := "anchor-etag"
+	anchorRow := fc.urls[keyOf("http", "h", "/r/dists/x/InRelease")]
+	anchorRow.UpstreamETag = &anchorTag
+	fc.putURL(anchorRow)
 	fc.putSuite(cache.SuiteFreshness{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x", InReleaseETag: &anchorTag})
 	now := int64(1_800_000_000)
 	if err := fc.RecordAdoptionFailure(context.Background(), "http", "h", "/r/dists/x", cache.AdoptionFailure{
@@ -305,8 +308,8 @@ func TestGate_IgnoredWithoutAnAdopter(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		c.Check(context.Background(), "http", "h", "/r/dists/x")
 	}
-	if sent := up.etagsSent(rigAnchorURL); len(sent) != 2 || sent[0] != anchorTag || sent[1] != anchorTag {
-		t.Fatalf("validators sent = %q, want the anchor's twice", sent)
+	if sent := up.etagsSent(rigAnchorURL); len(sent) != 1 || sent[0] != anchorTag {
+		t.Fatalf("validators sent = %q, want one check with the anchor validator before invalidation", sent)
 	}
 	if strings.Contains(logs.String(), "changed_deferred") {
 		t.Fatalf("a Phase 1 check reported changed_deferred; log:\n%s", logs.String())
