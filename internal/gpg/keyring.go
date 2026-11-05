@@ -227,7 +227,8 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 	//     gpgv refuses an anchor by K that the cache accepts (sqv agrees
 	//     with the cache: kr10_renew_old_first); a client that cannot use the
 	//     key fails with or without the cache, as with V-R2M3's gaps.
-	//   - the third re-review's V-R3M1, open (Task 9c records it): from a
+	//   - the third re-review's V-R3M1, open (docs/open-decisions.md, *Open*:
+	//     "The key reader reads more than some apt reads"): from a
 	//     copy holding K with P expired and a renewed copy without K, the
 	//     merged key verifies an anchor by K (K's binding from the one, P's
 	//     renewal from the other), which all six apt refuse (sqv: K "is not

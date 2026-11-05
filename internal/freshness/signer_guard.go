@@ -70,7 +70,8 @@ const (
 // suite's row, so its next adoption is a first one and the guard stands
 // down (ruling G6) — which adopts the downgraded anchor, the very thing the
 // guard refused. Its Open gap: a strip at a suite's first adoption is not
-// caught (Task 9c records it).
+// caught (docs/open-decisions.md, *Open*: "The signer downgrade guard
+// cannot see a strip at a suite's first adoption").
 func (a *Adopter) signerGuard(ctx context.Context, suite SuiteRef, prior *cache.SuiteSnapshot, fresh Signers) error {
 	if a.signers == nil || prior == nil || fresh.Strong != "" {
 		return nil

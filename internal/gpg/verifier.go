@@ -147,9 +147,15 @@ func NewVerifier(cfg VerifierConfig) (*Verifier, error) {
 // VerifyDetached (possibly wrapped by the adopter) to the SPEC5 §10.5
 // `recent_adoptions[].reason` short tag. Returns "" when err is nil.
 // Unknown errors that chain through ErrAdoptionGPGFailed without a
-// recognized gpg sentinel return "crypto_verify_failed" — the only
-// remaining route after the trust check is the cryptographic verify
-// inside verifyAnyTrusted.
+// recognized gpg sentinel return "crypto_verify_failed": since the hybrid
+// verifier (layers T, A and P refuse with the malformed_* sentinels, S1
+// with ErrBadSignature) that is S2 finding a trusted packet it does not
+// count — its key or signature expired or revoked (go-crypto's error), its
+// key marked by the keyring (uncountableKey), its key unable to sign, a
+// SHA-1 hash, apt's erasure or a packet sqv does not read (discount) — and
+// S2's key-ID collision quirk, and the empty-input errors of
+// VerifyDetachedSigners (docs/open-decisions.md, *Open*: "What
+// crypto_verify_failed still means"; the final review's D-M6).
 //
 // freshness imports observability and depends on this function through
 // an injected classifier so this gpg package remains the single owner

@@ -21,7 +21,6 @@ var mainEventsWithoutARow = []string{
 	"adoption_blocked_serve_target_missing",
 	"adoption_byhash_fallback",
 	"adoption_form_drift",
-	"adoption_gpg_failed",
 	"adoption_heartbeat_blobs_failed",
 	"adoption_heartbeat_failed",
 	"adoption_hot_prefetch_complete",
