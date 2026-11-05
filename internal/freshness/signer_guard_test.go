@@ -215,6 +215,17 @@ func TestSignerGuard_StandsDownOnItsOwnErrors(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
+		// The task review's 9d-M3: a pool file that opens but cannot be
+		// read (a directory in its place: EISDIR, neither missing nor too
+		// large).
+		{guardSkipAnchorUnreadable, func(t *testing.T, g *guardEnv, _ []byte, h string) {
+			if err := os.Remove(g.cache.BlobPath(h)); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(g.cache.BlobPath(h), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}},
 	} {
 		t.Run(c.reason, func(t *testing.T) {
 			g := newGuardEnv(t)
