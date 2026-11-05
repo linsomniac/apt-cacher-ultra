@@ -19,9 +19,9 @@ import (
 // revoked or expired at now, as go-crypto's checkMessageSignatureDetails
 // refuses a signing key, and passes it otherwise.
 func TestKeyLive_RefusesARevokedOrExpiredKey(t *testing.T) {
-	now := time.Now()
-	past := now.Add(-time.Hour)
 	raw := detachSignWith(t, newTestEntity(t, "Packet", "packet@example.com"), []byte(fakeReleasePlaintext), false)
+	now := time.Now() // after the signing: a packet made after now is expired (SigExpired)
+	past := now.Add(-time.Hour)
 	for _, tc := range []struct {
 		name string
 		edit func(e *openpgp.Entity, k *openpgp.Key)
@@ -86,5 +86,45 @@ func TestLiveSigner_ReadsTheKeyReadersMarks(t *testing.T) {
 	}
 	if v.liveSigner(keys[0], signed, pkts[0], now) {
 		t.Error("a good packet by a marked key: live, want not live")
+	}
+}
+
+// TestLiveSigner_ReadsANonSigningKeysLiveness: liveSigner passes a good
+// packet by a key that cannot sign (an encryption subkey, by
+// verifiesDirectly) while it is live, and refuses it once it is revoked
+// (keyLive), as gpgv 1.4 reports REVKEYSIG for it.
+func TestLiveSigner_ReadsANonSigningKeysLiveness(t *testing.T) {
+	signed := []byte(fakeReleasePlaintext)
+	for _, revoked := range []bool{false, true} {
+		e := newTestEntity(t, "Enc", "enc@example.com")
+		sub := e.Subkeys[0]
+		if sub.Sig.FlagSign || sub.PrivateKey == nil {
+			t.Fatal("test premise: want an encryption subkey with its private key")
+		}
+		// go-crypto signs only with a signing key: the subkey's flag is
+		// set for the signing, and cleared again before the check.
+		sub.Sig.FlagSign = true
+		raw := detachSignWith(t, e, signed, false)
+		sub.Sig.FlagSign = false
+		pkts, err := parseSigPackets(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if revoked {
+			e.Subkeys[0].Revocations = []*packet.Signature{{CreationTime: time.Now().Add(-time.Hour)}}
+		}
+		// The verifier's keyring is read for its marks alone (none here);
+		// the key's entity is the one in memory, its flag cleared.
+		v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t, newTestEntity(t, "Other", "other@example.com")), RequireSignature: true, Logger: silentLogger()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys := openpgp.EntityList{e}.KeysById(pkts[0].issuer)
+		if len(keys) != 1 || keys[0].PublicKey != sub.PublicKey || len(openpgp.EntityList{e}.KeysByIdUsage(pkts[0].issuer, packet.KeyFlagSign)) != 0 {
+			t.Fatalf("test premise: %d keys of the packet's issuer, want the subkey", len(keys))
+		}
+		if got := v.liveSigner(keys[0], signed, pkts[0], time.Now()); got == revoked {
+			t.Errorf("revoked %v: liveSigner %v, want %v", revoked, got, !revoked)
+		}
 	}
 }
