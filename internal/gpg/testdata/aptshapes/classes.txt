@@ -4,7 +4,7 @@
 # nodata (the verifier found no signature data: gpgv's NODATA), badsig
 # (a signature failed its check: gpgv's BADSIG, sqv's "Message has been
 # manipulated") or other (anything else the verifier said). Measured
-# 2026-11-05 08:21 UTC with verdicts.txt; e2e/apt-oracle/README.md,
+# 2026-11-05 10:52 UTC with verdicts.txt; e2e/apt-oracle/README.md,
 # "Error classes", says how each is derived.
 a_aftercrc_cr_sp - - - - - -
 a_aftercrc_nbsp - - - - other -
@@ -669,6 +669,17 @@ u_good_unh_sigtarget_1 - - - - other -
 u_good_unh_trust_1 - - - - other -
 u_i_unknown_bad_good badsig badsig badsig badsig - badsig
 u_i_unknown_good_bad badsig badsig badsig badsig - badsig
+us_bad_enc_plus_good - - - - - -
+us_bad_primary_plus_good - - - - - -
+us_d_bad_enc_plus_good - - - - - -
+us_d_good_enc_plus_good - - - - - -
+us_good_control - - - - - -
+us_good_enc_alone other other other other other other
+us_good_enc_plus_good - - - - - -
+us_good_plus_bad_enc - - - - - -
+us_good_plus_two_unknown - - - - - -
+us_good_primary_alone other other other other other other
+us_good_primary_plus_good - - - - - -
 v4_i_ed25519unknown_plus_good - - - - - -
 v4_i_ed448unknown_plus_good - - - - - -
 v6_d_good_plus_v6unknown - - - - - -

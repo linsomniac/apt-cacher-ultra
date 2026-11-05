@@ -48,14 +48,14 @@ images, a corpus file missing.
 
 ## The corpus
 
-`internal/gpg/testdata/aptshapes/` holds 940 files, about 1.2 MiB:
+`internal/gpg/testdata/aptshapes/` holds 962 files, about 1.3 MiB:
 
 | File | What it is |
 |---|---|
-| `<name>.InRelease` | an inline shape (613 of them): the whole `InRelease`, its signed text included |
-| `<name>.Release.gpg` | a detached shape (252): a `Release.gpg` that signs the shared `Release`, or its own |
+| `<name>.InRelease` | an inline shape (622 of them): the whole `InRelease`, its signed text included |
+| `<name>.Release.gpg` | a detached shape (254): a `Release.gpg` that signs the shared `Release`, or its own |
 | `<name>.Release` | a detached shape's own `Release` (4: `a_d_release_crlf`, `a_d_release_extra_nl`, `a_d_release_no_final_nl`, `o2_textmode_detached_release_crlf`), which `in-container.sh` serves in the shared one's place |
-| `<name>.keys.asc` | a shape's own `signed-by` (65: batch fx16's `ka_*`, the keys A and E in one block each; fx19's `e7_*`, key K; fx20's `pk_*`, its keys): an armored key file, which `in-container.sh` names in `keys.gpg`'s place and the table test loads as that shape's host keyring, as `LoadKeyring` reads a `.asc` file (every block) |
+| `<name>.keys.asc` | a shape's own `signed-by` (76: batch fx16's `ka_*`, the keys A and E in one block each; fx19's `e7_*`, key K; fx20's `pk_*`, its keys; fx21's `us_*`, key U): an armored key file, which `in-container.sh` names in `keys.gpg`'s place and the table test loads as that shape's host keyring, as `LoadKeyring` reads a `.asc` file (every block) |
 | `Release` | the shared `Release`, a flat repository's: the SHA256 line of an empty `Packages`, a fixed `Date:` in the past (2026-10-01), no `Valid-Until` |
 | `keys.gpg` | the public keys A, E, S and O, in binary: the clients' `signed-by` here, and the host keyring of the verifier's table test (the hardening plan's Task 6), which loads the file whole, so every key in it is a trusted signer there |
 | `verdicts.txt` | apt's verdicts: a `#` header naming the measurement's date and each image's apt and verifier versions, then one row per shape, `<name>` and one verdict per image in the order of *The images* below, `ok` (`apt-get update` exited 0) or `REJ` |
@@ -66,7 +66,7 @@ The repository's `.gitattributes` marks every file here `-text`, so no
 checkout or commit converts their line ends, whatever `core.autocrlf`
 says: several shapes differ from their controls only in CRs.
 
-There are 865 shapes, in twenty batches. The first 135 are those the
+There are 876 shapes, in twenty-one batches. The first 135 are those the
 hardening plan measured on 2026-10-28
 (`docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md`: DN-2
 sorts them into classes, Appendix A gives each one's verdicts), rebuilt by
@@ -84,7 +84,7 @@ batch fx11, `n_` batches fx12 to fx14, `o_` and `o2_` batch fx13,
 `c_text_`, `e_`, `e2_`, `g5_`, `h_`, `k_`, `l_`, `m_`, `u_`, `v_`,
 `w_d_`, `x_`, `y_`, `z_` and `n_clearhdr_` batch fx15, `rd_`, `c_` and
 `ka_` batch fx16, `sq_` batch fx17, `q6_`, `e8_`, `q9_` and `q10_`
-batch fx18, `e7_` batch fx19, `pk_` batch fx20;
+batch fx18, `e7_` batch fx19, `pk_` batch fx20, `us_` batch fx21;
 `i_trail_lf` is a blank line after the END line, `xd_good_plus_literal` a
 literal-data packet beside a good detached signature, a `*_control*` its
 batch's unmodified control.
@@ -290,14 +290,35 @@ strong signer for every other row it accepts but
 accepts it (`aptShapeStrongOverStrict`: the cache reads go-crypto's
 newest self-signature, made after the packet). `--policy-keys` makes the batch again alone.
 
+Batch fx21, 11 shapes (`us_`), is the plan's Task 9e's fix round's: key U,
+an RSA-3072 primary that only certifies with a signing and an encryption
+subkey, signs the shared `Release` with its signing subkey (gpg's packet),
+and with its primary and its encryption subkey (packets gpg will not make,
+built by the generator and their hash signed by the temporary home's
+gpg-agent, each checked against U's public key): a bad packet by the
+primary or the encryption subkey beside the signing subkey's good one
+(`us_bad_primary_plus_good`, `us_bad_enc_plus_good`,
+`us_good_plus_bad_enc`, `us_d_bad_enc_plus_good`), which gpgv 2.2.4 and 1.4
+(`ubuntu:18.04`, `16.04`, `14.04`) check against that key and refuse (BADSIG)
+while every other image accepts it, as it does `t7g5_s_primary`; a good one
+beside it (`us_good_primary_plus_good`, `us_good_enc_plus_good`,
+`us_d_good_enc_plus_good`), which every image accepts; one alone
+(`us_good_primary_alone`, `us_good_enc_alone`), which every current image
+refuses; the control (`us_good_control`); and the good packet beside two by
+keys X1 and X2, which the clients lack (`us_good_plus_two_unknown`,
+debian-buster-archive's layout), which apt 1.2 (`ubuntu:16.04`) alone
+refuses ("Invalid message from method gpgv: NO_PUBKEY …"). Each shape's
+`keys.asc` is U's public key alone; `--usage-keys` makes the batch again
+alone.
+
 The keys are made in a temporary GnuPG home that the generator deletes
 when the run ends, by an error, Ctrl-C, SIGTERM or SIGHUP too (only
 SIGKILL leaves it, and a home it cannot delete is named on stderr); no
 secret key is written anywhere else, and the generator checks that
 `keys.gpg` holds public packets only, of exactly A, E, S and O, and
 K's public key, fx19's `keys.asc`, public packets only, of K and its
-two subkeys, and each of fx20's keys, public packets only, of that key and
-its subkey.
+two subkeys, each of fx20's keys, public packets only, of that key and
+its subkey, and U's, of U and its two subkeys.
 
 | Key | What it is | Why |
 |---|---|---|
@@ -307,6 +328,8 @@ its subkey.
 | S | an RSA-3072 primary that only certifies, with an RSA-3072 signing subkey | a signature by a subkey (`x3i_subkey_*`), and a forged packet naming the primary (`t7g5_s_primary`) |
 | O | RSA-3072, signs | batch fx13's key: the shapes that need a signer but no other key, so that they can be made again alone (`--own-key`), the other keys' secrets being gone after every run |
 | K | RSA-3072, signs, with two RSA-3072 signing subkeys; not in `keys.gpg` | batch fx19's key: signatures by its primary and by each subkey (`e7_`), each shape with K's public key as its own `keys.asc`, made again alone with `--subkeys-key` |
+| U | an RSA-3072 primary that only certifies, with an RSA-3072 signing subkey and an RSA-3072 encryption subkey; not in `keys.gpg` | batch fx21's key: good and bad packets by each of its keys (`us_`), each shape with U's public key as its own `keys.asc`, made again alone with `--usage-keys` |
+| X1, X2 | RSA-3072, sign; never exported | batch fx21's keys the clients lack: `us_good_plus_two_unknown` |
 | fx20's | one key per class (`POLICY_KEYS` in `gen_shapes.py`); not in `keys.gpg` | batch fx20's keys: each signs the shared `Release` alone (`pk_<name>`) or beside the Ed25519 one (`pk_ed25519_plus_<name>`), each shape with its keys as its own `keys.asc`, made again alone with `--policy-keys` |
 
 ### Adding a shape
@@ -346,6 +369,12 @@ its subkey.
      `python3 -I e2e/apt-oracle/gen_shapes.py --policy-keys
      internal/gpg/testdata/aptshapes` makes new keys and writes fx20 and its
      key files alone; every other file keeps its bytes.
+   - **A key with keys outside its signing usage**: batch fx21
+     (`batch_fx21`, from `UsageMaterial`), each shape with U's public key
+     as its `<name>.keys.asc`. `python3 -I e2e/apt-oracle/gen_shapes.py
+     --usage-keys internal/gpg/testdata/aptshapes` makes new keys U, X1
+     and X2 and writes fx21 and its key files alone; every other file keeps
+     its bytes.
    - **The keys A, B, E and S** (`Material`): a batch in `BATCHES`, made
      only by a full regeneration.
    A detached shape that signs another text than the shared `Release`
@@ -420,18 +449,24 @@ Since the plan's Task 9e the table test reads `verdicts-old.txt` too
 (ruling HD-19, *The older images*): the cache refuses a shape an older
 image refuses, the format rules (layers T, A and P) holding over every
 supported generation, but for the rows `aptShapeOldExempt` lists, each with
-its class, which the cache accepts as the six do: (a) crypto policy, not
-intersected across generations (the `pk_` rows of EdDSA and ECDSA keys,
-which gpgv 1.4 cannot use); (b) a layout a real signer emits (a CR after
-the clearsign marker, nginx's, which apt 1.2 refuses; base64 needing no
-padding and no CRC line, syncthing's, which gpgv 1.4 misreads), and
-`t7g5_s_primary`, pending a ruling (no layer but S sees it). Of the 26 rows
-an older image refuses while the six accept, layer P already refused three
-(gpgv 1.4's v6 and 10 kB unhashed-area refusals: no longer strict
-deviations), and T6 refuses three (blanks after the clearsign marker, which
-apt 1.2 refuses: `a_msgbegin_sp_cr`, `q_msgbegin_sp_tab_crcr`,
-`i_begin_trailing_ws`). Where an older image accepts what the cache
-refuses, the cache stays strict.
+its class and the refusal its class was measured with
+(`aptShapeOldRefusals`), which the cache accepts as the six do: (a) crypto
+policy, not intersected across generations (the `pk_` rows of EdDSA and
+ECDSA keys, which gpgv 1.4 cannot use); (b) a layout a real signer emits (a
+CR after the clearsign marker, nginx's, which apt 1.2 refuses; no CRC line,
+the base64 happening to need no padding, syncthing's today and any CRC-less
+signer's when its packets' length lands on a multiple of 3, which gpgv 1.4
+misreads; a good signature beside two by keys the client lacks,
+debian-buster-archive's, which apt 1.2 refuses). Of the 32 rows an older
+image refuses while the six accept, layer P already refused three (gpgv
+1.4's v6 and 10 kB unhashed-area refusals: no longer strict deviations), T6
+refuses three (blanks after the clearsign marker, which apt 1.2 refuses:
+`a_msgbegin_sp_cr`, `q_msgbegin_sp_tab_crcr`, `i_begin_trailing_ws`), and
+S1 five (a bad packet by a known key outside its signing usage, which gpgv
+2.2.4 and 1.4 check: `t7g5_s_primary` and fx21's `us_bad_*` and
+`us_good_plus_bad_enc`; the controller's ruling for Task 9e's fix round:
+S1 checks every known key, an integrity rule, not crypto policy). Where an
+older image accepts what the cache refuses, the cache stays strict.
 
 `xi_good_plus_marker` (a marker packet after a good signature) is refused
 by `ubuntu:26.04` alone, and not as a policy: its gpgv 2.4.8 crashes on it
@@ -528,7 +563,9 @@ apt version, so that the six current images run exactly as before:
   `ka_*` file's), are the one file of `/etc/apt/trusted.gpg.d`, the
   sources line naming no `signed-by`. The image's own directory, not
   `-o Dir::Etc::TrustedParts`: apt 1.2's `apt-key` reads its configuration
-  by `apt-config`, never by `apt-get`'s options.
+  by `apt-config`, never by `apt-get`'s options. The run stops (exit 2) if
+  the image's `/etc/apt/trusted.gpg` is still there at a shape, so that the
+  shape's keys are its keyring alone, as `signed-by` makes them.
 - **apt before 1.5** (`ubuntu:16.04`) treats a repository it cannot
   authenticate as unsigned, a warning, and exits 0:
   `-o Acquire::AllowInsecureRepositories=false` makes that an error.
@@ -536,18 +573,21 @@ apt version, so that the six current images run exactly as before:
   gpgv said, so its status is taken as 100 when apt exited 0 but its lists
   hold no verified `InRelease` or `Release.gpg`, which apt keeps only once
   gpgv has passed it (`debReleaseIndex::IsTrusted` reads the same file).
-  Measured on all 865 rows: the verdict this gives is the gpgv method's
-  own answer (`-o Debug::pkgAcquire::Worker=1`: `gpgv:201 URI Done` or
-  `gpgv:400 URI Failure`), where the exit status alone missed 116
+  Measured on Task 9e's 865 rows: the verdict this gives is the gpgv
+  method's own answer (`-o Debug::pkgAcquire::Worker=1`: `gpgv:201 URI
+  Done` or `gpgv:400 URI Failure`), where the exit status alone missed 116
   refusals.
 
 What they measure: `debian:10` and `ubuntu:20.04` give `debian:11`'s
-verdict on every row. `ubuntu:18.04`'s gpgv 2.2.4 also checks a packet
-whose issuer is a known primary key that only certifies, against that key
-(`t7g5_s_primary`: BADSIG), and its apt reads some layouts the newer text
-layer refuses. `ubuntu:16.04`'s apt 1.2 refuses an InRelease with any byte
-after the clearsign marker on line 1, a CR or a blank (`i_crlf_all`,
-`n_i_nginx_crlf`, `i_begin_trailing_ws`: nginx's real InRelease is CRLF).
+verdict on every row. `ubuntu:18.04`'s gpgv 2.2.4 (and gpgv 1.4) also
+checks a packet against a known key that cannot sign, a certify-only
+primary or an encryption subkey, and refuses a bad one (`t7g5_s_primary`,
+`us_bad_*`: BADSIG), and its apt reads some layouts the newer text layer
+refuses. `ubuntu:16.04`'s apt 1.2 refuses an InRelease with any byte after
+the clearsign marker on line 1, a CR or a blank (`i_crlf_all`,
+`n_i_nginx_crlf`, `i_begin_trailing_ws`: nginx's real InRelease is CRLF),
+and a good signature beside two by keys the client lacks
+(`us_good_plus_two_unknown`: debian-buster-archive's real anchors are so).
 gpgv 1.4 (`ubuntu:16.04`, `14.04`) cannot verify EdDSA or ECDSA (the `pk_`
 rows of those keys), reads past base64 that needs no padding into the END
 line when no CRC line follows it (`i_crc_missing`, `d_crc_missing`:
@@ -604,3 +644,4 @@ together (*Adding a shape*).
 | 2026-11-01, 23:41 UTC (the plan's Task 9b, its second fix round) | the commit that adds batches fx18 and fx19 | `--from-controls` wrote fx18's 76 shapes (fx8 to fx12's and fx14 to fx17's 580 again, byte for byte), the second re-review's 76 files byte for byte as its generator wrote them; `--subkeys-key` fx19's 17 shapes and their 17 key files, signed by a new key K; `--record`: 823 shapes in 6 images, the 730 earlier rows and their error classes unchanged, the 93 new rows as the second re-review measured them (fx19's with K for its K3); then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 84 s and 77 s, images cached |
 | 2026-11-05, 08:21 UTC (the plan's Task 9d) | the commit that adds batch fx20 | `--policy-keys` wrote fx20's 42 shapes and their 42 key files, signed by new throwaway keys (three earlier runs of the same batch, at 07:32, 07:35 and 07:51 UTC, each with other keys and fewer rows, gave the same verdict on every row they shared); `--record`: 865 shapes in 6 images, the 823 earlier rows and their error classes unchanged, the 42 new rows as *Batch fx20* above describes them; then `make e2e-apt-oracle`: PASS. The same apt and verifiers | 82 s, images cached |
 | 2026-11-05, 09:31 UTC (the plan's Task 9e) | the commit that adds the older images, on 0d7b103 | `bash e2e/apt-oracle/run.sh --old --record`: 865 shapes in the five older images (*The older images*), every image pulled and ran; then `make e2e-apt-oracle-old`: PASS, every verdict and class as recorded, and `make e2e-apt-oracle`: PASS with the adapted `in-container.sh`. apt 1.8.2.3, 2.0.10, 1.6.17, 1.2.35 and 1.0.1ubuntu2.24 | 93 s and 94 s (the five), 82 s (the six), images cached |
+| 2026-11-05, 10:53 UTC (the plan's Task 9e, its fix round) | the commit that adds batch fx21 | `--usage-keys` wrote fx21's 11 shapes and their 11 key files, signed by a new key U (`--from-controls` then rewrote every other batch byte for byte); `--record` and `--old --record`: 876 shapes in 6 and in 5 images, the 865 earlier rows and their error classes unchanged in both files, the 11 new ones as *Batch fx21* above describes them (as the Task 9e review measured its s1m and fx2 shapes); then both make targets: PASS. The same apt and verifiers | 83 s (the six), 94 s (the five), images cached |

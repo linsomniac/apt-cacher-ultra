@@ -234,32 +234,55 @@ var aptShapeOldExempt = map[string]string{
 	"a_text_crlf_sig_lf": aptShapeOldCRAfterMarker,
 	"i_crlf_all":         aptShapeOldCRAfterMarker,
 	"n_i_nginx_crlf":     aptShapeOldCRAfterMarker,
-	// aptShapeOldUnpaddedNoCRC (2)
-	"d_crc_missing": aptShapeOldUnpaddedNoCRC,
-	"i_crc_missing": aptShapeOldUnpaddedNoCRC,
-	// aptShapeOldCertifyOnlyIssuer (1)
-	"t7g5_s_primary": aptShapeOldCertifyOnlyIssuer,
+	// aptShapeOldNoCRCUnpadded (2)
+	"d_crc_missing": aptShapeOldNoCRCUnpadded,
+	"i_crc_missing": aptShapeOldNoCRCUnpadded,
+	// aptShapeOldTwoUnknownKeys (1)
+	"us_good_plus_two_unknown": aptShapeOldTwoUnknownKeys,
 }
 
 // The classes of aptShapeOldExempt (the hardening plan's Task 9e): "(a) "
 // crypto policy, "(b) " a real signer's layout, each one reason a family.
-// TestAptShapeOldExempt_AreOlderImagesRefusals requires a row in each.
-//
-// AIDEV-NOTE: aptShapeOldCertifyOnlyIssuer is the one (b) without a real
-// signer: no surveyed anchor names a known key that cannot sign, but the
-// shape cannot be refused in layers T, A or P, where a class (c) row's rule
-// must live (S1 reads signing keys only, KeysByIdUsage). It is listed for
-// the controller's ruling (Task 9e's report, its doubt list); move it, or
-// fold it by S1, only with that ruling.
+// TestAptShapeOldExempt_AreOlderImagesRefusals requires a row in each, and
+// holds each row to its class's measured refusal (aptShapeOldRefusals).
+// (t7g5_s_primary, once listed pending a ruling, is folded: S1 checks every
+// known key whatever its usage, Task 9e's fix round.)
 const (
-	aptShapeOldECC               = "(a) crypto policy: an EdDSA or ECDSA signing key, which gpgv 1.4 (ubuntu:16.04, ubuntu:14.04) cannot use (\"can't handle public key algorithm\"); not intersected (HD-19: the survey's yarn signs with EdDSA)"
-	aptShapeOldCRAfterMarker     = "(b) a real signer's layout: a CR after the clearsign marker on line 1, nginx's CRLF InRelease (PE/vendor/nginx, testdata/vendors/nginx), which apt 1.2 (ubuntu:16.04) reads as not clearsigned (\"Clearsigned file isn't valid, got 'NOSPLIT'\")"
-	aptShapeOldUnpaddedNoCRC     = "(b) a real signer's layout: base64 that needs no padding and no CRC line after it, syncthing's InRelease (PE/vendor/syncthing, OpenPGP.js), which gpgv 1.4 (ubuntu:16.04, ubuntu:14.04) reads on into the END line (\"invalid radix64 character\", NODATA)"
-	aptShapeOldCertifyOnlyIssuer = "(b) pending a ruling: a bad packet whose issuer is a known primary key that only certifies, which gpgv 2.2.4 and 1.4 (ubuntu:18.04, 16.04, 14.04) check against that key (BADSIG) and later gpgv and sqv skip; no surveyed anchor has it, but layers T, A and P cannot see it"
+	aptShapeOldECC            = "(a) crypto policy: an EdDSA or ECDSA signing key, which gpgv 1.4 (ubuntu:16.04, ubuntu:14.04) cannot use (\"can't handle public key algorithm\"); not intersected (HD-19: the survey's yarn signs with EdDSA)"
+	aptShapeOldCRAfterMarker  = "(b) a real signer's layout: a CR after the clearsign marker on line 1, nginx's CRLF InRelease (PE/vendor/nginx, testdata/vendors/nginx), which apt 1.2 (ubuntu:16.04) reads as not clearsigned (\"Clearsigned file isn't valid, got 'NOSPLIT'\")"
+	aptShapeOldNoCRCUnpadded  = "(b) a real signer's layout: no CRC line, the base64 happening to need no padding (its packets' length a multiple of 3): syncthing's InRelease (PE/vendor/syncthing, OpenPGP.js), and any CRC-less signer's (ms-*, signal, tailscale: RFC 9580 drops the CRC) whenever its length lands there; gpgv 1.4 (ubuntu:16.04, ubuntu:14.04) then reads on into the END line (\"invalid radix64 character\", NODATA)"
+	aptShapeOldTwoUnknownKeys = "(b) a real signer's layout: a good signature beside two by keys the client lacks, debian-buster-archive's InRelease and Release.gpg (PE/vendor), which apt 1.2 (ubuntu:16.04) refuses (\"Invalid message from method gpgv: NO_PUBKEY ...\"); the trigger is the client's keyring, which no byte layout tells"
 )
 
 // aptShapeOldClasses lists aptShapeOldExempt's classes, for its guard.
-var aptShapeOldClasses = []string{aptShapeOldECC, aptShapeOldCRAfterMarker, aptShapeOldUnpaddedNoCRC, aptShapeOldCertifyOnlyIssuer}
+var aptShapeOldClasses = []string{aptShapeOldECC, aptShapeOldCRAfterMarker, aptShapeOldNoCRCUnpadded, aptShapeOldTwoUnknownKeys}
+
+// aptShapeOldRefusal is a class's measured refusal: the older columns that
+// refuse each of its rows (verdicts-old.txt's, from 0), every other one
+// accepting, and the error class each refusal has in classes-old.txt.
+type aptShapeOldRefusal struct {
+	cols  []int
+	class string
+}
+
+// aptShapeOldRefusals pins each aptShapeOldExempt class to its measurement
+// (the Task 9e review's 9e-M4), so that an older apt refusing such a row
+// for another reason, or another image refusing it, shows.
+var aptShapeOldRefusals = map[string]aptShapeOldRefusal{
+	aptShapeOldECC:            {cols: []int{3, 4}, class: "other"},
+	aptShapeOldCRAfterMarker:  {cols: []int{3}, class: "split"},
+	aptShapeOldNoCRCUnpadded:  {cols: []int{3, 4}, class: "nodata"},
+	aptShapeOldTwoUnknownKeys: {cols: []int{3}, class: "other"},
+}
+
+// aptShapeOldImages are verdicts-old.txt's columns in their order (OLD_COLUMNS
+// in e2e/apt-oracle/run.sh), aptShapeImages verdicts.txt's: the tests that
+// read a column by its index check them against the files' headers
+// (TestAptShapeVerdicts_ColumnsAreTheImages).
+var (
+	aptShapeImages    = []string{"debian:11", "ubuntu:22.04", "ubuntu:24.04", "debian:12", "debian:13", "ubuntu:26.04"}
+	aptShapeOldImages = []string{"debian:10", "ubuntu:20.04", "ubuntu:18.04", "ubuntu:16.04", "ubuntu:14.04"}
+)
 
 // aptShapeKeyPolicy are the rows only a newest-generation client's key
 // policy refuses: debian:13's sqv, ubuntu:24.04's or ubuntu:26.04's
@@ -611,7 +634,7 @@ func TestVerifier_FollowsTheAptShapeTable(t *testing.T) {
 			}
 			wantRejected, why := anyRejects(s.rejected), "apt's verdicts"
 			if !wantRejected && anyRejects(s.oldRejected) {
-				wantRejected, why = true, "an older image's refusal (a format rule: HD-19)"
+				wantRejected, why = true, "an older image's refusal, not exempt (HD-19)"
 				if class, ok := aptShapeOldExempt[s.name]; ok {
 					wantRejected, why = false, "an older image's refusal, exempt: "+class
 				}
@@ -717,10 +740,14 @@ func TestVerifier_StrongSignerFollowsTheAptShapeTable(t *testing.T) {
 // TestAptShapeKeyPolicy_AreTheNewestImagesRefusals: every aptShapeKeyPolicy
 // row is accepted by the three gpgv 2.2 images and refused by one of the
 // newest, every one of whose refusals is its verifier's (class other: no
-// split, no bad signature), and every row so measured is listed.
+// split, no bad signature), the older images' refusals too (the override
+// accepts the row whatever verdicts-old.txt says, so it must hide no other
+// refusal: the Task 9e review's 9e-M3), and every row so measured is listed.
 func TestAptShapeKeyPolicy_AreTheNewestImagesRefusals(t *testing.T) {
 	verdicts := loadAptShapeVerdicts(t)
 	classes := loadAptShapeClasses(t)
+	oldVerdicts := loadAptShapeOldVerdicts(t)
+	oldClasses := loadAptShapeOldClasses(t)
 	for name := range aptShapeKeyPolicy {
 		rejected, ok := verdicts[name]
 		if !ok {
@@ -733,6 +760,16 @@ func TestAptShapeKeyPolicy_AreTheNewestImagesRefusals(t *testing.T) {
 		for i, c := range classes[name] {
 			if rejected[i] && c != "other" {
 				t.Errorf("%s, column %d: class %q, want other (a key policy)", name, i+1, c)
+			}
+		}
+		oldRow, ok := oldClasses[name]
+		if !ok || len(oldVerdicts[name]) != aptShapeOldColumns {
+			t.Errorf("%s: no row in verdicts-old.txt or classes-old.txt", name)
+			continue
+		}
+		for i, c := range oldRow {
+			if oldVerdicts[name][i] && c != "other" {
+				t.Errorf("%s, older column %d: class %q, want other (a key policy, or crypto policy the older verifier cannot use)", name, i+1, c)
 			}
 		}
 	}
@@ -832,14 +869,26 @@ func TestAptShapeOldExempt_AreOlderImagesRefusals(t *testing.T) {
 		if anyRejects(verdicts[name]) || !anyRejects(oldVerdicts[name]) {
 			t.Errorf("%s: apt REJ per column %v, older images %v; want accepted by the six, refused by an older image", name, verdicts[name], oldVerdicts[name])
 		}
-		if strings.HasPrefix(class, "(a) ") {
-			for i, c := range oldClasses[name] {
-				if oldVerdicts[name][i] && c != "other" {
-					t.Errorf("%s, older column %d: class %q, want other (crypto policy: the verifier refused it)", name, i+1, c)
-				}
-			}
-		} else if !strings.HasPrefix(class, "(b) ") {
+		if !strings.HasPrefix(class, "(a) ") && !strings.HasPrefix(class, "(b) ") {
 			t.Errorf("%s: class %q is neither (a) nor (b)", name, class)
+		}
+		want, ok := aptShapeOldRefusals[class]
+		row := oldClasses[name]
+		if !ok || len(row) != aptShapeOldColumns || len(oldVerdicts[name]) != aptShapeOldColumns {
+			t.Errorf("%s: no measured refusal pinned for its class, or no row in classes-old.txt", name)
+			continue
+		}
+		refusing := make(map[int]bool)
+		for _, c := range want.cols {
+			refusing[c] = true
+		}
+		for i := range aptShapeOldColumns {
+			switch {
+			case refusing[i] && (!oldVerdicts[name][i] || row[i] != want.class):
+				t.Errorf("%s, %s: %v (class %q); its class's measurement is a refusal of class %q", name, aptShapeOldImages[i], oldVerdicts[name][i], row[i], want.class)
+			case !refusing[i] && oldVerdicts[name][i]:
+				t.Errorf("%s, %s: refused (class %q); its class's measurement is that only %v refuse", name, aptShapeOldImages[i], row[i], want.cols)
+			}
 		}
 	}
 	for class, n := range known {
@@ -973,18 +1022,60 @@ func TestAptShapeOldClasses_AgreeWithTheVerdicts(t *testing.T) {
 				t.Errorf("%s, older column %d: apt refused it, but its class %q is none of split, nodata, badsig and other", name, i+1, class)
 			}
 		}
-		split := classes[name][0] == "split"
+		cur, ok := classes[name]
+		if !ok || len(cur) == 0 {
+			t.Errorf("%s: a row in classes-old.txt, none in classes.txt", name)
+			continue
+		}
+		split := cur[0] == "split"
 		if split {
 			splits++
 		}
 		for i := range 2 {
 			if (row[i] == "split") != split {
-				t.Errorf("%s, older column %d: class %q, classes.txt's %v: apt 1.8 and 2.0 split as the current images do", name, i+1, row[i], classes[name])
+				t.Errorf("%s, older column %d: class %q, classes.txt's %v: apt 1.8 and 2.0 split as the current images do", name, i+1, row[i], cur)
 			}
 		}
 	}
 	if splits < 60 {
 		t.Fatalf("test premise: %d split rows, want the corpus's 64", splits)
+	}
+}
+
+// aptShapeHeaderImages reads the images a verdict file's header names, in
+// order: its "#   <image>  apt <version> ..." lines (run.sh --record writes
+// one per column).
+func aptShapeHeaderImages(t *testing.T, file string) []string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(aptShapeDir, file))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, m := range regexp.MustCompile(`(?m)^#   (\S+) +apt `).FindAllSubmatch(b, -1) {
+		out = append(out, string(m[1]))
+	}
+	return out
+}
+
+// TestAptShapeVerdicts_ColumnsAreTheImages: verdicts.txt's and
+// verdicts-old.txt's headers name the images in the order the tests index
+// them (aptShapeImages, aptShapeOldImages: aptShapeNewest, the split check
+// of debian:10 and ubuntu:20.04, aptShapeOldRefusals), so that a reordered
+// COLUMNS or OLD_COLUMNS re-recorded fails here, not by pointing a check at
+// another image (the Task 9e review's 9e-M8). classes.txt and
+// classes-old.txt share their verdict file's columns (run.sh writes both).
+func TestAptShapeVerdicts_ColumnsAreTheImages(t *testing.T) {
+	for file, want := range map[string][]string{
+		"verdicts.txt":     aptShapeImages,
+		"verdicts-old.txt": aptShapeOldImages,
+	} {
+		if got := aptShapeHeaderImages(t, file); strings.Join(got, " ") != strings.Join(want, " ") {
+			t.Errorf("%s: its header names the columns %v, the tests index %v", file, got, want)
+		}
+	}
+	if len(aptShapeImages) != aptShapeColumns || len(aptShapeOldImages) != aptShapeOldColumns {
+		t.Errorf("aptShapeImages or aptShapeOldImages: not one image per column")
 	}
 }
 

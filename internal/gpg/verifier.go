@@ -238,9 +238,9 @@ var (
 	// substitute for the intended signer. Fail closed.
 	ErrAmbiguousKeyID = errors.New("ambiguous short issuer keyid in trust set")
 
-	// ErrBadSignature means a signature packet whose issuer names a
-	// signing key in the host keyring failed its cryptographic check
-	// against every entity holding that key, or verified with a
+	// ErrBadSignature means a signature packet whose issuer names a key
+	// in the host keyring (whatever its usage: Task 9e's fix round) failed
+	// its cryptographic check against every key of that ID, or verified with a
 	// SignatureError (S1, requireKnownSignaturesVerify): gpgv's BADSIG,
 	// which makes apt refuse the anchor even beside a good signature (the
 	// 2026-09 security review's VC-1).
@@ -581,9 +581,12 @@ func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (suiteTrust, error)
 
 // requireKnownSignaturesVerify is S1, apt's rule that a bad signature from
 // a known key is fatal (VC-1; rulings HD-3, HD-8): every packet of pkts
-// (the packets gpgv checks) whose issuer key ID names a signing key in the
-// host keyring must pass its cryptographic check against one of the
-// keyring's entities holding that key ID. A packet whose check passes but
+// (the packets gpgv checks) whose issuer key ID names a key in the host
+// keyring, a primary or a subkey whatever its usage (the hardening plan's
+// Task 9e fix round), must pass its cryptographic check against one of the
+// keys holding that key ID: a signing key's by go-crypto's verification of
+// its entity, any other key's directly (verifiesDirectly). A packet whose
+// check passes but
 // whose key or signature is expired or revoked passes (gpgv's EXPKEYSIG and
 // REVKEYSIG, which apt ignores beside a good signature); a SignatureError
 // fails (an unknown critical notation, on the packet or the key's
@@ -610,17 +613,41 @@ func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (suiteTrust, error)
 // set: a client that installed any of the cache's keys sees the BADSIG.
 // Re-check all of this when go-crypto is upgraded (the table test and this
 // file's tests pin it).
+//
+// AIDEV-NOTE: S1 reads every known key, not only signing ones (the
+// controller's ruling for Task 9e's fix round; the review's 9e-I1). gpgv
+// 2.2.4 and 1.4 (ubuntu:18.04, 16.04 and 14.04) check a packet against any
+// key of its key ID, whatever its usage, and refuse the anchor on BADSIG,
+// where later gpgv and sqv skip a key that cannot sign: t7g5_s_primary (a
+// bad packet naming S's certify-only primary) and batch fx21's
+// us_bad_primary_plus_good, us_bad_enc_plus_good, us_good_plus_bad_enc and
+// us_d_bad_enc_plus_good (U's certify-only primary, U's encryption
+// subkey), each beside a good packet: every one of those three images
+// refuses them, every other accepts them. S1 is integrity, not crypto
+// policy, so HD-19's rule against intersecting S does not apply, and a real
+// signer emits no bad packet (no vendor anchor changes). A non-signing key
+// is checked by verifiesDirectly, never through
+// openpgp.VerifyDetachedSignature: go-crypto looks the key up again by sign
+// usage (v1.5.2 openpgp/read.go:528), finds none and fails, which would
+// refuse a good packet by such a key that every image accepts
+// (us_good_primary_plus_good, us_good_enc_plus_good,
+// us_d_good_enc_plus_good). S2 is unchanged: such a packet never counts
+// (us_good_primary_alone, us_good_enc_alone: refused, as every current
+// image refuses them).
 func (v *Verifier) requireKnownSignaturesVerify(signed []byte, pkts []sigPacket) error {
 	keyring := v.keyring.EntityList()
 	for _, p := range pkts {
-		keys := keyring.KeysByIdUsage(p.issuer, packet.KeyFlagSign)
-		if len(keys) == 0 {
+		known := keyring.KeysById(p.issuer)
+		if len(known) == 0 {
 			continue
 		}
+		keys := keyring.KeysByIdUsage(p.issuer, packet.KeyFlagSign)
 		passed := false
 		tried := make(map[*openpgp.Entity]bool, len(keys))
+		signing := make(map[*packet.PublicKey]bool, len(keys))
 		for _, k := range keys {
-			if tried[k.Entity] {
+			signing[k.PublicKey] = true
+			if passed || tried[k.Entity] {
 				continue
 			}
 			tried[k.Entity] = true
@@ -628,7 +655,14 @@ func (v *Verifier) requireKnownSignaturesVerify(signed []byte, pkts []sigPacket)
 				bytes.NewReader(signed), bytes.NewReader(p.raw), nil)
 			if got != nil && !errors.As(verr, new(pgperrors.SignatureError)) {
 				passed = true
+			}
+		}
+		for _, k := range known {
+			if passed {
 				break
+			}
+			if !signing[k.PublicKey] {
+				passed = verifiesDirectly(k.PublicKey, signed, p.raw)
 			}
 		}
 		if !passed {
@@ -636,6 +670,43 @@ func (v *Verifier) requireKnownSignaturesVerify(signed []byte, pkts []sigPacket)
 		}
 	}
 	return nil
+}
+
+// verifiesDirectly reports whether raw, one signature packet as layer P
+// framed it (v4, a binary or text signature: P's grammar), is pk's good
+// signature over signed: the packet's hash over signed (its canonical text
+// for a text signature) and the packet's hashed part, checked by pk alone.
+// No key usage, expiry or revocation is read, nor an unknown critical
+// notation (go-crypto reports one only on its signing-key path, as a
+// SignatureError): S1 asks only whether the packet is good, which is what
+// gpgv 2.2.4 and 1.4 ask of a key that cannot sign
+// (requireKnownSignaturesVerify's note); a critical notation in such a
+// packet is unmeasured.
+func verifiesDirectly(pk *packet.PublicKey, signed, raw []byte) bool {
+	pkt, err := packet.Read(bytes.NewReader(raw))
+	if err != nil {
+		return false
+	}
+	sig, ok := pkt.(*packet.Signature)
+	if !ok {
+		return false
+	}
+	h, err := sig.PrepareVerify()
+	if err != nil {
+		return false
+	}
+	w := h
+	switch sig.SigType {
+	case packet.SigTypeBinary:
+	case packet.SigTypeText:
+		w = openpgp.NewCanonicalTextHash(h)
+	default:
+		return false
+	}
+	if _, err := w.Write(signed); err != nil {
+		return false
+	}
+	return pk.VerifySignature(h, sig) == nil
 }
 
 // s2Hashes are the hash algorithms whose signatures S2 counts (ruling

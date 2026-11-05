@@ -59,8 +59,16 @@ and ``keys.gpg`` is checked to hold public packets only.
   primary/subkey pairs). No client's keys.gpg holds them: each fx20 shape
   has its keys as its own signed-by, and ``--policy-keys`` makes the batch
   again alone.
+- U, an RSA-3072 primary that only certifies, with an RSA-3072 signing
+  subkey and an RSA-3072 encryption subkey, and X1 and X2, RSA-3072, sign:
+  batch fx21's keys (``us_``, Task 9e's fix round). Packets by U's
+  primary and its encryption subkey, which gpg will not make, are built
+  here and their hash signed by the temporary home's gpg-agent, which signs
+  with any secret key (agent_packet). No client's keys.gpg holds U, X1 or
+  X2: each fx21 shape has U's public key alone as its own signed-by (X1 and
+  X2 are keys it lacks), and ``--usage-keys`` makes the batch again alone.
 
-865 shapes, in 20 batches. The first 135 are the planning measurement's
+876 shapes, in 21 batches. The first 135 are the planning measurement's
 (2026-10-28; DN-2 and Appendix A of
 docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md), by the
 same names and built as its throwaway generators built them (the plan's
@@ -130,6 +138,13 @@ key policies: the shared Release clearsigned by each POLICY_KEYS key alone,
 and by POLICY_PAIRS' pairs (an Ed25519 key's signature and a weak key's),
 whose strip is the weak key's own shape.
 
+Batch fx21, 11 (``us_``), is Task 9e's fix round's: packets by a known key
+outside its signing usage (a certify-only primary, an encryption subkey),
+bad or good, beside a good packet of its signing subkey, alone, and inline
+and detached, which gpgv 2.2.4 and 1.4 check against that key and later
+gpgv skip; and a good packet beside two by keys the client lacks
+(debian-buster-archive's layout, which apt 1.2 refuses).
+
 AIDEV-NOTE: the fixtures, verdicts.txt and classes.txt are one
 measurement. Each run makes new keys, new signatures and new random bytes
 (the v3 garbage packets), so a regenerated corpus must be re-measured
@@ -147,13 +162,17 @@ bytes), then cuts the FROM_CONTROLS batches again (fx18's ``e8_`` shapes
 are cut from fx13's SHA-224 and SHA3-256 anchors; every other one comes
 out byte for byte as it was); ``--subkeys-key`` makes key K alone and
 writes only batch fx19 and its key files; ``--policy-keys`` makes fx20's
-keys alone and writes only batch fx20 and its key files.
+keys alone and writes only batch fx20 and its key files; ``--usage-keys``
+makes fx21's keys alone and writes only batch fx21 and its key files.
+(verdicts-old.txt and classes-old.txt, the older images' measurement, are
+re-measured with ``run.sh --old --record`` alike.)
 
 Usage: python3 -I e2e/apt-oracle/gen_shapes.py OUT
        python3 -I e2e/apt-oracle/gen_shapes.py --from-controls OUT
        python3 -I e2e/apt-oracle/gen_shapes.py --own-key OUT
        python3 -I e2e/apt-oracle/gen_shapes.py --subkeys-key OUT
        python3 -I e2e/apt-oracle/gen_shapes.py --policy-keys OUT
+       python3 -I e2e/apt-oracle/gen_shapes.py --usage-keys OUT
 """
 
 from __future__ import annotations
@@ -210,6 +229,13 @@ E_SIGNS = "20200601T000000!"
 OWN_KEY_UID = "Apt-shape O <o@example.invalid>"
 # Key K's user ID (batch fx19's key, in no client's keys.gpg).
 SUBKEYS_KEY_UID = "Apt-shape K <k@example.invalid>"
+# Batch fx21's keys: U, whose primary only certifies, and X1 and X2, keys
+# the clients lack.
+USAGE_KEY_UID = "Apt-shape U <u@example.invalid>"
+UNKNOWN_KEY_UIDS = (
+    "Apt-shape X1 <x1@example.invalid>",
+    "Apt-shape X2 <x2@example.invalid>",
+)
 
 BEGIN = b"-----BEGIN PGP SIGNATURE-----"
 END = b"-----END PGP SIGNATURE-----"
@@ -221,9 +247,21 @@ EXIT_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
 
 NAME_RE = re.compile(r"[A-Za-z0-9_]+")
 # The files of a corpus directory, besides the shapes'.
-CORPUS_FILES = ("keys.gpg", "Release", "verdicts.txt", "classes.txt")
+CORPUS_FILES = (
+    "keys.gpg",
+    "Release",
+    "verdicts.txt",
+    "classes.txt",
+    "verdicts-old.txt",
+    "classes-old.txt",
+)
 # What a regeneration leaves in place: apt's measurement of the old bytes.
-MEASUREMENT_FILES = ("verdicts.txt", "classes.txt")
+MEASUREMENT_FILES = (
+    "verdicts.txt",
+    "classes.txt",
+    "verdicts-old.txt",
+    "classes-old.txt",
+)
 SHAPE_SUFFIXES = (".InRelease", ".Release.gpg", ".Release", ".keys.asc")
 
 
@@ -730,6 +768,8 @@ def merge(*parts: Batch) -> Batch:
 # SETHASH takes; OpenPGP's is 12 (RFC 9580, 9.5).
 GCRY_MD_SHA3_256 = 313
 OPENPGP_SHA3_256 = 12
+# And for SHA-256 (GCRY_MD_SHA256; OpenPGP's 8): batch fx21's agent packets.
+GCRY_MD_SHA256 = 8
 # The DER DigestInfo prefixes of EMSA-PKCS1-v1_5 (RFC 8017, 9.2; NIST's
 # hash OIDs 2.16.840.1.101.3.4.2.1 and .8).
 DIGEST_INFO_SHA256 = bytes.fromhex("3031300d060960864801650304020105000420")
@@ -3716,6 +3756,173 @@ def keyrings_fx20(pm: PolicyMaterial) -> Shapes:
     return out
 
 
+def rsa_key_of(keyring: bytes, fpr: str) -> tuple[int, int]:
+    """(n, e) of the v4 RSA key or subkey fpr in keyring."""
+    for tag, body in split_packets(keyring):
+        if tag in (6, 14) and body[0] == 4 and v4_fingerprint(body) == fpr:
+            if body[5] != 1:
+                raise ValueError(f"{fpr}: not an RSA key")
+            rest = body[6:]
+            values: list[int] = []
+            for _ in range(2):
+                n = (int.from_bytes(rest[:2], "big") + 7) // 8
+                values.append(int.from_bytes(rest[2 : 2 + n], "big"))
+                rest = rest[2 + n :]
+            return values[0], values[1]
+    raise ValueError(f"{fpr}: no such key in the keyring")
+
+
+def rsa_verifies(keyring: bytes, fpr: str, framed: bytes, data: bytes) -> bool:
+    """Whether framed, one v4 RSA SHA-256 signature packet, is key fpr's
+    good signature over data (data as hashed: canonical text for 0x01)."""
+    body = one_signature(framed)
+    n, e = rsa_key_of(keyring, fpr)
+    k = (n.bit_length() + 7) // 8
+    want = emsa_pkcs1_v15(DIGEST_INFO_SHA256, signed_digest(body, data, sha256), k)
+    return pow(rsa_signature_value(body), e, n) == want
+
+
+def agent_packet(
+    g: GnuPG, template: bytes, keyring: bytes, fpr: str, data: bytes
+) -> bytes:
+    """template (one gpg-made v4 RSA SHA-256 signature packet) made again by
+    key fpr over data (canonical text for a text-mode template): the same
+    fields and subpackets, the issuer fingerprint (hashed 33) and key ID
+    (unhashed 16) fpr's, the hash signed by the home's gpg-agent, which signs
+    with any secret key whatever its usage. Checked against fpr's public key
+    in keyring; in gpg's framing."""
+    head, hashed, unhashed, _ = v4_parts(one_signature(template))
+    if head[2] != 1 or head[3] != 8:
+        raise ValueError("agent_packet: the template is no RSA SHA-256 signature")
+    fp = bytes.fromhex(fpr)
+    seen = {16: 0, 33: 0}
+
+    def renamed(area: bytes) -> bytes:
+        out: list[Subpacket] = []
+        for typ, crit, d in subpackets(area):
+            if typ == 33:
+                d = b"\x04" + fp
+            elif typ == 16:
+                d = fp[-8:]
+            seen[typ] = seen.get(typ, 0) + 1
+            out.append((typ, crit, d))
+        return build_subpackets(out)
+
+    partial = v4_build(head, renamed(hashed), renamed(unhashed), b"")
+    if seen[33] != 1:
+        raise ValueError(
+            f"agent_packet: {seen[33]} issuer fingerprints in the template"
+        )
+    digest = signed_digest(partial, data, sha256)
+    value = g.agent_sign(g.keygrip(fpr), GCRY_MD_SHA256, digest)
+    out = old_frame(partial + digest[:2] + mpi(value), 2)
+    if not rsa_verifies(keyring, fpr, out, data):
+        raise RuntimeError(f"agent_packet: {fpr}'s signature does not verify")
+    return out
+
+
+@dataclass(frozen=True)
+class UsageMaterial:
+    """What batch fx21 is cut from: key U's public key, gpg's clearsigning
+    of RELEASE by U's signing subkey (its header and its packet) and its
+    binary detached signature, and the packets agent_packet makes by U's
+    certify-only primary and by its encryption subkey, good (over RELEASE)
+    and bad (over OTHER_TEXT); and X1's and X2's packets over RELEASE."""
+
+    public: bytes
+    head: bytes  # the clearsigning's header and signed text
+    good: bytes  # the signing subkey's text-mode packet (gpg's)
+    primary_good: bytes
+    primary_bad: bytes
+    enc_good: bytes
+    enc_bad: bytes
+    d_good: bytes  # the signing subkey's binary-mode detached packet (gpg's)
+    d_enc_good: bytes
+    d_enc_bad: bytes
+    unknown: tuple[bytes, bytes]  # X1's and X2's text-mode packets
+
+
+def make_usage_material(g: GnuPG) -> UsageMaterial:
+    """Makes key U (a certify-only primary, a signing and an encryption
+    subkey) and X1 and X2, and signs what batch fx21 needs."""
+    u = g.gen_key(USAGE_KEY_UID, "cert", "never")
+    sign, enc = g.add_subkey(u, "sign"), g.add_subkey(u, "encr")
+    public = g.export(u)
+    check_keyring(public, {u, sign, enc})
+    clear = g.clearsign(sign + "!", RELEASE)
+    good = sig_packets(clear)
+    if issuer_fingerprint(good) != sign:
+        raise RuntimeError(f"gpg signed with another key than {sign}")
+    text = RELEASE.replace(b"\n", b"\r\n")
+    other = OTHER_TEXT.replace(b"\n", b"\r\n")
+    if not rsa_verifies(public, sign, good, text):
+        raise RuntimeError("gpg's clearsigning does not cover RELEASE's CRLF text")
+    d_good = g.detach_sign(sign + "!", RELEASE)
+    if issuer_fingerprint(d_good) != sign or not rsa_verifies(
+        public, sign, d_good, RELEASE
+    ):
+        raise RuntimeError(
+            "the signing subkey's detached signature: another key or text"
+        )
+    unknown: list[bytes] = []
+    for uid in UNKNOWN_KEY_UIDS:
+        x = g.gen_key(uid, "sign", "never")
+        pkt = sig_packets(g.clearsign(x + "!", RELEASE))
+        if issuer_fingerprint(pkt) != x:
+            raise RuntimeError(f"gpg signed with another key than {x}")
+        unknown.append(pkt)
+    return UsageMaterial(
+        public=public,
+        head=clear[: clear.index(BEGIN)],
+        good=good,
+        primary_good=agent_packet(g, good, public, u, text),
+        primary_bad=agent_packet(g, good, public, u, other),
+        enc_good=agent_packet(g, good, public, enc, text),
+        enc_bad=agent_packet(g, good, public, enc, other),
+        d_good=d_good,
+        d_enc_good=agent_packet(g, d_good, public, enc, RELEASE),
+        d_enc_bad=agent_packet(g, d_good, public, enc, OTHER_TEXT),
+        unknown=(unknown[0], unknown[1]),
+    )
+
+
+def batch_fx21(um: UsageMaterial) -> Batch:
+    """Task 9e's fix round (the review's 9e-I1 and 9e-M1): a packet by a
+    known key outside its signing usage, U's certify-only primary or its
+    encryption subkey, bad or good, beside a good packet of U's signing
+    subkey (gpgv 2.2.4 and 1.4 check it against that key, later gpgv skip
+    it), or alone (no apt counts it); and a good packet beside X1's and
+    X2's, keys the client lacks (debian-buster-archive's layout, which apt
+    1.2 refuses). Each shape's signed-by is U's public key alone
+    (keyrings_fx21)."""
+    h = um.head
+    inline = {
+        "us_good_control": h + armor_parts(um.good),
+        "us_bad_primary_plus_good": h + armor_parts(um.primary_bad + um.good),
+        "us_bad_enc_plus_good": h + armor_parts(um.enc_bad + um.good),
+        "us_good_plus_bad_enc": h + armor_parts(um.good + um.enc_bad),
+        "us_good_primary_plus_good": h + armor_parts(um.primary_good + um.good),
+        "us_good_enc_plus_good": h + armor_parts(um.enc_good + um.good),
+        "us_good_primary_alone": h + armor_parts(um.primary_good),
+        "us_good_enc_alone": h + armor_parts(um.enc_good),
+        "us_good_plus_two_unknown": h
+        + armor_parts(um.good + um.unknown[0] + um.unknown[1]),
+    }
+    detached = {
+        "us_d_bad_enc_plus_good": armor_parts(um.d_enc_bad + um.d_good),
+        "us_d_good_enc_plus_good": armor_parts(um.d_enc_good + um.d_good),
+    }
+    return inline, detached, {}
+
+
+def keyrings_fx21(um: UsageMaterial) -> Shapes:
+    """The own signed-by (<name>.keys.asc) of every batch fx21 shape: key
+    U's public key, alone, in one armor block."""
+    asc = armored_keys(um.public, USAGE_KEY_UID.encode())
+    inline, detached, _ = batch_fx21(um)
+    return {name: asc for name in (*inline, *detached)}
+
+
 # The batches cut from Material, in a run that makes keys.
 BATCHES: list[Callable[[Material], tuple[Shapes, Shapes]]] = [
     batch_fx,
@@ -3803,12 +4010,13 @@ def build_shapes(
     om: OwnMaterial,
     km: SubkeysMaterial,
     pm: PolicyMaterial,
+    um: UsageMaterial,
     keyring: bytes,
 ) -> Corpus:
     """Every batch's shapes: those cut from Material, batch fx13, those cut
     from the control files among them (as --from-controls cuts them from
-    committed ones), and batches fx19 and fx20 with their key files; names
-    are unique."""
+    committed ones), and batches fx19, fx20 and fx21 with their key files;
+    names are unique."""
     corpus = Corpus()
     for batch in BATCHES:
         corpus.add(*batch(m))
@@ -3822,6 +4030,8 @@ def build_shapes(
     corpus.add_keyrings(keyrings_fx19(km))
     corpus.add(*batch_fx20(pm))
     corpus.add_keyrings(keyrings_fx20(pm))
+    corpus.add(*batch_fx21(um))
+    corpus.add_keyrings(keyrings_fx21(um))
     return corpus
 
 
@@ -3949,6 +4159,25 @@ def write_policy_keys(out: Path) -> Corpus:
     return corpus
 
 
+def write_usage_keys(out: Path) -> Corpus:
+    """Makes batch fx21's keys in a temporary GnuPG home and writes batch
+    fx21 and its key files into OUT; writes nothing else (keys.gpg holds
+    none of them). Returns what it wrote."""
+    if not (out / "keys.gpg").is_file():
+        raise SystemExit(f"{out}: no keys.gpg: generate the corpus first")
+    corpus_entries(out)  # refuse a wrong OUT before making a key
+    g = GnuPG()
+    try:
+        um = make_usage_material(g)
+    finally:
+        g.close()
+    corpus = Corpus()
+    corpus.add(*batch_fx21(um))
+    corpus.add_keyrings(keyrings_fx21(um))
+    write_files(out, corpus.files())
+    return corpus
+
+
 def exit_on_signal(signum: int, _frame: FrameType | None) -> None:
     """SIGTERM or SIGHUP: unwind with exit status 128 + signum. Once: later
     ones are ignored, so a second cannot cut the clean-up short."""
@@ -3966,14 +4195,21 @@ def main(argv: list[str]) -> int:
     for s in EXIT_SIGNALS:
         signal.signal(s, exit_on_signal)
     args = argv[1:]
-    modes = ("--from-controls", "--own-key", "--subkeys-key", "--policy-keys")
+    modes = (
+        "--from-controls",
+        "--own-key",
+        "--subkeys-key",
+        "--policy-keys",
+        "--usage-keys",
+    )
     mode = args[0] if args and args[0] in modes else ""
     if mode:
         args = args[1:]
     if len(args) != 1:
         print(
             "usage: python3 -I e2e/apt-oracle/gen_shapes.py"
-            " [--from-controls | --own-key | --subkeys-key | --policy-keys] OUT",
+            " [--from-controls | --own-key | --subkeys-key | --policy-keys"
+            " | --usage-keys] OUT",
             file=sys.stderr,
         )
         return 2
@@ -3991,14 +4227,18 @@ def main(argv: list[str]) -> int:
         elif mode == "--subkeys-key":
             corpus = write_subkeys_key(out)
             what = "signed by a new key K, each with K's public key as its keys.asc"
-        else:
+        elif mode == "--policy-keys":
             corpus = write_policy_keys(out)
             what = "signed by new policy keys, each with its keys as its keys.asc"
+        else:
+            corpus = write_usage_keys(out)
+            what = "signed by a new key U, each with U's public key as its keys.asc"
         n_inline, n_detached = len(corpus.inline), len(corpus.detached)
         print(
             f"wrote {n_inline + n_detached} shapes ({n_inline} inline, "
             f"{n_detached} detached) {what}; every other file is as it was: "
             "measure the new rows with bash e2e/apt-oracle/run.sh --record"
+            " and --old --record"
         )
         return 0
     corpus_entries(out)  # refuse a wrong OUT before making keys
@@ -4009,11 +4249,12 @@ def main(argv: list[str]) -> int:
         own = make_own_material(g, keys.o)
         subkeys = make_subkeys_material(g, make_subkeys_key(g))
         policy = make_policy_material(g)
+        usage = make_usage_material(g)
         keyring = g.export(keys.a, keys.e, keys.s, keys.o)
     finally:
         g.close()
     check_keyring(keyring, {keys.a, keys.e, keys.s, keys.s_sub, keys.o})
-    corpus = build_shapes(material, own, subkeys, policy, keyring)
+    corpus = build_shapes(material, own, subkeys, policy, usage, keyring)
     write_corpus(out, corpus, keyring)
     total = len(corpus.inline) + len(corpus.detached)
     print(
@@ -4022,8 +4263,9 @@ def main(argv: list[str]) -> int:
     )
     if any((out / f).exists() for f in MEASUREMENT_FILES):
         print(
-            "verdicts.txt and classes.txt measured the old fixtures: re-measure"
-            " with bash e2e/apt-oracle/run.sh --record"
+            "verdicts.txt, classes.txt and their -old twins measured the old"
+            " fixtures: re-measure with bash e2e/apt-oracle/run.sh --record and"
+            " --old --record"
         )
     return 0
 
