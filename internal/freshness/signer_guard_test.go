@@ -6,6 +6,8 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 )
 
 // The signer downgrade guard's own decisions (signer_guard.go), with a
@@ -22,11 +25,13 @@ import (
 
 // signersVerifier passes anchors through, as passThroughVerifier does, and
 // reports for each the Signers its bytes are labelled with: an anchor whose
-// signed text holds "strong:" has that strong signer; failCurrent makes the
-// verification of the anchors it names fail. It counts its verifications.
+// signed text holds "strong:" has that strong signer; fail makes the
+// verification of the anchors it names fail, panic makes it panic. It
+// counts its verifications.
 type signersVerifier struct {
 	calls atomic.Int32
 	fail  map[string]bool
+	panic map[string]bool
 }
 
 func (v *signersVerifier) signersOf(b []byte) Signers {
@@ -49,6 +54,9 @@ func (v *signersVerifier) VerifyDetached(ctx context.Context, s SuiteRef, r, g [
 
 func (v *signersVerifier) VerifyInlineSigners(_ context.Context, _ SuiteRef, b []byte) ([]byte, Signers, error) {
 	v.calls.Add(1)
+	if v.panic[string(b)] {
+		panic("a test panic")
+	}
 	if v.fail[string(b)] {
 		return nil, Signers{}, errors.New("a test refusal")
 	}
@@ -74,7 +82,7 @@ type guardEnv struct {
 func newGuardEnv(t *testing.T) *guardEnv {
 	t.Helper()
 	env := newAdoptionTestEnv(t)
-	v := &signersVerifier{fail: map[string]bool{}}
+	v := &signersVerifier{fail: map[string]bool{}, panic: map[string]bool{}}
 	var logs bytes.Buffer
 	ad, err := NewAdopter(AdoptionConfig{Cache: env.cache, Fetcher: env.fetcher, Verifier: v,
 		HostLimiter: hostsem.New(8), Logger: slog.New(slog.NewJSONHandler(&logs, nil))})
@@ -245,6 +253,34 @@ func TestSignerGuard_StandsDownOnItsOwnErrors(t *testing.T) {
 	}
 }
 
+// TestSignerGuard_APanicOnTheCurrentAnchorStandsDown (the final review's
+// F2-M1, ruling G2): a verifier that panics on the current anchor only
+// (the candidate verifies) stands the guard down: WARN
+// adoption_signer_guard_panicked, INFO adoption_signer_guard_skipped with
+// reason anchor_unverified, and the candidate adopts.
+func TestSignerGuard_APanicOnTheCurrentAnchorStandsDown(t *testing.T) {
+	g := newGuardEnv(t)
+	anchor, err := g.adopt(t, "v1", "AAAA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.v.panic[string(anchor)] = true
+	cur := currentSnapshotID(t, g.adoptionTestEnv)
+	if _, err := g.adopt(t, "v2", ""); err != nil {
+		t.Fatalf("v2: %v; want it adopted, the guard standing down", err)
+	}
+	if currentSnapshotID(t, g.adoptionTestEnv) == cur {
+		t.Fatal("v2 not adopted")
+	}
+	logs := g.logs.String()
+	if !strings.Contains(logs, `"level":"WARN","msg":"adoption_signer_guard_panicked"`) ||
+		!strings.Contains(logs, `"panic":"a test panic"`) ||
+		!strings.Contains(logs, `"level":"INFO","msg":"adoption_signer_guard_skipped"`) ||
+		!strings.Contains(logs, `"reason":"`+guardSkipUnverified+`"`) {
+		t.Fatalf("want WARN adoption_signer_guard_panicked and INFO adoption_signer_guard_skipped (anchor_unverified):\n%s", logs)
+	}
+}
+
 // TestSignerGuard_StandsDownWithoutWhatItCompares: no current snapshot (a
 // first adoption, or after /forget: ruling G6), a current unsigned anchor,
 // a form it does not know (logged), and a Verifier that reports no signers
@@ -304,6 +340,60 @@ func TestSignerGuard_SaysWhenItIsOff(t *testing.T) {
 		if got := strings.Count(logs.String(), `"msg":"adoption_signer_guard_unavailable"`); got != map[bool]int{true: 1, false: 0}[c.warn] ||
 			(c.warn && !strings.Contains(logs.String(), line)) {
 			t.Fatalf("%T: logged %q; want the WARN %v", c.v, logs.String(), c.warn)
+		}
+	}
+}
+
+// refusedTotalFor reads acu_adoption_refused_total{reason}, 0 when the
+// series is not there yet.
+func refusedTotalFor(t *testing.T, reason string) float64 {
+	t.Helper()
+	var buf bytes.Buffer
+	metrics.Default.Render(&buf)
+	prefix := `acu_adoption_refused_total{reason="` + reason + `"} `
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.HasPrefix(line, prefix) {
+			v, err := strconv.ParseFloat(strings.TrimPrefix(line, prefix), 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return v
+		}
+	}
+	return 0
+}
+
+// TestAdoptionRefusedTotal_LabelsAreTheRefusalReasons (the final review's
+// F2-M2): acu_adoption_refused_total's reason label takes the closed
+// refusal-reason enum — eight values, signer_downgrade among them, each
+// named by the metric's help — and each value counts on its own series.
+func TestAdoptionRefusedTotal_LabelsAreTheRefusalReasons(t *testing.T) {
+	reasons := cache.RefusalReasons()
+	want := []string{cache.ReasonUpstreamOlder, cache.ReasonRollbackRefused, cache.ReasonUnsignedDowngradeRefused,
+		cache.ReasonUnsignedUnconfirmed, cache.ReasonUnsignedTooLarge, cache.ReasonAnchorAbsent,
+		cache.ReasonUnsignedDisabled, cache.ReasonSignerDowngrade}
+	slices.Sort(reasons)
+	slices.Sort(want)
+	if !slices.Equal(reasons, want) {
+		t.Fatalf("refusal reasons %v, want %v: a new one is a new label value (document it)", reasons, want)
+	}
+	var buf bytes.Buffer
+	metrics.Default.Render(&buf)
+	for _, r := range reasons {
+		if !strings.Contains(buf.String(), "# HELP acu_adoption_refused_total") {
+			t.Fatal("acu_adoption_refused_total is not registered")
+		}
+		before := refusedTotalFor(t, r)
+		adoptionRefusedTotal.Inc(r)
+		if got := refusedTotalFor(t, r) - before; got != 1 {
+			t.Errorf("reason %s: rose by %v, want 1", r, got)
+		}
+	}
+	help := buf.String()[strings.Index(buf.String(), "# HELP acu_adoption_refused_total"):]
+	help = help[:strings.IndexByte(help, '\n')]
+	for _, r := range reasons {
+		if !strings.Contains(help, r) {
+			t.Errorf("the metric's help does not name %s: %s", r, help)
 		}
 	}
 }

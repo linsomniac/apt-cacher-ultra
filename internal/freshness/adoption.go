@@ -77,11 +77,16 @@ type Verifier interface {
 // Strong is the uppercase fingerprint of the first counted packet's
 // signing key that is strong (internal/gpg's strongSigner), "" when none
 // is; Counted names the counted packets' signing keys in packet order, up
-// to and including the strong one, each one not strong with why. Under
-// accept_any_signer's bypass no packet is verified, and both are empty.
+// to and including the strong one, each one not strong with why;
+// Uncounted names every packet examined that did not count (its issuer,
+// "fpr:<fingerprint>" or "keyid:<key ID>", and why: a key the keyring
+// lacks, a discount, a failed verification), and the packets the
+// verifier's rules left unchecked. Under accept_any_signer's bypass no
+// packet is verified, and all three are empty.
 type Signers struct {
-	Strong  string
-	Counted []string
+	Strong    string
+	Counted   []string
+	Uncounted []string
 }
 
 // SignerVerifier is a Verifier that also reports an anchor's Signers: the

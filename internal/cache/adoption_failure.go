@@ -47,6 +47,10 @@ var refusalReasons = []string{
 // refusal state rather than a failure.
 func IsRefusalReason(reason string) bool { return slices.Contains(refusalReasons, reason) }
 
+// RefusalReasons returns the refusal reasons, a closed enum: the label set
+// of acu_adoption_refused_total{reason} (freshness).
+func RefusalReasons() []string { return slices.Clone(refusalReasons) }
+
 // ErrInvalidAdoptionFailure rejects a record without a content key, a
 // reason or a positive streak count, before any SQL runs.
 var ErrInvalidAdoptionFailure = errors.New("cache: invalid adoption failure record")

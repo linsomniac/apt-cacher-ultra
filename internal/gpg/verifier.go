@@ -486,7 +486,19 @@ func (v *Verifier) checkSignatures(suite freshness.SuiteRef, trust suiteTrust, s
 			return freshness.Signers{}, err
 		}
 	}
-	return v.verifyAnyTrusted(suite, trust.entities, trust.fps, signed, checked)
+	signers, err := v.verifyAnyTrusted(suite, trust.entities, trust.fps, signed, checked)
+	if err == nil && signers.Strong == "" {
+		// The packets gpgv does not check (anyGpgvChecks: signature types
+		// that differ) are not counted either; the guard's WARN names them.
+		for _, p := range pkts[len(checked):] {
+			issuer := fmt.Sprintf("keyid:%016X", p.issuer)
+			if p.fpr != nil {
+				issuer = "fpr:" + upperFP(p.fpr)
+			}
+			signers.Uncounted = append(signers.Uncounted, issuer+" (not checked: gpgv checks the first packet alone when their signature types differ)")
+		}
+	}
+	return signers, err
 }
 
 // The packet sets layer S reads, named for what they model (the second
@@ -881,7 +893,11 @@ var s2Hashes = map[byte]bool{8: true, 9: true, 10: true}
 // which decides the acceptance as before, it goes on counting the packets
 // after it, each under the same rules, until one's key is strong
 // (strongSigner, at the verifier's clock). A later packet that does not
-// count changes nothing: the anchor is accepted at the first.
+// count changes nothing: the anchor is accepted at the first. It also
+// names every packet it examined and did not count (Signers.Uncounted: its
+// issuer, and why), so that the guard's WARN can tell a vendor's new key
+// the keyring lacks ("not in the trust set") from a stripped signature
+// (the final review's F2-I2).
 //
 // A trusted packet whose signing key the keyring marks as not countable
 // (Keyring.uncountableKey: a revocation or a newer binding the cache cannot
@@ -922,6 +938,15 @@ func (v *Verifier) verifyAnyTrusted(
 		anyTrustedSeen  bool
 		rejectedSigners []string
 	)
+	// uncount records that S2 did not count pkts[i], and why, in
+	// signers.Uncounted.
+	uncount := func(i int, why string) {
+		issuer := fmt.Sprintf("keyid:%016X", pkts[i].issuer)
+		if pkts[i].fpr != nil {
+			issuer = "fpr:" + upperFP(pkts[i].fpr)
+		}
+		signers.Uncounted = append(signers.Uncounted, issuer+" ("+why+")")
+	}
 	// skip records why S2 does not count pkts[i], a packet it trusts, and
 	// says whether it does not (discount).
 	skip := func(i int) bool {
@@ -934,6 +959,7 @@ func (v *Verifier) verifyAnyTrusted(
 		case discounted == nil:
 			discounted = err
 		}
+		uncount(i, err.Error())
 		return true
 	}
 	// uncountableKey records that S2 does not count pkts[i], a packet it
@@ -953,9 +979,11 @@ func (v *Verifier) verifyAnyTrusted(
 		if why == nil {
 			return false
 		}
+		err := fmt.Errorf("S2: packet %d: its key %s is not counted: %w", pkts[i].n, fp, why)
 		if discounted == nil {
-			discounted = fmt.Errorf("S2: packet %d: its key %s is not counted: %w", pkts[i].n, fp, why)
+			discounted = err
 		}
+		uncount(i, err.Error())
 		return true
 	}
 	// count records pkts[i], a packet S2 counts, as made by signer's key of
@@ -993,6 +1021,7 @@ func (v *Verifier) verifyAnyTrusted(
 			anyShortKeyID = true
 			if !v.allowShortKeyID {
 				rejectedSigners = append(rejectedSigners, fmt.Sprintf("keyid:%016X", p.issuer))
+				uncount(i, "a short key ID alone, refused: allow_short_keyid is off")
 				continue
 			}
 			matched, err := findUniqueEntityByKeyID(trustSet, p.issuer)
@@ -1003,11 +1032,13 @@ func (v *Verifier) verifyAnyTrusted(
 				// proper precedence.
 				anyTrustedSeen = true
 				lastVerifyErr = err
+				uncount(i, err.Error())
 				continue
 			}
 			if matched == nil {
 				anyUntrusted = true
 				rejectedSigners = append(rejectedSigners, fmt.Sprintf("keyid:%016X", p.issuer))
+				uncount(i, untrustedIssuer)
 				continue
 			}
 			anyTrustedSeen = true
@@ -1020,6 +1051,7 @@ func (v *Verifier) verifyAnyTrusted(
 				bytes.NewReader(signed), bytes.NewReader(p.raw), v.sigConfig())
 			if verr != nil {
 				lastVerifyErr = verr
+				uncount(i, "not verified: "+verr.Error())
 				continue
 			}
 			if len(signers.Counted) == 0 {
@@ -1036,6 +1068,7 @@ func (v *Verifier) verifyAnyTrusted(
 		if _, ok := trustFPs[issuerFP]; !ok {
 			anyUntrusted = true
 			rejectedSigners = append(rejectedSigners, "fpr:"+issuerFP)
+			uncount(i, untrustedIssuer)
 			continue
 		}
 		anyTrustedSeen = true
@@ -1053,6 +1086,7 @@ func (v *Verifier) verifyAnyTrusted(
 		)
 		if verr != nil {
 			lastVerifyErr = verr
+			uncount(i, "not verified: "+verr.Error())
 			continue
 		}
 		if count(sig, signer, i) {
@@ -1078,6 +1112,11 @@ func (v *Verifier) verifyAnyTrusted(
 		return signers, ErrNoUsableSignature
 	}
 }
+
+// untrustedIssuer is why Signers.Uncounted names a packet whose issuer the
+// suite's trust set lacks: the key the keyring does not hold (or a pin
+// excludes) — after a vendor's key rotation, its new key.
+const untrustedIssuer = "not in the trust set: a key the keyring lacks, or a pin excludes"
 
 // signerStrength is the uppercase fingerprint of signer's key whose key ID
 // is issuer and that may sign — the key go-crypto verified a counted packet

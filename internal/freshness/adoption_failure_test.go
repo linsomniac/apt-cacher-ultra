@@ -228,6 +228,7 @@ func TestAdoptionFailure_RefusalIsNotAFailure(t *testing.T) {
 		t.Fatal("setup: v2 not adopted")
 	}
 	r.up.set(r.release("v1", d2-3600))
+	before := refusedTotalFor(t, cache.ReasonUpstreamOlder)
 	for i := 0; i < 3; i++ {
 		r.check()
 		r.clock.advance(2 * time.Hour)
@@ -235,6 +236,9 @@ func TestAdoptionFailure_RefusalIsNotAFailure(t *testing.T) {
 	row := r.row()
 	if row.AdoptionFailCount != 3 || strOf(row.AdoptionFailReason) != cache.ReasonUpstreamOlder {
 		t.Fatalf("record = %d %q, want 3 upstream_older", row.AdoptionFailCount, strOf(row.AdoptionFailReason))
+	}
+	if got := refusedTotalFor(t, cache.ReasonUpstreamOlder) - before; got != 3 {
+		t.Fatalf(`acu_adoption_refused_total{reason="upstream_older"} rose by %v, want 3 (one per adoption_refused line)`, got)
 	}
 	if n := len(r.events("adoption_refused")); n != 3 {
 		t.Fatalf("adoption_refused lines = %d, want 3 (one per refused attempt)", n)

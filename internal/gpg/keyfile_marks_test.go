@@ -17,7 +17,10 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -941,5 +944,43 @@ func TestVerifier_V3RevocationsAreMarked(t *testing.T) {
 				t.Errorf("%s: %v; want P read with K and its encryption subkey, K2 dropped", tc.name, err)
 			}
 		}
+	}
+}
+
+// TestLoadKeyring_NamesEveryMarkedKeyAtStart (the final review 2's D2-M8):
+// the loader logs one INFO keyring_key_marked per key or subkey the reader
+// marks, with its fingerprint, the mark and its file (path, or name for an
+// embedded source); a file it marks nothing in logs none.
+func TestLoadKeyring_NamesEveryMarkedKeyAtStart(t *testing.T) {
+	kk := newKR14Keys(t)
+	fpK := upperFP(kk.k.PublicKey.Fingerprint)
+	dir := makeTestDir(t)
+	marked := filepath.Join(dir, "marked.gpg")
+	writeFile(t, marked, kk.ring(t, nil, [][]byte{kk.subrev(t, crypto.RIPEMD160, hashRIPEMD160, []byte("\x02compromised"))}))
+	writeFile(t, filepath.Join(dir, "clean.gpg"), binaryKey(t, newTestEntity(t, "Clean", "clean@example.invalid")))
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	if _, err := LoadKeyringWithEmbedded([]string{dir}, []EmbeddedSource{{Name: "embedded-marked", Data: kk.ring(t,
+		[][]byte{kk.keyrev(t, crypto.RIPEMD160, hashRIPEMD160, []byte("\x02compromised"))}, nil)}}, logger); err != nil {
+		t.Fatal(err)
+	}
+	var lines []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var m map[string]any
+		if json.Unmarshal([]byte(line), &m) == nil && m["msg"] == "keyring_key_marked" {
+			lines = append(lines, m)
+		}
+	}
+	if len(lines) != 2 {
+		t.Fatalf("keyring_key_marked lines %v, want two (K in marked.gpg, P in the embedded source):\n%s", lines, logs.String())
+	}
+	fromFile, fromEmbedded := lines[0], lines[1]
+	if fromFile["level"] != "INFO" || fromFile["fingerprint"] != fpK || fromFile["path"] != marked ||
+		!strings.Contains(fmt.Sprint(fromFile["mark"]), "0x28") {
+		t.Errorf("the file's line %v; want INFO, K's fingerprint %s, path %s, a 0x28 mark", fromFile, fpK, marked)
+	}
+	if fromEmbedded["fingerprint"] != upperFP(kk.p.PrimaryKey.Fingerprint) || fromEmbedded["name"] != "embedded-marked" ||
+		!strings.Contains(fmt.Sprint(fromEmbedded["mark"]), "0x20") {
+		t.Errorf("the embedded source's line %v; want P's fingerprint, name embedded-marked, a 0x20 mark", fromEmbedded)
 	}
 }

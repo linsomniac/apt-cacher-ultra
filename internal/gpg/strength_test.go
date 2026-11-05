@@ -474,6 +474,41 @@ func TestVerifier_ReportsTheFirstStrongCountedSigner(t *testing.T) {
 	}
 }
 
+// TestVerifier_NamesTheUncountedPackets (the final review's F2-I2): an
+// anchor counted by its weak key alone names, in Signers.Uncounted, every
+// other packet with why: a key the keyring lacks ("not in the trust set",
+// a vendor's rotated key), a packet S2 does not count (a SHA-1 hash), and
+// a packet gpgv does not check (another signature type after the first).
+func TestVerifier_NamesTheUncountedPackets(t *testing.T) {
+	strong := policyKey(t, "strong", cfgEd25519)
+	weak := policyKey(t, "weak", cfgRSA1024)
+	unknown := policyKey(t, "unknown", cfgEd25519)
+	at := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	v := strengthVerifier(t, at, strong, weak)
+	text := []byte(fakeReleasePlaintext)
+	fp := func(e *openpgp.Entity) string { return "fpr:" + upperFP(e.PrimaryKey.Fingerprint) }
+	det := armorSignature(t, joined(binarySignature(t, weak, text, crypto.SHA256, at),
+		binarySignature(t, unknown, text, crypto.SHA256, at), binarySignature(t, strong, text, crypto.SHA1, at)))
+	_, got, err := v.VerifyDetachedSigners(context.Background(), newSuite(), text, det)
+	if err != nil || got.Strong != "" || len(got.Counted) != 1 || len(got.Uncounted) != 2 ||
+		!strings.HasPrefix(got.Uncounted[0], fp(unknown)+" (not in the trust set") ||
+		!strings.HasPrefix(got.Uncounted[1], fp(strong)+" (S2: packet 3: hash algorithm 2") {
+		t.Fatalf("weak, unknown, strong's SHA-1: %+v, %v; want the unknown and the SHA-1 packets uncounted, with why", got, err)
+	}
+	textSig := signaturePacketsOf(t, clearsignWithConfig(t, unknown, text,
+		&packet.Config{DefaultHash: crypto.SHA256, Time: func() time.Time { return at }}))
+	det = armorSignature(t, joined(binarySignature(t, weak, text, crypto.SHA256, at), textSig))
+	_, got, err = v.VerifyDetachedSigners(context.Background(), newSuite(), text, det)
+	if err != nil || len(got.Uncounted) != 1 || !strings.HasPrefix(got.Uncounted[0], fp(unknown)+" (not checked") {
+		t.Fatalf("weak binary, then a text-mode packet: %+v, %v; want the second packet named as not checked", got, err)
+	}
+	if _, got, err = v.VerifyDetachedSigners(context.Background(), newSuite(), text,
+		armorSignature(t, joined(binarySignature(t, strong, text, crypto.SHA256, at), binarySignature(t, unknown, text, crypto.SHA256, at)))); err != nil ||
+		got.Strong == "" || len(got.Uncounted) != 0 {
+		t.Fatalf("strong first: %+v, %v; want strong, and nothing examined after it", got, err)
+	}
+}
+
 // TestVerifier_CountsOnlyTheSuitesTrustedSigners: a strong key outside the
 // suite's pin set signs too, but S2 counts the pinned weak key's packet
 // alone, so the anchor has no strong signer.

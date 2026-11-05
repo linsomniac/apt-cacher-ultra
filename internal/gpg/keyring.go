@@ -243,6 +243,35 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 	var entries []KeyringEntry
 	uncountable := make(map[string]keyMarks)
 
+	// logMarks names, at start, each key or subkey the reader marked in one
+	// file (keyring_key_marked, INFO; the final review 2's D2-M8): its
+	// fingerprint, its marks and the file, so an operator can check the
+	// key before its vendor's next adoption fails on it
+	// (crypto_verify_failed). field is "path" for a file, "name" for an
+	// embedded source, as keyring_file_truncated's.
+	logMarks := func(parsed *keyFile, field, value string) {
+		fps := make([]string, 0, len(parsed.uncountable))
+		for fp := range parsed.uncountable {
+			fps = append(fps, fp)
+		}
+		slices.Sort(fps)
+		for _, fp := range fps {
+			marks := make([]string, 0, len(parsed.uncountable[fp]))
+			for _, m := range parsed.uncountable[fp] {
+				s := m.why.Error()
+				if !m.from.IsZero() {
+					s += " (from " + m.from.UTC().Format(time.RFC3339) + ")"
+				}
+				marks = append(marks, s)
+			}
+			logger.Info("keyring_key_marked",
+				"fingerprint", fp,
+				"mark", strings.Join(marks, "; "),
+				field, value,
+			)
+		}
+	}
+
 	addEntities := func(parsed *keyFile, source string) {
 		// Every mark from every copy of a key is kept (keyMarks: the
 		// union), as a revocation in any copy counts (the merge below).
@@ -341,6 +370,7 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 					"err", parsed.broken,
 				)
 			}
+			logMarks(parsed, "path", path)
 			addEntities(parsed, path)
 		}
 	}
@@ -360,6 +390,7 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 				"err", parsed.broken,
 			)
 		}
+		logMarks(parsed, "name", es.Name)
 		addEntities(parsed, "embedded:"+es.Name)
 	}
 

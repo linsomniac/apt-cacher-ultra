@@ -332,6 +332,35 @@ func TestSignerGuard_RefusesTheStripOfEachWeakClass(t *testing.T) {
 	}
 }
 
+// The final review's F2-I2: a vendor that signs with a strong key and a
+// weak co-signer rotates to a new strong key the keyring lacks, keeping the
+// weak one. The candidate is refused signer_downgrade (only the weak key
+// counts), and the WARN's uncounted_signers names the new key's
+// fingerprint as "not in the trust set", so the operator can tell the
+// rotation from a strip. Installing the new key (a restart with it in the
+// keyring) clears the refusal and keeps the guard armed: the next strip of
+// the new key's signature is refused again.
+func TestSignerGuard_NamesTheUncountedKeyOfARotation(t *testing.T) {
+	k := newGuardKeys(t)
+	r := newRig(t, guardVerifier(t, false, k.strong, k.weak))
+	if err := r.Run(inline(t, releaseText("v1"), k.strong, k.weak)); err != nil {
+		t.Fatalf("v1 by strong and weak: %v", err)
+	}
+	cur := r.Current()
+	rotated := inline(t, releaseText("v2"), k.other, k.weak)
+	err := r.Run(rotated)
+	refused(t, r, "v2 by the new (unknown) strong key and weak", cur, err, fpOf(k.strong), fpOf(k.weak))
+	want := `"uncounted_signers":["fpr:` + fpOf(k.other) + ` (not in the trust set`
+	if !strings.Contains(r.Logs(), want) || !strings.Contains(err.Error(), "fpr:"+fpOf(k.other)) {
+		t.Fatalf("the WARN and the error must name the new key %s as not in the trust set:\n%v\n%s", fpOf(k.other), err, r.Logs())
+	}
+	r.SetVerifier(guardVerifier(t, false, k.strong, k.other, k.weak))
+	adopted(t, r, "v2, the new key installed", cur, r.Run(rotated))
+	cur = r.Current()
+	refused(t, r, "v3 by weak alone, the new key's signature stripped", cur, r.Run(inline(t, releaseText("v3"), k.weak)),
+		fpOf(k.other), fpOf(k.weak))
+}
+
 // The Date rule still runs first, and the guard compares no clock of its
 // own with an anchor's Date: a candidate the weak key signs, dated after
 // the current anchor, is refused all the same.
