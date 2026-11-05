@@ -1052,6 +1052,19 @@ func (r rawSig) issuerIs(key *packet.PublicKey) bool {
 		r.keyID != nil && binary.BigEndian.Uint64(r.keyID) == key.KeyId
 }
 
+// name is the issuer as a log names it: its key ID, else its fingerprint
+// (a signature may name its issuer by fingerprint alone: the sixth
+// re-review's V-R6M2), else "an unnamed key".
+func (r rawSig) name() string {
+	switch {
+	case r.keyID != nil:
+		return fmt.Sprintf("%X", r.keyID)
+	case r.fpr != nil:
+		return fmt.Sprintf("%X", r.fpr)
+	}
+	return "an unnamed key"
+}
+
 // rawSigInfo reads a v4 (or v6) signature packet's body for rawSig: the
 // version octet, type, algorithms, then the hashed and unhashed subpacket
 // areas, each behind its two-octet (v6: four-octet) length.
@@ -1222,7 +1235,7 @@ func (kb *keyBlock) marks() map[string]error {
 				mark(fp, fmt.Errorf("%w: a signature of type 0x%02x stands on %s that %s; gpgv may take it as the newest binding or direct-key signature and refuse the component, so the cache fails closed whoever its issuer and whatever its age", pgperrors.ErrKeyExpired, s.typ, what, s.why))
 			case (t == packet.SigTypeKeyRevocation || t == packet.SigTypeSubkeyRevocation) && !s.self:
 				if kb.designated(&s) {
-					mark(fp, fmt.Errorf("%w: a revocation of %s (signature type 0x%02x) by a designated revoker, %X, stands on it, which the cache cannot verify; gpgv honours it when it holds that key", pgperrors.ErrKeyRevoked, what, s.typ, s.issuer.keyID))
+					mark(fp, fmt.Errorf("%w: a revocation of %s (signature type 0x%02x) by a designated revoker, %s, stands on it, which the cache cannot verify; gpgv honours it when it holds that key", pgperrors.ErrKeyRevoked, what, s.typ, s.issuer.name()))
 				}
 			case t == packet.SigTypeKeyRevocation, t == packet.SigTypeSubkeyRevocation:
 				mark(fp, fmt.Errorf("%w: a revocation of %s (signature type 0x%02x) stands on it that %s; gpgv honours it", pgperrors.ErrKeyRevoked, what, s.typ, s.why))

@@ -628,6 +628,7 @@ func TestVerifier_ThirdPartyRevocationsMarkOnlyWhenDesignated(t *testing.T) {
 		// revocation whose fingerprint names Y while its key ID names P.
 		{"kr21_dr_fprmis_xin: P designates X, X's readable 0x20 naming Y by fingerprint and X by key ID: P marked", kk.ring(t, [][]byte{designating(x, crypto.SHA256, hashSHA256), rsaKeySig(t, x, byte(packet.SigTypeKeyRevocation), crypto.SHA256, hashSHA256, joined(createdAt(t, kr14Created), issuerFpr(t, y.PrimaryKey), reason), pMaterial)}, nil), pgperrors.ErrKeyRevoked},
 		{"kr23_dr_er_fprmis_xin: the same, unreadable (RIPEMD-160): P marked", kk.ring(t, [][]byte{designating(x, crypto.SHA256, hashSHA256), rsaKeySig(t, x, byte(packet.SigTypeKeyRevocation), crypto.RIPEMD160, hashRIPEMD160, joined(createdAt(t, kr14Created), issuerFpr(t, y.PrimaryKey), reason), pMaterial)}, nil), pgperrors.ErrKeyRevoked},
+		{"kr24_dr_er_fpronly_xin: P designates X, X's unreadable 0x20 naming X by fingerprint alone: P marked, the mark naming X's fingerprint", kk.ring(t, [][]byte{designating(x, crypto.SHA256, hashSHA256), rsaKeySigUnhashed(t, x, byte(packet.SigTypeKeyRevocation), crypto.RIPEMD160, hashRIPEMD160, joined(createdAt(t, kr14Created), issuerFpr(t, x.PrimaryKey), reason), nil, pMaterial)}, nil), pgperrors.ErrKeyRevoked},
 	} {
 		v := kr14Verifier(t, map[string][]byte{"00-a.gpg": binaryKey(t, a), "20-p.gpg": tc.ring})
 		_, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, kGood))
@@ -636,6 +637,8 @@ func TestVerifier_ThirdPartyRevocationsMarkOnlyWhenDesignated(t *testing.T) {
 			t.Errorf("%s: K's good signature: %v; want it adopted", tc.name, err)
 		case tc.want != nil && (!errors.Is(err, tc.want) || !strings.Contains(err.Error(), "designated revoker") && !strings.Contains(err.Error(), "whoever its issuer")):
 			t.Errorf("%s: K's good signature: %v; want %v, the reader's mark naming a designated revoker (or a version 2 or 3 signature, marked whoever its issuer)", tc.name, err, tc.want)
+		case strings.Contains(tc.name, "fpronly") && (!strings.Contains(err.Error(), upperFP(x.PrimaryKey.Fingerprint)) || strings.Contains(err.Error(), ", ,")):
+			t.Errorf("%s: %v; want the mark to name X by its fingerprint (the sixth re-review's V-R6M2)", tc.name, err)
 		}
 		if _, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, aGood, kBad)); !errors.Is(err, ErrBadSignature) {
 			t.Errorf("%s: A's good signature and K's bad one: %v; want ErrBadSignature (S1 knows K)", tc.name, err)
