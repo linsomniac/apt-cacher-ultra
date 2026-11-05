@@ -573,7 +573,9 @@ func TestParseKeyring_MarksWhatItCannotRead(t *testing.T) {
 // direct-key signatures that verify. The cache marks wider, to fail closed
 // (the sixth re-review's V-R6M1, over-strict, Minor and Open under ruling
 // R3): without X's key loaded, X's 0x28 of K, a designation in a
-// self-certification or in a direct-key signature the cache cannot read,
+// self-certification or in a direct-key signature that does not verify
+// (one the cache cannot read but gpgv can, RIPEMD-160, gpgv honours:
+// kr25_dr_desig_ripemd_xin, REVKEYSIG in the five; that mark is exact),
 // and a forged designated revocation, which the cache never verifies. A
 // designation of another key, Y, is no designation of X. S1 knows K
 // throughout.

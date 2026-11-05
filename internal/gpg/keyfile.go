@@ -830,11 +830,15 @@ func sigTypeOf(p rawPacket, version int) (byte, bool) {
 // debian-maintainers and the 70 surveyed vendor files), so over-strictness
 // here costs nothing real: a legacy signature of these types marks the
 // component it stands on whoever its issuer and whatever its age (marks),
-// with no issuer or time parsing. The rows that makes over-strict, each
-// Minor and Open under ruling R3: a third party's legacy 0x20 or 0x28 the
-// key never designated (kr21_tp_v3rev_xin, ok ×6), and a legacy binding
-// older than the one kept (unmeasured). A legacy 0x30 keeps round 5's rule
-// (the key's own marks the key).
+// with no issuer or time parsing. The rows that makes over-strict, each ok
+// in all six images and each Minor and Open under ruling R3 (the seventh
+// re-review's section 3): a third party's legacy 0x20 or 0x28 the key never
+// designated (kr21_tp_v3rev_xin, kr25_tp_v3subrev); a legacy binding older
+// than, or as old as, the one kept (kr25_v3_bind_older,
+// kr25_v3_bind_tie_before); a legacy direct-key signature
+// (kr25_v3_directkey); a legacy back-signature standing alone
+// (kr25_v3_backsig_alone). A legacy 0x30 keeps round 5's rule (the key's
+// own marks the key).
 func legacySigType(p rawPacket) (byte, bool) {
 	if len(p.body) == 0 || p.body[0] != 3 && p.body[0] != 2 {
 		return 0, false
@@ -1221,9 +1225,10 @@ func supersedes(typ byte) byte {
 // images). A version 2 or 3 binding, back-signature, direct-key signature
 // or revocation of the key or a subkey IS marked, whoever its issuer and
 // whatever its age (legacySigType's note: the fifth re-review's V-R5I1 and
-// the sixth's V-R6I1 and V-R6I2; every supported apt honours a key's own
+// the sixth's V-R6I1 and V-R6I2; the five gpgv-based apt honour a key's own
 // v3 or v2 revocation, kr17_v3_keyrev, kr17_v3_subrev, kr20_v2_keyrev,
-// kr20_v2_subrev, REJ in the five gpgv-based apt, and gpgv takes a newer v3
+// kr20_v2_subrev, REVKEYSIG, debian:13's sqv the v3 ones alone (it ignores
+// the v2 ones: d13 ok), and gpgv takes a newer v3
 // or v2 binding as the subkey's and refuses it as not cross-certified,
 // kr21_v3_bind_newer, kr21_v2_bind_newer, ERRSIG); fix round 4 dropped every
 // such signature before the marks were made, and round 5's version 3
@@ -1259,7 +1264,7 @@ func (kb *keyBlock) marks() map[string]error {
 					mark(key, fmt.Errorf("%w: the key's revocation of its user ID %q (signature type 0x30) stands on it that %s; gpgv honours it", pgperrors.ErrKeyRevoked, c.uid, s.why))
 				}
 			case s.legacy && (t == packet.SigTypeKeyRevocation || t == packet.SigTypeSubkeyRevocation):
-				mark(fp, fmt.Errorf("%w: a revocation of %s (signature type 0x%02x) stands on it that %s; gpgv honours it whoever its issuer, so the cache fails closed", pgperrors.ErrKeyRevoked, what, s.typ, s.why))
+				mark(fp, fmt.Errorf("%w: a revocation of %s (signature type 0x%02x) stands on it that %s; the cache marks it whoever its issuer, to fail closed (gpgv honours the key's own and ignores a third party's)", pgperrors.ErrKeyRevoked, what, s.typ, s.why))
 			case s.legacy:
 				mark(fp, fmt.Errorf("%w: a signature of type 0x%02x stands on %s that %s; gpgv may take it as the newest binding or direct-key signature and refuse the component, so the cache fails closed whoever its issuer and whatever its age", pgperrors.ErrKeyExpired, s.typ, what, s.why))
 			case (t == packet.SigTypeKeyRevocation || t == packet.SigTypeSubkeyRevocation) && !s.self:
