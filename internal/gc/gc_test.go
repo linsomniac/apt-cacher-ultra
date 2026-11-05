@@ -532,14 +532,22 @@ func TestRunSnapshotPass_DeadlineReached_EmitsEvent(t *testing.T) {
 	}
 }
 
-// Exhausting the shared budget defers the remaining passes. The next tick
-// must resume at snapshots rather than restart URL-path work.
-func TestRunTick_SnapshotDeadlineDefersBlobPass(t *testing.T) {
+// Issue #14 (the final review 2's G2-I1; this test was
+// TestRunTick_SnapshotDeadlineDefersBlobPass, which pinned the starvation):
+// a snapshot pass that hits its deadline moves the rotation past itself, as
+// a failed pass does (ruling HD-15), so the next tick resumes at the blob
+// pass and never repeats the snapshot pass first. Here the budget is spent
+// before either pass's first batch, so the blob pass hits its own deadline
+// too and the rotation stays at it; the next tick runs the blob pass alone
+// (no url-path scan), and the one after it a fresh url-path sweep.
+// TestRunTick_ASnapshotDeadlineDoesNotDeferTheBlobPass pins the same tick's
+// blob pass when its share of the budget is left.
+func TestRunTick_ASnapshotDeadlineMovesTheRotationToTheBlobPass(t *testing.T) {
 	c := openTestCache(t)
 	logger, buf := captureLogger()
 
 	// Seed a reapable blob; a healthy tick would normally reap it, but
-	// the cascade makes the blob pass return immediately.
+	// the spent budget makes the blob pass return immediately.
 	seedReapableBlob(t, c, "cascade test blob")
 
 	g, err := New(Config{
@@ -567,19 +575,19 @@ func TestRunTick_SnapshotDeadlineDefersBlobPass(t *testing.T) {
 		t.Errorf("deadlineReached = false, want true")
 	}
 	if res.blobsReaped != 0 {
-		t.Errorf("blobsReaped = %d, want 0 (cascade should have starved blob pass)", res.blobsReaped)
+		t.Errorf("blobsReaped = %d, want 0 (the spent budget leaves the blob pass no time)", res.blobsReaped)
 	}
 
 	logs := buf.String()
-	if !strings.Contains(logs, `"which":"snapshot"`) {
-		t.Errorf(`expected which="snapshot" deadline event: %s`, logs)
+	if !strings.Contains(logs, `"which":"snapshot"`) || !strings.Contains(logs, `"which":"blob"`) {
+		t.Errorf(`expected which="snapshot" and which="blob" deadline events: %s`, logs)
 	}
-	if g.nextPass != snapshotPass {
-		t.Fatalf("next pass = %v, want snapshot", g.nextPass)
+	if g.nextPass != blobPass {
+		t.Fatalf("next pass = %v, want blob: a snapshot deadline moves the rotation past the snapshot pass", g.nextPass)
 	}
 
 	// Make new URL-path work eligible before resuming. It must wait until
-	// the pending snapshot/blob passes drain, even with URL GC enabled.
+	// the pending blob pass drains, even with URL GC enabled.
 	db := dbOf(t, c)
 	if _, err := db.Exec(`INSERT INTO url_path
   (canonical_scheme, canonical_host, path, upstream_url, is_metadata, last_requested_at)

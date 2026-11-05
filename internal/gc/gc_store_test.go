@@ -27,9 +27,13 @@ import (
 // none (or panic, chunkPanics, or fail, chunkErrs), and whose HashKnown
 // knows no hash and panics for hashPanic. A batch or chunk call checks
 // for its panic first, then calls its hook (batchHook, chunkHook), then
-// fails or answers.
+// fails or answers. Its url-path batches are the real cache's (storeGC
+// gives it the cache: useCache), each taking urlSleep first.
 type fakeStore struct {
 	mu          sync.Mutex
+	cache       *cache.Cache  // the url-path batches' (useCache)
+	urlSleep    time.Duration // each url-path batch takes this long first (virtual time in a bubble)
+	urlBatches  int           // RunURLPathGCBatch calls
 	batchPanics int           // RunSnapshotGCBatch panics on this many first calls
 	batchErrs   int           // RunSnapshotGCBatch fails on this many calls after the batchPanics ones
 	batchHook   func()        // called on every RunSnapshotGCBatch call that does not panic, before it fails or answers
@@ -41,6 +45,19 @@ type fakeStore struct {
 	chunkErrs   bool   // RunRetiredSnapshotGCChunk fails
 	chunkHook   func() // called on every RunRetiredSnapshotGCChunk call that does not panic, before it fails or answers; runs under f.mu: it must not call the fake
 	hashPanic   string
+}
+
+// useCache is storeGC's: the url-path batches go to c.
+func (f *fakeStore) useCache(c *cache.Cache) { f.cache = c }
+
+func (f *fakeStore) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds, holdSeconds int64, maxVersions int,
+	afterScheme, afterHost, afterPath string,
+) (cache.URLPathGCBatchResult, error) {
+	time.Sleep(f.urlSleep)
+	f.mu.Lock()
+	f.urlBatches++
+	f.mu.Unlock()
+	return f.cache.RunURLPathGCBatch(ctx, batchSize, ttlSeconds, holdSeconds, maxVersions, afterScheme, afterHost, afterPath)
 }
 
 func (f *fakeStore) RunSnapshotGCBatch(context.Context, int, int64, int, bool) (cache.SnapshotGCBatchResult, error) {
@@ -91,10 +108,14 @@ func (f *fakeStore) HashKnown(_ context.Context, hash string) (bool, error) {
 }
 
 // storeGC is a GC over a real cache (for the passes outside the seam)
-// whose gcStore is store, logging into the returned buffer.
+// whose gcStore is store, logging into the returned buffer. A store with a
+// useCache method (fakeStore) is given the cache for its url-path batches.
 func storeGC(t *testing.T, store gcStore, workers int, logger *slog.Logger) (*GC, *cache.Cache) {
 	t.Helper()
 	c := openTestCache(t)
+	if u, ok := store.(interface{ useCache(*cache.Cache) }); ok {
+		u.useCache(c)
+	}
 	g, err := New(Config{Cache: c, Logger: logger, Enabled: true, Interval: time.Hour, BatchSize: 100,
 		SnapshotBatchSize: 10, MaxTickDuration: time.Minute, BlobGrace: 5 * time.Minute, KeepDisplaced: 3,
 		PoolScanWorkers: workers, HeartbeatStaleGrace: 30 * time.Minute})

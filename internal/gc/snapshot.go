@@ -50,7 +50,7 @@ type snapshotPassResult struct {
 // wave's re-review, gc-sims minor 1): the passes resume in rotation
 // (runTick), so when the startup pass's own blob pass hits its deadline,
 // the first periodic tick resumes only that blob pass, and C runs at the
-// second at the earliest; a periodic pass that hits its deadline defers C
+// second at the earliest; a periodic blob pass that hits its deadline defers C
 // the same way. Retired rows wait for that tick: normally one GC interval
 // after the startup pass, two or more when its blob pass hit its deadline.
 // They never serve meanwhile. When gc.interval is longer than an hour,
@@ -82,9 +82,10 @@ type snapshotPassResult struct {
 // Returns:
 //   - the cumulative counts (orphan, displaced, retired),
 //   - whether the deadline tripped (true means the pass exited
-//     between batches with backlog remaining; runTick then returns
-//     without running the blob pass, and the next tick resumes this
-//     pass — A ∪ B, then C — before the blob pass),
+//     between batches with backlog remaining; runTick then moves the
+//     rotation to the blob pass, which runs in the same tick, under its
+//     own share of the budget, and the next tick that reaches this pass
+//     re-selects — A ∪ B, then C: issue #14),
 //   - error iff a DB-level failure occurred (runTick then runs the blob
 //     pass all the same: ruling HD-15).
 func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase string) (snapshotPassResult, bool, error) {
