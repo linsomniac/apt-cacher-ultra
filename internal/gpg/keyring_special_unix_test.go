@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -90,5 +91,21 @@ func TestLoadKeyring_SkipsWhatIsNotARegularFile(t *testing.T) {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("no WARN says %s:\n%s", want, logs.String())
 		}
+	}
+	// The stat_failed line's own path field names the dangling path (the
+	// fifth re-review's V-R5M2: the stat error's text names it too, which
+	// is no substitute for the documented field).
+	dangling := filepath.Join(dir, "dangling.gpg")
+	statFailed := false
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(line, "reason=stat_failed") {
+			statFailed = true
+			if !strings.Contains(line, "path="+dangling) && !strings.Contains(line, "path="+strconv.Quote(dangling)) {
+				t.Errorf("the stat_failed WARN's path field is not %s:\n%s", dangling, line)
+			}
+		}
+	}
+	if !statFailed {
+		t.Errorf("no stat_failed WARN:\n%s", logs.String())
 	}
 }
