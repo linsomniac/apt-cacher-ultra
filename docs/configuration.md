@@ -523,17 +523,18 @@ When an adoption fails (an untrusted or malformed signature, a member that will 
 
 If the cache cannot read the current snapshot when an adoption starts, the attempt fails as `db_failed` (and is retried on the backoff schedule) rather than skipping the rollback checks below.
 
-Seven outcomes are refusals, not failures, and are shown as "refused: …" on the status page:
+Eight outcomes are refusals, not failures, and are shown as "refused: …" on the status page:
 
 - `upstream_older`: upstream serves a Release whose `Date` is older than the snapshot being served, or has no `Date` at all after a dated snapshot (a missing `Date` counts as 0). apt would ignore it too; the cache keeps serving the newer snapshot.
 - `rollback_refused`: upstream serves content identical to an older snapshot the cache already replaced (a flapping mirror). Only the last `gc.keep_displaced` snapshots are remembered for this.
+- `signer_downgrade`: the new anchor has lost the strong signer the suite's current anchor has, the shape of an on-path strip, or of a vendor's rotation to a key the keyring lacks; the current snapshot keeps serving (see *Trust and signer pins*). It keeps its lag.
 - `unsigned_unconfirmed`: an unsigned repository's first adoption waits for a second observation of the same `Release` (see *Anchor forms and unsigned repositories*).
 - `unsigned_downgrade_refused`: the suite has been seen signed, so its unsigned `Release` is not adopted.
 - `unsigned_too_large`: an unsigned `Release` declares more than 1,000 files.
 - `unsigned_disabled`: `adopt_unsigned = false`, so an unsigned `Release` is not adopted; an unsigned suite already adopted keeps serving its last snapshot, not updated, until the knob is turned back on, the suite is forgotten (`POST /forget`), or it is reaped after `gc.suite_idle_ttl` without a client. Forgotten or reaped with the knob still off, it is then a repository not yet adopted, served as the cache first stored its files (see `adopt_unsigned`). A flat repository that publishes no `Release` at all is refused this way too while the knob is off: it is not refreshed (see *Flat repositories*).
 - `anchor_absent`: the suite's current anchor file is gone upstream, or a detached suite's changed `Release` comes without its `Release.gpg`; its snapshot keeps serving, and the suite moves to its other signed form when upstream serves one. A suite without a snapshot whose upstream serves neither `InRelease` nor `Release` shows it too (unless it is a flat repository the cache has never seen signed: see *Flat repositories*). While a failed adoption of the suite is recorded (its move to the other form failed), the status page shows that failure's reason instead, and the suite is paced the same way.
 
-Refused content follows the same retry schedule as a failure, but a refusal is a state, not a failure: it logs INFO (`adoption_refused`, and `adoption_run_failed` at INFO) and is not counted by `acu_adoption_failing_suites`. `upstream_older` and `rollback_refused` show no lag (the cache already serves content at least as new as upstream's); the other five keep their lag, because the suite is in fact behind. A refusal that lasts more than 24 hours is escalated anyway, because it may be a silent freeze (a vendor that stops emitting `Date` is refused `upstream_older` forever): the status page warns on its row and on the SUITES vital ("REFUSED 24H+", never critical) and the log carries WARN `adoption_refused_persistently` at the streak milestones.
+Refused content follows the same retry schedule as a failure, but a refusal is a state, not a failure: it logs INFO (`adoption_refused`, and `adoption_run_failed` at INFO), is counted by reason in `acu_adoption_refused_total{reason}`, and is not counted by `acu_adoption_failing_suites`. `upstream_older` and `rollback_refused` show no lag (the cache already serves content at least as new as upstream's); the other six keep their lag, because the suite is in fact behind. A refusal that lasts more than 24 hours is escalated anyway, because it may be a silent freeze (a vendor that stops emitting `Date` is refused `upstream_older` forever): the status page warns on its row and on the SUITES vital ("REFUSED 24H+", never critical) and the log carries WARN `adoption_refused_persistently` at the streak milestones.
 
 A Release dated more than 10 seconds ahead of the cache's clock is a failure (apt rejects it as "not valid yet"); check the cache host's clock if this persists.
 
@@ -568,12 +569,15 @@ anchor that carries a bad signature from any key in its keyring (reason
 `bad_signature`), as apt does with gpgv (`debian:13`'s apt, which verifies
 with sqv, refuses only a lone one), except under `accept_any_signer`'s
 bypass, which verifies no signature; install in the cache every key your
-clients' `signed-by` names, so that it refuses what they would. A key file
-is read as apt reads it: every armor block, the keys before any junk, and
-a revocation or expiry the cache cannot read stops that key from counting,
-as gpgv honours it; a file the cache skips, or reads only in part, is
-named at start by WARN `keyring_file_skipped`, `keyring_file_truncated`
-or `keyring: parse failed; skipping file`. A key that does not count is
+clients' `signed-by` names, so that it refuses what they would. Key
+files are read as the apt clients read them, every block and the keys
+before junk (where clients differ, the cache reads what any of them reads:
+`docs/open-decisions.md`), and a revocation or expiry the cache cannot
+read stops that key from counting, as gpgv honours it (INFO
+`keyring_key_marked` names each such key at start); a file the cache
+skips, or reads only in part, is named at start by WARN
+`keyring_file_skipped`, `keyring_file_truncated` or `keyring: parse
+failed; skipping file`. A key that does not count is
 reported as `crypto_verify_failed`. For a key the cache marks, the
 `adoption_gpg_failed` line names the key and why (`its key … is not
 counted: …`); for go-crypto's "key expired" or "signature made by
@@ -599,8 +603,8 @@ block, armor lines over 76 characters, bytes left inside a signature
 packet, a packet of an algorithm it does not read (SHA-224, SHA3-256),
 among others, refused as
 `malformed_clearsign` (an `InRelease`) or `malformed_signature` (a
-`Release.gpg`) even where apt would accept them; the status page's reason
-and the `adoption_gpg_failed` log line name the rule. No setting widens
+`Release.gpg`) even where apt would accept them; the status page shows
+the reason, and the `adoption_gpg_failed` log line names the rule. No setting widens
 it. A signature hashed with SHA-1 never counts, as every measured apt
 from 1.6 on (Ubuntu 18.04, Debian 10 and later) does not count it (apt 1.2
 and 1.0, on Ubuntu 16.04 and 14.04, still do). An anchor that holds a
@@ -619,25 +623,46 @@ keyring, has a *strong* signer — a key `debian:13`, `ubuntu:24.04` and
 `ubuntu:26.04` all accept (Ed25519, ECDSA P-256 or P-384, or RSA of 2048
 bits or more, until 2030-02-01 for 2048, bound with SHA-256 or better) —
 and a new anchor has none, the new anchor is refused (refusal
-`signer_downgrade`, WARN `adoption_signer_downgrade`) and the current
-snapshot keeps serving, its lag showing. It cannot see a strip at a
-suite's first adoption, and stands down for a suite whose current anchor
+`signer_downgrade`) and the current snapshot keeps serving, its lag
+showing. WARN `adoption_signer_downgrade` names the current strong signer,
+the new anchor's counted signers (`new_signers`) and every other signature
+of it with why it did not count (`uncounted_signers`), and
+`acu_adoption_refused_total{reason="signer_downgrade"}` counts each
+refused attempt, apart from the benign refusals. It cannot see a strip at
+a suite's first adoption, and stands down for a suite whose current anchor
 has no strong signer. The refusal clears by itself when the vendor signs
-again with a strong key. Before anything else, confirm out of band that
-the vendor really dropped its strong signer — its announcement, its site,
-or its key-rotation notice — because both of the operator's recourses
-adopt the very anchor the guard refused, which an on-path strip also
-produces. Then either remove the strong key from the keyring, or
-`POST /forget` the suite, which adopts the new anchor as a first adoption
-(the recourse for a bundled key). Removing the key has costs: the cache
-reads the host's own apt key directories, so the host's own apt loses the
-key too, and a key file a package installed comes back at the package's
-next upgrade; the bundled Debian, Ubuntu and Ubuntu Pro keys cannot be
-removed; every other suite that key signs stops counting it
-(`untrusted_signer` there); the keyring is read only at start, so it
-needs a restart; and the refusal keeps its retry time across the restart,
-so the suite adopts at that retry (at most 75 minutes later), not at the
-restart.
+again with a strong key the keyring holds. A vendor that rotates to a new
+strong key the keyring does not hold yet, and keeps a weak co-signer, is
+refused too: then `uncounted_signers` names the new key, `not in the trust
+set`, which a strip does not show. The recourses, in this order:
+
+1. **Install the vendor's new key**, once you have confirmed it out of
+   band (the vendor's announcement, its site or its key-rotation notice),
+   and restart: the keyring is read only at start. This is the recourse
+   for a rotation, and it keeps the guard on: the next candidate has a
+   strong signer again. The refusal keeps its retry time across the
+   restart, so the suite adopts at that retry (at most 75 minutes later).
+2. Otherwise, confirm out of band that the vendor really dropped its
+   strong signer, because the next two recourses adopt the very anchor
+   the guard refused, which an on-path strip also produces. Then
+   `POST /forget` the suite, which adopts the new anchor as a first
+   adoption (the recourse for a bundled key); its `/.` twin and its copy
+   under the other scheme are separate suites, each refused until it is
+   forgotten too (*Forgetting a suite* under `[gc]`).
+3. Or remove the old strong key from the keyring. The guard then stands
+   down for the suite until a strong key is installed again. Removing it
+   has costs: the cache reads the host's own apt key directories, so the
+   host's own apt loses the key too, and a key file a package installed
+   comes back at the package's next upgrade; where the vendor's strong
+   and weak keys share one `.asc` file, removing the strong one means
+   editing the vendor's file; the bundled Debian, Ubuntu and Ubuntu Pro
+   keys cannot be removed; every other suite that key signs stops counting
+   it (`untrusted_signer` there); it needs a restart; and the refusal
+   keeps its retry time across the restart.
+
+`accept_any_signer` would clear the refusal too, by verifying no signature
+for the host's suites (no anchor has a strong signer under its bypass): it
+is not a recourse.
 
 `accept_any_signer = true` makes client-side apt verification the trust boundary
 for unpinned suites: the cache continues serving the original signed bytes, but
@@ -1323,11 +1348,18 @@ metrics, tuning tradeoffs, and profile-capture commands.
 used (see *Suite reaping* under `[gc]`): its cached index files, its
 snapshots and its row are deleted. The next request for it tracks it again
 as a new repository and, with adoption enabled, adopts what upstream
-serves then. That is the way out of two refusal states: a deliberate
-upstream rollback (refused `upstream_older` or `rollback_refused`), and a
-vendor that stopped signing (`unsigned_downgrade_refused`). The latter
-needs `adoption.adopt_unsigned = true` (the default): with the knob off,
-the forgotten vendor's unsigned repository is not adopted — it is refused
+serves then. That is the way out of three refusal states: a deliberate
+upstream rollback (refused `upstream_older` or `rollback_refused`), a
+vendor that stopped signing (`unsigned_downgrade_refused`), and a vendor
+that dropped its strong signer (`signer_downgrade`). Confirm with the
+vendor out of band first: forgetting adopts the anchor the cache refused,
+which for the last two is also what an on-path attacker produces (for
+`signer_downgrade`, installing a rotated key comes first: *Trust and
+signer pins* under `[adoption]`). A suite's `/.` twin and its copy under
+the other scheme are separate suites: forget each, or it is refused
+again. `unsigned_downgrade_refused` also needs
+`adoption.adopt_unsigned = true` (the default): with the knob off, the
+forgotten vendor's unsigned repository is not adopted — it is refused
 `unsigned_disabled` and served as the cache first stores each of its
 files, never refreshed (see `adopt_unsigned` under `[adoption]`).
 

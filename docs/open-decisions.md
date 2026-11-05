@@ -130,7 +130,24 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
    and stop adopting), the signer downgrade guard (`signer_downgrade`)
    and its recourse, the six vendors with no strong signer, the SHA-1
    refusal, the key reader's changes, and the older-client oracle (`make
-   e2e-apt-oracle-old`). Their links name the `1.1.0` tag;
+   e2e-apt-oracle-old`). No Changelog entry names the following, so add
+   them by hand (the final review 2's D2-M5): the new events WARN
+   `adoption_signer_downgrade` (with its `uncounted_signers`),
+   `adoption_signer_guard_unavailable`, `adoption_signer_guard_panicked`,
+   `keyring_file_skipped` and `keyring_file_truncated`, and INFO
+   `adoption_signer_guard_skipped` and `keyring_key_marked`; the new
+   metrics `acu_adoption_reconcile_failed_total{stage}` and
+   `acu_adoption_refused_total{reason}`, which make 23, not the 21 the
+   notes first counted (the notes' *New metrics* lists both now); the GC
+   counters' new double count — a displaced snapshot beyond
+   `gc.keep_displaced` counts in `displaced_reaped`
+   (`acu_gc_displaced_reaped_total`) when a periodic tick retires it and
+   again in `retired_reaped` (`acu_gc_retired_reaped_total`) when it is
+   deleted, so a dashboard that sums them counts it twice; and the refusal
+   count, eight (`signer_downgrade` added; six keep their lag), which the
+   notes' *Retry discipline* says now. The per-release steps that outlive
+   this section are in [docs/releasing.md](releasing.md). Their links name
+   the `1.1.0` tag;
    for a release
    candidate, paste them with that tag replaced by the candidate's:
    `sed 's|/blob/1\.1\.0/|/blob/1.1.0-rc1/|g' docs/release-notes/1.1.0.md`.
@@ -745,29 +762,40 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   adopts what `debian:13` clients then refuse, until upstream changes and
   the next adoption brings the strong signer back. Class R2 (integrity,
   for the newest clients): at that moment a strip goes through; open by
-  ruling G6. The recourse for a refusal (ruling G4;
-  `adoption_signer_downgrade`'s row in `docs/log-fields.md`;
-  `docs/configuration.md`, *Trust and signer pins*): first confirm out of
-  band that the vendor really dropped its strong signer — its
-  announcement, its site or its key-rotation notice — since both of the
-  operator's recourses adopt the very anchor the guard refused, which an
-  on-path strip also produces. Then: the vendor signs again with a strong
-  key, which clears the refusal by itself; or the operator removes the
-  strong key from the keyring, at these costs — the cache reads the host's
-  own apt key directories (`/etc/apt/trusted.gpg.d`, `/etc/apt/keyrings`,
-  `/usr/share/keyrings`: `keyringDirs` in `cmd/apt-cacher-ultra/main.go`),
-  so the host's own apt loses the key too, and a file a package owns comes
-  back at its next upgrade; the bundled Debian, Ubuntu and Ubuntu Pro keys
+  ruling G6. The refusal clears by itself when the vendor signs again with
+  a strong key the keyring holds; a vendor that rotated to a new strong
+  key the keyring lacks, keeping a weak co-signer, does not clear it (the
+  final review 2's F2-I2), and the WARN's `uncounted_signers` then names
+  the new key, `not in the trust set`. The recourse for a refusal (ruling
+  G4; `adoption_signer_downgrade`'s row in `docs/log-fields.md`;
+  `docs/configuration.md`, *Trust and signer pins*), in this order:
+  install the vendor's new key, once confirmed out of band (its
+  announcement, its site or its key-rotation notice), and restart, which
+  keeps the guard on (`TestSignerGuard_NamesTheUncountedKeyOfARotation`).
+  Otherwise first confirm out of band that the vendor really dropped its
+  strong signer, since the other two recourses adopt the very anchor the
+  guard refused, which an on-path strip also produces: the operator sends
+  `POST /forget` (and for the suite's `/.` twin and other-scheme copy,
+  each a suite of its own), which adopts the candidate as a first adoption
+  and is the recourse for a bundled key; or the operator removes the old
+  strong key from the keyring, and the guard then stands down for the
+  suite until a strong key is installed again, at these costs (where the
+  vendor's strong and weak keys share one `.asc` file, it means editing
+  the vendor's file) — the cache reads the host's own apt key directories
+  (`/etc/apt/trusted.gpg.d`, `/etc/apt/keyrings`, `/usr/share/keyrings`:
+  `keyringDirs` in `cmd/apt-cacher-ultra/main.go`), so the host's own apt
+  loses the key too, and a file a package owns comes back at its next
+  upgrade; the bundled Debian, Ubuntu and Ubuntu Pro keys
   (`internal/gpg/embedded/`) cannot be removed; every other suite that key
   signs stops counting it (`untrusted_signer` there); the keyring is read
   only at start, so it needs a restart; and the refusal keeps its retry
   time across the restart (`rescheduleFailingAdoptions` leaves refusal
-  states alone), so the suite adopts at that retry, not at the restart —
-  or the operator sends `POST /forget`, which adopts the candidate as a
-  first adoption and is the recourse for a bundled key. No override and no
-  configuration key (ruling HD-17). Per-client tracking by User-Agent was
-  considered and not taken (the plan's addendum). Recommendation: leave
-  it; the per-suite identity
+  states alone), so the suite adopts at that retry, not at the restart.
+  `accept_any_signer` would clear it too, by verifying no signature for
+  the host's suites (no anchor has a strong signer under the bypass): not
+  a recourse. No override and no configuration key (ruling HD-17).
+  Per-client tracking by User-Agent was considered and not taken (the
+  plan's addendum). Recommendation: leave it; the per-suite identity
   pinning of the flat-repositories spec's §10 item 5 (the C-3 entry above)
   would close it with the first-snapshot problem.
 - **Older clients refuse real vendors' layouts that the cache accepts**
@@ -1434,7 +1462,8 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   blocks the release until it is recorded and the table test agrees
   (`e2e/apt-oracle/README.md`, *When to run it* and *When apt changes*).
   They are the only check that sees apt drift between releases; the table
-  test holds the cache to the recorded verdicts in CI.
+  test holds the cache to the recorded verdicts in CI. The per-release
+  checklist: [docs/releasing.md](releasing.md).
 - **Dependencies updated for 1.1.0** (the maintainer, 2026-10-28; raised
   2026-09-08, the security review's finding H-3): `golang.org/x/net`
   0.58.0, `golang.org/x/text` 0.41.0, `golang.org/x/crypto` 0.55.0,
@@ -1524,4 +1553,5 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
 - **`make e2e-live` runs before 1.1.0, and before later releases that
   change the request path, adoption or vouching** (the H3 controller's
   ruling PH3-9, from that plan's review V-M-15). Evidence:
-  `e2e/live/README.md`, its first paragraph.
+  `e2e/live/README.md`, its first paragraph. The per-release checklist:
+  [docs/releasing.md](releasing.md).

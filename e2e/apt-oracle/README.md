@@ -28,7 +28,8 @@ bash e2e/apt-oracle/run.sh --record                    # all six: rewrite verdic
 bash e2e/apt-oracle/run.sh --old --record              # all five: rewrite verdicts-old.txt and classes-old.txt
 ```
 
-It needs Docker and GNU `timeout`, and the images (pulled on first use;
+It needs Docker, GNU `timeout` and python3 (`run.sh` checks each first), and
+the images (pulled on first use;
 the containers themselves run with `--network none`). The images of a set
 run in parallel, one `apt-get update` per shape in each and a second one
 for each shape apt refuses (*Error classes*); with the images cached a run
@@ -41,11 +42,16 @@ version lines a run prints show which apt it measured. The eleven, as
 `COLUMNS` and `OLD_COLUMNS` in `run.sh` name them:
 
 ```sh
-for i in debian:11 ubuntu:22.04 ubuntu:24.04 debian:12 debian:13 ubuntu:26.04 \
-         debian:10 ubuntu:20.04 ubuntu:18.04 ubuntu:16.04 ubuntu:14.04; do
-  docker pull "$i" || exit 1
-done
+(
+  for i in debian:11 ubuntu:22.04 ubuntu:24.04 debian:12 debian:13 ubuntu:26.04 \
+           debian:10 ubuntu:20.04 ubuntu:18.04 ubuntu:16.04 ubuntu:14.04; do
+    docker pull "$i" || exit 1
+  done
+)
 ```
+
+The parentheses run the loop in a subshell, so a failed pull stops the
+loop without closing an interactive shell it was pasted into.
 
 The exit status is 0 when apt gives the recorded verdicts and error
 classes (or `--record` wrote them), 1 when apt changed, a container failed

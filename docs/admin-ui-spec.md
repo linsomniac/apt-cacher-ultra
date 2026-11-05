@@ -357,7 +357,7 @@ next to the Suites table contract in §5.3:
 | `adoption_fail_count` | int64 | Consecutive adoption attempts in the current failure/refusal streak; `0` when no record exists. |
 | `adoption_fail_first_unixtime` | int64 or `null` | When the current streak started; for `unsigned_unconfirmed` and `anchor_absent`, when the current bytes (or absence) were first observed — it restarts on new content while `adoption_fail_count` keeps growing. |
 | `adoption_next_retry_unixtime` | int64 or `null` | When the same content is retried next; new content is tried at once regardless of this stamp. |
-| `adoption_refused` | boolean | `true` when the record above is a refusal state (`upstream_older`, `rollback_refused`, `unsigned_downgrade_refused`, `unsigned_unconfirmed`, `unsigned_too_large`, `anchor_absent`, `unsigned_disabled`), not a failure. |
+| `adoption_refused` | boolean | `true` when the record above is a refusal state (`upstream_older`, `rollback_refused`, `unsigned_downgrade_refused`, `unsigned_unconfirmed`, `unsigned_too_large`, `anchor_absent`, `unsigned_disabled`, `signer_downgrade`), not a failure. |
 
 These are additive to the locked JSON contract (§0.1), the same way
 `keyring[]` was: no existing key changes shape or meaning (`scheme` too:
@@ -414,9 +414,14 @@ adopted keeps serving its last snapshot without updates until the knob is
 turned back on, the suite is forgotten, or it is reaped after
 `gc.suite_idle_ttl` without a client — forgotten or reaped with the knob
 still off, it is then a suite not yet adopted, served as the cache first
-stored its files. None of them hides lag (only `upstream_older` and
-`rollback_refused` do, §9.1), and all five follow the `REFUSED 24H+` rule
-below. A suite without a snapshot shows lag from the first check that
+stored its files. `signer_downgrade` (the GC and upstream hardening
+plan's Task 9d, not phase E) means the new anchor lost the strong signer
+the suite's current anchor has; the current snapshot keeps serving until
+upstream signs again with a strong key the keyring holds, the operator
+installs a rotated key, or the suite is forgotten (`docs/configuration.md`,
+*Trust and signer pins*). None of these six hides lag (only
+`upstream_older` and `rollback_refused` do, §9.1), and all six follow the
+`REFUSED 24H+` rule below. A suite without a snapshot shows lag from the first check that
 found its anchor, so a first adoption refused for good
 (`unsigned_downgrade_refused`, `unsigned_disabled`, or an
 `unsigned_unconfirmed` that never confirms) shows a lag that keeps
