@@ -931,23 +931,18 @@ func (kb *keyBlock) classify() {
 }
 
 // designated reports whether s, a signature by another key, is a designated
-// revoker's: its issuer is one of kb.revokers, by fingerprint when s names
-// one (subpacket 33), else by key ID (16, the fingerprint's last eight
-// octets); or kb.anyRevoker.
+// revoker's: either its issuer fingerprint (subpacket 33) or its issuer key
+// ID (16, a fingerprint's last eight octets) names one of kb.revokers (the
+// sixth re-review's V-R6I3: a disagreement between the two fails closed, as
+// rawSig.issuerIs); or kb.anyRevoker.
 func (kb *keyBlock) designated(s *keySig) bool {
 	if kb.anyRevoker {
 		return true
 	}
 	for _, r := range kb.revokers {
-		switch {
-		case s.issuer.fpr != nil:
-			if bytes.Equal(r, s.issuer.fpr) {
-				return true
-			}
-		case s.issuer.keyID != nil:
-			if bytes.Equal(r[len(r)-8:], s.issuer.keyID) {
-				return true
-			}
+		if s.issuer.fpr != nil && bytes.Equal(r, s.issuer.fpr) ||
+			s.issuer.keyID != nil && bytes.Equal(r[len(r)-8:], s.issuer.keyID) {
+			return true
 		}
 	}
 	return false
@@ -989,10 +984,17 @@ func (s *keySig) read(kb *keyBlock, c *keyComponent) {
 		}
 		return
 	}
-	s.self, s.created = sig.CheckKeyIdOrFingerprint(kb.key), sig.CreationTime
-	s.issuer = rawSig{fpr: sig.IssuerFingerprint}
+	s.issuer, s.created = rawSig{fpr: sig.IssuerFingerprint}, sig.CreationTime
 	if sig.IssuerKeyId != nil {
 		s.issuer.keyID = binary.BigEndian.AppendUint64(nil, *sig.IssuerKeyId)
+	}
+	// go-crypto's own answer (the fingerprint first, where there is one);
+	// a revocation is also the key's own when either issuer names the key
+	// (the sixth re-review's V-R6I3, as rawSig.issuerIs), so one whose two
+	// disagree fails closed as the key's own that does not verify.
+	s.self = sig.CheckKeyIdOrFingerprint(kb.key)
+	if t := packet.SignatureType(s.typ); t == packet.SigTypeKeyRevocation || t == packet.SigTypeSubkeyRevocation || t == packet.SigTypeCertificationRevocation {
+		s.self = s.self || s.issuer.issuerIs(kb.key)
 	}
 	var verr error
 	switch {
@@ -1035,17 +1037,19 @@ type rawSig struct {
 	whole      bool
 }
 
-// issuerIs reports whether the signature's issuer is key: by fingerprint
-// when it names one, else by key ID; one naming neither counts as the key's
-// own (it is not known to be another's).
+// issuerIs reports whether the signature's issuer is key: when either its
+// issuer fingerprint or its issuer key ID names the key (the sixth
+// re-review's V-R6I3: gpgv 2.2 takes a revocation's issuer from its key ID,
+// gpgv 2.4 from its fingerprint, so a signature whose two disagree is
+// honoured by some apt as the key's own; the cache fails closed on either
+// naming it); one naming neither counts as the key's own (it is not known to
+// be another's).
 func (r rawSig) issuerIs(key *packet.PublicKey) bool {
-	switch {
-	case r.fpr != nil:
-		return bytes.Equal(r.fpr, key.Fingerprint)
-	case r.keyID != nil:
-		return binary.BigEndian.Uint64(r.keyID) == key.KeyId
+	if r.fpr == nil && r.keyID == nil {
+		return true
 	}
-	return true
+	return r.fpr != nil && bytes.Equal(r.fpr, key.Fingerprint) ||
+		r.keyID != nil && binary.BigEndian.Uint64(r.keyID) == key.KeyId
 }
 
 // rawSigInfo reads a v4 (or v6) signature packet's body for rawSig: the

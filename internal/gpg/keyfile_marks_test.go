@@ -95,6 +95,14 @@ func uidMaterial(uid string) []byte {
 // not (a malformed subpacket), each verifiable by gpgv.
 func rsaKeySig(t *testing.T, signer *openpgp.Entity, sigType byte, hash crypto.Hash, hashID byte, hashed, material []byte) []byte {
 	t.Helper()
+	return rsaKeySigUnhashed(t, signer, sigType, hash, hashID, hashed, subpacket(t, 16, binary.BigEndian.AppendUint64(nil, signer.PrimaryKey.KeyId)), material)
+}
+
+// rsaKeySigUnhashed is rsaKeySig with the unhashed subpacket area given
+// (nil: none, so the signature names its issuer by whatever the hashed area
+// holds, a fingerprint alone, say).
+func rsaKeySigUnhashed(t *testing.T, signer *openpgp.Entity, sigType byte, hash crypto.Hash, hashID byte, hashed, unhashed, material []byte) []byte {
+	t.Helper()
 	priv, ok := signer.PrivateKey.PrivateKey.(*rsa.PrivateKey)
 	if !ok {
 		t.Fatalf("test premise: %T is no RSA key", signer.PrivateKey.PrivateKey)
@@ -112,7 +120,6 @@ func rsaKeySig(t *testing.T, signer *openpgp.Entity, sigType byte, hash crypto.H
 	if err != nil {
 		t.Fatalf("SignPKCS1v15 with %v: %v", hash, err)
 	}
-	unhashed := subpacket(t, 16, binary.BigEndian.AppendUint64(nil, signer.PrimaryKey.KeyId))
 	body := joined(head, binary.BigEndian.AppendUint16(nil, uint16(len(unhashed))), unhashed, digest[:2])
 	body = binary.BigEndian.AppendUint16(body, uint16(priv.N.BitLen()))
 	body = append(body, sig...)
@@ -476,6 +483,9 @@ func TestVerifier_WhatGpgvIgnoresIsNotMarked(t *testing.T) {
 		joined(createdAt(t, kr14Created), issuerFpr(t, x.PrimaryKey), subpacket(t, 29, reasonOK)), keyMaterial(t, kk.p.PrimaryKey))
 	corruptSub := kk.subrevOK(t)
 	corruptSub[len(corruptSub)-1] ^= 0x01
+	corruptMismatch := rsaKeySig(t, kk.p, byte(packet.SigTypeKeyRevocation), crypto.SHA256, hashSHA256,
+		joined(createdAt(t, kr14Created), issuerFpr(t, x.PrimaryKey), subpacket(t, 29, reasonOK)), keyMaterial(t, kk.p.PrimaryKey))
+	corruptMismatch[len(corruptMismatch)-1] ^= 0x01
 	for _, tc := range []struct {
 		name string
 		ring []byte
@@ -488,6 +498,13 @@ func TestVerifier_WhatGpgvIgnoresIsNotMarked(t *testing.T) {
 		{"P's own revocation that does not verify: P is known, not counted", kk.ring(t, [][]byte{corrupt}, nil), pgperrors.ErrKeyRevoked},
 		{"a revocation of P by another key P never designated: ignored, as every apt ignores it (kr17_tp_keyrev); K counts", kk.ring(t, [][]byte{byX}, nil), nil},
 		{"P's own revocation of K that does not verify: K is known, not counted", kk.ring(t, nil, [][]byte{corruptSub}), pgperrors.ErrKeyRevoked},
+		// The key's own unreadable revocation whose issuer fingerprint names
+		// another key while its key ID names P (the sixth re-review's V-R6I3;
+		// REVKEYSIG in gpgv 2.2): either naming the key fails closed.
+		{"kr23_self_er_fprmis_keyrev: P's unreadable 0x20 naming X by fingerprint and P by key ID: not counted", kk.ring(t, [][]byte{rsaKeySig(t, kk.p, byte(packet.SigTypeKeyRevocation), crypto.RIPEMD160, hashRIPEMD160, joined(createdAt(t, kr14Created), issuerFpr(t, x.PrimaryKey), subpacket(t, 29, reasonOK)), keyMaterial(t, kk.p.PrimaryKey))}, nil), pgperrors.ErrKeyRevoked},
+		{"kr23_self_er_fprmis_subrev: P's unreadable 0x28 of K, the same issuers: K not counted", kk.ring(t, nil, [][]byte{rsaKeySig(t, kk.p, byte(packet.SigTypeSubkeyRevocation), crypto.RIPEMD160, hashRIPEMD160, joined(createdAt(t, kr14Created), issuerFpr(t, x.PrimaryKey), subpacket(t, 29, reasonOK)), keyMaterial(t, kk.p.PrimaryKey, kk.k.PublicKey))}), pgperrors.ErrKeyRevoked},
+		{"P's unreadable 0x20 naming P by fingerprint alone (no key ID): not counted", kk.ring(t, [][]byte{rsaKeySigUnhashed(t, kk.p, byte(packet.SigTypeKeyRevocation), crypto.RIPEMD160, hashRIPEMD160, joined(createdAt(t, kr14Created), issuerFpr(t, kk.p.PrimaryKey), subpacket(t, 29, reasonOK)), nil, keyMaterial(t, kk.p.PrimaryKey))}, nil), pgperrors.ErrKeyRevoked},
+		{"P's readable 0x20 naming X by fingerprint and P by key ID that does not verify: the key's own by either issuer, not counted", kk.ring(t, [][]byte{corruptMismatch}, nil), pgperrors.ErrKeyRevoked},
 	} {
 		v := kr14Verifier(t, map[string][]byte{"00-a.gpg": binaryKey(t, a), "20-p.gpg": tc.ring})
 		_, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, kGood))
@@ -603,6 +620,14 @@ func TestVerifier_ThirdPartyRevocationsMarkOnlyWhenDesignated(t *testing.T) {
 		{"a 0x1f by P whose subpackets cannot be walked, X's 0x20 of P: P marked (any third party may be designated)", kk.ring(t, [][]byte{garbled, xRevP}, nil), pgperrors.ErrKeyRevoked},
 		{"P designates Y (0x1f), X's 0x20 of P: K counts", kk.ring(t, [][]byte{designating(y, crypto.SHA256, hashSHA256), xRevP}, nil), nil},
 		{"P designates X (0x1f), no revocation (kr19_dr_desig): K counts", kk.ring(t, [][]byte{designating(x, crypto.SHA256, hashSHA256)}, nil), nil},
+		// Issuer subpackets that disagree (the sixth re-review's V-R6I3:
+		// gpgv 2.2 reads a revocation's issuer from its key ID, gpgv 2.4 from
+		// its fingerprint; REVKEYSIG in apt 2.2.4, 2.4.14 and 2.6.1): a
+		// revocation whose fingerprint (33) names Y while its key ID (16)
+		// names the revoker, readable or not, and the key's own unreadable
+		// revocation whose fingerprint names Y while its key ID names P.
+		{"kr21_dr_fprmis_xin: P designates X, X's readable 0x20 naming Y by fingerprint and X by key ID: P marked", kk.ring(t, [][]byte{designating(x, crypto.SHA256, hashSHA256), rsaKeySig(t, x, byte(packet.SigTypeKeyRevocation), crypto.SHA256, hashSHA256, joined(createdAt(t, kr14Created), issuerFpr(t, y.PrimaryKey), reason), pMaterial)}, nil), pgperrors.ErrKeyRevoked},
+		{"kr23_dr_er_fprmis_xin: the same, unreadable (RIPEMD-160): P marked", kk.ring(t, [][]byte{designating(x, crypto.SHA256, hashSHA256), rsaKeySig(t, x, byte(packet.SigTypeKeyRevocation), crypto.RIPEMD160, hashRIPEMD160, joined(createdAt(t, kr14Created), issuerFpr(t, y.PrimaryKey), reason), pMaterial)}, nil), pgperrors.ErrKeyRevoked},
 	} {
 		v := kr14Verifier(t, map[string][]byte{"00-a.gpg": binaryKey(t, a), "20-p.gpg": tc.ring})
 		_, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, kGood))
