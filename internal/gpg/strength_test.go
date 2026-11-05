@@ -330,6 +330,16 @@ func TestStrongSigner_ReadsGoCryptosSelfSignatureInUse(t *testing.T) {
 	}
 }
 
+// TestStrongSigner_AnUnmeasuredBindingHashIsNotStrong: a self-signature
+// hashed with SHA3-256, which no row of strongHashes names, is not strong.
+func TestStrongSigner_AnUnmeasuredBindingHashIsNotStrong(t *testing.T) {
+	e := policyKey(t, "sha3self", cfgEd25519)
+	resignSelf(t, e, crypto.SHA3_256)
+	if got, why := strongAt(t, e, policyNow); got || !strings.Contains(why, "hashed with SHA3-256") {
+		t.Fatalf("a SHA3-256 self-signature: strong %v (%q); want not strong", got, why)
+	}
+}
+
 // TestStrongSigner_AMissingLinkIsNotStrong: a subkey whose binding has no
 // back-signature (go-crypto would find the link missing) is not strong.
 func TestStrongSigner_AMissingLinkIsNotStrong(t *testing.T) {
