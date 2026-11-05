@@ -1158,8 +1158,19 @@ rules; both reference this section.
 | CACHE     | `.GC.PoolUnlinkErrors > 0`                                   | `.Cache.ZeroRefcountBacklog > 1000`                              | `.Cache.BytesUsed == 0`                |
 | SUITES    | any suite's lag exceeds 24h                                  | any suite's lag exceeds 1h, an adoption is failing, or a refusal is older than 24h | `len .Suites == 0`, or adoption disabled |
 | ADOPTIONS | non-success rate ≥ 50%                                       | non-success rate ≥ 10%                                           | ring buffer empty (uptime <5m)         |
-| GC        | `.GC.LastRunDeadlineReached` true on the last run            | last run older than `2 × .GCIntervalSeconds` (wrapper)           | `.GC.LastRunUnixTime == nil`           |
+| GC        | (none since issue #14; see below)                            | `.GC.LastRunDeadlineReached` true on the last run, or last run older than `2 × .GCIntervalSeconds` (wrapper) | `.GC.LastRunUnixTime == nil`           |
 | ACTIVE    | (no crit threshold defined; reserved)                        | (no warn threshold; reserved)                                    | no active hosts and uptime <5m         |
+
+**GC (issue #14, 1.1.0).** A reached deadline was this cell's crit. Since
+1.1.0 a GC pass that reaches its share of `gc.max_tick_duration` no longer
+ends the run: the passes after it run, the blob pass included, so a busy
+cache reports a reached deadline in steady state while it frees disk. It is
+warn (the verdict reads WATCHING), and the GC panel's *Deadline reached*
+badge is `.b--warn`, with a tooltip naming the failure sign to watch
+instead: *Blobs reaped* staying 0 run after run. No GC state is crit: a
+failed pass has no status field (WARN `gc_tick_failed` is its sign), a GC
+that never ran is stale and one that stopped running warns; pool unlink
+errors are the CACHE cell's crit.
 
 **SUITES (phase B; replaces the two-stamp comparison this row originally
 described).** Lag runs from the first time the cache saw upstream's new

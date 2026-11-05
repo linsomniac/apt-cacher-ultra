@@ -953,8 +953,10 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   with `deadline_reached=true` while they free disk, a healthy steady
   state (`docs/configuration.md`, `[gc]`, which also gives 1.0.x users the
   interim workaround); the status page's *Deadline reached* badge is warn,
-  not crit, with a tooltip saying so (commit d7e9c8a), while the GC vital
-  still goes crit on it. Part (3) makes the first 1.1.0 start delete the
+  not crit, with a tooltip saying so (commit d7e9c8a), and the GC vital
+  warns on it rather than going crit, so the page reads WATCHING, not
+  DEGRADED (the controller's ruling, 2026-11-05; `admin-ui-spec.md`
+  §9.1). Part (3) makes the first 1.1.0 start delete the
   snapshots the upgrade's trust audit quarantined, so the 1.1.0 release
   notes' way back now loses their pool files even within the first hour.
   Pinned by `TestPassDeadlines_SplitTheBudget`,

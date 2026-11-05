@@ -1486,8 +1486,18 @@ func vitalState(kind string, m htmlRenderModel) string {
 		if m.GC == nil || m.GC.LastRunUnixTime == nil {
 			return "stale"
 		}
+		// AIDEV-NOTE: issue #14 (the hardening plan's Task 8; the
+		// controller's ruling of 2026-11-05). A reached deadline is warn,
+		// not crit: a pass that reaches its share of gc.max_tick_duration
+		// no longer ends the run, so a busy cache reports it in steady
+		// state while it frees disk (the page then reads WATCHING, not
+		// DEGRADED). No GC failure reads crit here, before or after this
+		// change: a failed pass has no status field (WARN gc_tick_failed
+		// is its sign), a GC that never ran is stale and one that stopped
+		// running is warn (the age rule below); pool unlink errors are the
+		// CACHE cell's crit.
 		if m.GC.LastRunDeadlineReached {
-			return "crit"
+			return "warn"
 		}
 		// AIDEV-NOTE: GCIntervalSeconds==0 means "interval unknown" —
 		// per §9.1 the warn branch is suppressed in that case and the

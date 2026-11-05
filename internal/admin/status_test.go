@@ -405,15 +405,36 @@ func TestVitalState(t *testing.T) {
 			},
 			"gc", "ok",
 		},
+		// Issue #14 (the hardening plan's Task 8): a reached deadline is a
+		// busy cache's steady state, so warn, not crit (was
+		// gc_crit_deadline_reached) — and it neither masks nor imitates
+		// the other GC states: no run is still stale, and pool unlink
+		// errors still make the CACHE cell crit.
 		{
-			"gc_crit_deadline_reached",
+			"gc_warn_deadline_reached",
 			func(m *htmlRenderModel) {
 				m.GC = &gcInfo{
 					LastRunUnixTime:        ptrI64(1_000_003_500),
 					LastRunDeadlineReached: true,
 				}
 			},
-			"gc", "crit",
+			"gc", "warn",
+		},
+		{
+			"gc_stale_no_run_despite_deadline_flag",
+			func(m *htmlRenderModel) { m.GC = &gcInfo{LastRunDeadlineReached: true} },
+			"gc", "stale",
+		},
+		{
+			"cache_crit_unlink_errors_beside_a_reached_deadline",
+			func(m *htmlRenderModel) {
+				m.GC = &gcInfo{
+					LastRunUnixTime:        ptrI64(1_000_003_500),
+					LastRunDeadlineReached: true,
+					PoolUnlinkErrors:       1,
+				}
+			},
+			"cache", "crit",
 		},
 
 		{
@@ -474,11 +495,22 @@ func TestVerdictExplanation(t *testing.T) {
 
 	degraded := healthy
 	degraded.GC = &gcInfo{
-		LastRunUnixTime:        ptrI64(1_000_006_000),
-		LastRunDeadlineReached: true,
+		LastRunUnixTime:  ptrI64(1_000_006_000),
+		PoolUnlinkErrors: 1, // the CACHE cell's crit
 	}
 	if got := verdictExplanation(degraded); !contains(got, "Degraded") {
 		t.Errorf("verdictExplanation(degraded) = %q; want 'Degraded'", got)
+	}
+
+	// Issue #14 (the hardening plan's Task 8): a reached GC deadline is a
+	// busy cache's steady state — Watching, no longer Degraded.
+	deadline := healthy
+	deadline.GC = &gcInfo{
+		LastRunUnixTime:        ptrI64(1_000_006_000),
+		LastRunDeadlineReached: true,
+	}
+	if got := verdictExplanation(deadline); !contains(got, "Watching") {
+		t.Errorf("verdictExplanation(deadline reached) = %q; want 'Watching'", got)
 	}
 
 	// §5.1.1: adoption enabled + zero keys is a crit signal that must
