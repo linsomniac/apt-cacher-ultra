@@ -2,7 +2,7 @@ package gpg
 
 // aptShapeRefusedBy pins, for every corpus row the verifier refuses, the
 // rule that refuses it (the hardening plan's Task 9b; the final review's
-// V-M8): a structural rule of layers T, A and P (T1–T5, F0,
+// V-M8): a structural rule of layers T, A and P (T1–T6, F0,
 // T4/one-block, A1–A6, P1–P5), S1, or S2 with its reason (ruleOf).
 // TestVerifier_RefusesEachRowByItsRule holds the verifier to it, so a rule
 // that goes vacuous behind another, or refuses what another used to,
@@ -140,6 +140,7 @@ var aptShapeRefusedBy = map[string]string{
 	"a_msgbegin_cr_tab":                           "T1",
 	"a_msgbegin_ff":                               "T1",
 	"a_msgbegin_nbsp":                             "T1",
+	"a_msgbegin_sp_cr":                            "T6",
 	"a_msgbegin_nul":                              "T1",
 	"a_msgbegin_sp_cr_sp":                         "T1",
 	"a_msgbegin_vt":                               "T1",
@@ -213,6 +214,7 @@ var aptShapeRefusedBy = map[string]string{
 	"i_badsig_badfirst":                           "S1",
 	"i_badsig_goodfirst":                          "S1",
 	"i_badsig_only":                               "S1",
+	"i_begin_trailing_ws":                         "T6",
 	"i_blank_in_base64":                           "A4",
 	"i_crc_forged":                                "A5",
 	"i_crc_lowercase_eq_ws":                       "A4",
@@ -336,6 +338,7 @@ var aptShapeRefusedBy = map[string]string{
 	"q_good_unh_33B_16A":                          "P4",
 	"q_hdr_colon_nul_space":                       "T5",
 	"q_hdr_comment_empty_cr":                      "A2",
+	"q_msgbegin_sp_tab_crcr":                      "T6",
 	"q_nohash_hdrterm_vt":                         "S1",
 	"q_sighdrterm_vt":                             "A2",
 	"q_unknownB_bigunh_plus_good":                 "P3",

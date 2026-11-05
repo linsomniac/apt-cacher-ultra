@@ -14,12 +14,15 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
 )
 
-// The apt-shape table test (the hardening plan's Tasks 6, 7 and 9b,
+// The apt-shape table test (the hardening plan's Tasks 6, 7, 9b and 9e,
 // docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md, DN-2 to
-// DN-6 and DN-11): the verifier, run on every shape of the committed corpus
-// (testdata/aptshapes, e2e/apt-oracle/README.md), refuses a shape when any
-// measured apt refuses it and accepts a shape every measured apt accepts,
-// but for the strict deviations listed below, each in its family.
+// DN-6, DN-11 and HD-19): the verifier, run on every shape of the committed
+// corpus (testdata/aptshapes, e2e/apt-oracle/README.md), refuses a shape when
+// any measured apt refuses it, the six current images' (verdicts.txt) or the
+// five older ones' (verdicts-old.txt), and accepts a shape every measured apt
+// accepts, but for the strict deviations listed below, each in its family,
+// and the older images' refusals of crypto policy and of real signers'
+// layouts (aptShapeOldExempt), which the cache accepts as the six do.
 //
 // AIDEV-NOTE: the corpus, verdicts.txt and classes.txt are one measurement
 // (never edit a fixture by hand; e2e/apt-oracle/README.md, "Adding a
@@ -36,10 +39,19 @@ import (
 // Another set of images is another set of columns: change it with them.
 const aptShapeColumns = 6
 
+// aptShapeOldColumns is the number of verdicts on each row of
+// verdicts-old.txt, one per older client image (debian:10, ubuntu:20.04,
+// ubuntu:18.04, ubuntu:16.04, ubuntu:14.04: OLD_COLUMNS in
+// e2e/apt-oracle/run.sh; the hardening plan's Task 9e).
+const aptShapeOldColumns = 5
+
 // aptShapeDeviations are the strict deviations: shapes every measured apt
-// accepts and the cache refuses, each with its family (DN-11: one reason a
-// family, rulings HD-16 and HD-17). Every one is an edit no surveyed signer
-// makes; widening the grammar to accept one is a code change with its row.
+// accepts, the six current images and the five older ones, and the cache
+// refuses, each with its family (DN-11: one reason a family, rulings HD-16
+// and HD-17). Every one is an edit no surveyed signer makes; widening the
+// grammar to accept one is a code change with its row. (Task 9e took three
+// out, which gpgv 1.4 refuses: q_good_plus_bigunh_dup and the two
+// v6_*_good_plus_v6unknown, ubuntu:16.04 and 14.04's NODATA.)
 var aptShapeDeviations = map[string]string{
 	// aptShapeOneArmorBlock (6)
 	"a_d_twoblocks_same":        aptShapeOneArmorBlock,
@@ -123,7 +135,7 @@ var aptShapeDeviations = map[string]string{
 	"x5i_hdr_space_in_key":     aptShapeNonCanonicalArmor,
 	"xd_blank_after_crc":       aptShapeNonCanonicalArmor,
 	"xi_blank_after_crc":       aptShapeNonCanonicalArmor,
-	// aptShapeNonCanonicalPacket (43)
+	// aptShapeNonCanonicalPacket (40)
 	"gd_p1_inner_marker":                          aptShapeNonCanonicalPacket,
 	"gd_p2_inner_unknowntag":                      aptShapeNonCanonicalPacket,
 	"gd_p3_inner_zero_bytes":                      aptShapeNonCanonicalPacket,
@@ -148,7 +160,6 @@ var aptShapeDeviations = map[string]string{
 	"q10_unknownB_hashed_t4_empty_plus_good":      aptShapeNonCanonicalPacket,
 	"q9_unh_33_v5form_5":                          aptShapeNonCanonicalPacket,
 	"q9_unh_33_v6form_33":                         aptShapeNonCanonicalPacket,
-	"q_good_plus_bigunh_dup":                      aptShapeNonCanonicalPacket,
 	"q_good_plus_unknownB_critunh":                aptShapeNonCanonicalPacket,
 	"q_good_unh_16A_16B":                          aptShapeNonCanonicalPacket,
 	"q_good_unh_16A_33A":                          aptShapeNonCanonicalPacket,
@@ -162,8 +173,6 @@ var aptShapeDeviations = map[string]string{
 	"t7g7b_33junk_33A":                            aptShapeNonCanonicalPacket,
 	"v4_i_ed25519unknown_plus_good":               aptShapeNonCanonicalPacket,
 	"v4_i_ed448unknown_plus_good":                 aptShapeNonCanonicalPacket,
-	"v6_d_good_plus_v6unknown":                    aptShapeNonCanonicalPacket,
-	"v6_i_good_plus_v6unknown":                    aptShapeNonCanonicalPacket,
 	"v_good_plus_unknownB_hashed_regexp_nonul_go": aptShapeNonCanonicalPacket,
 	"x3i_goodsig_unhashed_fpr_added":              aptShapeNonCanonicalPacket,
 	"z_good_unh_embedded_sig":                     aptShapeNonCanonicalPacket,
@@ -195,6 +204,62 @@ var aptShapeFamilies = []string{aptShapeOneArmorBlock, aptShapeNonCanonicalArmor
 // TestAptShapeKnownUnsafe_IsEmpty keeps it so: adding to it needs a ruling,
 // not an edit.
 var aptShapeKnownUnsafe = map[string]string{}
+
+// aptShapeOldExempt are the rows an older image refuses and the six current
+// images all accept that the cache accepts all the same (the hardening
+// plan's Task 9e, rulings HD-19 and E2), each with its class and reason: (a)
+// crypto policy, which is not intersected across client generations, or (b)
+// a layout a real signer emits (a surveyed vendor's anchor or a vendor
+// fixture has it), which an older apt's refusal never makes the cache refuse.
+// Every other row an older image refuses, the cache refuses (class (c): an
+// attacker's edit, folded into layers T, A or P).
+// TestAptShapeOldExempt_AreOlderImagesRefusals guards the list.
+var aptShapeOldExempt = map[string]string{
+	// aptShapeOldECC (14)
+	"pk_ed25519":                                  aptShapeOldECC,
+	"pk_ed25519_on_ed25519":                       aptShapeOldECC,
+	"pk_ed25519_on_nistp256":                      aptShapeOldECC,
+	"pk_ed25519_on_nistp384":                      aptShapeOldECC,
+	"pk_ed25519_on_nistp521":                      aptShapeOldECC,
+	"pk_ed25519_on_rsa2048":                       aptShapeOldECC,
+	"pk_ed25519_on_rsa3072":                       aptShapeOldECC,
+	"pk_ed25519_plus_bp256":                       aptShapeOldECC,
+	"pk_ed25519_plus_ed25519_on_ed25519_sha1bind": aptShapeOldECC,
+	"pk_ed25519_plus_ed25519_on_rsa1024":          aptShapeOldECC,
+	"pk_ed25519_plus_nistp521":                    aptShapeOldECC,
+	"pk_ed25519_plus_secp256k1":                   aptShapeOldECC,
+	"pk_nistp256":                                 aptShapeOldECC,
+	"pk_nistp384":                                 aptShapeOldECC,
+	// aptShapeOldCRAfterMarker (3)
+	"a_text_crlf_sig_lf": aptShapeOldCRAfterMarker,
+	"i_crlf_all":         aptShapeOldCRAfterMarker,
+	"n_i_nginx_crlf":     aptShapeOldCRAfterMarker,
+	// aptShapeOldUnpaddedNoCRC (2)
+	"d_crc_missing": aptShapeOldUnpaddedNoCRC,
+	"i_crc_missing": aptShapeOldUnpaddedNoCRC,
+	// aptShapeOldCertifyOnlyIssuer (1)
+	"t7g5_s_primary": aptShapeOldCertifyOnlyIssuer,
+}
+
+// The classes of aptShapeOldExempt (the hardening plan's Task 9e): "(a) "
+// crypto policy, "(b) " a real signer's layout, each one reason a family.
+// TestAptShapeOldExempt_AreOlderImagesRefusals requires a row in each.
+//
+// AIDEV-NOTE: aptShapeOldCertifyOnlyIssuer is the one (b) without a real
+// signer: no surveyed anchor names a known key that cannot sign, but the
+// shape cannot be refused in layers T, A or P, where a class (c) row's rule
+// must live (S1 reads signing keys only, KeysByIdUsage). It is listed for
+// the controller's ruling (Task 9e's report, its doubt list); move it, or
+// fold it by S1, only with that ruling.
+const (
+	aptShapeOldECC               = "(a) crypto policy: an EdDSA or ECDSA signing key, which gpgv 1.4 (ubuntu:16.04, ubuntu:14.04) cannot use (\"can't handle public key algorithm\"); not intersected (HD-19: the survey's yarn signs with EdDSA)"
+	aptShapeOldCRAfterMarker     = "(b) a real signer's layout: a CR after the clearsign marker on line 1, nginx's CRLF InRelease (PE/vendor/nginx, testdata/vendors/nginx), which apt 1.2 (ubuntu:16.04) reads as not clearsigned (\"Clearsigned file isn't valid, got 'NOSPLIT'\")"
+	aptShapeOldUnpaddedNoCRC     = "(b) a real signer's layout: base64 that needs no padding and no CRC line after it, syncthing's InRelease (PE/vendor/syncthing, OpenPGP.js), which gpgv 1.4 (ubuntu:16.04, ubuntu:14.04) reads on into the END line (\"invalid radix64 character\", NODATA)"
+	aptShapeOldCertifyOnlyIssuer = "(b) pending a ruling: a bad packet whose issuer is a known primary key that only certifies, which gpgv 2.2.4 and 1.4 (ubuntu:18.04, 16.04, 14.04) check against that key (BADSIG) and later gpgv and sqv skip; no surveyed anchor has it, but layers T, A and P cannot see it"
+)
+
+// aptShapeOldClasses lists aptShapeOldExempt's classes, for its guard.
+var aptShapeOldClasses = []string{aptShapeOldECC, aptShapeOldCRAfterMarker, aptShapeOldUnpaddedNoCRC, aptShapeOldCertifyOnlyIssuer}
 
 // aptShapeKeyPolicy are the rows only a newest-generation client's key
 // policy refuses: debian:13's sqv, ubuntu:24.04's or ubuntu:26.04's
@@ -276,6 +341,9 @@ type aptShape struct {
 	release  []byte // detached: the shape's own <name>.Release, else the shared Release
 	keys     []byte // the shape's own signed-by, <name>.keys.asc (an armored keyring); nil: keys.gpg
 	rejected []bool // apt's verdicts, one per column: true is REJ
+	// oldRejected are the older images' verdicts (verdicts-old.txt), one
+	// per aptShapeOldColumns column: true is REJ.
+	oldRejected []bool
 }
 
 // loadAptShapeVerdicts parses verdicts.txt (its format: the AIDEV-NOTE in
@@ -283,7 +351,20 @@ type aptShape struct {
 // shape's name and aptShapeColumns verdicts, ok or REJ, single spaces apart.
 func loadAptShapeVerdicts(t *testing.T) map[string][]bool {
 	t.Helper()
-	f, err := os.Open(filepath.Join(aptShapeDir, "verdicts.txt"))
+	return loadVerdictFile(t, "verdicts.txt", aptShapeColumns)
+}
+
+// loadAptShapeOldVerdicts parses verdicts-old.txt, the older images'
+// verdicts, in verdicts.txt's format with aptShapeOldColumns verdicts a row.
+func loadAptShapeOldVerdicts(t *testing.T) map[string][]bool {
+	t.Helper()
+	return loadVerdictFile(t, "verdicts-old.txt", aptShapeOldColumns)
+}
+
+// loadVerdictFile parses the corpus's verdict file file, cols verdicts a row.
+func loadVerdictFile(t *testing.T, file string, cols int) map[string][]bool {
+	t.Helper()
+	f, err := os.Open(filepath.Join(aptShapeDir, file))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,21 +377,21 @@ func loadAptShapeVerdicts(t *testing.T) map[string][]bool {
 			continue
 		}
 		fields := strings.Split(line, " ")
-		if len(fields) != 1+aptShapeColumns {
-			t.Fatalf("verdicts.txt:%d: %q: want a name and %d verdicts", n, line, aptShapeColumns)
+		if len(fields) != 1+cols {
+			t.Fatalf("%s:%d: %q: want a name and %d verdicts", file, n, line, cols)
 		}
 		name := fields[0]
 		if _, dup := out[name]; dup {
-			t.Fatalf("verdicts.txt:%d: %s has two rows", n, name)
+			t.Fatalf("%s:%d: %s has two rows", file, n, name)
 		}
-		rejected := make([]bool, aptShapeColumns)
+		rejected := make([]bool, cols)
 		for i, v := range fields[1:] {
 			switch v {
 			case "ok":
 			case "REJ":
 				rejected[i] = true
 			default:
-				t.Fatalf("verdicts.txt:%d: %s: verdict %q is neither ok nor REJ", n, name, v)
+				t.Fatalf("%s:%d: %s: verdict %q is neither ok nor REJ", file, n, name, v)
 			}
 		}
 		out[name] = rejected
@@ -319,18 +400,20 @@ func loadAptShapeVerdicts(t *testing.T) map[string][]bool {
 		t.Fatal(err)
 	}
 	if len(out) == 0 {
-		t.Fatal("verdicts.txt holds no row")
+		t.Fatalf("%s holds no row", file)
 	}
 	return out
 }
 
 // loadAptShapes reads the corpus: every <name>.InRelease and
 // <name>.Release.gpg (with <name>.Release and <name>.keys.asc when
-// present), each with its row of verdicts.txt. A shape without a row, a row without a shape, or a file
-// the corpus does not define fails the test.
+// present), each with its rows of verdicts.txt and verdicts-old.txt. A shape
+// without a row, a row without a shape, or a file the corpus does not define
+// fails the test.
 func loadAptShapes(t *testing.T) []aptShape {
 	t.Helper()
 	verdicts := loadAptShapeVerdicts(t)
+	oldVerdicts := loadAptShapeOldVerdicts(t)
 	read := func(name string) []byte {
 		t.Helper()
 		b, err := os.ReadFile(filepath.Join(aptShapeDir, name))
@@ -391,6 +474,9 @@ func loadAptShapes(t *testing.T) []aptShape {
 			t.Fatalf("%s: no row in verdicts.txt", name)
 		}
 		s.rejected = rejected
+		if s.oldRejected, ok = oldVerdicts[name]; !ok {
+			t.Fatalf("%s: no row in verdicts-old.txt", name)
+		}
 		if !s.inline && s.release == nil {
 			s.release = shared
 		}
@@ -399,6 +485,11 @@ func loadAptShapes(t *testing.T) []aptShape {
 	for name := range verdicts {
 		if _, ok := byName[name]; !ok {
 			t.Fatalf("verdicts.txt: %s has no shape file", name)
+		}
+	}
+	for name := range oldVerdicts {
+		if _, ok := byName[name]; !ok {
+			t.Fatalf("verdicts-old.txt: %s has no shape file", name)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
@@ -506,9 +597,11 @@ func verifyShapeSigners(v *Verifier, s aptShape) (freshness.Signers, error) {
 }
 
 // TestVerifier_FollowsTheAptShapeTable holds the verifier to DN-3's rule over
-// the corpus: rejected iff any measured apt rejects, but for a strict
-// deviation (rejected, every apt accepts). No row is skipped (pendingS1 is
-// empty).
+// the corpus: rejected iff any measured apt rejects, the current images' or
+// the older ones' (Task 9e, ruling HD-19), but for a strict deviation
+// (rejected, every apt accepts) and an older image's exempt refusal
+// (aptShapeOldExempt: accepted, as the six current images accept it). No row
+// is skipped (pendingS1 is empty).
 func TestVerifier_FollowsTheAptShapeTable(t *testing.T) {
 	v := aptShapeVerifier(t)
 	for _, s := range loadAptShapes(t) {
@@ -517,9 +610,15 @@ func TestVerifier_FollowsTheAptShapeTable(t *testing.T) {
 				t.Skipf("%s: only S1 refuses it (the hardening plan's Task 7)", s.name)
 			}
 			wantRejected, why := anyRejects(s.rejected), "apt's verdicts"
+			if !wantRejected && anyRejects(s.oldRejected) {
+				wantRejected, why = true, "an older image's refusal (a format rule: HD-19)"
+				if class, ok := aptShapeOldExempt[s.name]; ok {
+					wantRejected, why = false, "an older image's refusal, exempt: "+class
+				}
+			}
 			if family, ok := aptShapeDeviations[s.name]; ok {
-				if anyRejects(s.rejected) || family == "" {
-					t.Fatalf("listed as a strict deviation (%q), but apt's verdicts are %v: a deviation is a shape every apt accepts, in a family", family, s.rejected)
+				if anyRejects(s.rejected) || anyRejects(s.oldRejected) || family == "" {
+					t.Fatalf("listed as a strict deviation (%q), but apt's verdicts are %v, the older images' %v: a deviation is a shape every apt accepts, in a family", family, s.rejected, s.oldRejected)
 				}
 				wantRejected, why = true, "a strict deviation: "+family
 			}
@@ -535,9 +634,9 @@ func TestVerifier_FollowsTheAptShapeTable(t *testing.T) {
 			err := verifyShape(v, s)
 			switch {
 			case wantRejected && err == nil:
-				t.Errorf("accepted; want rejected (%s; apt REJ per column: %v)", why, s.rejected)
+				t.Errorf("accepted; want rejected (%s; apt REJ per column: %v, older images: %v)", why, s.rejected, s.oldRejected)
 			case !wantRejected && err != nil:
-				t.Errorf("rejected: %v (reason %s); want accepted (%s; apt REJ per column: %v)", err, ClassifyVerifyErr(err), why, s.rejected)
+				t.Errorf("rejected: %v (reason %s); want accepted (%s; apt REJ per column: %v, older images: %v)", err, ClassifyVerifyErr(err), why, s.rejected, s.oldRejected)
 			case err != nil:
 				t.Logf("rejected: %v (reason %s)", err, ClassifyVerifyErr(err))
 			}
@@ -680,6 +779,9 @@ func TestAptShapeDeviations_NameShapesInTheTable(t *testing.T) {
 	for name := range aptShapeKeyPolicy {
 		check("aptShapeKeyPolicy", name, "HD-19")
 	}
+	for name, class := range aptShapeOldExempt {
+		check("aptShapeOldExempt", name, class)
+	}
 	for name, pending := range pendingS1 {
 		if !pending {
 			t.Errorf("pendingS1: %s is listed false: delete it instead", name)
@@ -705,6 +807,48 @@ func TestAptShapeDeviations_EveryFamilyHasARow(t *testing.T) {
 	}
 }
 
+// TestAptShapeOldExempt_AreOlderImagesRefusals guards aptShapeOldExempt
+// (Task 9e, ruling E2): every entry is in one of the classes, each class has
+// an entry, and each row is accepted by all six current images and refused
+// by an older one (an entry that is neither is stale); a crypto-policy row
+// (a) is refused by the verifier, never by apt's text layer (class other).
+// And every row an older image refuses while the six accept is either listed
+// or refused by the cache (TestVerifier_FollowsTheAptShapeTable).
+func TestAptShapeOldExempt_AreOlderImagesRefusals(t *testing.T) {
+	verdicts := loadAptShapeVerdicts(t)
+	oldVerdicts := loadAptShapeOldVerdicts(t)
+	oldClasses := loadAptShapeOldClasses(t)
+	known := make(map[string]int)
+	for _, c := range aptShapeOldClasses {
+		known[c] = 0
+	}
+	for name, class := range aptShapeOldExempt {
+		n, ok := known[class]
+		if !ok {
+			t.Errorf("%s: %q is none of aptShapeOldExempt's classes", name, class)
+			continue
+		}
+		known[class] = n + 1
+		if anyRejects(verdicts[name]) || !anyRejects(oldVerdicts[name]) {
+			t.Errorf("%s: apt REJ per column %v, older images %v; want accepted by the six, refused by an older image", name, verdicts[name], oldVerdicts[name])
+		}
+		if strings.HasPrefix(class, "(a) ") {
+			for i, c := range oldClasses[name] {
+				if oldVerdicts[name][i] && c != "other" {
+					t.Errorf("%s, older column %d: class %q, want other (crypto policy: the verifier refused it)", name, i+1, c)
+				}
+			}
+		} else if !strings.HasPrefix(class, "(b) ") {
+			t.Errorf("%s: class %q is neither (a) nor (b)", name, class)
+		}
+	}
+	for class, n := range known {
+		if n == 0 {
+			t.Errorf("no row in aptShapeOldExempt's class %q", class)
+		}
+	}
+}
+
 // The error classes of classes.txt (e2e/apt-oracle/README.md, "Error
 // classes"): "-" where apt accepted the shape; where it refused it, split
 // (apt's own checks of the file refused it before its verifier ran),
@@ -717,7 +861,20 @@ var aptShapeClasses = map[string]bool{"split": true, "nodata": true, "badsig": t
 // aptShapeColumns classes.
 func loadAptShapeClasses(t *testing.T) map[string][]string {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(aptShapeDir, "classes.txt"))
+	return loadClassFile(t, "classes.txt", aptShapeColumns)
+}
+
+// loadAptShapeOldClasses parses classes-old.txt, the older images' error
+// classes, whose rows and columns are verdicts-old.txt's.
+func loadAptShapeOldClasses(t *testing.T) map[string][]string {
+	t.Helper()
+	return loadClassFile(t, "classes-old.txt", aptShapeOldColumns)
+}
+
+// loadClassFile parses the corpus's class file file, cols classes a row.
+func loadClassFile(t *testing.T, file string, cols int) map[string][]string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(aptShapeDir, file))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -727,11 +884,11 @@ func loadAptShapeClasses(t *testing.T) map[string][]string {
 			continue
 		}
 		fields := strings.Split(line, " ")
-		if len(fields) != 1+aptShapeColumns {
-			t.Fatalf("classes.txt:%d: %q: want a name and %d classes", n+1, line, aptShapeColumns)
+		if len(fields) != 1+cols {
+			t.Fatalf("%s:%d: %q: want a name and %d classes", file, n+1, line, cols)
 		}
 		if _, dup := out[fields[0]]; dup {
-			t.Fatalf("classes.txt:%d: %s has two rows", n+1, fields[0])
+			t.Fatalf("%s:%d: %s has two rows", file, n+1, fields[0])
 		}
 		out[fields[0]] = fields[1:]
 	}
@@ -774,6 +931,60 @@ func TestAptShapeClasses_AgreeWithTheVerdicts(t *testing.T) {
 		if split != 0 && split != aptShapeColumns {
 			t.Errorf("%s: split in %d of %d columns (%v): apt's text layer is the same in every image", name, split, aptShapeColumns, row)
 		}
+	}
+}
+
+// TestAptShapeOldClasses_AgreeWithTheVerdicts: classes-old.txt and
+// verdicts-old.txt name exactly verdicts.txt's shapes; a cell is "-" exactly
+// where the older image accepted the shape, else one of the classes. apt's
+// text layer is not the same in the older images (apt 1.6 and before split
+// otherwise: e2e/apt-oracle/README.md, "The older images"), but debian:10's
+// and ubuntu:20.04's (apt 1.8 and 2.0) is the six current images': a row is
+// split in those two columns exactly when it is split in classes.txt.
+func TestAptShapeOldClasses_AgreeWithTheVerdicts(t *testing.T) {
+	verdicts := loadAptShapeVerdicts(t)
+	classes := loadAptShapeClasses(t)
+	oldVerdicts := loadAptShapeOldVerdicts(t)
+	oldClasses := loadAptShapeOldClasses(t)
+	for name := range verdicts {
+		if _, ok := oldVerdicts[name]; !ok {
+			t.Errorf("%s: a row in verdicts.txt, none in verdicts-old.txt", name)
+		}
+		if _, ok := oldClasses[name]; !ok {
+			t.Errorf("%s: a row in verdicts.txt, none in classes-old.txt", name)
+		}
+	}
+	splits := 0
+	for name, row := range oldClasses {
+		rejected, ok := oldVerdicts[name]
+		if !ok {
+			t.Errorf("%s: a row in classes-old.txt, none in verdicts-old.txt", name)
+			continue
+		}
+		if _, ok := verdicts[name]; !ok {
+			t.Errorf("%s: a row in classes-old.txt, none in verdicts.txt", name)
+			continue
+		}
+		for i, class := range row {
+			switch {
+			case !rejected[i] && class != "-":
+				t.Errorf("%s, older column %d: apt accepted it, but its class is %q", name, i+1, class)
+			case rejected[i] && !aptShapeClasses[class]:
+				t.Errorf("%s, older column %d: apt refused it, but its class %q is none of split, nodata, badsig and other", name, i+1, class)
+			}
+		}
+		split := classes[name][0] == "split"
+		if split {
+			splits++
+		}
+		for i := range 2 {
+			if (row[i] == "split") != split {
+				t.Errorf("%s, older column %d: class %q, classes.txt's %v: apt 1.8 and 2.0 split as the current images do", name, i+1, row[i], classes[name])
+			}
+		}
+	}
+	if splits < 60 {
+		t.Fatalf("test premise: %d split rows, want the corpus's 64", splits)
 	}
 }
 

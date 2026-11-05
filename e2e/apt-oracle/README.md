@@ -416,6 +416,23 @@ unmeasured, and the cache may adopt it while some apt refuses it. When a
 new shape turns up (a vendor's anchor, a go-crypto change, a review), add
 it.
 
+Since the plan's Task 9e the table test reads `verdicts-old.txt` too
+(ruling HD-19, *The older images*): the cache refuses a shape an older
+image refuses, the format rules (layers T, A and P) holding over every
+supported generation, but for the rows `aptShapeOldExempt` lists, each with
+its class, which the cache accepts as the six do: (a) crypto policy, not
+intersected across generations (the `pk_` rows of EdDSA and ECDSA keys,
+which gpgv 1.4 cannot use); (b) a layout a real signer emits (a CR after
+the clearsign marker, nginx's, which apt 1.2 refuses; base64 needing no
+padding and no CRC line, syncthing's, which gpgv 1.4 misreads), and
+`t7g5_s_primary`, pending a ruling (no layer but S sees it). Of the 26 rows
+an older image refuses while the six accept, layer P already refused three
+(gpgv 1.4's v6 and 10 kB unhashed-area refusals: no longer strict
+deviations), and T6 refuses three (blanks after the clearsign marker, which
+apt 1.2 refuses: `a_msgbegin_sp_cr`, `q_msgbegin_sp_tab_crcr`,
+`i_begin_trailing_ws`). Where an older image accepts what the cache
+refuses, the cache stays strict.
+
 `xi_good_plus_marker` (a marker packet after a good signature) is refused
 by `ubuntu:26.04` alone, and not as a policy: its gpgv 2.4.8 crashes on it
 (`Sub-process /usr/bin/gpgv exited unexpectedly`, the same in five reruns
@@ -460,9 +477,10 @@ are, all six), which `TestAptShapeClasses_AgreeWithTheVerdicts` checks. Not
 so in the older images (*The older images*): `debian:10`'s and
 `ubuntu:20.04`'s text layer is the six's (a row is `split` there exactly
 when it is in `classes.txt`: `TestAptShapeOldClasses_AgreeWithTheVerdicts`),
-`ubuntu:18.04`'s, `16.04`'s and `14.04`'s is not, and apt 1.0 and 1.2 word some of
-an InRelease's split refusals `Clearsigned file isn't valid, got 'NODATA'`,
-which `run.sh` accepts as `split` from an apt before 1.6 only.
+`ubuntu:18.04`'s, `16.04`'s and `14.04`'s is not, and apt 1.0 and 1.2
+word some of an InRelease's split refusals `Clearsigned file isn't valid,
+got 'NODATA'`, which `run.sh` accepts as `split` from an apt before 1.6
+only.
 
 ## The images
 

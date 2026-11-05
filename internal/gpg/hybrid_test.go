@@ -18,7 +18,7 @@ import (
 )
 
 // ruleOf names the rule that refused err: a structural rule of layers T, A
-// and P (T1–T5, F0, T4/one-block, A1–A6, P1–P5), "S1" for ErrBadSignature,
+// and P (T1–T6, F0, T4/one-block, A1–A6, P1–P5), "S1" for ErrBadSignature,
 // "S2:<reason>" for any other refusal (ClassifyVerifyErr's reason), "" for
 // none.
 func ruleOf(err error) string {
@@ -37,7 +37,7 @@ func ruleOf(err error) string {
 // TestAptTextLayer_RefusesExactlyTheSplitRows is layer T's differential
 // test (the hardening plan's DN-11; PE/approach-decision.md §6, its first
 // residual risk: a port bug): the port alone — apttext.SplitClearsigned and
-// apttext.SplitDetached, without the cache's rules on top (T5, F0, one block) —
+// apttext.SplitDetached, without the cache's rules on top (T5, T6, F0, one block) —
 // refuses a corpus row exactly when apt's own text layer refused it in
 // every image (classes.txt's "split": apt refused the file before its
 // verifier ran). That holds the port to apt's splitter row by row, not only

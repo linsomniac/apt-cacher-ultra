@@ -198,7 +198,7 @@ var (
 	// but is not a clearsigned message in the shape the cache accepts
 	// (the hardening plan's DN-11): apt's own text layer refuses it (T1–T4,
 	// internal/apttext: the marker not on line 1, a line after the END line,
-	// an undashed "-" line), or the cache's text rules do (T5, F0, one
+	// an undashed "-" line), or the cache's text rules do (T5, T6, F0, one
 	// armor block), or its armor or packets fall outside the canonical
 	// grammar (A1–A6, armor_canon.go: a forged checksum, a damaged armor;
 	// P1–P5, sigpacket.go: packets apt refuses or that some apt parses

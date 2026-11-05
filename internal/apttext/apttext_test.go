@@ -164,9 +164,10 @@ func TestAptLine_StripsAsApt(t *testing.T) {
 }
 
 // TestInline_TheCachesRules pins what layer T adds to apt's split:
-// no NUL (T5), no END marker in M (F0, which reads M only: an END marker in
-// an armor header's value is the armor layer's), one armor block; apt's own
-// refusals come first.
+// no NUL (T5), no blank after the clearsign marker (T6: CRs may follow it),
+// no END marker in M (F0, which reads M only: an END marker in an armor
+// header's value is the armor layer's), one armor block; apt's own refusals
+// come first.
 func TestInline_TheCachesRules(t *testing.T) {
 	const begin = ClearsignBeginMarker
 	for _, tc := range []struct{ name, body, rule string }{
@@ -175,6 +176,12 @@ func TestInline_TheCachesRules(t *testing.T) {
 		{"a dash-escaped END line", begin + "\n\n- " + SigArmorEnd + "\n" + textTestArmor, "F0"},
 		{"the END marker inside a text line", begin + "\n\nDescription: x " + SigArmorEnd + " y\n" + textTestArmor, "F0"},
 		{"the END marker in an armor header", begin + "\n\nx\n-----BEGIN PGP SIGNATURE-----\nComment: " + SigArmorEnd + "\n\nAAAA\n-----END PGP SIGNATURE-----\n", ""},
+		{"a space after the marker", begin + " \n\nx\n" + textTestArmor, "T6"},
+		{"a tab after the marker", begin + "\t\n\nx\n" + textTestArmor, "T6"},
+		{"a space, then a CR, after the marker", begin + " \r\n\nx\n" + textTestArmor, "T6"},
+		{"a CR after the marker", begin + "\r\n\nx\n" + textTestArmor, ""},
+		{"CRs after the marker", begin + "\r\r\n\nx\n" + textTestArmor, ""},
+		{"a blank on line 2, not line 1", begin + "\n \nx\n" + textTestArmor, ""},
 		{"two armor blocks", begin + "\n\nx\n" + textTestArmor + textTestArmor, "T4/one-block"},
 		{"apt's refusal first", "\x00\n" + begin + "\n\nx\n" + textTestArmor, "T1"},
 		{"accepted", begin + "\n\nx\n" + textTestArmor, ""},

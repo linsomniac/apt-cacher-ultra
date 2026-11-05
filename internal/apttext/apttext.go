@@ -27,8 +27,9 @@
 // AIDEV-NOTE: keep SplitClearsigned and SplitDetached byte-exact ports;
 // internal/gpg's TestAptTextLayer_RefusesExactlyTheSplitRows holds them to
 // apt's own refusals (classes.txt's "split" rows) on every corpus row. What
-// the cache adds on top — no NUL (T5), no END marker in M (F0), one armor
-// block (T4/one-block) — lives in Inline and Detached, never in the ports.
+// the cache adds on top — no NUL (T5), no blank after the clearsign marker
+// (T6), no END marker in M (F0), one armor block (T4/one-block) — lives in
+// Inline and Detached, never in the ports.
 //
 // AIDEV-NOTE: history moved here (through internal/gpg/textsplit.go) from
 // the deleted requireBareClearsigned and isArmoredSignature (rulings R-D2,
@@ -63,7 +64,7 @@ const (
 )
 
 // ShapeError is a refusal by one of DN-11's structural rules: the rule
-// (T1–T5, F0, T4/one-block for the text layer, here; A1–A6 for the armor
+// (T1–T6, F0, T4/one-block for the text layer, here; A1–A6 for the armor
 // and P1–P5 for the packets, in internal/gpg) and what it saw. The
 // verifier wraps it in ErrMalformedClearsign or ErrMalformedSignature, so
 // the operator's detail names the layer and the rule ("armor A4: line 7:
@@ -297,6 +298,10 @@ func SplitDetached(b []byte) ([][]byte, int, error) {
 //   - T5: no NUL byte anywhere: apt's split is length-aware, but gpgv
 //     parses the armor headers as C strings and sqv refuses NUL in the
 //     signed text (a_textline_nul, debian:13); no Release holds one.
+//   - T6: no space or tab after the clearsign marker on line 1 (CRs may
+//     follow it): apt 1.2 (ubuntu:16.04) reads line 1 whole and refuses an
+//     InRelease with anything after the marker, where apt's LineBuffer
+//     strips the blanks (the hardening plan's Task 9e, a class (c) fold).
 //   - F0: M holds no "-----END PGP SIGNATURE-----": apt's split accepts a
 //     dash-escaped END line in the signed text, its Release parser then
 //     refuses the file (i_dash_escaped_end, every apt), and the cache's
@@ -333,6 +338,9 @@ func Inline(b []byte) (Clearsigned, error) {
 	if i := bytes.IndexByte(b, 0); i >= 0 {
 		return Clearsigned{}, Refuse("T5", "a NUL byte at offset %d", i)
 	}
+	if after := markerLineTail(b); bytes.ContainsAny(after, " \t") {
+		return Clearsigned{}, Refuse("T6", "line 1 holds %q after %q, which apt 1.2 (ubuntu:16.04) refuses", after, ClearsignBeginMarker)
+	}
 	if i := bytes.Index(cs.Message, []byte(SigArmorEnd)); i >= 0 {
 		return Clearsigned{}, Refuse("F0", "the signed text holds %q (line %d of it), which apt's Release parser refuses", SigArmorEnd, bytes.Count(cs.Message[:i], []byte("\n"))+1)
 	}
@@ -340,6 +348,30 @@ func Inline(b []byte) (Clearsigned, error) {
 		return Clearsigned{}, Refuse("T4/one-block", "%d armor blocks: the cache reads one", cs.Blocks)
 	}
 	return cs, nil
+}
+
+// markerLineTail is what follows the clearsign marker on b's raw first line,
+// its LF excluded: b's line 1, which SplitClearsigned has read as the marker
+// (so the tail is blanks, then CRs: AptLine strips them).
+//
+// AIDEV-NOTE: T6, the hardening plan's Task 9e (ruling HD-19's format rules
+// over every supported generation). ubuntu:16.04's apt 1.2.35 refuses an
+// InRelease whose line 1 is more than the marker ("Clearsigned file isn't
+// valid, got 'NOSPLIT'"; classes-old.txt's split): the corpus' i_crlf_all,
+// n_i_nginx_crlf and a_text_crlf_sig_lf (a CR) and a_msgbegin_sp_cr,
+// q_msgbegin_sp_tab_crcr and i_begin_trailing_ws (blanks), which every other
+// measured apt accepts. A CR there is nginx's real layout
+// (its CRLF InRelease, the survey's and testdata/vendors/nginx): never
+// refused (aptShapeOldExempt, class (b)). No surveyed anchor has a blank
+// there (checked byte for byte over PE/vendor and testdata/vendors), so
+// the blanks alone are refused: the narrowest rule that refuses the three
+// rows. Widen it to a CR only with a ruling that drops nginx's 16.04 users.
+func markerLineTail(b []byte) []byte {
+	l := b
+	if i := bytes.IndexByte(b, '\n'); i >= 0 {
+		l = b[:i]
+	}
+	return l[min(len(ClearsignBeginMarker), len(l)):]
 }
 
 // Detached is layer T for a Release.gpg: apt's check, then one armor block
