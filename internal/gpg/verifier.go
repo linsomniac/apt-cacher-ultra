@@ -115,6 +115,10 @@ type Verifier struct {
 // Compile-time interface check: Verifier satisfies freshness.Verifier.
 var _ freshness.Verifier = (*Verifier)(nil)
 
+// Compile-time interface check: Verifier reports the signers the adopter's
+// signer downgrade guard reads (Task 9d); without it the guard stands down.
+var _ freshness.SignerVerifier = (*Verifier)(nil)
+
 // NewVerifier validates dependencies and constructs a Verifier.
 func NewVerifier(cfg VerifierConfig) (*Verifier, error) {
 	if cfg.Keyring == nil {
@@ -287,13 +291,22 @@ var (
 // ctx is accepted for interface compatibility but VerifyInline does
 // no I/O — verification is CPU-bound and short.
 func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, inRelease []byte) ([]byte, error) {
+	m, _, err := v.VerifyInlineSigners(ctx, suite, inRelease)
+	return m, err
+}
+
+// VerifyInlineSigners implements freshness.SignerVerifier: VerifyInline,
+// and the anchor's signers (checkSignatures) for the signer downgrade
+// guard (Task 9d).
+func (v *Verifier) VerifyInlineSigners(ctx context.Context, suite freshness.SuiteRef, inRelease []byte) ([]byte, freshness.Signers, error) {
 	_ = ctx
+	var none freshness.Signers
 
 	// Step 0: the suite's trust set; an unpinned suite under
 	// require_pinned_signer is refused here, whatever the anchor.
 	trust, err := v.resolveTrustSet(suite)
 	if err != nil {
-		return nil, err
+		return nil, none, err
 	}
 
 	// Step 1: layer T. Only a clearsigned envelope is inline metadata,
@@ -311,26 +324,27 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 		// (ruling R-D2) — is reported as a damaged envelope, as before
 		// the port: what the operator should hear about it.
 		if bytes.Contains(inRelease, []byte(apttext.ClearsignBeginMarker)) {
-			return nil, fmt.Errorf("%w: %w", ErrMalformedClearsign,
+			return nil, none, fmt.Errorf("%w: %w", ErrMalformedClearsign,
 				refuse("T1", "line 1 is not %q, which the body holds elsewhere (apt reads it as not clearsigned)", apttext.ClearsignBeginMarker))
 		}
-		return nil, ErrMissingSignature
+		return nil, none, ErrMissingSignature
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrMalformedClearsign, err)
+		return nil, none, fmt.Errorf("%w: %w", ErrMalformedClearsign, err)
 	}
 
 	// Step 2: layers A and P.
 	pkts, err := armorPackets(cs.Armor, cs.ArmorLine)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrMalformedClearsign, err)
+		return nil, none, fmt.Errorf("%w: %w", ErrMalformedClearsign, err)
 	}
 
 	// Steps 3-5.
-	if err := v.checkSignatures(suite, trust, cs.Message, pkts); err != nil {
-		return nil, err
+	signers, err := v.checkSignatures(suite, trust, cs.Message, pkts)
+	if err != nil {
+		return nil, none, err
 	}
-	return cs.Message, nil
+	return cs.Message, signers, nil
 }
 
 // VerifyDetached verifies a detached signature (Release.gpg bytes)
@@ -365,35 +379,48 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 // history note): until the 2026-10-28 hardening plan it enforced none, and
 // so adopted what apt refuses (VC-2, C-4) while every client of the suite
 // then failed `apt update`. Enforced now by apt's own grammar, ported (T),
-// before any parser reads the armor. Still open: weak keys (the security
-// review's C-3, its key half: VerifyDetachedSignature runs with a nil
-// config, so RSA-1024 passes); C-3's digest half is closed by S2's
-// countability (ruling HD-18).
+// before any parser reads the armor. Weak keys (the security review's C-3,
+// its key half: RSA-1024 passes S2, as every gpgv 2.2 apt accepts it) stay
+// accepted: crypto policy is not intersected across client generations
+// (ruling HD-19); the signers this reports instead feed the adopter's
+// signer downgrade guard (strength.go, Task 9d), which refuses an anchor
+// that has lost its suite's strong signer. C-3's digest half is closed by
+// S2's countability (ruling HD-18).
 func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef, releaseBytes, sigBytes []byte) ([]byte, error) {
+	m, _, err := v.VerifyDetachedSigners(ctx, suite, releaseBytes, sigBytes)
+	return m, err
+}
+
+// VerifyDetachedSigners implements freshness.SignerVerifier:
+// VerifyDetached, and the anchor's signers (checkSignatures) for the
+// signer downgrade guard (Task 9d).
+func (v *Verifier) VerifyDetachedSigners(ctx context.Context, suite freshness.SuiteRef, releaseBytes, sigBytes []byte) ([]byte, freshness.Signers, error) {
 	_ = ctx
+	var none freshness.Signers
 
 	if len(releaseBytes) == 0 {
-		return nil, errors.New("empty Release body")
+		return nil, none, errors.New("empty Release body")
 	}
 	if len(sigBytes) == 0 {
-		return nil, errors.New("empty Release.gpg body")
+		return nil, none, errors.New("empty Release.gpg body")
 	}
 	trust, err := v.resolveTrustSet(suite)
 	if err != nil {
-		return nil, err
+		return nil, none, err
 	}
 	lines, err := apttext.Detached(sigBytes)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrMalformedSignature, err)
+		return nil, none, fmt.Errorf("%w: %w", ErrMalformedSignature, err)
 	}
 	pkts, err := armorPackets(lines, 1)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrMalformedSignature, err)
+		return nil, none, fmt.Errorf("%w: %w", ErrMalformedSignature, err)
 	}
-	if err := v.checkSignatures(suite, trust, releaseBytes, pkts); err != nil {
-		return nil, err
+	signers, err := v.checkSignatures(suite, trust, releaseBytes, pkts)
+	if err != nil {
+		return nil, none, err
 	}
-	return releaseBytes, nil
+	return releaseBytes, signers, nil
 }
 
 // armorPackets is layers A and P: the armor block's lines (first is
@@ -408,8 +435,11 @@ func armorPackets(lines [][]byte, first int) ([]sigPacket, error) {
 
 // checkSignatures is layer S over the packets layer P read, signed being
 // what they sign (M inline, the Release detached), under the suite's
-// trust set (resolveTrustSet): the bypass, or S1 and S2.
-func (v *Verifier) checkSignatures(suite freshness.SuiteRef, trust suiteTrust, signed []byte, pkts []sigPacket) error {
+// trust set (resolveTrustSet): the bypass, or S1 and S2. It returns the
+// signers S2 counted (verifyAnyTrusted); the bypass verifies no packet, so
+// its anchor never has a strong signer and the downgrade guard never fires
+// on it (ruling G1).
+func (v *Verifier) checkSignatures(suite freshness.SuiteRef, trust suiteTrust, signed []byte, pkts []sigPacket) (freshness.Signers, error) {
 	if trust.bypass {
 		// SPEC2 §7.6.2 bypass: the anchor parsed structurally (T, A and
 		// P, so at least one signature packet: parseSigPackets refuses
@@ -425,7 +455,7 @@ func (v *Verifier) checkSignatures(suite freshness.SuiteRef, trust suiteTrust, s
 		// without that decision. The structural layers are the same
 		// code on both paths (TestVerifier_BypassRefusesEveryMalformedRow).
 		v.logUnverifiedSignerOnce(suite, pkts[0])
-		return nil
+		return freshness.Signers{}, nil
 	}
 	if len(trust.entities) == 0 {
 		// No key can verify the signed metadata — fail closed. Unpinned:
@@ -434,13 +464,13 @@ func (v *Verifier) checkSignatures(suite freshness.SuiteRef, trust suiteTrust, s
 		// pinned fingerprints (we already passed the RequirePinned
 		// gate, so this is "configured but un-loadable").
 		if !trust.pinned {
-			return fmt.Errorf("%w: the host keyring is empty — signed suites cannot adopt until keys are installed or adoption.accept_any_signer is set", ErrNoUsableSignature)
+			return freshness.Signers{}, fmt.Errorf("%w: the host keyring is empty — signed suites cannot adopt until keys are installed or adoption.accept_any_signer is set", ErrNoUsableSignature)
 		}
-		return fmt.Errorf("%w: pin matched but no key in host keyring satisfies it", ErrNoUsableSignature)
+		return freshness.Signers{}, fmt.Errorf("%w: pin matched but no key in host keyring satisfies it", ErrNoUsableSignature)
 	}
 	checked := gpgvChecks(pkts)
 	if err := v.requireKnownSignaturesVerify(signed, checked); err != nil {
-		return err
+		return freshness.Signers{}, err
 	}
 	return v.verifyAnyTrusted(suite, trust.entities, trust.fps, signed, checked)
 }
@@ -617,7 +647,7 @@ func (v *Verifier) requireKnownSignaturesVerify(signed []byte, pkts []sigPacket)
 var s2Hashes = map[byte]bool{8: true, 9: true, 10: true}
 
 // verifyAnyTrusted is S2: it walks pkts (the packets gpgv checks) and
-// accepts on the FIRST one that passes BOTH (a) a trust check —
+// accepts when one passes BOTH (a) a trust check —
 // long-form IssuerFingerprint in trustFPs, or (when AllowShortKeyID
 // is enabled) the legacy 8-byte issuer keyid maps to a single entity
 // in trustSet — AND (b) cryptographic verification against the
@@ -626,6 +656,13 @@ var s2Hashes = map[byte]bool{8: true, 9: true, 10: true}
 // invariant: a multi-signature block must not satisfy the policy with one
 // packet while the library's verifier accepts a different packet. Each
 // packet is verified as layer P framed it (p.raw), alone.
+//
+// It returns the signers of the packets it counted (freshness.Signers),
+// for the signer downgrade guard (Task 9d): past the first counted packet,
+// which decides the acceptance as before, it goes on counting the packets
+// after it, each under the same rules, until one's key is strong
+// (strongSigner, at the verifier's clock). A later packet that does not
+// count changes nothing: the anchor is accepted at the first.
 //
 // A trusted packet whose signing key the keyring marks as not countable
 // (Keyring.uncountableKey: a revocation or a newer binding the cache cannot
@@ -655,8 +692,9 @@ func (v *Verifier) verifyAnyTrusted(
 	trustFPs map[string]struct{},
 	signed []byte,
 	pkts []sigPacket,
-) error {
+) (freshness.Signers, error) {
 	var (
+		signers         freshness.Signers
 		anyShortKeyID   bool
 		anyUntrusted    bool
 		sawSignature    bool
@@ -700,6 +738,25 @@ func (v *Verifier) verifyAnyTrusted(
 			discounted = fmt.Errorf("S2: packet %d: its key %s is not counted: %w", pkts[i].n, fp, why)
 		}
 		return true
+	}
+	// count records pkts[i], a packet S2 counts, as made by signer's key of
+	// its issuer key ID, and says whether that key is strong: S2 is done.
+	//
+	// AIDEV-NOTE: Task 9d. The anchor is accepted at the first counted
+	// packet, as before; the loop goes on only to find a strong signer for
+	// the downgrade guard, so a later packet's failure, discount or mark
+	// must never change the verdict (the switch below runs only when
+	// nothing counted). The short key ID fallback's log stays the accepting
+	// packet's.
+	count := func(signer *openpgp.Entity, i int) bool {
+		fp, strong, why := signerStrength(signer, pkts[i].issuer, now)
+		if strong {
+			signers.Strong = fp
+			signers.Counted = append(signers.Counted, fp)
+			return true
+		}
+		signers.Counted = append(signers.Counted, fp+" (not strong: "+why+")")
+		return false
 	}
 	for i, p := range pkts {
 		sawSignature = true
@@ -745,8 +802,14 @@ func (v *Verifier) verifyAnyTrusted(
 				lastVerifyErr = verr
 				continue
 			}
-			v.logShortKeyIDFallbackOnce(suite, matched, p.issuer)
-			return nil
+			if len(signers.Counted) == 0 {
+				// The packet that accepts the anchor, as before Task 9d.
+				v.logShortKeyIDFallbackOnce(suite, matched, p.issuer)
+			}
+			if count(matched, i) {
+				return signers, nil
+			}
+			continue
 		}
 
 		issuerFP := upperFP(p.fpr)
@@ -762,32 +825,58 @@ func (v *Verifier) verifyAnyTrusted(
 		// Verify this one packet in isolation, as framed: the packet
 		// that satisfied the IssuerFingerprint policy is the packet
 		// whose hash is cryptographically validated.
-		_, _, verr := openpgp.VerifyDetachedSignature(
+		_, signer, verr := openpgp.VerifyDetachedSignature(
 			trustSet,
 			bytes.NewReader(signed),
 			bytes.NewReader(p.raw),
 			v.sigConfig(),
 		)
-		if verr == nil {
-			return nil
+		if verr != nil {
+			lastVerifyErr = verr
+			continue
 		}
-		lastVerifyErr = verr
+		if count(signer, i) {
+			return signers, nil
+		}
+	}
+	if len(signers.Counted) > 0 {
+		return signers, nil // accepted, no counted packet's key strong
 	}
 	switch {
 	case !sawSignature:
-		return ErrNoUsableSignature
+		return signers, ErrNoUsableSignature
 	case anyTrustedSeen && discounted != nil:
-		return fmt.Errorf("signature verification failed: %w", discounted)
+		return signers, fmt.Errorf("signature verification failed: %w", discounted)
 	case anyTrustedSeen && lastVerifyErr != nil:
-		return fmt.Errorf("signature verification failed: %w", lastVerifyErr)
+		return signers, fmt.Errorf("signature verification failed: %w", lastVerifyErr)
 	case anyUntrusted:
 		v.logUntrustedSignerOnce(suite, rejectedSigners)
-		return fmt.Errorf("%w: IssuerFingerprint not in trust set", ErrUntrustedSigner)
+		return signers, fmt.Errorf("%w: IssuerFingerprint not in trust set", ErrUntrustedSigner)
 	case anyShortKeyID && !v.allowShortKeyID:
-		return ErrShortKeyID
+		return signers, ErrShortKeyID
 	default:
-		return ErrNoUsableSignature
+		return signers, ErrNoUsableSignature
 	}
+}
+
+// signerStrength is the uppercase fingerprint of signer's key whose key ID
+// is issuer and that may sign — the key go-crypto verified a counted packet
+// with (openpgp.EntityList.KeysByIdUsage, as VerifyDetachedSignature looks
+// it up) — and whether it is strong at now (strongSigner), else why not.
+// An entity holding two such keys (a key ID collision inside one key) is
+// strong only when both are; the first one's fingerprint names it.
+func signerStrength(signer *openpgp.Entity, issuer uint64, now time.Time) (fp string, strong bool, why string) {
+	keys := openpgp.EntityList{signer}.KeysByIdUsage(issuer, packet.KeyFlagSign)
+	if len(keys) == 0 {
+		return fmt.Sprintf("%016X", issuer), false, "no signing key of its key ID"
+	}
+	fp = upperFP(keys[0].PublicKey.Fingerprint)
+	for _, k := range keys {
+		if ok, w := strongSigner(k, now); !ok {
+			return fp, false, w
+		}
+	}
+	return fp, true, ""
 }
 
 // sigConfig is the go-crypto configuration S2 verifies a packet with: nil

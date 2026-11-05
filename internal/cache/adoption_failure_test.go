@@ -287,7 +287,7 @@ func TestRescheduleFailingAdoptions_SkipsRefusalsAndPanics(t *testing.T) {
 
 func TestIsRefusalReason(t *testing.T) {
 	for _, r := range []string{ReasonUpstreamOlder, ReasonRollbackRefused, ReasonUnsignedDowngradeRefused,
-		ReasonUnsignedUnconfirmed, ReasonUnsignedTooLarge, ReasonAnchorAbsent} {
+		ReasonUnsignedUnconfirmed, ReasonUnsignedTooLarge, ReasonAnchorAbsent, ReasonSignerDowngrade} {
 		if !IsRefusalReason(r) {
 			t.Errorf("%q: want refusal", r)
 		}

@@ -641,6 +641,7 @@ func TestUnsignedKeysAndReasons(t *testing.T) {
 		{ErrAdoptionRollbackRefused, cache.ReasonRollbackRefused},
 		{ErrAdoptionUnsignedDowngradeRefused, cache.ReasonUnsignedDowngradeRefused},
 		{ErrAdoptionUnsignedTooLarge, cache.ReasonUnsignedTooLarge},
+		{ErrAdoptionSignerDowngrade, cache.ReasonSignerDowngrade},
 	} {
 		err := fmt.Errorf("adoption: %w", c.err)
 		outcome := classifyAdoptionOutcome(err)

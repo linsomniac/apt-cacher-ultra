@@ -331,7 +331,8 @@ func classifyAdoptionOutcome(err error) string {
 	}
 	switch {
 	case errors.Is(err, ErrAdoptionUpstreamOlder), errors.Is(err, ErrAdoptionRollbackRefused),
-		errors.Is(err, ErrAdoptionUnsignedDowngradeRefused), errors.Is(err, ErrAdoptionUnsignedTooLarge):
+		errors.Is(err, ErrAdoptionUnsignedDowngradeRefused), errors.Is(err, ErrAdoptionUnsignedTooLarge),
+		errors.Is(err, ErrAdoptionSignerDowngrade):
 		return "refused"
 	case errors.Is(err, ErrAdoptionReleaseDateInFuture):
 		return "release_date_in_future"
@@ -411,6 +412,8 @@ func classifyAdoptionReason(err error, outcome string, gpgClassifier func(error)
 			return cache.ReasonUnsignedDowngradeRefused
 		case errors.Is(err, ErrAdoptionUnsignedTooLarge):
 			return cache.ReasonUnsignedTooLarge
+		case errors.Is(err, ErrAdoptionSignerDowngrade):
+			return cache.ReasonSignerDowngrade
 		}
 		return outcome
 	case "panicked":

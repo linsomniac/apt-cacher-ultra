@@ -1,6 +1,6 @@
 # apt's verdicts on the shapes of internal/gpg/testdata/aptshapes, one
 # row per shape: ok (apt-get update succeeded) or REJ (it failed), in
-# each client image. Measured 2026-11-01 23:41 UTC by
+# each client image. Measured 2026-11-05 07:51 UTC by
 # bash e2e/apt-oracle/run.sh --record (e2e/apt-oracle/README.md); the
 # fixtures, this file and classes.txt are one measurement. The columns,
 # after the shape's name:
@@ -430,6 +430,46 @@ p_good_unh_fpr_v4_dup ok ok ok ok ok ok
 p_good_unh_noncrit_notation ok ok ok ok ok ok
 p_good_unh_noncrit_unknown100 ok ok ok ok ok ok
 p_good_unh_sig_expire_1s ok ok ok ok ok ok
+pk_bp256 ok ok ok ok REJ ok
+pk_bp384 ok ok ok ok REJ ok
+pk_bp512 ok ok ok ok REJ ok
+pk_dsa2048 ok ok REJ ok REJ REJ
+pk_dsa2048_on_ed25519 ok ok REJ ok REJ REJ
+pk_dsa3072 ok ok REJ ok REJ REJ
+pk_ed25519 ok ok ok ok ok ok
+pk_ed25519_on_bp256 ok ok ok ok REJ ok
+pk_ed25519_on_dsa2048 ok ok ok ok REJ ok
+pk_ed25519_on_ed25519 ok ok ok ok ok ok
+pk_ed25519_on_ed25519_sha1bind ok ok ok ok REJ ok
+pk_ed25519_on_ed25519_sha1self ok ok ok ok REJ ok
+pk_ed25519_on_nistp256 ok ok ok ok ok ok
+pk_ed25519_on_nistp384 ok ok ok ok ok ok
+pk_ed25519_on_nistp521 ok ok ok ok ok ok
+pk_ed25519_on_rsa1024 ok ok ok ok REJ ok
+pk_ed25519_on_rsa2048 ok ok ok ok ok ok
+pk_ed25519_on_rsa3072 ok ok ok ok ok ok
+pk_ed25519_on_secp256k1 ok ok ok ok REJ ok
+pk_ed25519_plus_bp256 ok ok ok ok ok ok
+pk_ed25519_plus_dsa2048 ok ok ok ok ok ok
+pk_ed25519_plus_ed25519_on_ed25519_sha1bind ok ok ok ok ok ok
+pk_ed25519_plus_ed25519_on_rsa1024 ok ok ok ok ok ok
+pk_ed25519_plus_nistp521 ok ok ok ok ok ok
+pk_ed25519_plus_rsa1024 ok ok ok ok ok ok
+pk_ed25519_plus_rsa3072_sha1bound ok ok ok ok ok ok
+pk_ed25519_plus_rsa3072_sha224bound ok ok ok ok ok ok
+pk_ed25519_plus_secp256k1 ok ok ok ok ok ok
+pk_nistp256 ok ok ok ok ok ok
+pk_nistp384 ok ok ok ok ok ok
+pk_nistp521 ok ok REJ ok ok REJ
+pk_nistp521_on_ed25519 ok ok REJ ok ok REJ
+pk_rsa1024 ok ok ok ok REJ REJ
+pk_rsa1024_on_ed25519 ok ok ok ok REJ REJ
+pk_rsa2048 ok ok ok ok ok ok
+pk_rsa3072 ok ok ok ok ok ok
+pk_rsa3072_sha1bound ok ok ok ok REJ ok
+pk_rsa3072_sha224bound ok ok ok ok REJ ok
+pk_rsa4096 ok ok ok ok ok ok
+pk_secp256k1 ok ok ok ok REJ ok
 q10_d_good_plus_unknownB_hashed_t4_empty ok ok ok ok ok ok
 q10_good_plus_unknownB_hashed_crit_t4_empty ok ok ok ok ok ok
 q10_good_plus_unknownB_hashed_t4_empty ok ok ok ok ok ok

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
+
 	"github.com/linsomniac/apt-cacher-ultra/internal/apttext"
 )
 
@@ -133,6 +135,31 @@ func TestVerifier_BypassRefusesEveryMalformedRow(t *testing.T) {
 // before go-crypto reads a byte.
 const aptShapeAllocationMax = 1 << 20
 
+// aptShapeGenericCurveMax is the bound for a row whose keyring holds a
+// brainpool or secp256k1 key (batch fx20): go-crypto verifies those curves
+// with its generic big.Int arithmetic, a few mebibytes a signature
+// (measured: 3.5 MiB for P-256's size, 11 MiB for brainpoolP512r1), set by
+// the curve, never by a length the anchor claims; layer P bounds the
+// packets.
+const aptShapeGenericCurveMax = 16 << 20
+
+// genericCurveKeyring reports whether v's keyring holds a key or subkey of
+// a curve go-crypto verifies generically (aptShapeGenericCurveMax).
+func genericCurveKeyring(v *Verifier) bool {
+	for _, e := range v.keyring.EntityList() {
+		keys := []*packet.PublicKey{e.PrimaryKey}
+		for _, sub := range e.Subkeys {
+			keys = append(keys, sub.PublicKey)
+		}
+		for _, k := range keys {
+			if c := keyClass(k); c == "brainpool" || c == "secp256k1" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // allocatedBy returns what one call of f allocated, in bytes.
 func allocatedBy(f func()) uint64 {
 	var before, after runtime.MemStats
@@ -150,8 +177,21 @@ func allocatedBy(f func()) uint64 {
 func TestVerifier_BoundsAllocationOnEveryRow(t *testing.T) {
 	v := aptShapeVerifier(t)
 	for _, s := range loadAptShapes(t) {
-		if n := allocatedBy(func() { _ = verifyShape(v, s) }); n >= aptShapeAllocationMax {
-			t.Errorf("%s: the verification allocated %d bytes; the bound is %d", s.name, n, aptShapeAllocationMax)
+		// The shape's own keyring, if it has one, is loaded first: the bound
+		// is the verification's, not the key reader's (a brainpool or
+		// secp256k1 key's self-signature costs go-crypto's generic curve
+		// arithmetic megabytes, batch fx20).
+		sv, err := shapeVerifier(v, s)
+		if err != nil {
+			t.Errorf("%s: its keyring: %v", s.name, err)
+			continue
+		}
+		bound := uint64(aptShapeAllocationMax)
+		if genericCurveKeyring(sv) {
+			bound = aptShapeGenericCurveMax
+		}
+		if n := allocatedBy(func() { _, _ = verifyShapeSigners(sv, s) }); n >= bound {
+			t.Errorf("%s: the verification allocated %d bytes; the bound is %d", s.name, n, bound)
 		}
 	}
 }

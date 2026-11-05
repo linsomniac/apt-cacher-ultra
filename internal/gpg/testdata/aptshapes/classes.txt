@@ -4,7 +4,7 @@
 # nodata (the verifier found no signature data: gpgv's NODATA), badsig
 # (a signature failed its check: gpgv's BADSIG, sqv's "Message has been
 # manipulated") or other (anything else the verifier said). Measured
-# 2026-11-01 23:41 UTC with verdicts.txt; e2e/apt-oracle/README.md,
+# 2026-11-05 07:51 UTC with verdicts.txt; e2e/apt-oracle/README.md,
 # "Error classes", says how each is derived.
 a_aftercrc_cr_sp - - - - - -
 a_aftercrc_nbsp - - - - other -
@@ -426,6 +426,46 @@ p_good_unh_fpr_v4_dup - - - - - -
 p_good_unh_noncrit_notation - - - - - -
 p_good_unh_noncrit_unknown100 - - - - - -
 p_good_unh_sig_expire_1s - - - - - -
+pk_bp256 - - - - other -
+pk_bp384 - - - - other -
+pk_bp512 - - - - other -
+pk_dsa2048 - - other - other other
+pk_dsa2048_on_ed25519 - - other - other other
+pk_dsa3072 - - other - other other
+pk_ed25519 - - - - - -
+pk_ed25519_on_bp256 - - - - other -
+pk_ed25519_on_dsa2048 - - - - other -
+pk_ed25519_on_ed25519 - - - - - -
+pk_ed25519_on_ed25519_sha1bind - - - - other -
+pk_ed25519_on_ed25519_sha1self - - - - other -
+pk_ed25519_on_nistp256 - - - - - -
+pk_ed25519_on_nistp384 - - - - - -
+pk_ed25519_on_nistp521 - - - - - -
+pk_ed25519_on_rsa1024 - - - - other -
+pk_ed25519_on_rsa2048 - - - - - -
+pk_ed25519_on_rsa3072 - - - - - -
+pk_ed25519_on_secp256k1 - - - - other -
+pk_ed25519_plus_bp256 - - - - - -
+pk_ed25519_plus_dsa2048 - - - - - -
+pk_ed25519_plus_ed25519_on_ed25519_sha1bind - - - - - -
+pk_ed25519_plus_ed25519_on_rsa1024 - - - - - -
+pk_ed25519_plus_nistp521 - - - - - -
+pk_ed25519_plus_rsa1024 - - - - - -
+pk_ed25519_plus_rsa3072_sha1bound - - - - - -
+pk_ed25519_plus_rsa3072_sha224bound - - - - - -
+pk_ed25519_plus_secp256k1 - - - - - -
+pk_nistp256 - - - - - -
+pk_nistp384 - - - - - -
+pk_nistp521 - - other - - other
+pk_nistp521_on_ed25519 - - other - - other
+pk_rsa1024 - - - - other other
+pk_rsa1024_on_ed25519 - - - - other other
+pk_rsa2048 - - - - - -
+pk_rsa3072 - - - - - -
+pk_rsa3072_sha1bound - - - - other -
+pk_rsa3072_sha224bound - - - - other -
+pk_rsa4096 - - - - - -
+pk_secp256k1 - - - - other -
 q10_d_good_plus_unknownB_hashed_t4_empty - - - - - -
 q10_good_plus_unknownB_hashed_crit_t4_empty - - - - - -
 q10_good_plus_unknownB_hashed_t4_empty - - - - - -

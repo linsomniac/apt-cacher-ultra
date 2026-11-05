@@ -877,7 +877,8 @@ func suitesForHTML(suites []suiteEntry, adoptionEnabled bool) []suiteEntry {
 //
 // Every other refusal reason — the phase E reasons
 // (unsigned_downgrade_refused, unsigned_unconfirmed, unsigned_too_large,
-// anchor_absent, unsigned_disabled) — means the cache really is behind
+// anchor_absent, unsigned_disabled) and signer_downgrade (the hardening
+// plan's Task 9d) — means the cache really is behind
 // (e.g. a vendor that stopped signing, or adopt_unsigned turned off), so
 // those keep the ordinary lag behaviour; the operator must act (the
 // spec's POST /forget escape hatch, or the knob). Extend the

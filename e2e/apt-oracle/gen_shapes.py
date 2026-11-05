@@ -52,8 +52,14 @@ and ``keys.gpg`` is checked to hold public packets only.
   client's keys.gpg holds it: each fx19 shape has K's public key as its
   own signed-by (``<name>.keys.asc``), as the second re-review measured
   them, and ``--subkeys-key`` makes the batch again alone.
+- Batch fx20's keys (POLICY_KEYS), one per class the signer downgrade
+  guard's table names (Task 9d: RSA of four sizes, DSA, Ed25519, the NIST
+  and brainpool curves, secp256k1, SHA-1- and SHA-224-bound keys, and
+  primary/subkey pairs). No client's keys.gpg holds them: each fx20 shape
+  has its keys as its own signed-by, and ``--policy-keys`` makes the batch
+  again alone.
 
-823 shapes, in 19 batches. The first 135 are the planning measurement's
+863 shapes, in 20 batches. The first 135 are the planning measurement's
 (2026-10-28; DN-2 and Appendix A of
 docs/superpowers/plans/2026-10-28-gc-and-upstream-hardening.md), by the
 same names and built as its throwaway generators built them (the plan's
@@ -118,6 +124,11 @@ without a key from committed fixtures as its tools/gen_a.py cut them (the
 ``e8_`` shapes from fx13's ``n_i_sha224`` and ``n_i_sha3_256`` too); fx19,
 17 (``e7_``), its own-key batch rr7, made with key K.
 
+Batch fx20, 40 (``pk_``), is Task 9d's measurement of the newest clients'
+key policies: the shared Release clearsigned by each POLICY_KEYS key alone,
+and by POLICY_PAIRS' pairs (an Ed25519 key's signature and a weak key's),
+whose strip is the weak key's own shape.
+
 AIDEV-NOTE: the fixtures, verdicts.txt and classes.txt are one
 measurement. Each run makes new keys, new signatures and new random bytes
 (the v3 garbage packets), so a regenerated corpus must be re-measured
@@ -134,12 +145,14 @@ fx13 and O's public key in keys.gpg (the other keys' packets keep their
 bytes), then cuts the FROM_CONTROLS batches again (fx18's ``e8_`` shapes
 are cut from fx13's SHA-224 and SHA3-256 anchors; every other one comes
 out byte for byte as it was); ``--subkeys-key`` makes key K alone and
-writes only batch fx19 and its key files.
+writes only batch fx19 and its key files; ``--policy-keys`` makes fx20's
+keys alone and writes only batch fx20 and its key files.
 
 Usage: python3 -I e2e/apt-oracle/gen_shapes.py OUT
        python3 -I e2e/apt-oracle/gen_shapes.py --from-controls OUT
        python3 -I e2e/apt-oracle/gen_shapes.py --own-key OUT
        python3 -I e2e/apt-oracle/gen_shapes.py --subkeys-key OUT
+       python3 -I e2e/apt-oracle/gen_shapes.py --policy-keys OUT
 """
 
 from __future__ import annotations
@@ -3475,6 +3488,169 @@ def keyrings_fx19(km: SubkeysMaterial) -> Shapes:
     return {name: asc for name in (*inline, *detached)}
 
 
+@dataclass(frozen=True)
+class PolicyKey:
+    """One of batch fx20's keys (Task 9d, the signer downgrade guard): what
+    gpg makes it from. primary is gpg's algorithm name for the primary key;
+    sub, when set, that of a signing subkey, the primary then certifying
+    only; cert and sub_cert, when set, gpg's --cert-digest-algo for the
+    primary's self-signature and for the subkey's binding and back-signature
+    (gpg uses it for both); digest the data signature's hash."""
+
+    name: str
+    primary: str
+    sub: str | None = None
+    cert: str | None = None
+    sub_cert: str | None = None
+    digest: str = "SHA256"
+
+    @property
+    def uid(self) -> str:
+        """Its user ID, which names it."""
+        return f"Apt-shape P {self.name} <pk-{self.name}@example.invalid>"
+
+
+# Batch fx20's keys: each signing key the downgrade guard's table (Task 9d)
+# classes, signing alone, and primary/subkey pairs, which ask whether the
+# primary's algorithm or a binding's hash matters to a subkey's signature.
+# The data signature is SHA-256 but where gpg needs a longer hash (ECDSA on
+# a larger curve).
+POLICY_KEYS: tuple[PolicyKey, ...] = (
+    PolicyKey("rsa1024", "rsa1024"),
+    PolicyKey("rsa2048", "rsa2048"),
+    PolicyKey("rsa3072", "rsa3072"),
+    PolicyKey("rsa4096", "rsa4096"),
+    PolicyKey("dsa2048", "dsa2048"),
+    PolicyKey("dsa3072", "dsa3072"),
+    PolicyKey("ed25519", "ed25519"),
+    PolicyKey("nistp256", "nistp256"),
+    PolicyKey("nistp384", "nistp384", digest="SHA384"),
+    PolicyKey("nistp521", "nistp521", digest="SHA512"),
+    PolicyKey("bp256", "brainpoolP256r1"),
+    PolicyKey("bp384", "brainpoolP384r1", digest="SHA384"),
+    PolicyKey("bp512", "brainpoolP512r1", digest="SHA512"),
+    PolicyKey("secp256k1", "secp256k1"),
+    PolicyKey("rsa3072_sha1bound", "rsa3072", cert="SHA1"),
+    PolicyKey("rsa3072_sha224bound", "rsa3072", cert="SHA224"),
+    PolicyKey("ed25519_on_ed25519", "ed25519", sub="ed25519"),
+    PolicyKey("ed25519_on_rsa1024", "rsa1024", sub="ed25519"),
+    PolicyKey("ed25519_on_dsa2048", "dsa2048", sub="ed25519"),
+    PolicyKey("ed25519_on_nistp521", "nistp521", sub="ed25519"),
+    PolicyKey("ed25519_on_secp256k1", "secp256k1", sub="ed25519"),
+    PolicyKey("ed25519_on_bp256", "brainpoolP256r1", sub="ed25519"),
+    PolicyKey("ed25519_on_nistp256", "nistp256", sub="ed25519"),
+    PolicyKey("ed25519_on_nistp384", "nistp384", sub="ed25519"),
+    PolicyKey("ed25519_on_rsa2048", "rsa2048", sub="ed25519"),
+    PolicyKey("ed25519_on_rsa3072", "rsa3072", sub="ed25519"),
+    PolicyKey("rsa1024_on_ed25519", "ed25519", sub="rsa1024"),
+    PolicyKey("dsa2048_on_ed25519", "ed25519", sub="dsa2048"),
+    PolicyKey("nistp521_on_ed25519", "ed25519", sub="nistp521", digest="SHA512"),
+    PolicyKey("ed25519_on_ed25519_sha1self", "ed25519", sub="ed25519", cert="SHA1"),
+    PolicyKey("ed25519_on_ed25519_sha1bind", "ed25519", sub="ed25519", sub_cert="SHA1"),
+)
+
+# Batch fx20's pairs: an anchor signed by two of its keys, the strong one
+# first, each with both keys as its signed-by; dropping the strong packet
+# leaves the second key's pk_ shape (the strip the guard refuses).
+POLICY_PAIRS: tuple[tuple[str, str], ...] = (
+    ("ed25519", "rsa3072_sha1bound"),
+    ("ed25519", "rsa3072_sha224bound"),
+    ("ed25519", "dsa2048"),
+    ("ed25519", "rsa1024"),
+    ("ed25519", "nistp521"),
+    ("ed25519", "bp256"),
+    ("ed25519", "secp256k1"),
+    ("ed25519", "ed25519_on_rsa1024"),
+    ("ed25519", "ed25519_on_ed25519_sha1bind"),
+)
+
+
+@dataclass(frozen=True)
+class PolicyMaterial:
+    """What batch fx20 is cut from: each POLICY_KEYS key's public key (its
+    binary export, checked to hold its public packets only) and its
+    clearsigning of RELEASE (gpg's whole output), by the key's name."""
+
+    public: dict[str, bytes]
+    signed: dict[str, bytes]
+
+
+def make_policy_key(g: GnuPG, k: PolicyKey) -> tuple[str, str]:
+    """k, made in g's home; the primary's fingerprint and the signing key's
+    (the subkey's, when k has one)."""
+    cert = ["--cert-digest-algo", k.cert] if k.cert else []
+    usage = "cert" if k.sub else "sign"
+    out = g.run(
+        *cert, "--status-fd", "1", "--quick-gen-key", k.uid, k.primary, usage, "never"
+    )
+    primary = key_created(out, "P")
+    if k.sub is None:
+        return primary, primary
+    # gpg makes the back-signature too with --cert-digest-algo, and refuses a
+    # SHA-1 one (as a third-party signature) without --allow-weak-key-signatures.
+    sub_cert = (
+        ["--cert-digest-algo", k.sub_cert, "--allow-weak-key-signatures"]
+        if k.sub_cert
+        else []
+    )
+    out = g.run(
+        *sub_cert,
+        "--status-fd",
+        "1",
+        "--quick-add-key",
+        primary,
+        k.sub,
+        "sign",
+        "never",
+    )
+    return primary, key_created(out, "S")
+
+
+def make_policy_material(g: GnuPG) -> PolicyMaterial:
+    """Makes every POLICY_KEYS key and signs RELEASE with each, each
+    signature checked to name the key it was asked of."""
+    public: dict[str, bytes] = {}
+    signed: dict[str, bytes] = {}
+    for k in POLICY_KEYS:
+        primary, signer = make_policy_key(g, k)
+        out = g.clearsign(signer + "!", RELEASE, digest=k.digest)
+        if issuer_fingerprint(sig_packets(out)) != signer:
+            raise RuntimeError(f"gpg signed with another key than {signer}")
+        public[k.name] = g.export(primary)
+        check_keyring(public[k.name], {primary, signer})
+        signed[k.name] = out
+    return PolicyMaterial(public=public, signed=signed)
+
+
+def batch_fx20(pm: PolicyMaterial) -> Batch:
+    """Task 9d, the signer downgrade guard's measurement: RELEASE
+    clearsigned by each POLICY_KEYS key alone (``pk_<name>``), and by each
+    POLICY_PAIRS pair (``pk_<strong>_plus_<weak>``), whose strip is the weak
+    key's pk_ shape. Each shape's signed-by is its keys alone
+    (keyrings_fx20)."""
+    inline: Shapes = {f"pk_{name}": out for name, out in pm.signed.items()}
+    for strong, weak in POLICY_PAIRS:
+        head = pm.signed[strong][: pm.signed[strong].index(BEGIN)]
+        pkts = sig_packets(pm.signed[strong]) + sig_packets(pm.signed[weak])
+        inline[f"pk_{strong}_plus_{weak}"] = head + armor_parts(pkts)
+    return inline, {}, {}
+
+
+def keyrings_fx20(pm: PolicyMaterial) -> Shapes:
+    """The own signed-by (<name>.keys.asc) of every batch fx20 shape: its
+    key's public key alone, in one armor block, or a pair's two keys, one
+    block each, the strong key's first."""
+    by_name = {k.name: k for k in POLICY_KEYS}
+
+    def asc(name: str) -> bytes:
+        return armored_keys(pm.public[name], by_name[name].uid.encode())
+
+    out: Shapes = {f"pk_{name}": asc(name) for name in pm.public}
+    for strong, weak in POLICY_PAIRS:
+        out[f"pk_{strong}_plus_{weak}"] = asc(strong) + asc(weak)
+    return out
+
+
 # The batches cut from Material, in a run that makes keys.
 BATCHES: list[Callable[[Material], tuple[Shapes, Shapes]]] = [
     batch_fx,
@@ -3558,11 +3734,16 @@ class Corpus:
 
 
 def build_shapes(
-    m: Material, om: OwnMaterial, km: SubkeysMaterial, keyring: bytes
+    m: Material,
+    om: OwnMaterial,
+    km: SubkeysMaterial,
+    pm: PolicyMaterial,
+    keyring: bytes,
 ) -> Corpus:
     """Every batch's shapes: those cut from Material, batch fx13, those cut
     from the control files among them (as --from-controls cuts them from
-    committed ones), and batch fx19 with its key files; names are unique."""
+    committed ones), and batches fx19 and fx20 with their key files; names
+    are unique."""
     corpus = Corpus()
     for batch in BATCHES:
         corpus.add(*batch(m))
@@ -3574,6 +3755,8 @@ def build_shapes(
         corpus.add_keyrings(keyrings_from(controls))
     corpus.add(*batch_fx19(km))
     corpus.add_keyrings(keyrings_fx19(km))
+    corpus.add(*batch_fx20(pm))
+    corpus.add_keyrings(keyrings_fx20(pm))
     return corpus
 
 
@@ -3682,6 +3865,25 @@ def write_subkeys_key(out: Path) -> Corpus:
     return corpus
 
 
+def write_policy_keys(out: Path) -> Corpus:
+    """Makes batch fx20's keys in a temporary GnuPG home and writes batch
+    fx20 and its key files into OUT; writes nothing else (keys.gpg holds
+    none of them). Returns what it wrote."""
+    if not (out / "keys.gpg").is_file():
+        raise SystemExit(f"{out}: no keys.gpg: generate the corpus first")
+    corpus_entries(out)  # refuse a wrong OUT before making a key
+    g = GnuPG()
+    try:
+        pm = make_policy_material(g)
+    finally:
+        g.close()
+    corpus = Corpus()
+    corpus.add(*batch_fx20(pm))
+    corpus.add_keyrings(keyrings_fx20(pm))
+    write_files(out, corpus.files())
+    return corpus
+
+
 def exit_on_signal(signum: int, _frame: FrameType | None) -> None:
     """SIGTERM or SIGHUP: unwind with exit status 128 + signum. Once: later
     ones are ignored, so a second cannot cut the clean-up short."""
@@ -3699,14 +3901,14 @@ def main(argv: list[str]) -> int:
     for s in EXIT_SIGNALS:
         signal.signal(s, exit_on_signal)
     args = argv[1:]
-    modes = ("--from-controls", "--own-key", "--subkeys-key")
+    modes = ("--from-controls", "--own-key", "--subkeys-key", "--policy-keys")
     mode = args[0] if args and args[0] in modes else ""
     if mode:
         args = args[1:]
     if len(args) != 1:
         print(
             "usage: python3 -I e2e/apt-oracle/gen_shapes.py"
-            " [--from-controls | --own-key | --subkeys-key] OUT",
+            " [--from-controls | --own-key | --subkeys-key | --policy-keys] OUT",
             file=sys.stderr,
         )
         return 2
@@ -3721,9 +3923,12 @@ def main(argv: list[str]) -> int:
                 f"signed by a new key O, whose public key replaces O's in"
                 f" {out}/keys.gpg, and the batches cut from the controls again"
             )
-        else:
+        elif mode == "--subkeys-key":
             corpus = write_subkeys_key(out)
             what = "signed by a new key K, each with K's public key as its keys.asc"
+        else:
+            corpus = write_policy_keys(out)
+            what = "signed by new policy keys, each with its keys as its keys.asc"
         n_inline, n_detached = len(corpus.inline), len(corpus.detached)
         print(
             f"wrote {n_inline + n_detached} shapes ({n_inline} inline, "
@@ -3738,11 +3943,12 @@ def main(argv: list[str]) -> int:
         material = make_material(g, keys)
         own = make_own_material(g, keys.o)
         subkeys = make_subkeys_material(g, make_subkeys_key(g))
+        policy = make_policy_material(g)
         keyring = g.export(keys.a, keys.e, keys.s, keys.o)
     finally:
         g.close()
     check_keyring(keyring, {keys.a, keys.e, keys.s, keys.s_sub, keys.o})
-    corpus = build_shapes(material, own, subkeys, keyring)
+    corpus = build_shapes(material, own, subkeys, policy, keyring)
     write_corpus(out, corpus, keyring)
     total = len(corpus.inline) + len(corpus.detached)
     print(

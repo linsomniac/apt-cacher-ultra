@@ -72,6 +72,28 @@ type Verifier interface {
 	VerifyDetached(ctx context.Context, suite SuiteRef, releaseBytes, sigBytes []byte) ([]byte, error)
 }
 
+// Signers is what a SignerVerifier reports about the signatures of an
+// anchor it verified, for the signer downgrade guard (signer_guard.go):
+// Strong is the uppercase fingerprint of the first counted packet's
+// signing key that is strong (internal/gpg's strongSigner), "" when none
+// is; Counted names the counted packets' signing keys in packet order, up
+// to and including the strong one, each one not strong with why. Under
+// accept_any_signer's bypass no packet is verified, and both are empty.
+type Signers struct {
+	Strong  string
+	Counted []string
+}
+
+// SignerVerifier is a Verifier that also reports an anchor's Signers: the
+// two methods return what VerifyInline and VerifyDetached return, and the
+// Signers. The production verifier (internal/gpg) is one; the Adopter's
+// signer downgrade guard stands down for a Verifier that is not (the
+// tests' pass-through fakes).
+type SignerVerifier interface {
+	VerifyInlineSigners(ctx context.Context, suite SuiteRef, inRelease []byte) ([]byte, Signers, error)
+	VerifyDetachedSigners(ctx context.Context, suite SuiteRef, releaseBytes, sigBytes []byte) ([]byte, Signers, error)
+}
+
 // AdoptionFetcher is the subset of *fetch.Client the Adopter uses to
 // pull declared members from upstream. The Fetch method writes the
 // member bytes into the cache.BlobWriter that the caller provides;
@@ -119,6 +141,12 @@ var (
 	// to an adopted snapshot of the suite that is no longer current: a
 	// flapping mirror must not flip the cache backwards.
 	ErrAdoptionRollbackRefused = errors.New("adoption_rollback_refused")
+
+	// ErrAdoptionSignerDowngrade is the refusal of a candidate that has
+	// lost the strong signer the suite's current anchor has (the hardening
+	// plan's Task 9d, ruling HD-19; signer_guard.go): an on-path strip of a
+	// strong signature beside a weak one. A refusal state, not a failure.
+	ErrAdoptionSignerDowngrade = errors.New("adoption_signer_downgrade")
 
 	// ErrAdoptionReleaseDateInFuture fails a candidate dated more than
 	// maxReleaseDateSkew ahead of the cache's clock (apt: "not valid
@@ -588,6 +616,10 @@ type Adopter struct {
 	verifier Verifier
 	hostSem  *hostsem.Sem
 
+	// signers is verifier as a SignerVerifier, nil when it is not one: the
+	// signer downgrade guard (signer_guard.go) then stands down.
+	signers SignerVerifier
+
 	// maxConcurrent and maxDuration configure the Checker's admission and
 	// run deadline (spec C4); the Adopter itself never waits for a slot.
 	maxConcurrent int
@@ -766,10 +798,12 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 			required[arch] = struct{}{}
 		}
 	}
+	signers, _ := cfg.Verifier.(SignerVerifier)
 	return &Adopter{
 		cache:                   cfg.Cache,
 		fetcher:                 cfg.Fetcher,
 		verifier:                cfg.Verifier,
+		signers:                 signers,
 		hostSem:                 cfg.HostLimiter,
 		maxConcurrent:           cfg.MaxConcurrent,
 		maxDuration:             maxDur,
@@ -1095,16 +1129,24 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// splitter reads it, or releaseBytes verbatim in detached mode).
 	// Both paths converge on "verified Release-equivalent text" for the
 	// §7.5 step 3 parse.
+	// With a SignerVerifier, the same verification also reports the
+	// anchor's signers, for the downgrade guard at Step 3b; the unsigned
+	// form has none.
 	var (
 		releaseText []byte
 		verifyErr   error
+		signers     Signers
 	)
-	switch p.form {
-	case adoptionFormInline:
+	switch {
+	case p.form == adoptionFormInline && a.signers != nil:
+		releaseText, signers, verifyErr = a.signers.VerifyInlineSigners(ctx, suite, p.inlineBytes)
+	case p.form == adoptionFormInline:
 		releaseText, verifyErr = a.verifier.VerifyInline(ctx, suite, p.inlineBytes)
-	case adoptionFormDetached:
+	case p.form == adoptionFormDetached && a.signers != nil:
+		releaseText, signers, verifyErr = a.signers.VerifyDetachedSigners(ctx, suite, p.releaseBytes, p.sigBytes)
+	case p.form == adoptionFormDetached:
 		releaseText, verifyErr = a.verifier.VerifyDetached(ctx, suite, p.releaseBytes, p.sigBytes)
-	case adoptionFormUnsigned:
+	case p.form == adoptionFormUnsigned:
 		// Spec C5: unsigned eligibility takes the verification's place —
 		// the first never-downgrade point, before anything is downloaded.
 		// Nothing verifies the text: it never vouches a .deb (Step 8).
@@ -1211,6 +1253,14 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	if prior != nil && prior.ReleaseDate != nil && relDate < *prior.ReleaseDate {
 		return fmt.Errorf("%w: Date %d is older than the current snapshot's %d",
 			ErrAdoptionUpstreamOlder, relDate, *prior.ReleaseDate)
+	}
+
+	// Step 3b (Task 9d): the signer downgrade guard, beside the Date and
+	// rollback refusals and before any member download: a candidate that
+	// has lost the current anchor's strong signer is refused
+	// (signer_downgrade; signer_guard.go).
+	if err := a.signerGuard(ctx, suite, prior, signers); err != nil {
+		return err
 	}
 
 	// Step 4: insert the candidate suite_snapshot row. The schema

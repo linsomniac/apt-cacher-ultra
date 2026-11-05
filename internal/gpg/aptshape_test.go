@@ -5,9 +5,13 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
 )
 
 // The apt-shape table test (the hardening plan's Tasks 6, 7 and 9b,
@@ -191,6 +195,55 @@ var aptShapeFamilies = []string{aptShapeOneArmorBlock, aptShapeNonCanonicalArmor
 // TestAptShapeKnownUnsafe_IsEmpty keeps it so: adding to it needs a ruling,
 // not an edit.
 var aptShapeKnownUnsafe = map[string]string{}
+
+// aptShapeKeyPolicy are the rows only a newest-generation client's key
+// policy refuses: debian:13's sqv, ubuntu:24.04's or ubuntu:26.04's
+// APT::Key::Assert-Pubkey-Algo (batch fx20, the hardening plan's Task 9d).
+// Crypto policy is not intersected across client generations (ruling
+// HD-19): S2 counts what the gpgv-based apt count, so the cache accepts
+// each, and reports no strong signer for it (strongSigner), which is what
+// the adopter's signer downgrade guard reads. Every gpgv 2.2 image
+// (debian:11, ubuntu:22.04, debian:12) accepts each, and some newest image
+// refuses it (TestAptShapeKeyPolicy_AreTheNewestImagesRefusals).
+var aptShapeKeyPolicy = map[string]bool{
+	"pk_bp256":                       true,
+	"pk_bp384":                       true,
+	"pk_bp512":                       true,
+	"pk_dsa2048":                     true,
+	"pk_dsa2048_on_ed25519":          true,
+	"pk_dsa3072":                     true,
+	"pk_ed25519_on_bp256":            true,
+	"pk_ed25519_on_dsa2048":          true,
+	"pk_ed25519_on_ed25519_sha1bind": true,
+	"pk_ed25519_on_ed25519_sha1self": true,
+	"pk_ed25519_on_rsa1024":          true,
+	"pk_ed25519_on_secp256k1":        true,
+	"pk_nistp521":                    true,
+	"pk_nistp521_on_ed25519":         true,
+	"pk_rsa1024":                     true,
+	"pk_rsa1024_on_ed25519":          true,
+	"pk_rsa3072_sha1bound":           true,
+	"pk_rsa3072_sha224bound":         true,
+	"pk_secp256k1":                   true,
+}
+
+// aptShapeNewest are the columns of the newest-generation images, whose
+// policies define a strong signer (ruling HD-19): ubuntu:24.04, debian:13
+// and ubuntu:26.04; aptShapeGPGV22 those of the gpgv 2.2 images.
+var (
+	aptShapeNewest = []int{2, 4, 5}
+	aptShapeGPGV22 = []int{0, 1, 3}
+)
+
+// anyRejectsIn reads a row of apt's verdicts in the given columns.
+func anyRejectsIn(rejected []bool, cols []int) bool {
+	for _, c := range cols {
+		if rejected[c] {
+			return true
+		}
+	}
+	return false
+}
 
 // pendingS1 held the twelve shapes only S1 refuses (Appendix A's rule
 // column marks them REJ(S1): a bad signature from a known key beside a good
@@ -398,24 +451,45 @@ func aptShapeVerifier(t *testing.T, acceptAnySigner ...bool) *Verifier {
 // like v whose host keyring is that file, read as LoadKeyring reads an
 // armored key file (every block: the re-review's V-RC1).
 func verifyShape(v *Verifier, s aptShape) error {
-	if s.keys != nil {
-		keyring, err := LoadKeyringWithEmbedded(nil, []EmbeddedSource{{Name: s.name + ".keys.asc", Data: s.keys}}, silentLogger())
-		if err != nil {
-			return err
-		}
-		if v, err = NewVerifier(VerifierConfig{
-			Keyring: keyring, Pins: v.pins, RequireSignature: true, RequirePinned: v.requirePinned,
-			AllowShortKeyID: v.allowShortKeyID, AcceptAnySigner: v.acceptAnySigner, Logger: v.logger,
-		}); err != nil {
-			return err
-		}
-	}
-	if s.inline {
-		_, err := v.VerifyInline(context.Background(), newSuite(), s.body)
+	v, err := shapeVerifier(v, s)
+	if err != nil {
 		return err
 	}
-	_, err := v.VerifyDetached(context.Background(), newSuite(), s.release, s.body)
+	_, err = verifyShapeSigners(v, s)
 	return err
+}
+
+// shapeVerifier is the verifier verifyShape runs s with: v, or, for a shape
+// with its own keys.asc, a verifier like v (its clock too) whose host
+// keyring is that file.
+func shapeVerifier(v *Verifier, s aptShape) (*Verifier, error) {
+	if s.keys == nil {
+		return v, nil
+	}
+	keyring, err := LoadKeyringWithEmbedded(nil, []EmbeddedSource{{Name: s.name + ".keys.asc", Data: s.keys}}, silentLogger())
+	if err != nil {
+		return nil, err
+	}
+	own, err := NewVerifier(VerifierConfig{
+		Keyring: keyring, Pins: v.pins, RequireSignature: true, RequirePinned: v.requirePinned,
+		AllowShortKeyID: v.allowShortKeyID, AcceptAnySigner: v.acceptAnySigner, Logger: v.logger,
+	})
+	if err != nil {
+		return nil, err
+	}
+	own.now = v.now
+	return own, nil
+}
+
+// verifyShapeSigners runs v on s, in its form, and returns the signers the
+// verifier reports (freshness.Signers) and the error.
+func verifyShapeSigners(v *Verifier, s aptShape) (freshness.Signers, error) {
+	if s.inline {
+		_, signers, err := v.VerifyInlineSigners(context.Background(), newSuite(), s.body)
+		return signers, err
+	}
+	_, signers, err := v.VerifyDetachedSigners(context.Background(), newSuite(), s.release, s.body)
+	return signers, err
 }
 
 // TestVerifier_FollowsTheAptShapeTable holds the verifier to DN-3's rule over
@@ -442,6 +516,9 @@ func TestVerifier_FollowsTheAptShapeTable(t *testing.T) {
 				}
 				wantRejected, why = false, "known unsafe: "+reason
 			}
+			if aptShapeKeyPolicy[s.name] {
+				wantRejected, why = false, "a newest client's key policy (ruling HD-19: not intersected; no strong signer)"
+			}
 			err := verifyShape(v, s)
 			switch {
 			case wantRejected && err == nil:
@@ -452,6 +529,99 @@ func TestVerifier_FollowsTheAptShapeTable(t *testing.T) {
 				t.Logf("rejected: %v (reason %s)", err, ClassifyVerifyErr(err))
 			}
 		})
+	}
+}
+
+// aptShapeMeasuredAt is when verdicts.txt was measured, from its header
+// ("Measured <date> <time> UTC"), a minute later (the header's time is cut
+// to the minute): every corpus key was made before it, and the strong
+// flag's dated rules are judged at it, so the flag follows the measurement
+// whatever today's date (ruling G3).
+func aptShapeMeasuredAt(t *testing.T) time.Time {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(aptShapeDir, "verdicts.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`Measured (\d{4}-\d\d-\d\d \d\d:\d\d) UTC`).FindSubmatch(b)
+	if m == nil {
+		t.Fatal("verdicts.txt: no \"Measured <date> <time> UTC\" in its header")
+	}
+	at, err := time.Parse("2006-01-02 15:04", string(m[1]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return at.Add(time.Minute)
+}
+
+// TestVerifier_StrongSignerFollowsTheAptShapeTable holds the strong flag
+// (freshness.Signers.Strong, strongSigner) to its definition over the
+// corpus, at the measurement's time: for every row the cache accepts, it
+// reports a strong signer exactly when debian:13, ubuntu:24.04 and
+// ubuntu:26.04 all accept the row (the hardening plan's Task 9d), and a
+// strong signer it reports is one of the signers it counted.
+func TestVerifier_StrongSignerFollowsTheAptShapeTable(t *testing.T) {
+	v := aptShapeVerifier(t)
+	at := aptShapeMeasuredAt(t)
+	v.now = func() time.Time { return at }
+	strong, weak := 0, 0
+	for _, s := range loadAptShapes(t) {
+		sv, err := shapeVerifier(v, s)
+		if err != nil {
+			t.Fatalf("%s: its keyring: %v", s.name, err)
+		}
+		signers, err := verifyShapeSigners(sv, s)
+		if err != nil {
+			continue
+		}
+		want := !anyRejectsIn(s.rejected, aptShapeNewest)
+		if got := signers.Strong != ""; got != want {
+			t.Errorf("%s: strong signer %q (counted %v), want strong %v (apt REJ per column: %v)",
+				s.name, signers.Strong, signers.Counted, want, s.rejected)
+		}
+		if signers.Strong != "" && (len(signers.Counted) == 0 || signers.Counted[len(signers.Counted)-1] != signers.Strong) {
+			t.Errorf("%s: strong signer %q is not the last counted of %v", s.name, signers.Strong, signers.Counted)
+		}
+		if len(signers.Counted) == 0 {
+			t.Errorf("%s: accepted with no counted signer", s.name)
+		}
+		if want {
+			strong++
+		} else {
+			weak++
+		}
+	}
+	if strong == 0 || weak < len(aptShapeKeyPolicy) {
+		t.Fatalf("test premise: %d accepted rows strong, %d not; want both, and every key-policy row among the latter", strong, weak)
+	}
+}
+
+// TestAptShapeKeyPolicy_AreTheNewestImagesRefusals: every aptShapeKeyPolicy
+// row is accepted by the three gpgv 2.2 images and refused by one of the
+// newest, every one of whose refusals is its verifier's (class other: no
+// split, no bad signature), and every row so measured is listed.
+func TestAptShapeKeyPolicy_AreTheNewestImagesRefusals(t *testing.T) {
+	verdicts := loadAptShapeVerdicts(t)
+	classes := loadAptShapeClasses(t)
+	for name := range aptShapeKeyPolicy {
+		rejected, ok := verdicts[name]
+		if !ok {
+			t.Errorf("%s: no row in verdicts.txt", name)
+			continue
+		}
+		if anyRejectsIn(rejected, aptShapeGPGV22) || !anyRejectsIn(rejected, aptShapeNewest) {
+			t.Errorf("%s: apt REJ per column %v; want a refusal by a newest image alone", name, rejected)
+		}
+		for i, c := range classes[name] {
+			if rejected[i] && c != "other" {
+				t.Errorf("%s, column %d: class %q, want other (a key policy)", name, i+1, c)
+			}
+		}
+	}
+	for name, rejected := range verdicts {
+		if strings.HasPrefix(name, "pk_") && anyRejects(rejected) && !aptShapeKeyPolicy[name] {
+			t.Errorf("%s: a batch fx20 row some apt refuses, not in aptShapeKeyPolicy", name)
+		}
 	}
 }
 
@@ -487,6 +657,9 @@ func TestAptShapeDeviations_NameShapesInTheTable(t *testing.T) {
 	}
 	for name, reason := range aptShapeKnownUnsafe {
 		check("aptShapeKnownUnsafe", name, reason)
+	}
+	for name := range aptShapeKeyPolicy {
+		check("aptShapeKeyPolicy", name, "HD-19")
 	}
 	for name, pending := range pendingS1 {
 		if !pending {

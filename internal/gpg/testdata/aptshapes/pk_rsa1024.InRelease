@@ -1,0 +1,20 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+Origin: oracle
+Label: oracle
+Suite: test
+Codename: test
+Date: Thu, 01 Oct 2026 00:00:00 GMT
+Architectures: amd64
+SHA256:
+ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 Packages
+
+-----BEGIN PGP SIGNATURE-----
+
+iLMEAQEIAB0WIQThIZ1OOdnEho9Wq7G3SnPMYw+QugUCauw1JQAKCRC3SnPMYw+Q
+uuiAA/sFu6bsbSvsT8VncfT6aeYZYK5tI4CvlgqLXM+zyDYIq129/xUNv9mjnIoA
++W+DnRfuN75scW0qutjTMOo6/B8jenyd/nroiUwyuVw7QJ1PZTg/EmmbQYozTpcO
+Blifrao7BK1xz2wjTLvXjyZW2ZeA+R7DShIRJEJCWOvlwYw7PA==
+=xE4n
+-----END PGP SIGNATURE-----
