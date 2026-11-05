@@ -701,6 +701,108 @@ Findings closed: V-C1 (P3), V-C2 (P2, P4), V-C3 (P2), A-C1 (T1/T3/T4, A1/A6), A-
 
 The verifier's docs and records follow DN-11: docs/open-decisions.md (the verifier Decided entry rewritten for HD-16–HD-18; the Open entries the hybrid closes or changes — (e) deviations as families, (f) C-3's digest half closed, (l) classification, (m) re-serialization gone, (n) the residual of `PE/approach-decision.md` §6, (o) go-crypto now only S1/S2), the Changelog (the final review's D-I1: the reason changes, incl. pkgs.k8s.io v1.30's v3 signature, devuan's and the binary Release.gpg; A-M11: no overstated guarantee; the SHA-1 refusal), the admin tooltips (D-M1: no "apt accepts" claim for deviations; the previous snapshot keeps serving; the detail names the rule), docs/configuration.md (D-M2 "with gpgv", D-M3 the bypass's structural checks), e2e/apt-oracle/README.md (D-M5 `docker pull` first, a durable "before every release" record; D-M7), the remaining verifier-related D minors (D-M6, D-M9, D-M10, D-M12), and the flat-repositories spec's stale passages (D-M4).
 
+## Addendum (2026-11-03): the signer downgrade guard and older clients — Tasks 9d, 9e
+
+**V-RC2.** The verifier lens found it in Task 9b's first re-review (`final/V-report.txt` ~:523). debian:13's sqv refuses a signature whose key is bound only by SHA-1 self-signatures ("Signing key on <fpr> is not bound"). The five gpgv-based apt accept it, and so does the cache.
+- **sublime.** Its real InRelease carries two signatures. Dropping the second (key-free) leaves a signature by its SHA-1-bound block-1 key. The five gpgv images verify that; debian:13 refuses it; the cache adopts it. An on-path strip therefore becomes a persistent breakage for every debian:13 client of the suite.
+- **openresty.** Its only signing key is SHA-1-bound, so debian:13 refuses its real, unmodified anchors.
+
+The lens's later re-review measured the same class for key algorithms (`final/V-report.txt` ~:821, ASSERT_PUBKEY_ALGO):
+- ubuntu:24.04 refuses DSA and P-521 signers;
+- ubuntu:26.04 refuses DSA, P-521 and RSA under 2048 bits;
+- debian:13's sqv applies /usr/share/apt/default-sequoia.config (DSA cut 2024-02-01; SHA-1 key bindings and SHA-224 cut 2026-02-01; brainpool 2028-02-01; RSA-2048 2030-02-01).
+- The cache models none of it.
+
+The maintainer said (2026-11-01) that the cache should support every distro that still has upstream support, which includes Ubuntu 14.04 through Ubuntu Pro until May 2029. Newer upstreams can be expected to be read by newer clients. On 2026-11-03 the maintainer agreed to the downgrade guard.
+
+**HD-19: format rules and crypto policy are judged differently.**
+- **Format rules (layers T, A, P)** follow "refuse if any supported apt refuses" over every supported client generation: the six images, plus debian:10, ubuntu:20.04, ubuntu:18.04, ubuntu:16.04 and ubuntu:14.04 (where its image runs; Task 9e).
+  - An older image's refusal is folded in only for a shape no real signer emits.
+  - A layout real signers emit is never refused because an old apt refuses it. The vendor fixtures and the survey guard this, and each such case is recorded.
+- **Crypto policy (layer S: algorithms, hashes, key bindings, key sizes)** is not intersected across generations.
+  - S2 counts what the gpgv-based apt count, with HD-18 (no SHA-1 data digest).
+  - Intersecting would refuse real vendors that their own clients accept: gpgv 1.4 (ubuntu 14.04, 16.04) cannot verify EdDSA, which would refuse yarn; debian:13 refuses SHA-1-bound keys, which would refuse openresty.
+- **The downgrade guard (Task 9d)** closes the strip, for V-RC2 and for the key-algorithm class.
+  - A *strong signer* is a packet S2 counts whose key every newest-generation policy accepts: debian:13's sqv, and ubuntu:24.04's and ubuntu:26.04's `APT::Key::Assert-Pubkey-Algo`.
+  - A new anchor is refused, with reason `signer_downgrade`, when the suite's current snapshot's stored anchor has a strong signer and the new anchor has none. The current anchor is re-verified at adoption time against the current keyring.
+  - It uses the stored anchor: no schema change, and no config key (HD-17).
+  - **Recourse** for a genuine vendor downgrade: the vendor re-signs, or the operator removes the strong key from the keyring. The current anchor then has no strong signer, and the guard stands down.
+- **Open, recorded by Task 9c:**
+  - A strip at a suite's first adoption is not caught: there is no current snapshot to compare against.
+  - debian:13 clients of a vendor whose keys are all SHA-1-bound (openresty) stay broken. That is upstream's problem; the cache adopts, as the gpgv apt do.
+  - Per-client User-Agent tracking was considered and not taken.
+
+### Task 9d: the signer downgrade guard
+
+**The policy.** One function in internal/gpg, `strongSigner` (the name is free), holds the rules in a table, each rule with its source and, where the source has one, its date. It is evaluated at the verifier's clock (the test hook `Verifier.now`).
+
+What makes a key not strong:
+- a binding chain resting on a SHA-1 or SHA-224 signature. The chain is the primary's self-signature or direct-key signature in use, the signing subkey's 0x18 binding and its 0x19 back-signature.
+- its algorithm:
+  - DSA and ElGamal;
+  - RSA under 2048 bits, and from 2030-02-01, under 3072;
+  - P-521 (ubuntu:24.04 and 26.04 refuse it: apt says "nistp512");
+  - brainpool from 2028-02-01;
+  - anything not measured.
+
+What counts as strong: Ed25519, Ed448, ECDSA P-256 and P-384, RSA ≥ 2048 (dated as above), and brainpool until 2028-02-01.
+
+**Measurement settles the table.** strong ⇔ debian:13, ubuntu:24.04 and ubuntu:26.04 each accept an anchor signed by that key alone.
+- Measure primary/subkey algorithm combinations: does the primary's algorithm matter, or only the signing key's?
+- Use throwaway keys, made by the generator's key path (public keys only in the tree): DSA-2048, RSA-1024, RSA-2048, RSA-3072, P-256, P-384, P-521, Ed25519, an SHA-1-bound RSA-3072, and secp256k1 if gpg can make it.
+- Record them as corpus rows with `--record`.
+- The verifier lens's kr4/kr5 rows (`final/V/rr*`) are the starting measurement.
+
+**The verifier** reports, for each verified anchor, whether one of its counted packets has a strong key. Make that the smallest addition to what freshness reads.
+
+**The adopter.** After the new anchor verifies, and before member downloads (beside the rollback refusal, 56006b3):
+- Re-verify the current snapshot's stored anchor (InRelease, or Release plus Release.gpg) with the same verifier and keyring.
+- If it has a strong signer and the new anchor has none:
+  - refuse with `signer_downgrade`;
+  - log at WARN, naming the current strong signer's fingerprint and the new anchor's signers;
+  - the current snapshot keeps serving.
+- If the current anchor no longer verifies, or no longer has a strong signer, the guard stands down. The same holds for a legacy snapshot that the hybrid can't read.
+
+**Tests** (generated throwaway keys; no committed secret):
+- current signed by strong + weak, new by weak only → signer_downgrade, current kept;
+- new by strong + weak → adopted;
+- current weak only, new weak only (openresty) → adopted;
+- new signed only by a different strong key → adopted;
+- the strong key removed from the keyring → adopted;
+- a first adoption by weak only → adopted (the Open gap, pinned);
+- a weak key of each algorithm class above in place of the SHA-1-bound one;
+- every vendor fixture's strong flag pinned.
+
+**The vendor re-run** prints each vendor's strong flag. Expected: every surveyed vendor is strong except openresty, and except sublime's block-1 key alone.
+
+Mutants per rule.
+
+### Task 9e: older clients in the apt oracle
+
+**The images.** Add debian:10, ubuntu:20.04, ubuntu:18.04, ubuntu:16.04 and ubuntu:14.04 to e2e/apt-oracle, each only if it pulls and its apt runs. Record each image's apt and gpgv versions.
+
+**Harness adaptations** that old apt needs: apt before 1.1 has no `signed-by`, and an .asc in trusted.gpg.d needs apt 1.4. Dearmor into trusted.gpg.d there. The README states each adaptation.
+
+**Recording.** Record every corpus shape and the vendor anchors (PE/vendor) in the new images. The old images' verdicts go in a sibling file of verdicts.txt that the table test also reads.
+
+**Classification.** Classify every row that an old image refuses while all six current images accept:
+- **(a) Crypto policy:** an algorithm, hash or key binding the old gpgv can't use, such as EdDSA on gpgv 1.4. Not folded (HD-19).
+- **(b) A real-signer layout:** any vendor anchor or fixture, or a corpus control made like one. Not folded; recorded.
+- **(c) An attacker-edited shape:** folded. The cache refuses it with the narrowest rule in T, A or P, as a deviation family or a rule pin, as Tasks 6 and 9b did.
+
+The verifier must still verify every vendor fixture and every survey anchor it verifies today. Rows where an old image accepts what the cache refuses are fine (strict is safe); list them by family.
+
+**Time.** Record the oracle's time. If it grows past about 3 minutes, the old images may run in a separate make target, which the release gate runs.
+
+### Task 9c gains
+
+- The HD-19 Decided entry.
+- `signer_downgrade`, in the tooltips, the Changelog and docs/log-fields.md.
+- The Open entries above.
+- The older-client oracle, in e2e/apt-oracle/README.md.
+
+**Order:** Task 9b's remaining rounds → 9d → 9e → 9c → Task 8's gate and final review over the whole branch.
+
 ## Appendix A — The planning verdicts (2026-10-28)
 
 Each shape: apt's verdict in `debian:11`, `ubuntu:22.04`, `ubuntu:24.04`, `debian:12`, `debian:13`, `ubuntu:26.04`; then **rule**, the verdict DN-3's rules give (from the security review's prototype, `PE/proto/fixed.go`), with the rule that refuses it where only S1 does (`S1`) and the class: `ok` (agrees with DN-3), `dev` (a DN-6 strict deviation), `UNSAFE` (DN-6's known-unsafe shape: C-3, out of scope). Batch `fx` is the controller's (`PE/gen.py`), `fx2`–`fx6` the security review's (`PE/gen2.py`–`gen6.py`), `fx7` its re-review's (`PE/rereview/gen7.py`). Source: `PE/combined-fixed.txt` and `PE/rereview/table-fx7.txt`, checked by the re-review against the rules exactly as DN-3 words them (`PE/rereview/compare-appendix.txt`: 0 differing rows); Task 5 Step 4 re-measures the apt columns on the committed corpus.
