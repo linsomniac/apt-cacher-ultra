@@ -102,17 +102,31 @@ var (
 	sigHashes = map[byte]bool{2: true, 8: true, 9: true, 10: true} // SHA-1, SHA-256, SHA-384, SHA-512
 )
 
-// sigCriticalOK reports whether gpgv 2.2's can_handle_critical
-// (g10/parse-packet.c, gnupg 2.2.27) accepts a critical subpacket of typ
-// with data, less 32 (refused anywhere) and 20 (a notation: refused, gpgv's
-// known notations aside). gpgv 2.4 handles 34 and 37 too; 2.2 is the
-// strictest supported gpgv.
-func sigCriticalOK(typ byte, data []byte) bool {
+// sigCriticalOK reports whether every supported gpgv's can_handle_critical
+// (g10/parse-packet.c) accepts a critical subpacket of typ, less 32 (refused
+// anywhere) and 20 (a notation: refused, gpgv's known notations aside): the
+// intersection over gpgv 1.4.16 to 2.4.8, measured.
+//
+// AIDEV-NOTE: V2-C2 (the second final review's lens V2, Task 8's verifier
+// fix; a format rule over every generation, HD-19). The list was gpgv
+// 2.2.27's, "the strictest supported gpgv" until Task 9e made older ones
+// supported: gpgv 1.4 (ubuntu:16.04, 14.04) does not handle a critical 29
+// (reason for revocation) or 33 (issuer fingerprint), and no gpgv before
+// 2.2.27 (debian:10's 2.2.12, ubuntu:20.04's 2.2.19, ubuntu:18.04's 2.2.4,
+// and 1.4) a critical 38 (a key block, version 0); each refuses the anchor
+// (BADSIG) where the six current images accept it. A critical subpacket in
+// the unhashed area is a key-free edit: batch fx22's cr_good_unh_crit29,
+// cr_d_good_unh_crit29, cr_good_unh_crit38v0 and cr_d_good_unh_crit38v0,
+// fx21's us_bsn_unh_crit33 (BSN's layout, no hashed 33), refused here; their
+// non-critical twins are accepted everywhere. The others (2 to 7, 9, 11, 12,
+// 16, 21, 22, 24 to 27, 30) are accepted by all eleven images (the lens's
+// cr_ probes; the corpus' z_good_unh_revkey_ok_crit and
+// p_good_unh_crit_keyflags). Real signers write critical 2 and 16 only,
+// hashed (the survey). gpgv 2.4 handles 34 and 37 too.
+func sigCriticalOK(typ byte) bool {
 	switch typ {
-	case 2, 3, 4, 5, 6, 7, 9, 11, 12, 16, 21, 22, 24, 25, 26, 27, 29, 30, 33:
+	case 2, 3, 4, 5, 6, 7, 9, 11, 12, 16, 21, 22, 24, 25, 26, 27, 30:
 		return true
-	case 38: // a key block, version 0
-		return len(data) > 0 && data[0] == 0
 	}
 	return false
 }
@@ -133,7 +147,8 @@ func sigCriticalOK(typ byte, data []byte) bool {
 //     minimal (its first octet non-zero, its bit count exact); then the
 //     body ends: not one byte after.
 //   - P4: no subpacket 32 (an embedded signature) in either area; a
-//     critical subpacket only of a type gpgv 2.2 handles (sigCriticalOK);
+//     critical subpacket only of a type every supported gpgv handles
+//     (sigCriticalOK);
 //     exactly one 2 (creation time, 4 octets) in the hashed area; exactly
 //     one 16 (issuer key ID, 8 octets) in the packet; at most one 33
 //     (issuer fingerprint: 21 octets, version 4, its key ID the 16's).
@@ -452,8 +467,8 @@ func (s *subpacketCounts) walk(area []byte, hashed bool, n int) error {
 		switch {
 		case typ == 32:
 			return refuse("P4", "packet %d: an embedded signature (subpacket 32) in its %s area", n, where)
-		case critical && !sigCriticalOK(typ, data):
-			return refuse("P4", "packet %d: a critical subpacket %d in its %s area, which gpgv 2.2 does not handle", n, typ, where)
+		case critical && !sigCriticalOK(typ):
+			return refuse("P4", "packet %d: a critical subpacket %d in its %s area, which some supported gpgv does not handle", n, typ, where)
 		case typ == 4 && hashed && len(data) == 0:
 			return refuse("P4", "packet %d: an exportable certification (subpacket 4) without its value octet in its hashed area, which go-crypto before v1.5.0 reads past", n)
 		}

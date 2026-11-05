@@ -267,7 +267,6 @@ func TestParseSigPackets_OneIssuer(t *testing.T) {
 		{"a two-octet-length notation before the issuers", joined(tcreated, note, a33), joined(note, a16), "", true},
 		{"a five-octet length for small subpackets", joined(tsub5(2, 0x65, 0, 0, 0), tsub5(16, tkeyID(testIDA)...)), nil, "", false},
 		{"an unhashed creation time beside the hashed one", joined(tcreated, a16), tcreated, "", false},
-		{"a critical key block of version 0, unhashed", joined(tcreated, a16), crit(38, 0, 1, 2), "", false},
 		{"hashed 33 alone", joined(tcreated, a33), nil, "P4", false},
 		{"hashed 33, unhashed 16, two keys", joined(tcreated, a33), b16, "P4", false},
 		{"hashed 16, then a 33 naming another key", joined(tcreated, b16, a33), nil, "P4", false},
@@ -291,6 +290,10 @@ func TestParseSigPackets_OneIssuer(t *testing.T) {
 		{"a critical unknown subpacket, unhashed", joined(tcreated, a16), crit(100, 1), "P4", false},
 		{"a critical signer's user ID, unhashed", joined(tcreated, a16), crit(28, 'u'), "P4", false},
 		{"a critical key block of version 1, unhashed", joined(tcreated, a16), crit(38, 1, 1, 2), "P4", false},
+		{"a critical key block of version 0, unhashed: no gpgv before 2.2.27 handles it", joined(tcreated, a16), crit(38, 0, 1, 2), "P4", false},
+		{"a critical reason for revocation, unhashed: gpgv 1.4 does not handle it", joined(tcreated, a16), crit(29, 0), "P4", false},
+		{"a critical issuer fingerprint, unhashed: gpgv 1.4 does not handle it", joined(tcreated, a16), crit(33, tv4fpr(testIDA)...), "P4", false},
+		{"a critical reason for revocation, hashed", joined(tcreated, a16, crit(29, 0)), nil, "P4", false},
 	} {
 		pkts, err := parseSigPackets(trsa(tc.hashed, tc.unhashed))
 		if ruleOf(err) != tc.rule {
