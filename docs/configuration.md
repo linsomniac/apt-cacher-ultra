@@ -572,9 +572,10 @@ The verifier refuses an anchor whose format any supported apt refuses —
 the six current client images and the five older ones its corpus is
 measured on (`e2e/apt-oracle/README.md`), an older client's refusal
 counting only for a shape no real signer writes — and, beyond that, any
-anchor outside the canonical shape real signers write: a second armor block, armor lines over
-76 characters, bytes left inside a signature packet, a packet of an
-algorithm it does not read (SHA-224, SHA3-256), among others, refused as
+anchor outside the canonical shape real signers write: a second armor
+block, armor lines over 76 characters, bytes left inside a signature
+packet, a packet of an algorithm it does not read (SHA-224, SHA3-256),
+among others, refused as
 `malformed_clearsign` (an `InRelease`) or `malformed_signature` (a
 `Release.gpg`) even where apt would accept them; the status page's reason
 and the `adoption_gpg_failed` log line name the rule. No setting widens

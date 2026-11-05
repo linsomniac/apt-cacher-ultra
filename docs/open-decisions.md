@@ -674,7 +674,8 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   debian-maintainers (761) and the 70 survey files (201) count exactly as
   before those rounds (Task 9b's fix round 9). And 322 corpus rows are
   accepted by some older image and refused by the cache (Task 9e, counted
-  again by script at HEAD, Task 9c's fix round): 127 are the strict
+  again at 79e7dd2 by `PE/task9c/split.py` over
+  `PE/task9c/reasons-79e7dd2.tsv`, Task 9c's fix round): 127 are the strict
   deviations every image accepts (their entry above), 184 are rows some
   current image refuses, and 11 are rows only an older image refuses,
   which the cache folds in (Task 9e's class (c): T6's
@@ -682,12 +683,13 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   S1's every-key rows `t7g5_s_primary`, `us_bad_primary_plus_good`,
   `us_bad_enc_plus_good`, `us_good_plus_bad_enc` and
   `us_d_bad_enc_plus_good`; and P's `q_good_plus_bigunh_dup`,
-  `v6_i_good_plus_v6unknown` and `v6_d_good_plus_v6unknown`, which yet
-  another older image accepts). By the rule that refuses them: layer T
-  (F0 included) 56, layer A 117, layer P 71, S1 15 and S2 63, where an old
-  image's lenient parser or older crypto reads the shape. Strict is safe:
-  the cache stays strict. Recommendation: leave them; narrow a rule only
-  if a real key file or anchor meets it, with a measured row.
+  `v6_i_good_plus_v6unknown` and `v6_d_good_plus_v6unknown`; each is in
+  the 322 because another older image accepts it). By the rule that
+  refuses them: layer T (F0 included) 56, layer A 117, layer P 71, S1 15
+  and S2 63, where an old image's lenient parser or older crypto reads the
+  shape. Strict is safe: the cache stays strict. Recommendation: leave
+  them; narrow a rule only if a real key file or anchor meets it, with a
+  measured row.
 - **Three debian-keyring keys every apt refuses from 2027** (raised
   2026-11-04, Task 9b's fix rounds 8 and 9; exact, not over-strict).
   `440B7638ED88D68D5F351BCFB95B0493F5AB0C47` (from 2027-12-24),
@@ -1121,9 +1123,10 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   stays as written): the deviations were fourteen, not eleven, before the
   hybrid made them families; key E expired on 2020-12-31, not in 2021
   (DN-2); and of the survey's 158 anchors 152, not all, lie inside the
-  canonical grammar (HD-16; the deviations' entry under *Open*). Done in the hardening plan's Tasks 5 to 7 (commits dc6c8ee,
-  3c54a22, 80af12b, b51ee0e, 132ebe6, 8d2900d, fdfa2b0, 40d3614, 276d60d
-  and a900dbd), its Task 9a (9efa08d, the corpus to 490 shapes) and its
+  canonical grammar (HD-16; the deviations' entry under *Open*). Done in
+  the hardening plan's Tasks 5 to 7 (commits dc6c8ee, 3c54a22, 80af12b,
+  b51ee0e, 132ebe6, 8d2900d, fdfa2b0, 40d3614, 276d60d and a900dbd), its
+  Task 9a (9efa08d, the corpus to 490 shapes) and its
   Task 9b (7701e7b, 2552ebf, 5d881fb, 5899af8, e819372; fix round 1
   10098d1, 650f356, 72b8359, 3281d6a, a47437e; fix round 2 a89211f,
   4fa21be, abc37e5, b7b5c31, ffbcbf9), with Task 9e's T6 (28c72ea).
