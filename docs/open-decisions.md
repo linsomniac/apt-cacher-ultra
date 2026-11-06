@@ -121,12 +121,12 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
 6. **Tag `1.1.0-rc1`** on `main`. The release workflow's
    `Verify no e2e test seam` step runs first on the tag: check it there.
 7. **The release notes** (`docs/release-notes/1.1.0.md`): bring them up
-   to date with what `Changelog.md` collected since this branch, then
-   paste them into the GitHub release, as
-   [docs/releasing.md](releasing.md)'s step 6 says (it gives the
-   commands that rewrite the links for a release candidate and unwrap the
-   paragraphs for GitHub's editor; the per-release steps that outlive this
-   section are there). The GC and upstream hardening plan's Task 8 rebuilt
+   to date with what `Changelog.md` collected since this branch and
+   commit them before the tag (item 6), then paste them into the GitHub
+   release the tag created, as [docs/releasing.md](releasing.md)'s steps 6
+   and 8 say (step 8 gives the commands that rewrite the links to the tag
+   just made and unwrap the paragraphs for GitHub's editor; the
+   per-release steps that outlive this section are there). The GC and upstream hardening plan's Task 8 rebuilt
    them from the Changelog on 2026-11-05, main's changes included: the
    verifier and its reasons, the signer downgrade guard and its recourse,
    the six vendors with no strong signer, the SHA-1 refusal, the key

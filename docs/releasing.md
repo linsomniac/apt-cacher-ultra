@@ -33,22 +33,26 @@ until its README's procedure says what to do.
    the tree, so it is not a release step; re-survey real vendors after a
    go-crypto upgrade or a verifier change, as that plan did.
 6. **The release notes** (`docs/release-notes/<version>.md`), brought up to
-   date with [Changelog.md](../Changelog.md), then pasted into the GitHub
-   release. Their links name the release's tag (`/blob/1.1.0/`); for a
-   release candidate, paste them with that tag replaced by the
-   candidate's:
-   `sed 's|/blob/1\.1\.0/|/blob/1.1.0-rc1/|g' docs/release-notes/1.1.0.md`
-   (for another version, its own numbers). The file is wrapped at about 72
-   columns: check the release editor's *Preview*, and if GitHub breaks the
-   lines where the file does, paste the paragraphs unwrapped instead
-   (lists, tables and headings kept):
-   `sed 's|/blob/1\.1\.0/|/blob/1.1.0-rc1/|g' docs/release-notes/1.1.0.md | perl -0777 -pe 's/([^\n|])\n *+(?![-|#\n]|\z)/$1 /g'`
-   (for the release itself, drop the `sed` and pass the file name to
-   `perl`: `perl -0777 -pe '…' docs/release-notes/1.1.0.md`). Links
-   written relative to the file (`../configuration.md`) do not resolve in
-   the GitHub release: write them as `/blob/<tag>/` links.
+   date with [Changelog.md](../Changelog.md) and committed before the tag.
+   In the tree their links name the release's own tag (`/blob/1.1.0/`),
+   whichever candidate comes first: never `main`, which moves, and never
+   links relative to the file (`../configuration.md`), which do not
+   resolve in a GitHub release.
 7. **Tag** the commit (`MAJOR.MINOR.PATCH`, or `-rcN`; no `v` prefix) and
    check the release workflow's `Verify no e2e test seam` step on the tag.
+   The workflow creates the GitHub release, with generated notes.
+8. **Paste the notes** into that release (edit it), once the tag exists,
+   with their links rewritten to the tag just made. For a release
+   candidate:
+   `sed 's|/blob/1\.1\.0/|/blob/1.1.0-rc1/|g' docs/release-notes/1.1.0.md`
+   (for another version or candidate, its own numbers); for the release
+   itself, the file as it is. The file is wrapped at about 72 columns:
+   check the release editor's *Preview*, and if GitHub breaks the lines
+   where the file does, paste the paragraphs unwrapped instead (lists,
+   tables and headings kept):
+   `sed 's|/blob/1\.1\.0/|/blob/1.1.0-rc1/|g' docs/release-notes/1.1.0.md | perl -0777 -pe 's/([^\n|])\n *+(?![-|#\n]|\z)/$1 /g'`
+   (for the release itself, drop the `sed` and pass the file name to
+   `perl`: `perl -0777 -pe '…' docs/release-notes/1.1.0.md`).
 
 Why each check exists: `docs/open-decisions.md`, *Decided*: "The apt
 oracle runs before every release, both sets of images" and "`make
