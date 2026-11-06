@@ -565,7 +565,7 @@ The five cells (left → right):
 | Cell | Eyebrow         | Value source                                | Sub source                          | Hint source                                  |
 |------|-----------------|---------------------------------------------|-------------------------------------|----------------------------------------------|
 | 1    | CACHE           | `formatBytes .Cache.BytesUsed`              | `.Cache.BlobCount` + " blobs"       | `.Cache.ZeroRefcountBacklog` (when > 0)      |
-| 2    | SUITES          | `len .Suites`                               | one line: `N LAGGING` (suites with `.LagWarn`) · `M FAILING` (suites with `.AdoptionFailing`), plus `K REFUSED 24H+` (suites with `.RefusedLong`) when K > 0; `ADOPTION DISABLED — METADATA NOT REFRESHED` instead while adoption is disabled | — (both counts render in the sub line) |
+| 2    | SUITES          | `len .Suites`                               | one line: `N LAGGING` (suites with `.LagWarn`) · `M FAILING` (suites with `.AdoptionFailing`), plus `K REFUSED 24H+` (suites with `.RefusedLong`) when K > 0; `ADOPTION DISABLED` instead while adoption is disabled | — (both counts render in the sub line) |
 | 3    | ADOPTIONS       | success-count / `len .RecentAdoptions`      | `N FAILED` and `M REFUSED` counts (`RING CLEAN` when both are 0) | `{n} EVENTS IN RING` (always shown) |
 | 4    | GC              | `formatShortDuration .GC.LastRunDurationSeconds` | `durationOf` since `.GC.LastRunUnixTime` | `formatBytes .GC.LastRunBytesReclaimed` |
 | 5    | ACTIVE          | `len .ActiveHosts`                          | "idle" / "busy"                     | max `.SlotCapacity`                          |
@@ -1188,13 +1188,17 @@ of any reason whose streak began more than 24 h ago warns the row and the
 vital, never crits (§4.5 `REFUSED 24H+`): a missing `Date` says nothing
 about the content's age, so a long refusal must not freeze a suite silently.
 
-**SUITES with adoption disabled (phase B).** Adoption is disabled by default,
-and Phase 1 never refreshes metadata, so every tracked upstream eventually
-lags by more than a day — truthfully, but by design. Following the keyring
-panel's `ADOPTION DISABLED` precedent, the SUITES vital is then `stale` (not
-`warn`/`crit` from lag) and its sub-line reads `ADOPTION DISABLED — METADATA
-NOT REFRESHED`; rows keep their "(lagging …)" text but do not warn, and a
-stored failure or refusal record is inert (§4.5). The page therefore stays
+**SUITES with adoption disabled (phase B; corrected for 1.1.0's #18).**
+Adoption is disabled by default. The freshness checker still refreshes a
+suite that has no adopted snapshot (#18): a changed tracked `InRelease` or
+`Release` invalidates its mutable metadata, and later requests fetch current
+files. A suite with an adopted snapshot keeps serving that snapshot until
+adoption is enabled, so it lags by more than a day — truthfully, but by
+design. Following the keyring panel's `ADOPTION DISABLED` precedent, the
+SUITES vital is then `stale` (not `warn`/`crit` from lag) and its sub-line
+reads `ADOPTION DISABLED`; rows keep their "(lagging …)" text but do not warn,
+and a stored failure or refusal record is inert, its text gaining
+" (adoption disabled)" (`suitesForHTML`; §4.5). The page therefore stays
 HEALTHY rather than DEGRADED forever.
 
 **ADOPTIONS (phase B).** The non-success ratio excludes `refused` rows from
