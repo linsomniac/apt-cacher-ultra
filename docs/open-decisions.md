@@ -976,6 +976,16 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   deadline ever matters again for the adopter's `Release.gpg` (a stall
   report, or a change to `checkDetached`'s contexts), bring the second
   back.
+- **The representation prune's scan grows with the cache** (raised
+  2026-11-06, the merge review's M-I1; undecided). Since the prune runs
+  once a tick, at the start of the blob pass, and releases up to
+  `representationPruneRows` (10,000) dates in one transaction
+  (`internal/gc/blob.go`), its scan, which walks every owned day-old date
+  before a prunable one, costs about 0.55 s at 200,000 url_path rows,
+  growing with the table, once a tick and once at each start. Class none:
+  performance. Recommendation: if that grows to seconds on a real cache,
+  keyset the scan on `observed_at` (resume after the last row examined), as
+  the merge review suggested.
 
 ## Decided
 

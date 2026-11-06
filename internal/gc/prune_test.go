@@ -102,6 +102,36 @@ func TestRunTick_NoPrunePastTheBlobDeadline(t *testing.T) {
 	}
 }
 
+// The controller's ruling on the prune's capacity (2026-11-06): one tick's
+// prune drains a backlog far larger than gc.batch_size (100 here): 250
+// unowned dates on a live blob go in one tick, in its one prune call.
+func TestPeriodicTick_APruneBacklogLargerThanABatchDrainsInOneTick(t *testing.T) {
+	logger, _ := captureLogger()
+	f := &fakeStore{}
+	g, c := storeGC(t, f, 2, logger)
+	shared := seedPruneFixture(t, c, 0)
+	ctx := context.Background()
+	for i := range 250 {
+		if err := c.PutRepresentation(ctx, "http", "h", fmt.Sprintf("/by-hash/gone-%d", i), shared,
+			"Mon, 01 Jan 2024 00:00:00 GMT"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db := dbOf(t, c)
+	if _, err := db.Exec(`UPDATE representation_metadata SET observed_at = 1`); err != nil {
+		t.Fatal(err)
+	}
+	g.periodicTick(ctx)
+	var left int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM representation_metadata WHERE path <> '/live'`).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if f.prunes != 1 || left != 0 {
+		t.Fatalf("%d prunes, %d unowned dates left; want one prune that drains all 251", f.prunes, left)
+	}
+	checkPruned(t, c, shared)
+}
+
 // A failed prune does not stop the blob batches: they reap, and the prune's
 // failure is the blob pass's, one WARN gc_tick_failed (ruling HD-15).
 func TestPeriodicTick_AFailedPruneStillReapsAndIsTheBlobPassFailure(t *testing.T) {
