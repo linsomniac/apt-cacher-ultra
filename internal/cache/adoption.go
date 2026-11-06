@@ -749,6 +749,16 @@ UPDATE blob
 // call before Step 3c re-seeds those rows. This is local bookkeeping, never an
 // HTTP Last-Modified date. Content ETags make client validation independent of
 // clock steps, same-second flips, reaping and snapshot recovery.
+//
+// AIDEV-NOTE: rulings C-11 and R-G3, after #17/#18 (0c6d2c0). The floor is
+// every snapshot of the suite still present, not only the current one
+// (C-11): stamps can lead the wall clock, and GC's keep_displaced ranking
+// and retained by-hash's newest-first window read their order. The
+// first-adoption floor over the anchors' MAX(last_fetched_at) + 1 no longer
+// protects a client-visible date (Last-Modified is upstream's, validation is
+// by content ETag), and no reader compares adopted_at with last_fetched_at;
+// runFetch and RefreshURLPathBlob still stamp a row only after its pool file
+// is final (R-G3). Check both before dropping the floor.
 func adoptionStampTx(ctx context.Context, tx *sql.Tx, scheme, host, suite string, now int64) (int64, error) {
 	var newest, current sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `
