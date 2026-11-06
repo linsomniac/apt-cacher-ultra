@@ -953,6 +953,29 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   the table tests and `TestVerifier_RefusesEachRowByItsRule` pin the
   verdicts and reasons a refactor must keep. Recommendation: after 1.1.0,
   as a refactor pinned by the table tests.
+- **Two pins main's #17/#18 work removed** (raised 2026-11-06, the merge
+  review of main into the hardening branch, M-M5; the removals are main's
+  0c6d2c0, deliberate, and are not undone). (1)
+  `TestServeHTTP_AMissStampsItsRowAfterItsPoolFile` pinned ruling R-G3's
+  order: `runFetch` reads a row's `last_fetched_at` stamp only after its pool
+  file is final. The code still keeps the order (the R-G3 AIDEV-NOTEs in
+  `internal/handler/handler.go` and at `adoptionStampTx`,
+  `internal/cache/adoption.go`), but nothing a client sees depends on it
+  any more: `Last-Modified` is upstream's date and validation is by content
+  ETag; only the first adoption's historical floor over the anchors'
+  `last_fetched_at` reads it. (2) B-33's
+  `TestCheck_DetachedSignatureStallEndsAtTheCheckDeadline` pinned that the
+  adopter path's `Release.gpg` GET runs under the check deadline
+  (`fetchCtx`, `checkDetached` in `internal/freshness/check.go`); main
+  rewrote it into the no-adopter
+  `TestCheck_LegacyDetachedRefreshDoesNotWaitForSignature`, and the adopter
+  path still uses `fetchCtx`, unpinned. Class none: test coverage; neither
+  behaviour changed. Recommendation: if R-G3's floor ever matters again (a
+  reader that compares `adopted_at` with `last_fetched_at`, or a
+  client-visible date from it), bring the first test back; if the check
+  deadline ever matters again for the adopter's `Release.gpg` (a stall
+  report, or a change to `checkDetached`'s contexts), bring the second
+  back.
 
 ## Decided
 

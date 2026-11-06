@@ -747,7 +747,11 @@ func (c *Checker) checkInline(ctx, fetchCtx context.Context, out *checkOutcome, 
 // the result is then deferred (its content key covers the signature), and
 // an upstream that ignores validators pays it on every deferred check
 // (deferred minor B-25: an accepted cost). The Release.gpg GET runs under
-// fetchCtx, the check deadline (TestCheck_DetachedSignatureStallEndsAtTheCheckDeadline).
+// fetchCtx, the check deadline. B-33's TestCheck_DetachedSignatureStallEndsAtTheCheckDeadline
+// pinned it until main's 0c6d2c0 rewrote that test for the no-adopter path
+// (TestCheck_LegacyDetachedRefreshDoesNotWaitForSignature); the adopter
+// path is unpinned now (docs/open-decisions.md, Open: the merge review's
+// M-M5).
 func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) (*adoptionRequest, *repairRequest) {
 	scheme, host, suitePath := suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath
 
