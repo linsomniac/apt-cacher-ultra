@@ -982,10 +982,14 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   `representationPruneRows` (10,000) dates in one transaction
   (`internal/gc/blob.go`), its scan, which walks every owned day-old date
   before a prunable one, costs about 0.55 s at 200,000 url_path rows,
-  growing with the table, once a tick and once at each start. Class none:
-  performance. Recommendation: if that grows to seconds on a real cache,
-  keyset the scan on `observed_at` (resume after the last row examined), as
-  the merge review suggested.
+  growing with the table, once a tick and once at each start. Measured by
+  the GC lens (G2-PR-M1): about 3 µs of writer hold per owned date — 0.7 s
+  at 200,000 cached URLs, past 2 s at about 650,000–700,000, 3.1 s at
+  1,000,000. No log line or metric reports the prune's count or duration
+  today. Class none: performance. Recommendation: if a real cache nears
+  that size, keyset the scan on `observed_at` (resume after the last row
+  examined), as the merge review suggested, and add the prune's count and
+  duration to the blob pass's tick line.
 
 ## Decided
 
