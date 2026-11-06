@@ -98,14 +98,47 @@ func TestRepresentation_GCPrunesUnownedDatesForSharedBlobs(t *testing.T) {
 	if _, err := c.db.Exec(`UPDATE representation_metadata SET observed_at = 1 WHERE path <> '/staging'`); err != nil {
 		t.Fatal(err)
 	}
-	// No blobs are reclaimable: the date cleanup must still run.
+	// The merge review's M-I1 (the maintainer, 2026-11-06): a blob batch no
+	// longer prunes; the GC's once-a-tick prune does, whether or not any blob
+	// is reclaimable.
 	if reaped, err := c.RunBlobGCBatch(ctx, 100, 1); err != nil || len(reaped) != 0 {
 		t.Fatal(reaped, err)
+	}
+	if got, err := c.RepresentationLastModified(ctx, "http", "h", "/orphan", hash); err != nil || got != date {
+		t.Fatalf("after a blob batch the unowned date is %q, %v; want it kept: a blob batch no longer prunes", got, err)
+	}
+	if n, err := c.PruneRepresentationMetadata(ctx, 100); err != nil || n != 1 {
+		t.Fatalf("PruneRepresentationMetadata = %d, %v; want the one unowned date pruned", n, err)
 	}
 	for path, want := range map[string]string{"/live": date, "/orphan": "", "/staging": date} {
 		got, err := c.RepresentationLastModified(ctx, "http", "h", path, hash)
 		if err != nil || got != want {
 			t.Fatal(path, got, err)
 		}
+	}
+}
+
+// The merge review's M-I1: the once-a-tick prune keeps its bound — at most
+// limit rows a call, oldest first.
+func TestPruneRepresentationMetadata_DeletesAtMostLimitOldestFirst(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	hash := seedBlob(t, c, "shared")
+	for _, path := range []string{"/a", "/b", "/c"} {
+		if err := c.PutRepresentation(ctx, "http", "h", path, hash, "Mon, 01 Jan 2024 00:00:00 GMT"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, path := range []string{"/a", "/b", "/c"} {
+		if _, err := c.db.Exec(`UPDATE representation_metadata SET observed_at = ? WHERE path = ?`, i+1, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := c.PruneRepresentationMetadata(ctx, 2); err != nil || n != 2 {
+		t.Fatalf("PruneRepresentationMetadata(2) = %d, %v; want 2", n, err)
+	}
+	var left string
+	if err := c.db.QueryRow(`SELECT path FROM representation_metadata`).Scan(&left); err != nil || left != "/c" {
+		t.Fatalf("left %q, %v; want the newest, /c", left, err)
 	}
 }

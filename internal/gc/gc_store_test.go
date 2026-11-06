@@ -34,6 +34,8 @@ type fakeStore struct {
 	cache       *cache.Cache  // the url-path batches' (useCache)
 	urlSleep    time.Duration // each url-path batch takes this long first (virtual time in a bubble)
 	urlBatches  int           // RunURLPathGCBatch calls
+	prunes      int           // PruneRepresentationMetadata calls (delegated to cache)
+	pruneErrs   bool          // PruneRepresentationMetadata fails
 	batchPanics int           // RunSnapshotGCBatch panics on this many first calls
 	batchErrs   int           // RunSnapshotGCBatch fails on this many calls after the batchPanics ones
 	batchHook   func()        // called on every RunSnapshotGCBatch call that does not panic, before it fails or answers
@@ -58,6 +60,17 @@ func (f *fakeStore) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSec
 	f.urlBatches++
 	f.mu.Unlock()
 	return f.cache.RunURLPathGCBatch(ctx, batchSize, ttlSeconds, holdSeconds, maxVersions, afterScheme, afterHost, afterPath)
+}
+
+func (f *fakeStore) PruneRepresentationMetadata(ctx context.Context, limit int) (int, error) {
+	f.mu.Lock()
+	f.prunes++
+	fail := f.pruneErrs
+	f.mu.Unlock()
+	if fail {
+		return 0, errors.New("prune fault")
+	}
+	return f.cache.PruneRepresentationMetadata(ctx, limit)
 }
 
 func (f *fakeStore) RunSnapshotGCBatch(context.Context, int, int64, int, bool) (cache.SnapshotGCBatchResult, error) {

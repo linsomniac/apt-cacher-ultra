@@ -99,9 +99,9 @@ SELECT hash FROM blob
 			return fmt.Errorf("RunBlobGCBatch: begin: %w", err)
 		}
 		defer func() { _ = tx.Rollback() }()
-		if err := pruneRepresentationMetadataTx(ctx, tx, now, batchSize); err != nil {
-			return fmt.Errorf("RunBlobGCBatch: response metadata: %w", err)
-		}
+		// No representation prune here (the merge review's M-I1, the
+		// maintainer, 2026-11-06): internal/gc runs PruneRepresentationMetadata
+		// once a tick, at the start of its blob pass.
 
 		// Step 1: SELECT candidate hashes inside the tx — the DELETE
 		// re-applies the same predicate atomically, but doing the

@@ -563,12 +563,15 @@ func (g *GC) periodicTick(ctx context.Context) (snapshotBacklog bool) {
 // sub-job C's deadline and chunk size without a 10,000-row fixture
 // (deferred minors F-1, F-2), make a tick or a pool-scan job panic (F-21),
 // and slow the url-path pass's batches past its deadline (issue #14's
-// fix). New sets it to Config.Cache; the blob pass keeps Config.Cache.
+// fix), and count the blob pass's once-a-tick representation prune (the
+// merge review's M-I1). New sets it to Config.Cache; the blob pass's batches
+// keep Config.Cache.
 type gcStore interface {
 	RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds, holdSeconds int64, maxVersions int, afterScheme, afterHost, afterPath string) (cache.URLPathGCBatchResult, error)
 	RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGraceSeconds int64, keepDisplaced int, retireDisplaced bool) (cache.SnapshotGCBatchResult, error)
 	RunRetiredSnapshotGCChunk(ctx context.Context, maxRows int) (reaped int, more bool, err error)
 	HashKnown(ctx context.Context, hash string) (bool, error)
+	PruneRepresentationMetadata(ctx context.Context, limit int) (int, error)
 }
 
 // skipPanickedPass is deferred by periodicTick before its recoverPanic,
