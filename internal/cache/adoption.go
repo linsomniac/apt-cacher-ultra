@@ -436,6 +436,14 @@ WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &form, &adopted
 		// Step 2: insert snapshot_member rows. Each member is validated
 		// against its declared invariants before we touch SQLite — a bad
 		// row should fail loud, not be smuggled past hash validation.
+		memberStmt, err := tx.PrepareContext(ctx, `
+INSERT INTO snapshot_member (snapshot_id, path, blob_hash, declared_sha256)
+VALUES (?, ?, ?, ?)`)
+		if err != nil {
+			return fmt.Errorf("CommitAdoption: prepare member insert: %w", err)
+		}
+		defer func() { _ = memberStmt.Close() }()
+
 		for _, m := range members {
 			if !validBlobHash(m.BlobHash) {
 				return fmt.Errorf("CommitAdoption: member %q blob_hash %w", m.Path, ErrInvalidHash)
@@ -443,10 +451,7 @@ WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &form, &adopted
 			if !validBlobHash(m.DeclaredSHA256) {
 				return fmt.Errorf("CommitAdoption: member %q declared_sha256 %w", m.Path, ErrInvalidHash)
 			}
-			if _, err := tx.ExecContext(ctx, `
-INSERT INTO snapshot_member (snapshot_id, path, blob_hash, declared_sha256)
-VALUES (?, ?, ?, ?)`,
-				snapshotID, m.Path, m.BlobHash, m.DeclaredSHA256); err != nil {
+			if _, err := memberStmt.ExecContext(ctx, snapshotID, m.Path, m.BlobHash, m.DeclaredSHA256); err != nil {
 				return fmt.Errorf("CommitAdoption: insert member %q: %w", m.Path, err)
 			}
 		}
@@ -456,14 +461,20 @@ VALUES (?, ?, ?, ?)`,
 		// anchor a later repair fetch verifies bytes against, so a
 		// malformed value must abort the flip, not ride along.
 		skipNow := nowUnix()
+		skippedStmt, err := tx.PrepareContext(ctx, `
+INSERT INTO snapshot_skipped_member
+  (snapshot_id, path, declared_sha256, size, reason, detail, skipped_at, retry_count)
+VALUES (?, ?, ?, ?, ?, ?, ?, 0)`)
+		if err != nil {
+			return fmt.Errorf("CommitAdoption: prepare skipped member insert: %w", err)
+		}
+		defer func() { _ = skippedStmt.Close() }()
+
 		for _, s := range skipped {
 			if !validBlobHash(s.DeclaredSHA256) {
 				return fmt.Errorf("CommitAdoption: skipped member %q declared_sha256 %w", s.Path, ErrInvalidHash)
 			}
-			if _, err := tx.ExecContext(ctx, `
-INSERT INTO snapshot_skipped_member
-  (snapshot_id, path, declared_sha256, size, reason, detail, skipped_at, retry_count)
-VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+			if _, err := skippedStmt.ExecContext(ctx,
 				snapshotID, s.Path, s.DeclaredSHA256, s.Size, s.Reason, s.Detail, skipNow); err != nil {
 				return fmt.Errorf("CommitAdoption: insert skipped member %q: %w", s.Path, err)
 			}
@@ -473,15 +484,21 @@ VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
 		// added package_name and architecture columns; rows whose
 		// stanza didn't declare both end up with empty strings, which
 		// the SPEC3 §7.5.3 hot-set query filters out.
+		packageStmt, err := tx.PrepareContext(ctx, `
+INSERT INTO package_hash (canonical_scheme, canonical_host, path,
+                          declared_sha256, snapshot_id,
+                          package_name, architecture, version, flat_filename)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		if err != nil {
+			return fmt.Errorf("CommitAdoption: prepare package_hash insert: %w", err)
+		}
+		defer func() { _ = packageStmt.Close() }()
+
 		for _, p := range packageHashes {
 			if !validBlobHash(p.DeclaredSHA256) {
 				return fmt.Errorf("CommitAdoption: package_hash %q declared_sha256 %w", p.Path, ErrInvalidHash)
 			}
-			if _, err := tx.ExecContext(ctx, `
-INSERT INTO package_hash (canonical_scheme, canonical_host, path,
-                          declared_sha256, snapshot_id,
-                          package_name, architecture, version, flat_filename)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			if _, err := packageStmt.ExecContext(ctx,
 				p.CanonicalScheme, p.CanonicalHost, p.Path,
 				p.DeclaredSHA256, snapshotID,
 				p.PackageName, p.Architecture, p.Version, p.FlatFilename); err != nil {

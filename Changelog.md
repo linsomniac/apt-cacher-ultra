@@ -75,6 +75,10 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Changed
 
+- Snapshot adoption reuses transaction-scoped prepared INSERT statements for
+  members, skipped members and package hashes, reducing commit time for large
+  repositories without changing validation or transaction boundaries. Thanks
+  to Scott Hyndman (@shyndman) for PR #28 (issue #27).
 - HTTP, HTTPS and admin ports bind after startup preparation, including
   certificate setup, database migration, the trust audit and startup GC.
   A lifetime cache-directory lock prevents concurrent daemon maintenance;
