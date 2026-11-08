@@ -357,7 +357,7 @@ next to the Suites table contract in §5.3:
 | `adoption_fail_count` | int64 | Consecutive adoption attempts in the current failure/refusal streak; `0` when no record exists. |
 | `adoption_fail_first_unixtime` | int64 or `null` | When the current streak started; for `unsigned_unconfirmed` and `anchor_absent`, when the current bytes (or absence) were first observed — it restarts on new content while `adoption_fail_count` keeps growing. |
 | `adoption_next_retry_unixtime` | int64 or `null` | When the same content is retried next; new content is tried at once regardless of this stamp. |
-| `adoption_refused` | boolean | `true` when the record above is a refusal state (`upstream_older`, `rollback_refused`, `unsigned_downgrade_refused`, `unsigned_unconfirmed`, `unsigned_too_large`, `anchor_absent`, `unsigned_disabled`), not a failure. |
+| `adoption_refused` | boolean | `true` when the record above is a refusal state (`upstream_older`, `rollback_refused`, `unsigned_downgrade_refused`, `unsigned_unconfirmed`, `unsigned_too_large`, `anchor_absent`, `unsigned_disabled`, `signer_downgrade`), not a failure. |
 
 These are additive to the locked JSON contract (§0.1), the same way
 `keyring[]` was: no existing key changes shape or meaning (`scheme` too:
@@ -414,9 +414,14 @@ adopted keeps serving its last snapshot without updates until the knob is
 turned back on, the suite is forgotten, or it is reaped after
 `gc.suite_idle_ttl` without a client — forgotten or reaped with the knob
 still off, it is then a suite not yet adopted, served as the cache first
-stored its files. None of them hides lag (only `upstream_older` and
-`rollback_refused` do, §9.1), and all five follow the `REFUSED 24H+` rule
-below. A suite without a snapshot shows lag from the first check that
+stored its files. `signer_downgrade` (the GC and upstream hardening
+plan's Task 9d, not phase E) means the new anchor lost the strong signer
+the suite's current anchor has; the current snapshot keeps serving until
+upstream signs again with a strong key the keyring holds, the operator
+installs a rotated key, or the suite is forgotten (`docs/configuration.md`,
+*Trust and signer pins*). None of these six hides lag (only
+`upstream_older` and `rollback_refused` do, §9.1), and all six follow the
+`REFUSED 24H+` rule below. A suite without a snapshot shows lag from the first check that
 found its anchor, so a first adoption refused for good
 (`unsigned_downgrade_refused`, `unsigned_disabled`, or an
 `unsigned_unconfirmed` that never confirms) shows a lag that keeps
@@ -454,7 +459,7 @@ Two more fields, additive to the locked JSON contract as §4.5's are:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `gc.retired_reaped` | int | Retired snapshots the last GC run deleted — those of reaped, forgotten and evicted suites, and those the upgrade's trust audit quarantined (spec C9, sub-job C) — beside `displaced_reaped`; the GC panel shows it as *Retired reaped*. Always 0 after the startup run, which leaves them to a run an hour after the start (when `gc.interval` is longer than an hour) and to the periodic runs; that run's count (INFO `gc_retired_run_complete`) is not a last-run figure and does not reach this field. |
+| `gc.retired_reaped` | int | Retired snapshots the last GC run deleted — those of reaped, forgotten and evicted suites, those the upgrade's trust audit quarantined, and the displaced snapshots beyond `gc.keep_displaced` a periodic run retired (spec C9, sub-job C) — beside `displaced_reaped`; the GC panel shows it as *Retired reaped*. A displaced snapshot a periodic run retires counts twice: in `displaced_reaped` when it is retired, and here when it is deleted, normally by the same run. The startup run deletes the displaced snapshots beyond `gc.keep_displaced` itself (counted in `displaced_reaped` only) and then the retired ones within its snapshot pass's share of `gc.max_tick_duration` (counted here, since 1.1.0's fix of issue #14), and leaves the rest to the retired runs (an hour after the start and hourly while some are left, when `gc.interval` is longer than an hour) and to the periodic runs; a retired run's count (INFO `gc_retired_run_complete`) is not a last-run figure and does not reach this field. |
 | `recent_adoptions[].scheme` | string | The adopted suite's canonical scheme, `http` or `https`; the Recent Adoptions table's Host cell shows `scheme://host`, as the Suites table does. Empty for an event recorded without one. |
 
 A Recent Adoptions row's duration is the attempt's wall-clock time,
@@ -560,7 +565,7 @@ The five cells (left → right):
 | Cell | Eyebrow         | Value source                                | Sub source                          | Hint source                                  |
 |------|-----------------|---------------------------------------------|-------------------------------------|----------------------------------------------|
 | 1    | CACHE           | `formatBytes .Cache.BytesUsed`              | `.Cache.BlobCount` + " blobs"       | `.Cache.ZeroRefcountBacklog` (when > 0)      |
-| 2    | SUITES          | `len .Suites`                               | one line: `N LAGGING` (suites with `.LagWarn`) · `M FAILING` (suites with `.AdoptionFailing`), plus `K REFUSED 24H+` (suites with `.RefusedLong`) when K > 0; `ADOPTION DISABLED — METADATA NOT REFRESHED` instead while adoption is disabled | — (both counts render in the sub line) |
+| 2    | SUITES          | `len .Suites`                               | one line: `N LAGGING` (suites with `.LagWarn`) · `M FAILING` (suites with `.AdoptionFailing`), plus `K REFUSED 24H+` (suites with `.RefusedLong`) when K > 0; `ADOPTION DISABLED` instead while adoption is disabled | — (both counts render in the sub line) |
 | 3    | ADOPTIONS       | success-count / `len .RecentAdoptions`      | `N FAILED` and `M REFUSED` counts (`RING CLEAN` when both are 0) | `{n} EVENTS IN RING` (always shown) |
 | 4    | GC              | `formatShortDuration .GC.LastRunDurationSeconds` | `durationOf` since `.GC.LastRunUnixTime` | `formatBytes .GC.LastRunBytesReclaimed` |
 | 5    | ACTIVE          | `len .ActiveHosts`                          | "idle" / "busy"                     | max `.SlotCapacity`                          |
@@ -1158,8 +1163,19 @@ rules; both reference this section.
 | CACHE     | `.GC.PoolUnlinkErrors > 0`                                   | `.Cache.ZeroRefcountBacklog > 1000`                              | `.Cache.BytesUsed == 0`                |
 | SUITES    | any suite's lag exceeds 24h                                  | any suite's lag exceeds 1h, an adoption is failing, or a refusal is older than 24h | `len .Suites == 0`, or adoption disabled |
 | ADOPTIONS | non-success rate ≥ 50%                                       | non-success rate ≥ 10%                                           | ring buffer empty (uptime <5m)         |
-| GC        | `.GC.LastRunDeadlineReached` true on the last run            | last run older than `2 × .GCIntervalSeconds` (wrapper)           | `.GC.LastRunUnixTime == nil`           |
+| GC        | (none since issue #14; see below)                            | `.GC.LastRunDeadlineReached` true on the last run, or last run older than `2 × .GCIntervalSeconds` (wrapper) | `.GC.LastRunUnixTime == nil`           |
 | ACTIVE    | (no crit threshold defined; reserved)                        | (no warn threshold; reserved)                                    | no active hosts and uptime <5m         |
+
+**GC (issue #14, 1.1.0).** A reached deadline was this cell's crit. Since
+1.1.0 a GC pass that reaches its share of `gc.max_tick_duration` no longer
+ends the run: the passes after it run, the blob pass included, so a busy
+cache reports a reached deadline in steady state while it frees disk. It is
+warn (the verdict reads WATCHING), and the GC panel's *Deadline reached*
+badge is `.b--warn`, with a tooltip naming the failure sign to watch
+instead: *Blobs reaped* staying 0 run after run. No GC state is crit: a
+failed pass has no status field (WARN `gc_tick_failed` is its sign), a GC
+that never ran is stale and one that stopped running warns; pool unlink
+errors are the CACHE cell's crit.
 
 **SUITES (phase B; replaces the two-stamp comparison this row originally
 described).** Lag runs from the first time the cache saw upstream's new
@@ -1172,13 +1188,17 @@ of any reason whose streak began more than 24 h ago warns the row and the
 vital, never crits (§4.5 `REFUSED 24H+`): a missing `Date` says nothing
 about the content's age, so a long refusal must not freeze a suite silently.
 
-**SUITES with adoption disabled (phase B).** Adoption is disabled by default,
-and Phase 1 never refreshes metadata, so every tracked upstream eventually
-lags by more than a day — truthfully, but by design. Following the keyring
-panel's `ADOPTION DISABLED` precedent, the SUITES vital is then `stale` (not
-`warn`/`crit` from lag) and its sub-line reads `ADOPTION DISABLED — METADATA
-NOT REFRESHED`; rows keep their "(lagging …)" text but do not warn, and a
-stored failure or refusal record is inert (§4.5). The page therefore stays
+**SUITES with adoption disabled (phase B; corrected for 1.1.0's #18).**
+Adoption is disabled by default. The freshness checker still refreshes a
+suite that has no adopted snapshot (#18): a changed tracked `InRelease` or
+`Release` invalidates its mutable metadata, and later requests fetch current
+files. A suite with an adopted snapshot keeps serving that snapshot until
+adoption is enabled, so it lags by more than a day — truthfully, but by
+design. Following the keyring panel's `ADOPTION DISABLED` precedent, the
+SUITES vital is then `stale` (not `warn`/`crit` from lag) and its sub-line
+reads `ADOPTION DISABLED`; rows keep their "(lagging …)" text but do not warn,
+and a stored failure or refusal record is inert, its text gaining
+" (adoption disabled)" (`suitesForHTML`; §4.5). The page therefore stays
 HEALTHY rather than DEGRADED forever.
 
 **ADOPTIONS (phase B).** The non-success ratio excludes `refused` rows from

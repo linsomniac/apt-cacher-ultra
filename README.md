@@ -57,6 +57,8 @@ request-path callers.
   automatically on the next unchanged freshness check or on demand via `POST /reconcile` (see "Recovering a degraded
   repository").
 - Observability — /metrics endpoint, status page, structured logs (see docs/log-fields.md).
+- [Usage statistics](docs/usage-statistics.md) — persistent data fetched/served,
+  cache savings and average effective transfer rates on the admin dashboard.
 - Packaging — install from the [apt repository](https://linsomniac.github.io/apt-cacher-ultra/), the `.deb` with systemd unit, or the standalone Go executable.
 
 ## Quickstart
@@ -421,13 +423,17 @@ section is ignored without a warning).
 ## Forgetting a suite
 
 `POST /forget` reaps one suite at once, however recently it was used. It
-is the way out of two refusal states the status page shows: a deliberate
-upstream rollback (`refused: upstream_older` or `rollback_refused`) and a
-vendor that stopped signing (`refused: unsigned_downgrade_refused`). The
-next request makes the suite new again and, with adoption enabled, adopts
-what upstream serves then (for `unsigned_downgrade_refused`, forget the
-path's other suites too — its `/.` twin, or its copy under the other
-scheme — or it is refused again). It takes the same header and host rules as
+is the way out of three refusal states the status page shows: a deliberate
+upstream rollback (`refused: upstream_older` or `rollback_refused`), a
+vendor that stopped signing (`refused: unsigned_downgrade_refused`), and a
+vendor that dropped its strong signer (`refused: signer_downgrade`; if the
+vendor rotated to a new key, install that key instead: see
+[Trust and signer pins](docs/configuration.md#trust-and-signer-pins)).
+Confirm with the vendor out of band first: forgetting adopts what the cache
+refused, which for the last two is also what an on-path attacker produces.
+The next request makes the suite new again and, with adoption enabled,
+adopts what upstream serves then; forget the suite's other copies too — its
+`/.` twin, or its copy under the other scheme — or each is refused again. It takes the same header and host rules as
 `POST /reconcile`; pass the scheme, host and suite path the status page
 shows:
 

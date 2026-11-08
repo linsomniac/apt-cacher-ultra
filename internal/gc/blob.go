@@ -9,6 +9,21 @@ import (
 	"time"
 )
 
+// representationPruneRows is the most stored upstream dates one tick's
+// representation prune releases (runBlobPass), in one writer transaction.
+//
+// AIDEV-NOTE: the controller's ruling of 2026-11-06 on the prune's
+// capacity. With gc.batch_size (100) a tick, 100 a day at the default
+// gc.interval, a busy cache's inflow outran it (every index blob also lives
+// under its by-hash URL, and new index versions arrive daily), the table
+// grew without bound, and the scan's cost with it. Measured (the merge's
+// prune task: 200,000 owned day-old dates plus 10,000 prunable, no -race):
+// one 10,000-row transaction took 565-665 ms, where the scan alone takes
+// about 550 ms; chunks of 100 took 52.9 s for the same 10,000 (101 calls,
+// each rescanning). So one transaction, not chunks. Re-measure before
+// raising it; no config key.
+const representationPruneRows = 10_000
+
 // runBlobPass implements SPEC4 §9.6.2: a per-tick batched reap loop
 // that walks the candidate set in oldest-first order
 // (ORDER BY refcount_zeroed_at). Each batch is one writer-tx with
@@ -26,7 +41,8 @@ import (
 //     into gc_run_complete.pool_unlink_errors,
 //   - error iff a DB-level failure occurred (ctx cancellation alone
 //     returns nil with deadline=false; the caller distinguishes via
-//     ctx.Err()).
+//     ctx.Err()): a failed batch's, or else the representation prune's,
+//     which does not stop the batches.
 func (g *GC) runBlobPass(ctx context.Context, deadline time.Time, phase string) (blobResult, bool, int, error) {
 	graceSeconds := int64(g.cfg.BlobGrace.Seconds())
 
@@ -35,7 +51,39 @@ func (g *GC) runBlobPass(ctx context.Context, deadline time.Time, phase string) 
 		unlinkErrors  int
 		batchesRun    int
 		bytesThisTick int64
+		// pruneErr is the representation prune's failure, the pass's
+		// error unless a batch fails too.
+		pruneErr error
 	)
+
+	// The representation prune, once a tick: here, at the start of the blob
+	// pass, which runs in every tick (and in the startup pass), once, before
+	// its first batch, and only while its deadline has not passed. One writer
+	// transaction, at most representationPruneRows dates, oldest first.
+	//
+	// AIDEV-NOTE: the merge review's M-I1 (the maintainer, 2026-11-06).
+	// main's prune ran inside every RunBlobGCBatch transaction, and its scan
+	// costs 0.56-0.64 s at 200,000 url_path rows whatever it finds, so a
+	// pass of 100 batches held the writer a minute longer and reaped less in
+	// its share of the budget, the throughput issue #14's fix is about. Here,
+	// not a sub-job of its own: the blob pass is the one pass every tick
+	// reaches (issue #14), its deadline bounds the prune's start, and dates
+	// pin no content (a reaped blob's go by ON DELETE CASCADE), so a prune
+	// that falls behind costs rows, never disk or a pass; but rows that pile
+	// up make every later scan slower, so one tick's capacity must stay far
+	// above a busy cache's daily inflow (representationPruneRows' AIDEV-NOTE:
+	// gc.batch_size, 100 a day at the defaults, was too low). A failed prune
+	// does not stop the batches: they run, and the prune's error is the blob
+	// pass's (one WARN gc_tick_failed for the pass, by runTick's failed,
+	// ruling HD-15), unless a batch fails too, whose error it then is. So a
+	// failed prune moves the rotation as a failed blob pass does, even when
+	// the batches stopped at their deadline.
+	if ctx.Err() == nil && time.Now().Before(deadline) {
+		if _, err := g.store.PruneRepresentationMetadata(ctx, representationPruneRows); err != nil {
+			pruneErr = fmt.Errorf("representation metadata prune: %w", err)
+		}
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
 			// Cooperative cancel — return what we have; not an error
@@ -50,7 +98,7 @@ func (g *GC) runBlobPass(ctx context.Context, deadline time.Time, phase string) 
 				"batches_completed", batchesRun,
 				"bytes_reclaimed_this_tick", bytesThisTick,
 			)
-			return res, true, unlinkErrors, nil
+			return res, true, unlinkErrors, pruneErr
 		}
 
 		reaped, err := g.cfg.Cache.RunBlobGCBatch(ctx, g.cfg.BatchSize, graceSeconds)
@@ -64,7 +112,7 @@ func (g *GC) runBlobPass(ctx context.Context, deadline time.Time, phase string) 
 		batchesRun++
 		if len(reaped) == 0 {
 			// Candidate set is drained.
-			return res, false, unlinkErrors, nil
+			return res, false, unlinkErrors, pruneErr
 		}
 
 		// SPEC4 §10.2: blobs_reaped/bytes_reclaimed count the rows

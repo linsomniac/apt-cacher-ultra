@@ -1,0 +1,56 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: Artifactory
+Label: Artifactory
+Suite: stable
+Codename: stable
+Date: Tue, 27 Oct 2026 00:59:22 UTC
+Acquire-By-Hash: yes
+Components: main
+Architectures: amd64 arm64 i386
+MD5Sum:
+ 01e57fe57238a4c00b893f9cf36d6178           946275 main/binary-amd64/Packages
+ 24b65c7decf1201f60a90a29eefdcf47           199910 main/binary-amd64/Packages.bz2
+ 249977ca5ed336f19918da1ba263c6fb           207410 main/binary-amd64/Packages.gz
+ 7dd21f2cd069c67cd4928e8e834f353a           941437 main/binary-arm64/Packages
+ df838b8baf905d3bdbd35f478268d352           196412 main/binary-arm64/Packages.bz2
+ 366231f7635a5d5eaedd5f2f588d37b9           206483 main/binary-arm64/Packages.gz
+ d41d8cd98f00b204e9800998ecf8427e                0 main/binary-i386/Packages
+ 4059d198768f9f8dc9372dc1c54bc3c3               14 main/binary-i386/Packages.bz2
+ 163be0a88c70ca629fd516dbaadad96a               20 main/binary-i386/Packages.gz
+SHA1:
+ c7ca1641d5bd4a18b583316509217095ded2be89           946275 main/binary-amd64/Packages
+ bfbe74a66314388d1be451b455c3fe76db9df02c           199910 main/binary-amd64/Packages.bz2
+ 17b1cc569be5b671da443810625c72d77a9ef0f1           207410 main/binary-amd64/Packages.gz
+ e528e9476e1381137a917007b35b8e41a3135d93           941437 main/binary-arm64/Packages
+ 6b38b7df436b82a27587d0a15b55a9338889aa19           196412 main/binary-arm64/Packages.bz2
+ e38ff2005a2959f62ca6924b8fd91a06eccbee1a           206483 main/binary-arm64/Packages.gz
+ da39a3ee5e6b4b0d3255bfef95601890afd80709                0 main/binary-i386/Packages
+ 64a543afbb5f4bf728636bdcbbe7a2ed0804adc2               14 main/binary-i386/Packages.bz2
+ c8830ccf3a863e489ca37f4da572bad0e05d077b               20 main/binary-i386/Packages.gz
+SHA256:
+ 5609503282ef06d2fa030e8e7536c0d386c7ad950485fa2ee6c6c4a7bfb79bd0           946275 main/binary-amd64/Packages
+ 8f73a947454c050b7799a2bb0e7e0ae5d731edfc13181857899c059e247267dc           199910 main/binary-amd64/Packages.bz2
+ dda97799596aca158e30b39fa3dafbd4fde01163f7a2002cd94d4d69b37ff8a8           207410 main/binary-amd64/Packages.gz
+ 603c96bc99e755ca4337129a3ab0114036290b9b6e4837f9aa0a391472555db0           941437 main/binary-arm64/Packages
+ bb038a3d208d6ff7c7a7c85e34d9877d0547cee00e50246215959ee5df025aef           196412 main/binary-arm64/Packages.bz2
+ 54b9ca96252e7836206ca881d4f934bb8b7ceee4c74711a1700eab7b4846c187           206483 main/binary-arm64/Packages.gz
+ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855                0 main/binary-i386/Packages
+ d3dda84eb03b9738d118eb2be78e246106900493c0ae07819ad60815134a8058               14 main/binary-i386/Packages.bz2
+ ac73670af3abed54ac6fb4695131f4099be9fbe39d6076c5d0264a6bbdae9d83               20 main/binary-i386/Packages.gz
+
+-----BEGIN PGP SIGNATURE-----
+Version: BCPG v1.86
+
+wsDcBAEBCgAGBYJq3/dqAAoJEGTLvIFz12s/IiAL/05SidybFO8CctpVZMhvMH3j
+ji3+NaNFKwEGDNIxGK2yda50e16RbyvZTxdWiI3x+mvUgEN1u4zJtOCvd860Jk2T
+EIJVOmrZZmc8UfK1tQElsGAQUa/nRsuAyVwarXVmyomIidIwsGGoqngY4ZYe85ff
+ri/DXkM5XdP09fr6fnm3DVfj1HU8wMgDQhFrIi6qHoJVh5eWP9/fkyqBwer1mikc
+7A3yvyTdTU2veXEycz4gXmI2QtsBeqqupTl67Ir2/3T+/vMsRjk4z1eNcIghDYuJ
+O62Asxe/ZpIWy6YVafNanDJawWerDvXgKe2sQhgIl0fytj++IHt/vGADK9Fly2aa
+UjiJA3ywAOWH9fIoL0ugbIHwPxSdJJc77+YH0QetkYp2l0lrf/2A7XaTQFPB+Hu/
+zgC9GNDB0/eX8jZ7UkB4EPw+cyjaymC0v6AI4iFv2fuCK/pAm0QfuKJy2bBOOjpm
+ea9M77im5VseH0IOHxEkpIZsiXA5YTkw8q3ndxqYsw==
+=6vsa
+-----END PGP SIGNATURE-----

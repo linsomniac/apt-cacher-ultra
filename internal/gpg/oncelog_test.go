@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"testing"
 
@@ -67,7 +66,7 @@ func TestVerifier_EachOnceLoggerHasItsOwnSet(t *testing.T) {
 	for range 2 {
 		v.logUntrustedSignerOnce(suite, nil)
 		v.logShortKeyIDFallbackOnce(suite, signer, signer.PrimaryKey.KeyId)
-		v.logUnverifiedSignerOnce(suite, strings.NewReader(""))
+		v.logUnverifiedSignerOnce(suite, sigPacket{n: 1, issuer: signer.PrimaryKey.KeyId})
 	}
 	for _, msg := range []string{"adoption_untrusted_signer", "adoption_short_keyid_fallback", "adoption_unverified_signer"} {
 		if n := h.n[msg]; n != 1 {

@@ -46,7 +46,7 @@ func TestRunSnapshotGCBatch_RetiredSnapshotsTakeNoKeepDisplacedSlot(t *testing.T
 	retire(t, c, ids[2])
 	retire(t, c, ids[3])
 	defer stubNow(t, 1_000_000)()
-	res, err := c.RunSnapshotGCBatch(ctx, 100, 1800, 2)
+	res, err := c.RunSnapshotGCBatch(ctx, 100, 1800, 2, false)
 	if err != nil {
 		t.Fatal(err)
 	}

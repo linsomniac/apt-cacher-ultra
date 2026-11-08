@@ -21,6 +21,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/servertls"
+	"github.com/linsomniac/apt-cacher-ultra/internal/usage"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
@@ -33,6 +34,7 @@ import (
 // `"gc": {"last_run_unixtime": null}` with the rest of the gc.*
 // block omitted (a custom MarshalJSON on gcInfo handles this).
 type statusModel struct {
+	Usage           *usage.Snapshot               `json:"usage,omitempty"`
 	ServerTLS       map[string]servertls.Snapshot `json:"server_tls,omitempty"`
 	ACME            *acme.Status                  `json:"acme,omitempty"`
 	Process         processInfo                   `json:"process"`
@@ -377,8 +379,9 @@ type adoptionEntry struct {
 	// Reason is the SPEC5 §10.5 additive sub-classification. Empty on
 	// success; for gpg_failed it carries the specific verifier
 	// sentinel (untrusted_signer, short_keyid, crypto_verify_failed,
-	// missing_signature, malformed_clearsign, ambiguous_keyid,
-	// no_usable_signature); for other failures it mirrors Outcome.
+	// missing_signature, malformed_clearsign, malformed_signature,
+	// bad_signature, ambiguous_keyid, no_usable_signature); for other
+	// failures it mirrors Outcome.
 	// JSON-omitted when empty so the wire shape is unchanged for
 	// success rows.
 	Reason string `json:"reason,omitempty"`
@@ -455,6 +458,7 @@ func (s *Server) buildStatusModel(r *http.Request) (statusModel, string, error) 
 
 	uptime := time.Since(s.cfg.StartTime)
 	model := statusModel{
+		Usage: s.cfg.Usage.Snapshot(),
 		Process: processInfo{
 			Version:         s.cfg.BuildInfo.Version,
 			StartedUnixTime: s.cfg.StartTime.Unix(),
@@ -850,12 +854,11 @@ func adoptionStatus(s cache.SuiteFreshness, refused, long bool, now int64) strin
 }
 
 // suitesForHTML adapts the suite rows to the HTML page. With adoption
-// disabled nothing is attempted or adopted, so a record stored while it
+// disabled no snapshot adoption is attempted, so a record stored while it
 // was enabled is inert: its text gains " (adoption disabled)" and it marks
-// no warn (final review S I3). A lag is truthful but expected — Phase 1
-// never refreshes metadata — so rows keep their lag text without warning,
-// and vitalState shows the SUITES vital stale with "ADOPTION DISABLED —
-// METADATA NOT REFRESHED" (ruling A4). The JSON keeps the raw fields.
+// no warn. Legacy URL metadata refreshes independently. Existing snapshots
+// still require adoption, so lag text stays visible and vitalState says
+// "ADOPTION DISABLED". The JSON keeps the raw fields.
 func suitesForHTML(suites []suiteEntry, adoptionEnabled bool) []suiteEntry {
 	if adoptionEnabled {
 		return suites
@@ -891,7 +894,8 @@ func suitesForHTML(suites []suiteEntry, adoptionEnabled bool) []suiteEntry {
 //
 // Every other refusal reason — the phase E reasons
 // (unsigned_downgrade_refused, unsigned_unconfirmed, unsigned_too_large,
-// anchor_absent, unsigned_disabled) — means the cache really is behind
+// anchor_absent, unsigned_disabled) and signer_downgrade (the hardening
+// plan's Task 9d) — means the cache really is behind
 // (e.g. a vendor that stopped signing, or adopt_unsigned turned off), so
 // those keep the ordinary lag behaviour; the operator must act (the
 // spec's POST /forget escape hatch, or the knob). Extend the
@@ -985,6 +989,7 @@ func buildKeyringEntries(p KeyringProvider) []keyringEntry {
 // renderStatus renders the SPEC5 §10.5 status page in either JSON
 // or HTML per content negotiation (§9.7.3).
 func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	start := time.Now()
 	format := chooseFormat(r)
 	defer func() {
@@ -1093,6 +1098,9 @@ func statusTemplateFuncMap() template.FuncMap {
 		"unixTime":            formatUnixTimeTag,
 		"unixTimePtr":         formatUnixTimePtrTag,
 		"formatBytes":         formatBytes,
+		"usageRate":           formatUsageRate,
+		"usagePercent":        formatUsagePercent,
+		"signedBytes":         formatSignedBytes,
 		"durationOf":          durationOf,
 		"i64Ptr":              formatInt64Ptr,
 		"hitRatePct":          formatHitRatePercent,
@@ -1118,10 +1126,21 @@ func statusTemplateFuncMap() template.FuncMap {
 // reason chip. Unknown tags pass through verbatim so future reasons
 // surface without a code change (just less helpful hover text until
 // the table is extended).
+//
+// AIDEV-NOTE: signer_downgrade (the hardening plan's Task 9d) has its text
+// here since Task 9c, and TestReasonTooltip_PhaseBOutcomes
+// (suites_status_test.go) lists it, so that a missing one fails (the Task
+// 9d review's 9d-M4; ruling G5 gave tooltips to Task 9c). Unlike
+// rollback_refused it is not in refusalKeepsCurrent: the suite really is
+// behind upstream, so its lag shows. The verifier's texts (Task 9c, the
+// final review's D-M1) claim no "apt refuses it" for the malformed_*
+// reasons: the cache's canonical grammar refuses some shapes every apt
+// accepts (the strict deviations, internal/gpg/aptshape_test.go), and
+// sqv accepts a bad signature beside a good one. Keep them so.
 func reasonTooltip(reason string) string {
 	switch reason {
 	case "untrusted_signer":
-		return "The InRelease signature's issuer key is not in the host keyring. Install the upstream's signing key under /usr/share/keyrings/ or /etc/apt/keyrings/."
+		return "The InRelease signature's issuer key is not in the host keyring. Install the upstream's signing key under /usr/share/keyrings/ or /etc/apt/keyrings/ and restart; if it is installed, the start's keyring WARN lines name a key file the cache skipped or read only in part."
 	case "short_keyid":
 		return "Signature lacks the long-form IssuerFingerprint subpacket and adoption.allow_short_keyid is false."
 	case "no_usable_signature":
@@ -1129,11 +1148,15 @@ func reasonTooltip(reason string) string {
 	case "missing_signature":
 		return "InRelease body is not clearsigned. Plain-text InRelease files are never adopted as signed metadata, whatever adoption.require_signature says."
 	case "malformed_clearsign":
-		return "InRelease starts like a clearsigned message but its signature frame does not decode."
+		return "InRelease starts like a clearsigned message but is not in the shape the cache accepts: apt's own text checks refuse it (a line after the signature, a dash line not escaped), or its armor or signature packets are outside the cache's canonical grammar (a forged checksum, damaged armor, a packet some apt refuses or that the cache cannot check), which refuses some shapes every apt would read. Any current snapshot keeps serving; the adoption_gpg_failed log line names the layer and the rule."
+	case "malformed_signature":
+		return "The upstream Release.gpg is not one ASCII-armored signature block in the shape the cache accepts: bytes before or after its armor, a binary signature, damaged armor, or a signature packet some apt refuses or that the cache cannot check (a version 3 signature, say), which refuses some shapes every apt would read. Any current snapshot keeps serving; the adoption_gpg_failed log line names the layer and the rule."
+	case "bad_signature":
+		return "The upstream anchor carries a signature from a key in the cache's keyring that fails verification, which apt with gpgv refuses even beside a good signature (debian:13's sqv refuses only a lone one): a Release.gpg out of step with its Release (a mirror caught mid-update), or tampering on the path. Any current snapshot keeps serving; retried on the backoff schedule; the adoption_gpg_failed log line names the key ID."
 	case "ambiguous_keyid":
 		return "Two or more keys in the trust set share the same 8-byte keyid; the short-keyid fallback refuses to guess."
 	case "crypto_verify_failed":
-		return "The signature's issuer was trusted but the cryptographic verification itself failed."
+		return "A trusted signature was found but none counts: its key or the signature has expired or been revoked in the cache's keyring (install the vendor's current key file and restart), the keyring marks its key as not countable (a revocation, expiry or binding it cannot read, which gpgv honours: install the vendor's current key file too, or ask the vendor about its key's status), its key may not sign, it is SHA-1 (never counted), or apt or debian:13's sqv would not count it. Any current snapshot keeps serving; the adoption_gpg_failed log line has the cause."
 	case "unpinned_suite":
 		return "adoption.require_pinned_signer is true and no [[trusted_signer]] block matches this canonical host."
 	case "parse_failed":
@@ -1152,6 +1175,8 @@ func reasonTooltip(reason string) string {
 		return "The upstream Release's Date is older than the current snapshot's, or missing after a dated one: apt would refuse it too. Refused, not failed."
 	case "rollback_refused":
 		return "Upstream serves content identical to an older snapshot the cache already replaced (a flapping mirror). Refused, not failed."
+	case "signer_downgrade":
+		return "The new anchor has lost the strong signer the suite's current anchor has (a key debian:13, ubuntu:24.04 and ubuntu:26.04 all accept): the shape of an on-path strip of a strong signature beside a weak one, or of a vendor's rotation to a new strong key the keyring lacks (the adoption_signer_downgrade line's uncounted_signers then names it, not in the trust set). Refused, not failed: the current snapshot keeps serving and the suite falls behind upstream. It clears by itself when the vendor signs again with a strong key the keyring holds. For a rotation: install the vendor's new key, once confirmed out of band, and restart; the guard stays on. Otherwise first confirm with the vendor, out of band, that it really dropped its strong signer, since the other recourses adopt the anchor the guard refused: POST /forget the suite, or remove the old strong key from the keyring and restart (every suite it signs loses it; a bundled key cannot be removed); see docs/configuration.md, Trust and signer pins."
 	case "release_date_in_future":
 		return "The Release's Date is more than 10 s ahead of the cache's clock (apt's Acquire::Max-FutureTime). Check the cache host's clock."
 	case "timed_out":
@@ -1243,6 +1268,35 @@ func formatBytes(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+func formatSignedBytes(n int64) string {
+	// Net savings is the difference of two nonnegative int64s, so never MinInt64.
+	if n < 0 {
+		return "−" + formatBytes(-n)
+	}
+	return formatBytes(n)
+}
+
+func formatUsageRate(v *float64) string {
+	if v == nil {
+		return "n/a"
+	}
+	n := *v
+	units := []string{"B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s", "PiB/s", "EiB/s"}
+	i := 0
+	for n >= 1024 && i < len(units)-1 {
+		n /= 1024
+		i++
+	}
+	return fmt.Sprintf("%.1f %s", n, units[i])
+}
+
+func formatUsagePercent(v *float64) string {
+	if v == nil {
+		return "n/a"
+	}
+	return fmt.Sprintf("%.1f%%", *v)
 }
 
 // formatHitRatePercent renders the SPEC6 §10.4 hit-rate cell. nil
@@ -1430,7 +1484,7 @@ func vitalState(kind string, m htmlRenderModel) string {
 			return "stale"
 		}
 		if !m.AdoptionEnabled {
-			// ADOPTION DISABLED — METADATA NOT REFRESHED (§9.1, the
+			// ADOPTION DISABLED (§9.1, the
 			// keyring panel's precedent): the lag is expected, not a
 			// fault, so it must not hold the page at DEGRADED.
 			return "stale"
@@ -1482,8 +1536,18 @@ func vitalState(kind string, m htmlRenderModel) string {
 		if m.GC == nil || m.GC.LastRunUnixTime == nil {
 			return "stale"
 		}
+		// AIDEV-NOTE: issue #14 (the hardening plan's Task 8; the
+		// controller's ruling of 2026-11-05). A reached deadline is warn,
+		// not crit: a pass that reaches its share of gc.max_tick_duration
+		// no longer ends the run, so a busy cache reports it in steady
+		// state while it frees disk (the page then reads WATCHING, not
+		// DEGRADED). No GC failure reads crit here, before or after this
+		// change: a failed pass has no status field (WARN gc_tick_failed
+		// is its sign), a GC that never ran is stale and one that stopped
+		// running is warn (the age rule below); pool unlink errors are the
+		// CACHE cell's crit.
 		if m.GC.LastRunDeadlineReached {
-			return "crit"
+			return "warn"
 		}
 		// AIDEV-NOTE: GCIntervalSeconds==0 means "interval unknown" —
 		// per §9.1 the warn branch is suppressed in that case and the

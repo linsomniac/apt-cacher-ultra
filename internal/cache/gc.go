@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 )
 
 // ReapedBlob is one (hash, size) tuple returned by RunBlobGCBatch's
@@ -97,6 +99,9 @@ SELECT hash FROM blob
 			return fmt.Errorf("RunBlobGCBatch: begin: %w", err)
 		}
 		defer func() { _ = tx.Rollback() }()
+		// No representation prune here (the merge review's M-I1, the
+		// maintainer, 2026-11-06): internal/gc runs PruneRepresentationMetadata
+		// once a tick, at the start of its blob pass.
 
 		// Step 1: SELECT candidate hashes inside the tx — the DELETE
 		// re-applies the same predicate atomically, but doing the
@@ -203,12 +208,15 @@ RETURNING hash, size`
 	return reaped, nil
 }
 
-// SnapshotGCBatchResult counts the rows reaped by one snapshot-GC
-// batch, broken down by reap class (sub-job A vs sub-job B per SPEC4
+// SnapshotGCBatchResult counts the snapshots one snapshot-GC batch reaped
+// or retired, broken down by reap class (sub-job A vs sub-job B per SPEC4
 // §9.6.3) so the gc package can emit the gc_run_complete fields
 // `orphan_candidates_reaped` and `displaced_reaped` separately.
 type SnapshotGCBatchResult struct {
-	OrphanReaped    int
+	OrphanReaped int
+	// DisplacedReaped counts the displaced snapshots the batch retired
+	// (retireDisplaced: sub-job C deletes them, and counts them again) or
+	// deleted (not).
 	DisplacedReaped int
 }
 
@@ -224,20 +232,28 @@ func (r SnapshotGCBatchResult) Total() int {
 //  1. BEGIN
 //  2. SELECT (sub-job A ∪ sub-job B) candidate ids inside the tx — the
 //     SELECT-DELETE liveness race is closed by single-writer ordering.
-//  3. cascade DELETE: snapshot_member, snapshot_skipped_member,
-//     package_hash, suite_snapshot (children before parent for FK
-//     ordering with PRAGMA foreign_keys = ON).
-//  4. COMMIT
+//  3. cascade DELETE of sub-job A's orphan candidates, and of sub-job B's
+//     displaced snapshots unless retireDisplaced: snapshot_member,
+//     snapshot_skipped_member, package_hash, suite_snapshot (children
+//     before parent for FK ordering with PRAGMA foreign_keys = ON).
+//  4. with retireDisplaced, sub-job B's displaced snapshots get
+//     retired_at = now in one UPDATE instead, their rows kept: sub-job C
+//     (RunRetiredSnapshotGCChunk) deletes them in chunks (DN-7 of the GC
+//     and upstream hardening plan).
+//  5. COMMIT
 //
 // staleGraceSeconds is the runtime-derived `max(total_timeout ×
 // max_retries, 30m).Seconds()` from §9.6.3 sub-job A; keepDisplaced is
 // `gc.keep_displaced` from config; batchSize is
-// `gc.snapshot_batch_size`.
+// `gc.snapshot_batch_size`; retireDisplaced is false for the startup
+// pass and true for the periodic ticks (internal/gc runSnapshotPass).
 //
 // Returns counts split by reap class. No on-disk side effects (the
-// blobs the snapshot pinned are reaped by the blob pass that runs
-// later in the same tick).
-func (c *Cache) RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGraceSeconds int64, keepDisplaced int) (SnapshotGCBatchResult, error) {
+// blobs a deleted snapshot pinned are reaped by the blob pass that runs
+// later in the same tick: at startup, and in a periodic tick once sub-job
+// C, later in the same snapshot pass, has deleted the snapshots this
+// batch retired).
+func (c *Cache) RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGraceSeconds int64, keepDisplaced int, retireDisplaced bool) (SnapshotGCBatchResult, error) {
 	if batchSize < 1 {
 		return SnapshotGCBatchResult{}, fmt.Errorf("RunSnapshotGCBatch: batchSize must be >= 1, got %d", batchSize)
 	}
@@ -256,11 +272,13 @@ func (c *Cache) RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGrac
 	// 1 current + 4 displaced keeps only 2 displaced. The (adopted_at
 	// DESC, snapshot_id DESC) tie-breaker makes ranking deterministic
 	// when two displacements share the same unix-second adopted_at.
-	// Retired snapshots (those of a suite reaped, evicted at a cap or
-	// forgotten, and those the legacy trust audit quarantined) are ranked
-	// out the same way, before the window function (spec C9): they never
-	// take one of a suite's keep_displaced slots, and sub-job C
-	// (RunRetiredSnapshotGCChunk) deletes them.
+	// Retired snapshots — those of a suite reaped, evicted at a cap or
+	// forgotten, those the legacy trust audit quarantined, and the displaced
+	// snapshots a periodic tick's sub-job B retired (ruling HD-4) — are
+	// ranked out the same way, before the window function (spec C9): they
+	// never take one of a suite's keep_displaced slots, B never selects one
+	// again (so a batch never selects what an earlier one retired), and
+	// sub-job C (RunRetiredSnapshotGCChunk) deletes them.
 	//
 	// AIDEV-NOTE: ruling R-H1 (deferred minor F-24). A snapshot still
 	// queued in legacy_trust_audit — one the audit deferred after an I/O
@@ -320,8 +338,10 @@ LIMIT ?`
 		if err != nil {
 			return fmt.Errorf("RunSnapshotGCBatch: select: %w", err)
 		}
-		var ids []int64
-		var classes []string
+		// The ids split by reap class: an orphan is deleted in both modes, a
+		// displaced snapshot deleted or retired (retireDisplaced). The
+		// SELECT yields only the two classes.
+		var orphans, displaced []any
 		for rows.Next() {
 			var (
 				id  int64
@@ -331,8 +351,11 @@ LIMIT ?`
 				_ = rows.Close()
 				return fmt.Errorf("RunSnapshotGCBatch: scan: %w", err)
 			}
-			ids = append(ids, id)
-			classes = append(classes, cls)
+			if cls == "displaced" {
+				displaced = append(displaced, id)
+			} else {
+				orphans = append(orphans, id)
+			}
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()
@@ -340,46 +363,70 @@ LIMIT ?`
 		}
 		_ = rows.Close()
 
-		if len(ids) == 0 {
-			return tx.Commit()
-		}
-
 		// Cascade DELETE: children before parent. PRAGMA foreign_keys
 		// = ON would FK-fail the suite_snapshot DELETE if the child
-		// rows still pointed at it.
-		args := make([]any, 0, len(ids))
-		ph := make([]byte, 0, 2*len(ids))
-		for i, id := range ids {
-			if i > 0 {
-				ph = append(ph, ',')
-			}
-			ph = append(ph, '?')
-			args = append(args, id)
+		// rows still pointed at it. An orphan candidate holds a header
+		// only — only CommitAdoption inserts child rows, in the
+		// transaction that sets adopted_at — so its delete is short in
+		// either mode (DN-7).
+		deleted := orphans
+		if !retireDisplaced {
+			deleted = slices.Concat(orphans, displaced)
 		}
-		idList := string(ph)
-		for _, stmt := range []string{
-			`DELETE FROM snapshot_member         WHERE snapshot_id IN (` + idList + `)`,
-			`DELETE FROM snapshot_skipped_member WHERE snapshot_id IN (` + idList + `)`,
-			`DELETE FROM package_hash            WHERE snapshot_id IN (` + idList + `)`,
-			`DELETE FROM suite_snapshot          WHERE snapshot_id IN (` + idList + `)`,
-		} {
-			if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
-				return fmt.Errorf("RunSnapshotGCBatch: cascade delete: %w", err)
+		if len(deleted) > 0 {
+			idList := placeholders(len(deleted))
+			for _, stmt := range []string{
+				`DELETE FROM snapshot_member         WHERE snapshot_id IN (` + idList + `)`,
+				`DELETE FROM snapshot_skipped_member WHERE snapshot_id IN (` + idList + `)`,
+				`DELETE FROM package_hash            WHERE snapshot_id IN (` + idList + `)`,
+				`DELETE FROM suite_snapshot          WHERE snapshot_id IN (` + idList + `)`,
+			} {
+				if _, err := tx.ExecContext(ctx, stmt, deleted...); err != nil {
+					return fmt.Errorf("RunSnapshotGCBatch: cascade delete: %w", err)
+				}
+			}
+		}
+		if retireDisplaced && len(displaced) > 0 {
+			// AIDEV-NOTE: rulings HD-4/HD-7 (the H3 final review R3 #4). A
+			// periodic tick's B used to delete a displaced snapshot's rows here,
+			// in this one writer transaction: six snapshots of 70,000
+			// package_hash rows held the writer 4.7 s in a probe, so a full
+			// batch held every write (a miss's store, a flip's commit) about
+			// 8 s. It now only retires them, and sub-job C deletes them in
+			// chunks (retiredChunkRows a transaction), in the same snapshot
+			// pass. Every reader that serves, vouches or judges history filters
+			// retired_at or reads current snapshots only, so a retired displaced
+			// snapshot is invisible to them exactly as a deleted one was, and
+			// B's selection (retired_at IS NULL) never selects it again. The
+			// startup pass still deletes (retireDisplaced false): it runs before
+			// the scheduler and the listeners, so its long transactions hold up
+			// no other writer and no request in flight (a large backlog delays
+			// the start, as before, up to max_tick_duration), and a daemon that
+			// never lives until sub-job C runs still deletes its displaced
+			// snapshots at every start. The periodic ticks keep the retired
+			// backlog small only while one budget's C deletes what a day's B
+			// retires; beyond that it grew without bound (issue #14, the final
+			// review 2's G2-I2), so internal/gc now repeats C hourly while a
+			// backlog lasts and runs it at every start (its Run and
+			// runSnapshotPass).
+			res, err := tx.ExecContext(ctx,
+				`UPDATE suite_snapshot SET retired_at = ? WHERE retired_at IS NULL AND snapshot_id IN (`+placeholders(len(displaced))+`)`,
+				append([]any{now}, displaced...)...)
+			if err != nil {
+				return fmt.Errorf("RunSnapshotGCBatch: retire displaced: %w", err)
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("RunSnapshotGCBatch: retire displaced: %w", err)
+			}
+			if n != int64(len(displaced)) {
+				return fmt.Errorf("RunSnapshotGCBatch: retired %d displaced snapshots, want %d", n, len(displaced))
 			}
 		}
 
-		// Tally reap classes from the SELECT result — the DELETE's
-		// RowsAffected on suite_snapshot equals len(ids) under
-		// single-writer ordering, but we want the per-class split for
+		// The per-class split, from the SELECT result, is for the
 		// gc_run_complete telemetry.
-		for _, cls := range classes {
-			switch cls {
-			case "orphan":
-				result.OrphanReaped++
-			case "displaced":
-				result.DisplacedReaped++
-			}
-		}
+		result = SnapshotGCBatchResult{OrphanReaped: len(orphans), DisplacedReaped: len(displaced)}
 		return tx.Commit()
 	})
 	if werr != nil {
@@ -388,12 +435,21 @@ LIMIT ?`
 	return result, nil
 }
 
+// placeholders returns n comma-separated SQL parameter markers ("?,?,?")
+// for an IN list; the values go in as bound arguments.
+func placeholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
 // retiredChunkRows is spec C9's chunk for snapshot-GC sub-job C: the rows
 // one writer transaction deletes.
 //
 // AIDEV-NOTE: measured (phase F design review, M-15): one 10,000-row
 // package_hash chunk held the writer about 80 ms over a 600,000-row table
-// with its four indexes. Re-measure before raising it.
+// with its four indexes. Measured again 2026-10-28, Task 2's probe of the
+// GC and upstream hardening plan: 120-240 ms a chunk, median 149-191 ms,
+// over ~700,000 package_hash rows, no -race, a loaded 12-thread laptop.
+// Re-measure before raising it.
 const retiredChunkRows = 10_000
 
 // effectiveChunkRows is the rows one sub-job C transaction deletes for a
@@ -419,20 +475,30 @@ func effectiveChunkRows(maxRows int) int {
 // AIDEV-NOTE: a retired snapshot never serves, vouches or becomes current
 // again (CommitAdoption refuses it; every reader filters retired_at), and
 // its suite holds no adoption of it — every retirer holds the suite's
-// mutex (spec C9) — so it is deleted with no grace. Its pins were released
-// when it stopped being current (displacement, the reap's or quarantine's
-// Step-8 decrement); deleting its rows and header only drops the
-// references the blob pass's reachability predicate reads, so its blobs go
-// at the next blob pass once blob_grace has passed. Two callers delete
-// them: a periodic tick's snapshot pass, whose blobs normally go in the
-// same tick's blob pass, and internal/gc's retired run an hour after a
-// start (gc.interval over an hour; the final review's R3 #2), which runs
-// no blob pass, so its blobs go at the next start's startup pass or the
-// next periodic tick. The startup pass runs no sub-job C (ruling PF-15),
-// and a pass or run that hits its deadline leaves the rest to a later one:
-// a retired snapshot normally goes within two periodic GC ticks of its
-// retirement, or an hour after the next start. Chunking bounds the
-// writer's hold on a large suite (tens of thousands of package_hash rows).
+// mutex (spec C9), but for sub-job B (RunSnapshotGCBatch with
+// retireDisplaced: DN-7 of the GC and upstream hardening plan), which
+// holds none: B retires only adopted, non-current snapshots, and
+// CommitAdoption, the only writer that points current_snapshot_id at a
+// snapshot, commits only an unadopted candidate, so a displaced snapshot B
+// retired never becomes current again — so it is deleted with no grace.
+// Its pins were released when it stopped being current (displacement, the
+// reap's or quarantine's Step-8 decrement); deleting its rows and header
+// only drops the references the blob pass's reachability predicate reads,
+// so its blobs go at the next blob pass once blob_grace has passed. Three
+// callers delete them: a periodic tick's snapshot pass and the startup
+// pass's (ruling PF-15, re-ruled for issue #14), whose blobs normally go
+// in the same tick's or start's blob pass, and internal/gc's retired run
+// (gc.interval over an hour; the final review's R3 #2), an hour after a
+// start and again hourly while a run or a tick's snapshot pass ends at its
+// deadline with a backlog left (issue #14), which runs no blob pass, so
+// its blobs go at the next periodic tick or start. A pass or run that hits
+// its deadline leaves the rest to a later one: a retired snapshot goes in
+// the tick that retired it, or within the hours after it, the hourly runs
+// draining a backlog at up to one max_tick_duration an hour; before issue
+// #14's fix a retirement rate above one tick's capacity grew the backlog
+// without bound (the final review 2's G2-I2). Chunking bounds the
+// writer's hold on a large suite (tens of thousands of package_hash
+// rows).
 func (c *Cache) RunRetiredSnapshotGCChunk(ctx context.Context, maxRows int) (reaped int, more bool, err error) {
 	maxRows = effectiveChunkRows(maxRows)
 	// The op writes gotReaped/gotMore, never the named results: on a

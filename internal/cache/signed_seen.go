@@ -135,12 +135,14 @@ func (c *Cache) CheckUnsignedDowngrade(ctx context.Context, host, suite string) 
 //     its twin: the current snapshot, or a displaced one the legacy trust
 //     audit left queued, and so unmarked, after an I/O fault.
 //
-// A retired snapshot (quarantined by the audit, or reaped) is no history:
-// its trust was removed — a suite-row delete (cap eviction, a reap, POST
-// /forget) turns the second clause into a marker before it retires the
-// suite's snapshots (markSnapshotHistoryTx, ruling PF-12). A read error is
-// returned as it is. (Moved here from adoption.go beside the markers it
-// reads, deferred minor E-5.)
+// A retired snapshot (quarantined by the audit, reaped, or retired by GC
+// sub-job B beyond gc.keep_displaced: DN-7) is no history: its trust was
+// removed — a suite-row delete (cap eviction, a reap, POST /forget) turns
+// the second clause into a marker before it retires the suite's snapshots
+// (markSnapshotHistoryTx, ruling PF-12), and B never retires one the audit
+// left queued, unmarked (ruling R-H1). A read error is returned as it is.
+// (Moved here from adoption.go beside the markers it reads, deferred minor
+// E-5.)
 //
 // AIDEV-NOTE: one rule and one SQL at both never-downgrade points, so the
 // early exits can never admit what the commit refuses. Either scheme counts

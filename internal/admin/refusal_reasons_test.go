@@ -17,6 +17,7 @@ func TestRefusalKeepsCurrent_OnlyUpstreamOlderAndRollback(t *testing.T) {
 		cache.ReasonUnsignedUnconfirmed:      false,
 		cache.ReasonUnsignedTooLarge:         false,
 		cache.ReasonAnchorAbsent:             false,
+		cache.ReasonSignerDowngrade:          false, // upstream moved on; the suite is behind it
 		"refused":                            false, // classifyAdoptionReason's fallback
 	} {
 		if got := refusalKeepsCurrent(reason); got != want {

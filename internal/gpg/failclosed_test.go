@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
+	"github.com/linsomniac/apt-cacher-ultra/internal/apttext"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
@@ -128,8 +129,12 @@ func TestVerifyInline_EmptyKeyringSaysSo(t *testing.T) {
 // StartsWithGPGClearTextSignature in apt-pkg/contrib/fileutl.cc, which
 // strips only trailing whitespace with _strrstrip, apt-pkg/contrib/
 // strutl.cc; spec §3's probes of real apt agree) — so the verifier refuses
-// it too, as malformed_clearsign, and the handler's sniff agrees. Trailing
-// blanks on the marker line are stripped by apt and accepted here.
+// it too, as malformed_clearsign, and the handler's sniff agrees. A CR
+// after the marker (nginx's CRLF InRelease) is stripped by every apt but
+// 1.2 and accepted here; trailing blanks, which the current apt strip too,
+// are refused (T6: apt 1.2, ubuntu:16.04, refuses anything after the
+// marker; the hardening plan's Task 9e, ruling HD-19), while the handler's
+// sniff, looser, still accepts them (the fail-safe direction).
 func TestVerifyInline_FollowsAptsFirstLineRule(t *testing.T) {
 	signer := newTestEntity(t, "Signer", "signer@example.com")
 	v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t, signer), RequireSignature: true, Logger: silentLogger()})
@@ -153,19 +158,31 @@ func TestVerifyInline_FollowsAptsFirstLineRule(t *testing.T) {
 			t.Errorf("%s: the handler's sniff accepts a body adoption refuses", name)
 		}
 	}
-	trailing := bytes.Replace(good, []byte(clearsignBeginMarker+"\n"), []byte(clearsignBeginMarker+" \t\r\n"), 1)
-	if bytes.Equal(trailing, good) {
+	cr := bytes.Replace(good, []byte(apttext.ClearsignBeginMarker+"\n"), []byte(apttext.ClearsignBeginMarker+"\r\n"), 1)
+	trailing := bytes.Replace(good, []byte(apttext.ClearsignBeginMarker+"\n"), []byte(apttext.ClearsignBeginMarker+" \t\r\n"), 1)
+	if bytes.Equal(cr, good) || bytes.Equal(trailing, good) {
 		t.Fatal("test premise: the marker line was not rewritten")
 	}
-	if _, err := v.VerifyInline(context.Background(), newSuite(), trailing); err != nil {
-		t.Fatalf("trailing blanks on the marker line: %v, want accepted (apt strips them)", err)
+	if _, err := v.VerifyInline(context.Background(), newSuite(), cr); err != nil {
+		t.Fatalf("a CR after the marker: %v, want accepted (nginx's layout)", err)
+	}
+	_, err = v.VerifyInline(context.Background(), newSuite(), trailing)
+	if !errors.Is(err, ErrMalformedClearsign) || ruleOf(err) != "T6" {
+		t.Fatalf("trailing blanks on the marker line: %v (rule %q), want malformed_clearsign by T6 (apt 1.2 refuses them)", err, ruleOf(err))
+	}
+	if !aptpath.SniffInRelease(trailing) {
+		t.Error("the handler's sniff refuses trailing blanks on the marker line; it is looser than adoption")
 	}
 }
 
 // Deferred minor D-6: the accept leg end to end for an envelope whose
-// every line ends in CRLF and whose marker line carries trailing blanks —
-// DecodableClearsign then hands go-crypto an LF marker line before CRLF
-// lines: it verifies, and the handler's sniff accepts it too.
+// every line ends in CRLF — apt's splitter (internal/apttext, AptLine)
+// strips the CRs from every line, as it did DecodableClearsign's LF marker
+// line before go-crypto's decoder until Task 9b: it verifies, and the
+// handler's sniff accepts it too. Its marker line also carried trailing
+// blanks until the hardening plan's Task 9e, whose T6 refuses them now (apt
+// 1.2 refuses them); the sniff still accepts that body, the fail-safe
+// direction.
 func TestVerifyInline_AcceptsACRLFEnvelopeWithABlankPaddedMarker(t *testing.T) {
 	signer := newTestEntity(t, "Signer", "signer@example.com")
 	v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t, signer), RequireSignature: true, Logger: silentLogger()})
@@ -173,18 +190,21 @@ func TestVerifyInline_AcceptsACRLFEnvelopeWithABlankPaddedMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	crlf := bytes.ReplaceAll(clearsignWith(t, signer, []byte(fakeReleasePlaintext)), []byte("\n"), []byte("\r\n"))
-	body := bytes.Replace(crlf, []byte(clearsignBeginMarker+"\r\n"), []byte(clearsignBeginMarker+" \t\r\n"), 1)
-	if bytes.Equal(body, crlf) {
+	padded := bytes.Replace(crlf, []byte(apttext.ClearsignBeginMarker+"\r\n"), []byte(apttext.ClearsignBeginMarker+" \t\r\n"), 1)
+	if bytes.Equal(padded, crlf) {
 		t.Fatal("test premise: the marker line was not rewritten")
 	}
-	if !aptpath.SniffInRelease(body) {
-		t.Fatal("the handler's sniff refuses a body adoption accepts")
+	if !aptpath.SniffInRelease(crlf) || !aptpath.SniffInRelease(padded) {
+		t.Fatal("the handler's sniff refuses a CRLF body")
 	}
-	out, err := v.VerifyInline(context.Background(), newSuite(), body)
+	out, err := v.VerifyInline(context.Background(), newSuite(), crlf)
 	// The exact signed text: the CRLF lines decode to the LF text that was
 	// signed (review M-1).
 	if err != nil || !bytes.Equal(out, []byte(fakeReleasePlaintext)) {
 		t.Fatalf("VerifyInline = %q, %v; want the signed text %q", out, err, fakeReleasePlaintext)
+	}
+	if _, err := v.VerifyInline(context.Background(), newSuite(), padded); ruleOf(err) != "T6" {
+		t.Fatalf("a CRLF envelope whose marker line carries blanks: %v (rule %q); want T6", err, ruleOf(err))
 	}
 }
 

@@ -38,6 +38,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/servertls"
+	"github.com/linsomniac/apt-cacher-ultra/internal/usage"
 )
 
 // BuildInfo carries the version information that cmd reads from
@@ -54,6 +55,7 @@ type BuildInfo struct {
 // Config wires the admin listener to its dependencies. All fields
 // are required; New returns an error on any nil dependency.
 type Config struct {
+	Usage     *usage.Collector // optional; production also collects with admin disabled
 	TLS       *tls.Config
 	ServerTLS func() map[string]servertls.Snapshot
 	ACME      func() *acme.Status

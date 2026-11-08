@@ -13,9 +13,11 @@ import (
 // surrounding RunSnapshotGCBatch:
 //
 //   - Variant 1 (displacement during tick): a snapshot displaced
-//     concurrently with a GC tick is observed in exactly one of two
-//     final states — survives (GC saw it as current) or reaped (GC
-//     saw it as displaced). No torn state. The
+//     concurrently with a periodic GC tick is observed in exactly one
+//     of two final states — survives unretired (GC saw it as current)
+//     or retired (GC saw it as displaced: a periodic tick's sub-job B
+//     retires, and sub-job C deletes it later; DN-7 of the GC and
+//     upstream hardening plan). No torn state. The
 //     `current_snapshot_id NOT IN` clause in §9.6.3's SELECT is the
 //     guarantee.
 //
@@ -36,7 +38,10 @@ import (
 // Variant 1: S1 is current; goroutines concurrently run GC (with
 // keep_displaced=0) and CommitAdoption(S2) which would displace S1.
 // The §9.6.3 SELECT's `NOT IN current_snapshot_id` clause guarantees
-// that whichever op runs first determines whether S1 is reaped.
+// that whichever op runs first determines whether S1 is retired. The
+// batch is a periodic tick's (retireDisplaced): the startup pass, whose
+// batches delete, runs before the freshness scheduler, so no adoption
+// races it.
 func TestChaos_SnapshotGC_DisplacementDuringTick_VariantOne(t *testing.T) {
 	for run := 0; run < chaosRuns; run++ {
 		t.Run(fmt.Sprintf("run-%02d", run), func(t *testing.T) {
@@ -82,7 +87,7 @@ func TestChaos_SnapshotGC_DisplacementDuringTick_VariantOne(t *testing.T) {
 			wg.Add(2)
 			go func() {
 				defer wg.Done()
-				gcResult, gcErr = c.RunSnapshotGCBatch(ctx, 100, 30*60, 0)
+				gcResult, gcErr = c.RunSnapshotGCBatch(ctx, 100, 30*60, 0, true)
 			}()
 			go func() {
 				defer wg.Done()
@@ -97,14 +102,17 @@ func TestChaos_SnapshotGC_DisplacementDuringTick_VariantOne(t *testing.T) {
 				t.Fatalf("CommitAdoption: %v", commitErr)
 			}
 
-			// Final state: S2 is always current. S1 is either still
-			// present-but-displaced (GC ran before CommitAdoption) or
-			// reaped (GC ran after).
-			s1Exists := snapshotExists(t, c, s1)
-			s2Exists := snapshotExists(t, c, s2)
-			if !s2Exists {
-				t.Fatalf("S2 (current) was reaped — torn state")
+			// Final state: S2 is always current, never retired. S1 is
+			// still there either way — a periodic tick's sub-job B only
+			// retires — and is either not retired (GC ran before
+			// CommitAdoption) or retired (GC ran after).
+			if _, s2Retired := snapshotRetiredAt(t, c, s2); !snapshotExists(t, c, s2) || s2Retired {
+				t.Fatalf("S2 (current): header %v, retired %v — torn state", snapshotExists(t, c, s2), s2Retired)
 			}
+			if !snapshotExists(t, c, s1) {
+				t.Fatalf("S1 was deleted by a periodic tick's sub-job B, which only retires")
+			}
+			_, s1Retired := snapshotRetiredAt(t, c, s1)
 
 			currentID := readCurrentSnapshotID(t, c, "http", "v1.example", "/p")
 			if currentID != s2 {
@@ -112,26 +120,26 @@ func TestChaos_SnapshotGC_DisplacementDuringTick_VariantOne(t *testing.T) {
 			}
 
 			// Either ordering is valid; check the gcResult matches the
-			// final state. If S1 reaped (gcResult.DisplacedReaped >= 1),
-			// then s1Exists must be false.
+			// final state. If S1 retired (gcResult.DisplacedReaped >= 1),
+			// then s1Retired must be true.
 			switch {
-			case s1Exists:
+			case !s1Retired:
 				// GC ran before displacement: S1 was current at SELECT
-				// time, NOT IN candidate set, not reaped.
+				// time, NOT IN candidate set, not retired.
 				if gcResult.DisplacedReaped > 0 {
-					t.Errorf("S1 exists but GC reported displacedReaped=%d — inconsistent",
+					t.Errorf("S1 not retired but GC reported displacedReaped=%d — inconsistent",
 						gcResult.DisplacedReaped)
 				}
-				t.Logf("ordering: GC-first (S1 survived as displaced)")
-			case !s1Exists:
+				t.Logf("ordering: GC-first (S1 current at the SELECT, not retired)")
+			case s1Retired:
 				// GC ran after displacement: S1 was already displaced
 				// by the time SELECT ran, so it WAS in candidate set,
-				// reaped via cascade.
+				// retired.
 				if gcResult.DisplacedReaped != 1 {
-					t.Errorf("S1 reaped but GC reported displacedReaped=%d, want 1",
+					t.Errorf("S1 retired but GC reported displacedReaped=%d, want 1",
 						gcResult.DisplacedReaped)
 				}
-				t.Logf("ordering: Commit-first (S1 reaped)")
+				t.Logf("ordering: Commit-first (S1 retired)")
 			}
 		})
 	}
@@ -183,7 +191,7 @@ func TestChaos_SnapshotGC_HeartbeatLivenessRace_VariantTwo(t *testing.T) {
 			}()
 			go func() {
 				defer wg.Done()
-				gcResult, gcErr = c.RunSnapshotGCBatch(ctx, 100, heartbeatStaleGrace, 0)
+				gcResult, gcErr = c.RunSnapshotGCBatch(ctx, 100, heartbeatStaleGrace, 0, false)
 			}()
 			wg.Wait()
 

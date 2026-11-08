@@ -15,7 +15,8 @@ import (
 //
 // Per-batch behavior mirrors the snapshot pass: SELECT-inside-tx +
 // per-row DELETE + refcount UPDATE, batched at gc.batch_size, capped
-// by the shared per-tick deadline.
+// by the url-path pass's deadline in the tick (passDeadlines: three
+// fifths of gc.max_tick_duration when it begins the tick).
 //
 // Returns cumulative evaluated/stamped/cleared/deleted row counts, a
 // deadline-reached flag, and an error iff a DB-level failure occurred.
@@ -67,7 +68,7 @@ func (g *GC) runURLPathPass(ctx context.Context, deadline time.Time, phase strin
 			return acc, true, nil
 		}
 
-		res, err := g.cfg.Cache.RunURLPathGCBatch(ctx, g.cfg.BatchSize, ttlSeconds, holdSeconds, maxVersions, curScheme, curHost, curPath)
+		res, err := g.store.RunURLPathGCBatch(ctx, g.cfg.BatchSize, ttlSeconds, holdSeconds, maxVersions, curScheme, curHost, curPath)
 		if err != nil {
 			return acc, false, fmt.Errorf("url_path gc batch: %w", err)
 		}

@@ -6,7 +6,8 @@ import (
 )
 
 // I-1 (security review 2026-09): go-crypto v1.4.1's clearsign.Decode
-// panics when a clearsigned message has no plaintext lines. VerifyInline
+// panics when a clearsigned message has no plaintext lines (fixed in
+// v1.5.0). VerifyInline
 // must return an ordinary error in both signature modes, never panic and
 // never hand the envelope back as "unsigned" text.
 func TestVerifyInline_ZeroPlaintextIsAnErrorNotAPanic(t *testing.T) {

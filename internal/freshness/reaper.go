@@ -1000,8 +1000,9 @@ func anchorEvidence(file aptpath.SuiteFile, path string, head []byte) bool {
 }
 
 // sweepReconcileMemo drops the adopter's reconcile memo entries
-// (Adopter.reconciledSnapshots) of snapshots no suite has as its current
-// one in rows (spec C9), so the memo stays bounded by the suite table.
+// (Adopter.reconciledSnapshots, Adopter.reconcileFailedSnapshots) of
+// snapshots no suite has as its current one in rows (spec C9), so the memos
+// stay bounded by the suite table.
 // Without an adopter there is no memo.
 func (r *Reaper) sweepReconcileMemo(rows []cache.SuiteWithAdoption) {
 	if r.checker.adopter == nil {

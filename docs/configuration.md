@@ -207,6 +207,21 @@ cache also escapes `"` `<` `>` `\` `^` `` ` `` `{` `|` `}`, because Go's URL
 handling requires those bytes escaped in a path. Request paths containing a
 decoded control byte are rejected with 400.
 
+An upstream answer of 204 No Content is an empty file only for index and
+metadata files (some registries, GitLab's Debian one among them, serve an
+empty index such as `binary-all/Packages` as 204): a `Release` member an
+adoption fetches (its declared size and hashes still decide, so only a member
+declared empty passes), and a client's request for an index (`Packages*`,
+`Sources*`, `Contents-*`, `Translation-*`, `Components-*`, `icons-*`, a
+`.diff/Index`) or a `by-hash` file, which is cached and served as an empty
+200. For a `.deb` or any other package file, and for a suite's `InRelease`,
+`Release` or `Release.gpg` (apt reads no empty one: it fails `apt update`
+outright, where a 502 only warns and keeps the old lists), a 204 is an
+upstream error: the client gets 502 with `Retry-After`, nothing is cached,
+and hot prefetch counts the `.deb` as failed. The request line's
+`upstream_status` (and `X-Upstream-Status`) is 204 either way, and the fetch
+counts in `acu_fetch_total{outcome="no_content"}`, not `success`.
+
 ### Using an upstream proxy
 
 To chain this cache through another forward proxy (including apt-cacher-ng),
@@ -311,25 +326,21 @@ whether a changed suite is staged and published as a new coherent snapshot.
 
 ### Tracked suites
 
-A suite is tracked once a client fetches its `InRelease` — or, with adoption
-enabled, its `Release` — and the bytes are what they claim (an `InRelease`
+A suite is tracked once a client fetches its `InRelease` or `Release`
+and the bytes are what they claim (an `InRelease`
 starts with the clearsign line apt requires; a `Release` has a hash block):
 an HTML error page or a stub never tracks a suite, and `Release.gpg` never
-does on its own. A suite whose `InRelease` (with adoption enabled, also
-`Release`) an earlier release cached is tracked on its first cache hit. A
+does on its own. A suite whose `InRelease` or `Release` an earlier release
+cached is tracked on its first cache hit. A
 suite path longer than 1024 bytes is never tracked; its files are served
 untracked.
 
-With adoption disabled only `InRelease` tracks a suite, and a refetched
-`InRelease` (after its cached copy was garbage-collected) still counts as a
-successful check, as before. Two things differ from earlier releases: a
-plain-text "InRelease" (no clearsign line; apt rejects it too) no longer
-tracks a suite, and neither does a repository that publishes only `Release`
-and `Release.gpg` (for example pkg.jenkins.io). Earlier releases tracked
-such a repository from its first `Release` hit; one first seen after the
-upgrade is now served as before but not tracked — not checked for changes
-or shown on the status page — while adoption is disabled, and one an
-earlier release already tracks stays tracked.
+With adoption disabled, either `InRelease` or `Release` tracks a suite.
+A refetched anchor counts as a successful check. A changed anchor invalidates
+its suite's mutable metadata, so subsequent requests fetch current files.
+A plain-text "InRelease" without the clearsign line does not track a suite;
+APT rejects it too. Release-only repositories remain tracked and refreshable.
+Existing adopted snapshots still require adoption to publish an update.
 
 At most `max_suites` suites are tracked and at most `max_suites / 10` per
 host. At the total cap, a new suite makes room by evicting the least
@@ -520,8 +531,9 @@ answered — no file asked for, or every real answer a delete — fails. Such
 a repository has no snapshot: it vouches nothing and never changes its
 host's strict posture; on a strict host whose signed suites are complete
 its `.deb`s are refused like any unvouched package. Its index files are
-served with `Last-Modified` the later of the file's time and its last
-refresh, so apt's `If-Modified-Since` sees a replacement. The check logs
+served with their recorded upstream `Last-Modified` dates and content ETags.
+Date-only conditions receive full bodies, so repeated or backward dates cannot
+hide a replacement. The check logs
 `freshness_check` with `result=anchorless_refreshed` or
 `anchorless_unchanged` and the number of files it replaced and deleted
 (`rows_replaced`, `rows_deleted`), and the repository is adopted at the
@@ -591,11 +603,11 @@ declares.
 
 | Key | Type | Default | Behavior and constraints |
 | --- | --- | --- | --- |
-| `enabled` | boolean | `false` | Enable adoption of new snapshots. When false, freshness differences are recorded without adopting them, so tracked suites lag upstream by design: the status page's SUITES vital then reads "ADOPTION DISABLED — METADATA NOT REFRESHED" (stale, not a fault), rows keep their lag text without warning, and failure records left from a time adoption was enabled are inert (no retries, `acu_adoption_failing_suites` reports 0). The suite reaper still runs (see *Suite reaping* under `[gc]`): a suite no client asked for in `gc.suite_idle_ttl` has its cached index files deleted, so clients that come back to it fetch upstream's current files through the cache, which then stay as fetched. |
+| `enabled` | boolean | `false` | Enable adoption of verified snapshots. When false, changes to an unadopted suite’s `InRelease` or `Release` invalidate its mutable cached metadata; subsequent requests fetch current upstream files. Existing adopted snapshots still require adoption to refresh and a changed snapshot emits `legacy_metadata_refresh_failed` at WARN. Failure records from earlier adoption runs remain inert. The suite reaper still runs. |
 | `require_signature` | boolean | `true` | Allows starting with an empty keyring. It no longer relaxes verification: only a decodable clearsigned `InRelease` is adopted as inline metadata in every mode (plain-text bodies are `missing_signature`, undecodable ones `malformed_clearsign`). Unsigned repositories are adopted in the unsigned form instead (`adopt_unsigned`). |
 | `adopt_unsigned` | boolean | `true` | Adopt a repository that publishes a `Release` with no signature (neither `InRelease` nor `Release.gpg`) as an unsigned snapshot: served coherently, but never trusted — it vouches no `.deb` and never counts for `integrity.refuse_unvouched_debs`. A suite the cache has seen signed is never adopted unsigned. `false` refuses every unsigned `Release` ("refused: unsigned_disabled", a state, not a failed check), so the cache no longer keeps unsigned repositories fresh: an unsigned suite already adopted keeps serving its last snapshot, coherent but frozen — never updated — until the knob is turned back on (it then updates at its next retry, at most 75 minutes later: a restart keeps a refusal's retry time), the suite is forgotten (`POST /forget`), or it is reaped after `gc.suite_idle_ttl` without a client. Forgotten or reaped with the knob still off, it is then a repository not yet adopted, which is worse: the forget or reap deletes its cached index files first, so its next requests fetch upstream's current files, but it stays unadopted and each file then stays as the cache first stored it, never refreshed, so an upstream publish can leave its clients with Hash Sum mismatches. Off also stops the refresh of a flat repository that publishes no `Release` at all (see *Flat repositories* under `[freshness]`): it is served as the cache first stored its files, and the status page shows "refused: unsigned_disabled"; turning the knob on resumes its refresh. Set it to `false` only if you do not serve unsigned repositories through the cache. Either way the suite is asked upstream again only at its retry times (2 minutes, doubling to an hour; for a suite not yet adopted, also once `periodic_refresh` has passed), never at the checks clients trigger in between. See *Anchor forms and unsigned repositories* for the safeguards and the threat notes. |
 | `require_pinned_signer` | boolean | `false` | Reject adoption when no `[[trusted_signer]]` matches the canonical host. Evaluated before `accept_any_signer`. |
-| `accept_any_signer` | boolean | `false` | For hosts without matching signer pins, skip both signer trust checks **and cryptographic signature verification**. A decodable clearsigned `InRelease` (or, for the detached pair, a parseable `Release.gpg` signature) is still required, as in every mode. Matching pins keep normal verification. Logs a startup warning. |
+| `accept_any_signer` | boolean | `false` | For hosts without matching signer pins, skip both signer trust checks **and cryptographic signature verification**. The anchor's structure is still checked, as in every mode: an `InRelease`, or an ASCII-armored `Release.gpg`, in the shape the cache accepts, holding at least one signature packet it can parse (a binary `Release.gpg` is refused, and so is every anchor the verifier refuses as `malformed_clearsign` or `malformed_signature`); only the signature checks are skipped, the bad-signature check and the signer downgrade guard included (*Trust and signer pins*). Matching pins keep normal verification. Logs a startup warning. |
 | `allow_short_keyid` | boolean | `true` | Accept signatures containing only a legacy 64-bit issuer key ID when it uniquely identifies a loaded trusted key and cryptographic verification succeeds. `false` requires the long issuer fingerprint. |
 | `keyring_dirs` | array of strings | `[]` | Extra startup keyring directories containing `.gpg` or `.asc` files. Entries must be nonempty absolute paths; nonexistent directories are skipped. Adds to built-in directories and bundled keys. |
 | `architectures` | array of strings | `[]` | Architectures to adopt; empty keeps all. Filters recognized per-architecture Packages, Sources, pdiff indexes, Contents, cnf Commands, and dep11 Components. Use `"source"` for source indexes. Architecture-independent `"all"` content is always retained. |
@@ -614,17 +626,18 @@ When an adoption fails (an untrusted or malformed signature, a member that will 
 
 If the cache cannot read the current snapshot when an adoption starts, the attempt fails as `db_failed` (and is retried on the backoff schedule) rather than skipping the rollback checks below.
 
-Seven outcomes are refusals, not failures, and are shown as "refused: …" on the status page:
+Eight outcomes are refusals, not failures, and are shown as "refused: …" on the status page:
 
 - `upstream_older`: upstream serves a Release whose `Date` is older than the snapshot being served, or has no `Date` at all after a dated snapshot (a missing `Date` counts as 0). apt would ignore it too; the cache keeps serving the newer snapshot.
 - `rollback_refused`: upstream serves content identical to an older snapshot the cache already replaced (a flapping mirror). Only the last `gc.keep_displaced` snapshots are remembered for this.
+- `signer_downgrade`: the new anchor has lost the strong signer the suite's current anchor has, the shape of an on-path strip, or of a vendor's rotation to a key the keyring lacks; the current snapshot keeps serving (see *Trust and signer pins*). It keeps its lag.
 - `unsigned_unconfirmed`: an unsigned repository's first adoption waits for a second observation of the same `Release` (see *Anchor forms and unsigned repositories*).
 - `unsigned_downgrade_refused`: the suite has been seen signed, so its unsigned `Release` is not adopted.
 - `unsigned_too_large`: an unsigned `Release` declares more than 1,000 files.
 - `unsigned_disabled`: `adopt_unsigned = false`, so an unsigned `Release` is not adopted; an unsigned suite already adopted keeps serving its last snapshot, not updated, until the knob is turned back on, the suite is forgotten (`POST /forget`), or it is reaped after `gc.suite_idle_ttl` without a client. Forgotten or reaped with the knob still off, it is then a repository not yet adopted, served as the cache first stored its files (see `adopt_unsigned`). A flat repository that publishes no `Release` at all is refused this way too while the knob is off: it is not refreshed (see *Flat repositories*).
 - `anchor_absent`: the suite's current anchor file is gone upstream, or a detached suite's changed `Release` comes without its `Release.gpg`; its snapshot keeps serving, and the suite moves to its other signed form when upstream serves one. A suite without a snapshot whose upstream serves neither `InRelease` nor `Release` shows it too (unless it is a flat repository the cache has never seen signed: see *Flat repositories*). While a failed adoption of the suite is recorded (its move to the other form failed), the status page shows that failure's reason instead, and the suite is paced the same way.
 
-Refused content follows the same retry schedule as a failure, but a refusal is a state, not a failure: it logs INFO (`adoption_refused`, and `adoption_run_failed` at INFO) and is not counted by `acu_adoption_failing_suites`. `upstream_older` and `rollback_refused` show no lag (the cache already serves content at least as new as upstream's); the other five keep their lag, because the suite is in fact behind. A refusal that lasts more than 24 hours is escalated anyway, because it may be a silent freeze (a vendor that stops emitting `Date` is refused `upstream_older` forever): the status page warns on its row and on the SUITES vital ("REFUSED 24H+", never critical) and the log carries WARN `adoption_refused_persistently` at the streak milestones.
+Refused content follows the same retry schedule as a failure, but a refusal is a state, not a failure: it logs INFO (`adoption_refused`, and `adoption_run_failed` at INFO), is counted by reason in `acu_adoption_refused_total{reason}`, and is not counted by `acu_adoption_failing_suites`. `upstream_older` and `rollback_refused` show no lag (the cache already serves content at least as new as upstream's); the other six keep their lag, because the suite is in fact behind. A refusal that lasts more than 24 hours is escalated anyway, because it may be a silent freeze (a vendor that stops emitting `Date` is refused `upstream_older` forever): the status page warns on its row and on the SUITES vital ("REFUSED 24H+", never critical) and the log carries WARN `adoption_refused_persistently` at the streak milestones.
 
 A Release dated more than 10 seconds ahead of the cache's clock is a failure (apt rejects it as "not valid yet"); check the cache host's clock if this persists.
 
@@ -646,7 +659,7 @@ apt fetches a suite's `InRelease` (or `Release`) first and its indexes after, on
 
 A client that received the old `InRelease` therefore either finished receiving it at least `flip_quiet_period` before the switch, or waited and got the new one, so the index requests it sends within that period of its `InRelease` match it — also when many suites share its connection (mirror mode, or more than ten hosts). The period runs from when the cache finished sending, so on a slow link it is slightly shorter for the client. A client that fetches many indexes over a slow link may send some later than that; for a repository whose `Release` declares `Acquire-By-Hash: yes` (most distribution archives) apt asks for those by hash, and they are still served from the snapshot they name (below); many third-party and flat repositories do not declare it, and for them the switch's wait is the only protection. A switch takes at most 60 s + 60 s + 20 s plus its commit; `adoption.max_duration` does not cut it short. A shutdown abandons it at once: at the signal the daemon answers the waiting requests and abandons every switch that has not started its commit (nothing is committed or recorded, the adoption logs INFO `adoption_abandoned_at_shutdown` and is not counted as an adoption outcome, and the change is adopted after the restart). The first adoption of a suite whose `InRelease` (for a detached suite, `Release`) is exactly the one clients were already being served skips the wait, unless the daemon is stopping. Each switch logs `adoption_flip_barrier`; `acu_flip_barrier_active` shows how many switches are waiting or holding now, and the `request` line of an `InRelease`/`Release` request that waited in a hold carries `flip_held_ms`.
 
-Residuals, each with a counter: a hold whose suite is still not quiet 15 s in — an `InRelease`/`Release` response still being sent then, or finished less than `flip_quiet_period` before (a client reading it more than 20 s − 5 s − `flip_quiet_period`, 5 s by default, into the hold: a slow, stalled or vanished client) — commits then; the waiting requests get the new snapshot, but such a late reader may fetch indexes that do not match the `InRelease` it got (`acu_flip_quiet_cut_short_total`); a commit that has not finished 20 s into the hold (very large suites) ends the hold anyway, and the waiting requests are answered from the snapshot still current then, so they may get indexes newer than their `InRelease` (`acu_flip_hold_expired_total`); a switch that waits 60 s for its turn commits without holding (`acu_flip_hold_skipped_total`; it takes three or four long holds ahead of it, so at least four suites switching at once, which needs `freshness.max_concurrent_adoptions` of 4 or more, or `0`); beyond 256 requests waiting in one hold, the next are answered at once (`acu_flip_waiters_over_cap_total`); and `InRelease`/`Release` responses that take 30 s or longer to send (very slow links) are not waited for (`acu_flip_slow_anchor_reads_total`). An alert on `rate(acu_flip_hold_expired_total)` catches commits slower than the hold. apt clients configured with an `Acquire::http::Timeout` below 20 s can time out while held; set `flip_quiet_period = "0s"` if you run such clients. A client still holding an older `InRelease` that asks for indexes by hash is still served: a by-hash file the current snapshot lacks is served from the newest `gc.keep_displaced` + 1 displaced snapshots of its suite (none when `gc.keep_displaced = 0`; `acu_serve_byhash_displaced_total`; the request line carries `snapshot_displaced`). Snapshot `InRelease`, `Release` and `Release.gpg` responses carry the snapshot's adoption time as `Last-Modified`, which grows with every switch — also for two switches in the same second and whatever the clock does — so `If-Modified-Since` never hides a new snapshot.
+Residuals, each with a counter: a hold whose suite is still not quiet 15 s in — an `InRelease`/`Release` response still being sent then, or finished less than `flip_quiet_period` before (a client reading it more than 20 s − 5 s − `flip_quiet_period`, 5 s by default, into the hold: a slow, stalled or vanished client) — commits then; the waiting requests get the new snapshot, but such a late reader may fetch indexes that do not match the `InRelease` it got (`acu_flip_quiet_cut_short_total`); a commit that has not finished 20 s into the hold (very large suites) ends the hold anyway, and the waiting requests are answered from the snapshot still current then, so they may get indexes newer than their `InRelease` (`acu_flip_hold_expired_total`); a switch that waits 60 s for its turn commits without holding (`acu_flip_hold_skipped_total`; it takes three or four long holds ahead of it, so at least four suites switching at once, which needs `freshness.max_concurrent_adoptions` of 4 or more, or `0`); beyond 256 requests waiting in one hold, the next are answered at once (`acu_flip_waiters_over_cap_total`); and `InRelease`/`Release` responses that take 30 s or longer to send (very slow links) are not waited for (`acu_flip_slow_anchor_reads_total`). An alert on `rate(acu_flip_hold_expired_total)` catches commits slower than the hold. apt clients configured with an `Acquire::http::Timeout` below 20 s can time out while held; set `flip_quiet_period = "0s"` if you run such clients. A client still holding an older `InRelease` that asks for indexes by hash is still served: a by-hash file the current snapshot lacks is served from the newest `gc.keep_displaced` + 1 displaced snapshots of its suite (none when `gc.keep_displaced = 0`; `acu_serve_byhash_displaced_total`; the request line carries `snapshot_displaced`). Snapshot `InRelease`, `Release` and `Release.gpg` responses carry their recorded upstream dates as `Last-Modified` and content-based ETags. Date-only conditions receive full bodies, so `If-Modified-Since` cannot hide a new snapshot, even across same-second switches or clock changes.
 
 ### Trust and signer pins
 
@@ -654,7 +667,105 @@ The default trust set combines bundled archive keys with `.gpg`/`.asc` files in
 `/etc/apt/trusted.gpg.d`, `/etc/apt/keyrings`, `/usr/share/keyrings`, and
 `keyring_dirs`. Keys are read at startup. Without a matching signer pin, any
 loaded trusted key can verify a suite; the cache does not derive per-source
-restrictions from a client's `Signed-By` configuration.
+restrictions from a client's `Signed-By` configuration. The cache refuses an
+anchor that carries a bad signature from any key in its keyring (reason
+`bad_signature`), as apt does with gpgv (`debian:13`'s apt, which verifies
+with sqv, refuses only a lone one), except under `accept_any_signer`'s
+bypass, which verifies no signature; install in the cache every key your
+clients' `signed-by` names, so that it refuses what they would. Key
+files are read as the apt clients read them, every block and the keys
+before junk (where clients differ, the cache reads what any of them reads:
+`docs/open-decisions.md`), and a revocation or expiry the cache cannot
+read stops that key from counting, as gpgv honours it (INFO
+`keyring_key_marked` names each such key at start); a file the cache
+skips, or reads only in part, is named at start by WARN
+`keyring_file_skipped`, `keyring_file_truncated` or `keyring: parse
+failed; skipping file`. A key that does not count is
+reported as `crypto_verify_failed`. For a key the cache marks, the
+`adoption_gpg_failed` line names the key and why (`its key … is not
+counted: …`); for go-crypto's "key expired" or "signature made by
+revoked key" it gives only the cause, and the key is the suite's signing
+key: the cache has no view that names it, so read the issuer from the
+upstream anchor (`gpg --list-packets` on its `InRelease` or
+`Release.gpg`) and find that fingerprint on the status page's keyring
+panel. A revoked or expired key needs the vendor's current key file
+(check the vendor's key status: most vendors publish a renewed or
+replacement key where they published the first), and a key marked for a
+revocation, expiry or binding the cache cannot read needs the same:
+every gpgv-based apt refuses such a key too, but for a few unusual
+layouts the cache marks fail-closed where apt does not (*Open* in
+`docs/open-decisions.md`: "Key files and anchors the cache refuses where
+every apt accepts them"); install it and restart.
+
+The verifier refuses an anchor whose format any supported apt refuses —
+the six current client images and the five older ones its corpus is
+measured on (`e2e/apt-oracle/README.md`), an older client's refusal
+counting only for a shape no real signer writes — and, beyond that, any
+anchor outside the canonical shape real signers write: a second armor
+block, armor lines over 76 characters, bytes left inside a signature
+packet, a packet of an algorithm it does not read (SHA-224, SHA3-256),
+among others, refused as
+`malformed_clearsign` (an `InRelease`) or `malformed_signature` (a
+`Release.gpg`) even where apt would accept them; the status page shows
+the reason, and the `adoption_gpg_failed` log line names the rule. No setting widens
+it. A signature hashed with SHA-1 never counts, as every measured apt
+from 1.6 on (Ubuntu 18.04, Debian 10 and later) does not count it (apt 1.2
+and 1.0, on Ubuntu 16.04 and 14.04, still do). An anchor that holds a
+version 3 signature packet is refused, even beside a version 4 one
+(`debian:13`'s apt refuses one too; older OBS-built repositories, such as
+pkgs.k8s.io's v1.30, publish one). Key strength is not judged: the cache
+counts what the gpgv-based apt count, an RSA-1024, DSA or SHA-1-bound key
+included, which `debian:13`'s sqv and the newer Ubuntu releases refuse,
+and an EdDSA or ECDSA key, which gpgv 1.4 (Ubuntu 16.04 and 14.04)
+cannot use; only the signer downgrade guard below follows the newest
+clients' key policy.
+
+The signer downgrade guard covers the strip of a strong signature beside
+a weak one: when the suite's current anchor, verified again with the same
+keyring, has a *strong* signer — a key `debian:13`, `ubuntu:24.04` and
+`ubuntu:26.04` all accept (Ed25519, ECDSA P-256 or P-384, or RSA of 2048
+bits or more, until 2030-02-01 for 2048, bound with SHA-256 or better) —
+and a new anchor has none, the new anchor is refused (refusal
+`signer_downgrade`) and the current snapshot keeps serving, its lag
+showing. WARN `adoption_signer_downgrade` names the current strong signer,
+the new anchor's counted signers (`new_signers`) and every other signature
+of it with why it did not count (`uncounted_signers`), and
+`acu_adoption_refused_total{reason="signer_downgrade"}` counts each
+refused attempt, apart from the benign refusals. It cannot see a strip at
+a suite's first adoption, and stands down for a suite whose current anchor
+has no strong signer. The refusal clears by itself when the vendor signs
+again with a strong key the keyring holds. A vendor that rotates to a new
+strong key the keyring does not hold yet, and keeps a weak co-signer, is
+refused too: then `uncounted_signers` names the new key, `not in the trust
+set`, which a strip does not show. The recourses, in this order:
+
+1. **Install the vendor's new key**, once you have confirmed it out of
+   band (the vendor's announcement, its site or its key-rotation notice),
+   and restart: the keyring is read only at start. This is the recourse
+   for a rotation, and it keeps the guard on: the next candidate has a
+   strong signer again. The refusal keeps its retry time across the
+   restart, so the suite adopts at that retry (at most 75 minutes later).
+2. Otherwise, confirm out of band that the vendor really dropped its
+   strong signer, because the next two recourses adopt the very anchor
+   the guard refused, which an on-path strip also produces. Then
+   `POST /forget` the suite, which adopts the new anchor as a first
+   adoption (the recourse for a bundled key); its `/.` twin and its copy
+   under the other scheme are separate suites, each refused until it is
+   forgotten too (*Forgetting a suite* under `[gc]`).
+3. Or remove the old strong key from the keyring. The guard then stands
+   down for the suite until a strong key is installed again. Removing it
+   has costs: the cache reads the host's own apt key directories, so the
+   host's own apt loses the key too, and a key file a package installed
+   comes back at the package's next upgrade; where the vendor's strong
+   and weak keys share one `.asc` file, removing the strong one means
+   editing the vendor's file; the bundled Debian, Ubuntu and Ubuntu Pro
+   keys cannot be removed; every other suite that key signs stops counting
+   it (`untrusted_signer` there); it needs a restart; and the refusal
+   keeps its retry time across the restart.
+
+`accept_any_signer` would clear the refusal too, by verifying no signature
+for the host's suites (no anchor has a strong signer under its bypass): it
+is not a recourse.
 
 `accept_any_signer = true` makes client-side apt verification the trust boundary
 for unpinned suites: the cache continues serving the original signed bytes, but
@@ -796,10 +907,11 @@ adopts unsigned. Under the default allow-all upstream policy
 with adoption enabled, a LAN client can make the cache adopt unsigned
 directories it controls; that is bounded by the per-host adoption slot,
 the reserved slot, `max_duration`, the 1,000-file cap and
-`freshness.max_suites`, but not in bytes: each file can be as large as
-its server sends within `upstream.total_timeout` (no response-body
-ceiling, and gzip is decompressed in transit: the 2026-09 security
-review's A-2 and VA-3, open), and an adopted file stays while its
+`freshness.max_suites`, and in bytes by the sizes its own
+`Release` declares: each file's download stops at its declared
+size, and nothing is decompressed in transit (the 2026-09 security
+review's A-2 and VA-3), but an unsigned `Release` declares what its
+server wants, and an adopted file stays while its
 snapshot is current or kept displaced, until the suite is reaped or
 forgotten. To harden, set `adopt_unsigned = false` (unsigned
 suites already adopted then stay at their last snapshot, see safeguard 1)
@@ -813,12 +925,13 @@ optional file that lists only a SHA512 hash and fails its integrity check
 is not retried by automatic repair; the reconcile on unchanged checks
 still heals the index files apt requests.
 
-A `Release.gpg` in binary form (not ASCII-armored) is accepted: the cache
-adopts a repository that publishes `Release` with such a signature. apt
-2.2 to 3.2 refuse it, through the cache or directly ("Detached signature
-file … is in unsupported binary format"), so such a repository is
-unusable unless it also publishes an `InRelease`, which apt then uses
-instead (Jitsi's repository does).
+A `Release.gpg` in binary form (not ASCII-armored) is refused, as apt 2.2
+to 3.2 refuse it, through the cache or directly ("Detached signature
+file … is in unsupported binary format"): the cache does not adopt a
+`Release` with such a signature (reason `malformed_signature`, as for a
+`Release.gpg` with bytes around its armor). Such a repository is usable
+only if it also publishes an `InRelease`, which apt and the cache then
+use instead (Jitsi's repository does).
 
 ### Architecture and member availability
 
@@ -908,7 +1021,7 @@ Keep `ca/`: unless `tls_mitm.ca_storage_dir` is set, it holds the MITM CA the ca
 for every client that trusts the old one. The rest of `cache.dir`,
 `tmp/` and `staging/`, is scratch space that may go too. The audit then
 changes nothing, but the migration before it has:
-the database is at schema 7, which 1.0.x refuses, so going back to 1.0.x
+the database is at schema 9, which older binaries refuse, so going back to 1.0.x
 means restoring the `cache.db` copied before the upgrade: stop the
 daemon first (a refused start runs again every 5 seconds and would
 migrate the copy again, and a copy put back under a running daemon can be
@@ -1055,7 +1168,12 @@ failed`, and `package_hash validate lookup failed` after a download). A
 miss reads the hashes before its download and again after it: when only
 the first read fails (WARN `package_hash_prefetch_lookup_failed`), the
 second decides, and a package strict mode refuses is refused after its
-download rather than served. A read fault never overturns a refusal
+download rather than served; and when the first read found the package
+vouched but no current snapshot vouches it after the download (its
+snapshot retired, or replaced by one that no longer lists it,
+meanwhile), it is decided then as any unvouched package: refused, or
+waited for while a signed adoption runs on its host. A read fault never
+overturns a refusal
 already decided: before refusing a package while no adoption runs on its
 host, the cache reads its hashes once more, in case an adoption has just
 vouched for it, and only hashes found there change the answer — a fault
@@ -1072,8 +1190,8 @@ unvouched package.
 | `enabled` | boolean | `true` | Run startup and periodic garbage collection, including the startup orphan-file scan. `false` disables those passes and logs WARN `gc_disabled`, whose `detail` ends by saying whether suite reaping still runs: `suite reaping still runs: gc.suite_idle_ttl = 720h0m0s …` (the value in Go's duration format), or, with `suite_idle_ttl = "0s"`, `suite reaping is off too (gc.suite_idle_ttl = "0s"), but still deleted are …` and what still deletes then: suites evicted at the `freshness.max_suites` total cap and, daily, signed-seen records of untracked paths last seen over a year ago. It does not stop the suite reaper, which deletes idle suites' cached index files whatever this says (see *Suite reaping*; `suite_idle_ttl = "0s"` turns its reaping off). |
 | `interval` | duration | `"24h"` | Delay after a GC tick completes before the next periodic tick. Must be positive; disable through `enabled`. |
 | `batch_size` | integer | `100` | Maximum URL-path/blob rows processed per GC batch. At least `1`. |
-| `snapshot_batch_size` | integer | `10` | Maximum snapshots removed per batch. Snapshot deletion can cascade through many member rows. At least `1`. |
-| `max_tick_duration` | duration | `"5m"` | Budget for startup/periodic GC passes, checked between batches; remaining work resumes later. The startup pass, which runs before the listeners serve, leaves the retired snapshots (of a reaped, evicted or forgotten suite, or one the upgrade's trust audit quarantined) to a run an hour after the start, when `interval` is longer than an hour, and to the periodic passes (see *Suite reaping*); it deletes only a retired one never adopted whose heartbeat went stale, as it does any abandoned adoption candidate. That run deletes only retired snapshots, within this budget too (INFO `gc_retired_run_complete`). Must be positive. |
+| `snapshot_batch_size` | integer | `10` | Maximum snapshots one GC batch handles: abandoned adoption candidates are deleted; displaced snapshots beyond `keep_displaced` are deleted by the startup pass and retired by the periodic runs, whose retired snapshots' rows are then deleted 10,000 rows a transaction, so a large suite never holds the database for long while the cache serves. At least `1`. |
+| `max_tick_duration` | duration | `"5m"` | Budget for one startup or periodic GC run, checked between batches; remaining work resumes later. The run splits it so every pass gets a turn: the URL-path pass stops by three fifths of it, the snapshot pass by four fifths, the blob pass at its end, and a pass that runs out of its share leaves its rest to a later run while the passes after it still run (1 m each, at least, at the default). The startup pass, which runs before the listeners serve, deletes the retired snapshots too (of a reaped, evicted or forgotten suite, one the upgrade's trust audit quarantined, and the displaced snapshots a periodic run retired beyond `keep_displaced`), within its snapshot pass's share, so a start with many of them may keep the listeners closed for up to this budget; what it leaves, a run of that work alone deletes an hour after the start, and again every hour while a run ends with some left, when `interval` is longer than an hour (INFO `gc_retired_run_complete`, within this budget too), as do the periodic passes (see *Suite reaping*). Must be positive. |
 | `blob_grace` | duration | `"5m"` | Grace after a blob's reference count reaches zero before deletion. At least `"1s"`, and greater than twice `heartbeat_interval`. |
 | `keep_displaced` | integer | `3` | Recent displaced snapshots kept per suite for inspection. `0` retains none; must be nonnegative. A displaced snapshot the upgrade's trust audit has not judged yet (one whose pool file it could not read: see *Upgrading an existing cache*) is kept, and takes none of the `keep_displaced` places, until the audit decides it: it may be the suite's only evidence of a signature. Does not by itself retain superseded package binaries. Also bounds retained by-hash: a by-hash request the current snapshot lacks is served from the newest `keep_displaced` + 1 displaced snapshots of its suite, and `0` turns that off (see *Flip consistency*). |
 | `pool_scan_workers` | integer | `4` | Workers for the startup orphan-file scan. At least `1`. |
@@ -1089,9 +1207,46 @@ immediate catch-up run. Existing configuration files that explicitly set
 Less frequent collection retains eligible data longer and can require more disk
 space. The interval controls cleanup only: freshness checks, integrity checks,
 adoption heartbeats, and offline serving remain independent. GC resumes unfinished
-work across ticks in URL-path, snapshot, then blob order; a large backlog can take
-several intervals to drain. `max_tick_duration` is checked between batches and
-does not interrupt a running batch or bound the startup orphan-file scan.
+work across ticks in URL-path, snapshot, then blob order. A pass that reaches its
+share of `max_tick_duration` no longer ends the run: the passes after it still
+run under their own shares, so the blob pass, the one that frees disk, runs at
+every tick whatever the backlog before it, and the retired snapshots left are
+deleted hourly until none is left (when `interval` is longer than an hour; at
+`"1h"` or less the periodic ticks come that often anyway). So a run that ends
+with `deadline_reached=true` (its `gc_run_complete` line,
+`acu_gc_deadline_reached_total`, the status page's *Deadline reached*) is a
+healthy steady state for a busy cache while a backlog drains; look further only
+when `acu_gc_blobs_reaped_total` also stays flat run after run, or the
+`gc_retired_run_complete` lines' `retired_reaped` stop adding up to what the
+periodic runs' `displaced_reaped` retire. `max_tick_duration` is checked
+between batches and does not interrupt a running batch or bound the startup
+orphan-file scan: a batch that waits long for the database (behind adoptions,
+say) can use up the later passes' shares. A blob pass left no time does no
+batch and keeps the rotation, so the next tick runs the blob pass alone, and
+the url-path and snapshot passes wait one more `interval` (a snapshot pass
+left no time runs at the tick after that, after the url-path pass).
+
+**Before 1.1.0 (1.0.x): a cache that keeps growing (issue #14).** In 1.0.x a
+run that reached `max_tick_duration` in its snapshot pass ended there, and the
+next run resumed that pass first, so while the displaced snapshots outran one
+run's budget the blob pass never ran and nothing was freed. The sign:
+`acu_gc_deadline_reached_total` rising while `acu_gc_blobs_reaped_total` stays
+flat (on the status page, *Deadline reached* `true` beside *Blobs reaped* `0`,
+run after run). Until you upgrade:
+
+1. Set `gc.interval = "1h"`. The snapshot pass then gets 24 budgets a day,
+   and once a run drains it, the same run's blob pass frees the disk.
+2. If a run still ends with `deadline_reached=true` and `blobs_reaped=0`,
+   raise `gc.max_tick_duration` (to `"30m"`, say) until a run ends with
+   `deadline_reached=false`, then lower it again. A 1.0.x batch's delete holds
+   the database for seconds whatever the budget, so this lengthens a run, not
+   a transaction.
+3. A restart runs the startup pass with no other writer, which helps, but it
+   may take two restarts: the first can still run out of time before its blob
+   pass.
+
+`keep_displaced` does not help: it changes how many displaced snapshots are
+kept, not how fast they are deleted.
 
 Both heartbeat conditions must hold:
 
@@ -1139,16 +1294,14 @@ snapshots only; a package another suite's snapshot lists keeps that
 one's): with `enabled = true` and a nonzero `url_path_ttl`, GC deletes
 those no client asked for within `url_path_ttl`, after
 `hold_packages.window`, and their pool files after `blob_grace`. GC
-deletes the retired snapshots an hour after each start (when `interval`
-is longer than an hour: a run of that work alone, INFO
-`gc_retired_run_complete`, so a daemon restarted more often than
-`interval` still deletes them) and at each periodic pass, but not in the
-pass at startup, which deletes only a never-adopted one whose heartbeat
-went stale, as it does any abandoned adoption candidate, so a restart
-after many reaps does not keep the listeners closed while they are
-deleted. The pool files nothing else uses then go at the next blob pass
-(the next start's, or the next periodic pass's), once `blob_grace` has
-passed. With `enabled = false` suites are still reaped, but their
+deletes the retired snapshots in the pass at startup, within its share of
+`max_tick_duration` (so a restart after many reaps may keep the listeners
+closed for up to that budget while they are deleted), at each periodic
+pass, and an hour after each start, again every hour while a run ends
+with some left (when `interval` is longer than an hour: a run of that work
+alone, INFO `gc_retired_run_complete`). The pool files nothing else uses
+then go at the same pass's blob pass, or for the hourly runs at the next
+periodic pass's or the next start's, once `blob_grace` has passed. With `enabled = false` suites are still reaped, but their
 snapshots and pool files stay until GC runs again.
 
 A reaped suite whose clients come back is tracked again at their first
@@ -1360,6 +1513,12 @@ The command-line package listing/copy tools remain available.
 
 ## `[admin]`: status, metrics, and maintenance
 
+The status page includes [usage statistics](usage-statistics.md): lifetime and
+since-start traffic, cache hits, savings estimates and average effective transfer
+rates, also available under `usage` in `GET /?format=json`. Collection and
+checkpointing continue with admin disabled; existing admin authentication applies
+when viewing the data. No usage-specific configuration is required.
+
 The separate **HTTP or HTTPS** admin listener serves the status page, `/metrics`, and
 `/healthz`, plus the mutating `POST /reconcile` and `POST /forget` maintenance
 endpoints. It is not a read-only interface. Keep access restricted to trusted
@@ -1427,11 +1586,18 @@ metrics, tuning tradeoffs, and profile-capture commands.
 used (see *Suite reaping* under `[gc]`): its cached index files, its
 snapshots and its row are deleted. The next request for it tracks it again
 as a new repository and, with adoption enabled, adopts what upstream
-serves then. That is the way out of two refusal states: a deliberate
-upstream rollback (refused `upstream_older` or `rollback_refused`), and a
-vendor that stopped signing (`unsigned_downgrade_refused`). The latter
-needs `adoption.adopt_unsigned = true` (the default): with the knob off,
-the forgotten vendor's unsigned repository is not adopted — it is refused
+serves then. That is the way out of three refusal states: a deliberate
+upstream rollback (refused `upstream_older` or `rollback_refused`), a
+vendor that stopped signing (`unsigned_downgrade_refused`), and a vendor
+that dropped its strong signer (`signer_downgrade`). Confirm with the
+vendor out of band first: forgetting adopts the anchor the cache refused,
+which for the last two is also what an on-path attacker produces (for
+`signer_downgrade`, installing a rotated key comes first: *Trust and
+signer pins* under `[adoption]`). A suite's `/.` twin and its copy under
+the other scheme are separate suites: forget each, or it is refused
+again. `unsigned_downgrade_refused` also needs
+`adoption.adopt_unsigned = true` (the default): with the knob off, the
+forgotten vendor's unsigned repository is not adopted — it is refused
 `unsigned_disabled` and served as the cache first stores each of its
 files, never refreshed (see `adopt_unsigned` under `[adoption]`).
 
@@ -1643,3 +1809,21 @@ The matched prefix is replaced with the upstream base path. `/corretto` matches
 `/corretto/dists/...` but not `/corretto-extra/...`. A prefix of `/` catches all
 mirror-mode paths and cannot coexist with another prefix. The selected upstream
 still goes through remapping and upstream access policy.
+
+## HTTP response timestamps and validators
+
+The cache preserves a valid upstream `Last-Modified` date for the URL and bytes
+being served. Local pool mtimes and snapshot adoption times are not exposed as
+upstream modification dates. Missing, invalid and future dates are omitted.
+Dates already saved with URL rows and snapshot anchors survive the schema 8
+upgrade; objects whose upstream dates were never recorded have no date until
+fetched again. Schema 9 then adds persistent usage totals. The migrations are
+forward-only; binaries supporting only schema 8 or earlier cannot open schema 9.
+
+Responses carry a strong content-based ETag. Clients using `If-None-Match` can
+receive 304 responses. Date-only conditional requests receive the full body:
+upstream dates can repeat or move backward, and older cache versions issued
+synthetic dates that could otherwise hide an update. Date-based `If-Range`
+also gets the full body; an ETag-based `If-Range` supports resuming. This trades
+some metadata bandwidth for reliable updates, including clients upgrading
+from earlier versions without clearing their APT lists.

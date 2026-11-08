@@ -239,7 +239,7 @@ func TestSuiteFile_Rules(t *testing.T) {
 	}{
 		{NotSuiteFile, false, false, false, false, SniffHeadBytes},
 		{FileInRelease, true, true, true, true, SniffHeadBytes},
-		{FileRelease, false, true, false, true, ReleaseSniffBytes},
+		{FileRelease, true, true, false, true, ReleaseSniffBytes},
 		{FileReleaseGPG, false, false, true, true, SniffHeadBytes},
 		{FileFlatIndex, false, true, false, true, SniffHeadBytes},
 	}

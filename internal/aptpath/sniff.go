@@ -277,13 +277,13 @@ func hasDistsSegment(p string) bool {
 }
 
 // CreatesRow reports whether a sniff-passing serve of f creates its
-// suite's row (spec C3): InRelease always; Release and flat indexes only
-// with an adopter wired. Release.gpg never does.
+// suite's row: InRelease and Release always (including legacy refresh);
+// flat indexes only with an adopter wired. Release.gpg never does.
 func (f SuiteFile) CreatesRow(adopter bool) bool {
 	switch f {
-	case FileInRelease:
+	case FileInRelease, FileRelease:
 		return true
-	case FileRelease, FileFlatIndex:
+	case FileFlatIndex:
 		return adopter
 	}
 	return false
@@ -324,14 +324,25 @@ func (f SuiteFile) Sniff(path string, head []byte) bool {
 // DecodableClearsign returns b ready for go-crypto's clearsign decoder:
 // when b's first line passes SniffInRelease but carries trailing blanks —
 // which apt's rule ignores and RFC 4880 §6.2 allows after an armor header
-// line, but go-crypto v1.4.1 refuses — it returns a copy whose first line
-// is exactly the marker; otherwise b itself. Nothing else changes, so
+// line, but go-crypto (v1.4.1 to v1.5.2) refuses — it returns a copy whose
+// first line is exactly the marker; otherwise b itself. Nothing else changes, so
 // neither does the signed text.
 //
-// AIDEV-NOTE: ruling R-D2 (phase D): adoption accepts exactly apt's first
-// line. Every decode of an InRelease envelope (the verifier, reconcile's
-// inReleasePlaintext) goes through this, so a body apt accepts is never
-// refused, nor later found undecodable, for its marker line alone.
+// AIDEV-NOTE: ruling R-D2 (phase D) had adoption accept exactly apt's first
+// line. Since the hardening plan's Task 9e adoption is stricter: the
+// verifier's T6 (internal/apttext's Inline) refuses a space or tab after
+// the marker, which every current apt strips but apt 1.2 (ubuntu:16.04)
+// refuses; a CR there (nginx's CRLF layout) is still accepted. This
+// function and SniffInRelease stay looser, by design: the sniff only asks
+// whether a body is an InRelease at all (the fail-safe direction: the
+// verifier refuses what it passes on), and this only readies a body for
+// go-crypto's decoder, which refuses any trailing blank on the marker line.
+// One go-crypto decode is left: the startup audit's
+// (freshness/legacy_audit.go, inReleasePlaintext), which reads anchors
+// adopted before T6 too. The verifier reads the envelope with its own port
+// of apt's splitter since the hardening plan's Task 9b (internal/apttext),
+// and reconcile with the same port since its fix round (the re-review's
+// V-RI1): neither decodes with go-crypto.
 func DecodableClearsign(b []byte) []byte {
 	if !SniffInRelease(b) {
 		return b

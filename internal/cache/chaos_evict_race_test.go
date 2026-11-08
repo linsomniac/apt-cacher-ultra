@@ -146,14 +146,22 @@ func TestChaos_BlobGC_EvictRace_OneZeroNegOne(t *testing.T) {
 			// keep_displaced=0 so all displaced snapshots are eligible.
 			// staleGraceSeconds is irrelevant for sub-job B (displaced
 			// path) — pass any value; we use 30 minutes as the runtime
-			// default would.
-			snapRes, err := c.RunSnapshotGCBatch(ctx, 100, 30*60, 0)
+			// default would. A periodic tick's sub-job B retires S1, its
+			// snapshot_member row kept, and sub-job C deletes it, as the
+			// tick's snapshot pass does before its blob pass (DN-7 of the
+			// GC and upstream hardening plan).
+			snapRes, err := c.RunSnapshotGCBatch(ctx, 100, 30*60, 0, true)
 			if err != nil {
 				t.Fatalf("RunSnapshotGCBatch: %v", err)
 			}
 			if snapRes.DisplacedReaped != 1 {
 				t.Fatalf("snapshot GC: DisplacedReaped = %d, want 1 (S1)", snapRes.DisplacedReaped)
 			}
+			assertRetired(t, c, []int64{s1}, []int64{s2})
+			if n := childRows(t, c, s1); n != 1 {
+				t.Fatalf("S1's child rows after its retirement = %d, want its snapshot_member row (sub-job C's to delete)", n)
+			}
+			drainRetired(t, c)
 			if snapshotExists(t, c, s1) {
 				t.Fatalf("S1 still present after snapshot GC")
 			}

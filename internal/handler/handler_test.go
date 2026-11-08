@@ -21,6 +21,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 	"github.com/linsomniac/apt-cacher-ultra/internal/simtest"
+	"github.com/linsomniac/apt-cacher-ultra/internal/usage"
 )
 
 // silentLogger discards all log output so test failures do not get drowned
@@ -367,6 +368,11 @@ func TestServeHTTP_Coalesced(t *testing.T) {
 	h := newTestHandler(t, nil, nil)
 
 	results := make(chan *httptest.ResponseRecorder, 2)
+	u, err := usage.New(t.Context(), h.cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.usage = u
 	var wg sync.WaitGroup
 
 	// Leader.
@@ -430,6 +436,9 @@ func TestServeHTTP_Coalesced(t *testing.T) {
 	}
 	if miss != 1 || coalesced != 1 {
 		t.Errorf("X-Cache distribution: miss=%d coalesced=%d, want 1/1", miss, coalesced)
+	}
+	if got := u.Snapshot().Lifetime; got.Requests != 2 || got.CacheHitRequests != 1 || got.ServedBytes != int64(2*len(body)) || got.CacheHitBytes != int64(len(body)) {
+		t.Fatalf("coalesced usage: %+v", got)
 	}
 }
 

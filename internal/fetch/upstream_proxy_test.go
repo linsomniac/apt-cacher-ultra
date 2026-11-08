@@ -186,7 +186,7 @@ func TestUpstreamProxy_HTTPAndHTTPS(t *testing.T) {
 				}
 				targetURL := scheme + "://archive.example.com/dists/stable/InRelease?test=1"
 				dst := &bufDst{}
-				if _, err := c.Fetch(context.Background(), &Target{"archive.example.com", targetURL}, dst); err != nil {
+				if _, err := c.Fetch(context.Background(), &Target{CanonicalHost: "archive.example.com", URL: targetURL}, dst); err != nil {
 					t.Fatalf("Fetch through proxy: %v", err)
 				}
 				if dst.String() != body || originHits.Load() != 1 {
@@ -233,7 +233,7 @@ func TestUpstreamProxy_VerifiesTLS(t *testing.T) {
 			}
 			t.Cleanup(SetRootCAsForTest(roots))
 			c := newUpstreamProxyClient(t, Options{Proxy: proxy.URL, AllowedHostRegex: []string{`^` + test.host + `$`}})
-			_, err := c.Fetch(context.Background(), &Target{test.host, "https://" + test.host + "/InRelease"}, &bufDst{})
+			_, err := c.Fetch(context.Background(), &Target{CanonicalHost: test.host, URL: "https://" + test.host + "/InRelease"}, &bufDst{})
 			if err == nil {
 				t.Fatal("Fetch accepted an invalid TLS peer")
 			}
@@ -277,7 +277,7 @@ func TestUpstreamProxy_EmptyIgnoresEnvironment(t *testing.T) {
 		},
 	})
 	dst := &bufDst{}
-	if _, err := c.Fetch(context.Background(), &Target{"archive.example.com", "http://archive.example.com/InRelease"}, dst); err != nil {
+	if _, err := c.Fetch(context.Background(), &Target{CanonicalHost: "archive.example.com", URL: "http://archive.example.com/InRelease"}, dst); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
@@ -313,12 +313,12 @@ func TestUpstreamProxy_ConditionalAndAccessPolicy(t *testing.T) {
 	}))
 	t.Cleanup(proxy.Close)
 	c := newUpstreamProxyClient(t, Options{Proxy: proxy.URL, AllowedHostRegex: []string{`^(archive|cdn)\.example\.com$`}})
-	res, err := c.Conditional(context.Background(), &Target{"archive.example.com", "http://archive.example.com/conditional"}, `"v1"`, "Mon, 01 Jan 2024 00:00:00 GMT", 1024)
+	res, err := c.Conditional(context.Background(), &Target{CanonicalHost: "archive.example.com", URL: "http://archive.example.com/conditional"}, `"v1"`, "Mon, 01 Jan 2024 00:00:00 GMT", 1024)
 	if err != nil || res.Status != http.StatusNotModified || len(res.Body) != 0 {
 		t.Fatalf("Conditional=%+v err=%v", res, err)
 	}
 	for _, conditional := range []bool{false, true} {
-		target := &Target{"blocked.invalid", "http://blocked.invalid/initial"}
+		target := &Target{CanonicalHost: "blocked.invalid", URL: "http://blocked.invalid/initial"}
 		if conditional {
 			_, err = c.Conditional(context.Background(), target, "", "", 1024)
 		} else {
@@ -327,7 +327,7 @@ func TestUpstreamProxy_ConditionalAndAccessPolicy(t *testing.T) {
 		if !errors.Is(err, ErrHostNotAllowed) {
 			t.Fatalf("conditional=%t initial host error=%v", conditional, err)
 		}
-		target = &Target{"archive.example.com", "http://archive.example.com/blocked-redirect"}
+		target = &Target{CanonicalHost: "archive.example.com", URL: "http://archive.example.com/blocked-redirect"}
 		if conditional {
 			_, err = c.Conditional(context.Background(), target, "", "", 1024)
 		} else {
@@ -338,7 +338,7 @@ func TestUpstreamProxy_ConditionalAndAccessPolicy(t *testing.T) {
 		}
 	}
 	dst := &bufDst{}
-	if _, err := c.Fetch(context.Background(), &Target{"archive.example.com", "http://archive.example.com/allowed-redirect"}, dst); err != nil || dst.String() != "redirected" {
+	if _, err := c.Fetch(context.Background(), &Target{CanonicalHost: "archive.example.com", URL: "http://archive.example.com/allowed-redirect"}, dst); err != nil || dst.String() != "redirected" {
 		t.Fatalf("allowed redirect body=%q err=%v", dst.String(), err)
 	}
 	mu.Lock()
@@ -383,7 +383,7 @@ func TestUpstreamProxy_ResumesRange(t *testing.T) {
 	proxyURL.User = url.UserPassword("range-user", "range-secret")
 	c := newUpstreamProxyClient(t, Options{Proxy: proxyURL.String(), MaxRetries: 1})
 	dst := &bufDst{}
-	if _, err := c.Fetch(context.Background(), &Target{"archive.example.com", "http://archive.example.com/package.deb"}, dst); err != nil {
+	if _, err := c.Fetch(context.Background(), &Target{CanonicalHost: "archive.example.com", URL: "http://archive.example.com/package.deb"}, dst); err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
 	if dst.String() != body || attempts.Load() != 2 {
@@ -414,7 +414,7 @@ func TestUpstreamProxy_AuthenticationFailure(t *testing.T) {
 					MaxRetries: 3,
 					Logger:     slog.New(slog.NewTextHandler(&logs, nil)),
 				})
-				target := &Target{"archive.example.com", scheme + "://archive.example.com/InRelease"}
+				target := &Target{CanonicalHost: "archive.example.com", URL: scheme + "://archive.example.com/InRelease"}
 				dst := &bufDst{}
 				var err error
 				if conditional {
@@ -484,7 +484,7 @@ func TestUpstreamProxy_FailureNeverFallsBack(t *testing.T) {
 				proxy.Close()
 			}
 			c := newUpstreamProxyClient(t, Options{Proxy: proxy.URL, MaxRetries: 1, AllowedHostRegex: []string{`^127\.0\.0\.1$`}})
-			_, err := c.Fetch(context.Background(), &Target{"127.0.0.1", origin.URL + "/InRelease"}, &bufDst{})
+			_, err := c.Fetch(context.Background(), &Target{CanonicalHost: "127.0.0.1", URL: origin.URL + "/InRelease"}, &bufDst{})
 			if !errors.Is(err, ErrUpstreamUnavailable) {
 				t.Fatalf("Fetch error=%v, want ErrUpstreamUnavailable", err)
 			}
@@ -518,7 +518,7 @@ func TestUpstreamProxy_TotalTimeoutIncludesCONNECT(t *testing.T) {
 	t.Cleanup(func() { close(release) })
 	c := newUpstreamProxyClient(t, Options{Proxy: proxy.URL, TotalTimeout: 100 * time.Millisecond, MaxRetries: 3})
 	begin := time.Now()
-	_, err := c.Fetch(context.Background(), &Target{"archive.example.com", "https://archive.example.com/InRelease"}, &bufDst{})
+	_, err := c.Fetch(context.Background(), &Target{CanonicalHost: "archive.example.com", URL: "https://archive.example.com/InRelease"}, &bufDst{})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Fetch error=%v, want deadline exceeded", err)
 	}

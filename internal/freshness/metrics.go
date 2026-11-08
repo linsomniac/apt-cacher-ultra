@@ -38,7 +38,11 @@ import (
 // counter by reason: idle, non_canonical, junk);
 // acu_anchorless_sniff_rejected_total (spec C4 Dispatch 4, counter by
 // host); acu_suite_reaper_last_run_unixtime (spec C9, deferred minor
-// F-13, unlabelled gauge). The flip barrier's
+// F-13, unlabelled gauge); acu_adoption_reconcile_failed_total (Task 9b's
+// fix round 2, the re-review's V-R2M1, counter by stage: decision, heal,
+// on_demand); acu_adoption_refused_total (the GC and upstream hardening
+// plan's Task 8, the final review's F2-M2, counter by reason: the closed
+// refusal-reason enum). The flip barrier's
 // acu_flip_hold_skipped_total, acu_flip_hold_expired_total,
 // acu_flip_quiet_cut_short_total, acu_flip_waiters_over_cap_total,
 // acu_flip_slow_anchor_reads_total and
@@ -281,6 +285,32 @@ var (
 		"architecture",
 	)
 
+	// adoptionReconcileFailedTotal counts every adoption_reconcile_failed
+	// line, whatever its level, by stage: decision, heal or on_demand (a
+	// closed enum; Checker.logReconcileFailure). A failing decision is
+	// logged at WARN once per snapshot (the re-review's V-R2M1), so the
+	// count is what shows it recurring.
+	adoptionReconcileFailedTotal = metrics.NewCounterWithCap(
+		"acu_adoption_reconcile_failed_total",
+		"Failed in-place reconciles, by stage: decision (an unchanged check's re-parse of the snapshot's anchor), heal or on_demand (SPEC6_8).",
+		metrics.DefaultMaxSeries,
+		"stage",
+	)
+
+	// adoptionRefusedTotal counts every adoption_refused line (an attempt
+	// ended in a refusal state, recordAdoptionFailure), by reason: one of
+	// cache's closed refusalReasons (cardinality 8), so signer_downgrade —
+	// a possible on-path strip — can be alerted on apart from the benign
+	// refusals that share acu_adoption_total{outcome="refused"} (the final
+	// review's F2-M2). A refusal decided before a slot is taken counts here
+	// too, as it logs adoption_refused.
+	adoptionRefusedTotal = metrics.NewCounterWithCap(
+		"acu_adoption_refused_total",
+		"Adoption attempts that ended in a refusal state (an adoption_refused line), by reason: upstream_older, rollback_refused, unsigned_downgrade_refused, unsigned_unconfirmed, unsigned_too_large, anchor_absent, unsigned_disabled or signer_downgrade.",
+		metrics.DefaultMaxSeries,
+		"reason",
+	)
+
 	adoptionSourcesParsedTotal = metrics.NewCounterWithCap(
 		"acu_adoption_sources_parsed_total",
 		"Sources index files processed during adoption, by outcome (SPEC6_5 §10.3).",
@@ -317,7 +347,8 @@ func classifyAdoptionOutcome(err error) string {
 	}
 	switch {
 	case errors.Is(err, ErrAdoptionUpstreamOlder), errors.Is(err, ErrAdoptionRollbackRefused),
-		errors.Is(err, ErrAdoptionUnsignedDowngradeRefused), errors.Is(err, ErrAdoptionUnsignedTooLarge):
+		errors.Is(err, ErrAdoptionUnsignedDowngradeRefused), errors.Is(err, ErrAdoptionUnsignedTooLarge),
+		errors.Is(err, ErrAdoptionSignerDowngrade):
 		return "refused"
 	case errors.Is(err, ErrAdoptionReleaseDateInFuture):
 		return "release_date_in_future"
@@ -397,6 +428,8 @@ func classifyAdoptionReason(err error, outcome string, gpgClassifier func(error)
 			return cache.ReasonUnsignedDowngradeRefused
 		case errors.Is(err, ErrAdoptionUnsignedTooLarge):
 			return cache.ReasonUnsignedTooLarge
+		case errors.Is(err, ErrAdoptionSignerDowngrade):
+			return cache.ReasonSignerDowngrade
 		}
 		return outcome
 	case "panicked":

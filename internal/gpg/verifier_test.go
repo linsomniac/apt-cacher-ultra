@@ -3,6 +3,8 @@ package gpg
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -10,9 +12,13 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
+	pgperrors "github.com/ProtonMail/go-crypto/openpgp/errors"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/apttext"
 	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
 )
 
@@ -410,8 +416,8 @@ func TestVerifier_RejectsPrefixGarbage(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected rejection for prefix-bearing clearsigned message")
 	}
-	if !bytes.Contains([]byte(err.Error()), []byte("BEGIN marker")) {
-		t.Fatalf("error doesn't mention BEGIN marker: %v", err)
+	if ruleOf(err) != "T1" { // apt: does not start with a signed message block
+		t.Fatalf("err = %v (rule %q); want layer T's T1, the BEGIN marker's line", err, ruleOf(err))
 	}
 	if ClassifyVerifyErr(err) != "malformed_clearsign" { // deferred minor A-51
 		t.Fatalf("reason = %q, want malformed_clearsign", ClassifyVerifyErr(err))
@@ -433,18 +439,23 @@ func TestVerifier_RejectsSuffixGarbage(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected rejection for suffix-bearing clearsigned message")
 	}
-	if !bytes.Contains([]byte(err.Error()), []byte("END marker")) {
-		t.Fatalf("error doesn't mention END marker: %v", err)
+	if ruleOf(err) != "T4" { // apt: unsigned lines
+		t.Fatalf("err = %v (rule %q); want layer T's T4, a line after the END line", err, ruleOf(err))
 	}
 	if ClassifyVerifyErr(err) != "malformed_clearsign" { // deferred minor A-51
 		t.Fatalf("reason = %q, want malformed_clearsign", ClassifyVerifyErr(err))
 	}
 }
 
-func TestVerifier_AcceptsTrailingNewlines(t *testing.T) {
-	// Whitespace-only trailing bytes are conventional (apt's own
-	// InRelease frequently ends with a final newline after the END
-	// marker). The strict guard must allow this.
+// TestVerifier_AcceptsOneFinalNewlineRefusesALineAfterEND (formerly
+// TestVerifier_AcceptsTrailingNewlines, which accepted "\n\n  \r\n" after
+// the END marker): an InRelease conventionally ends with one newline after
+// its END line, LF or CRLF, and that is accepted; but every apt 2.2–3.2
+// refuses any line after the END line, an empty or blank one included (the
+// corpus' i_trail_lf, i_trail_ws, x3i_after_end_cr_line), so the verifier
+// refuses it too (the 2026-09 security review's VC-2; F0 refused it until
+// the hybrid verifier, layer T's T4 now: apt's "unsigned lines").
+func TestVerifier_AcceptsOneFinalNewlineRefusesALineAfterEND(t *testing.T) {
 	signer := newTestEntity(t, "Signer", "signer@example.com")
 	keyring := newKeyring(t, signer)
 	v, _ := NewVerifier(VerifierConfig{
@@ -453,9 +464,19 @@ func TestVerifier_AcceptsTrailingNewlines(t *testing.T) {
 		Logger:           silentLogger(),
 	})
 	body := clearsignWith(t, signer, []byte(fakeReleasePlaintext))
-	withWS := append(append([]byte{}, body...), []byte("\n\n  \r\n")...)
-	if _, err := v.VerifyInline(context.Background(), newSuite(), withWS); err != nil {
-		t.Fatalf("trailing whitespace should be accepted: %v", err)
+	if !bytes.HasSuffix(body, []byte("-----END PGP SIGNATURE-----")) {
+		t.Fatalf("test premise: the clearsigned body does not end with the END marker: %q", body[len(body)-40:])
+	}
+	for _, tail := range []string{"", "\n", "\r\n"} {
+		if _, err := v.VerifyInline(context.Background(), newSuite(), append(append([]byte{}, body...), tail...)); err != nil {
+			t.Errorf("END line, then %q: %v; want accepted", tail, err)
+		}
+	}
+	for _, tail := range []string{"\n\n", "\n\n  \r\n", "\n\r", "\n \n"} {
+		_, err := v.VerifyInline(context.Background(), newSuite(), append(append([]byte{}, body...), tail...))
+		if !errors.Is(err, ErrMalformedClearsign) || ruleOf(err) != "T4" {
+			t.Errorf("END line, then %q: err = %v (rule %q); want ErrMalformedClearsign from T4, a line after the END line", tail, err, ruleOf(err))
+		}
 	}
 }
 
@@ -483,17 +504,22 @@ func TestVerifier_MarkerlessBodyRejectedWhenSignatureOptional(t *testing.T) {
 
 func TestVerifier_MultiSig_StaleAndCurrent(t *testing.T) {
 	// SPEC2 §7.6.3: per-packet verify-and-trust binding. Construct
-	// a clearsigned block with TWO signature packets — both by the
-	// same trusted key, but the FIRST is over different content
-	// (so its hash mismatches when verified against the block's
-	// cleartext). The second is the real one.
+	// a clearsigned block with TWO signature packets, both by trusted
+	// keys: the FIRST is a stale key's — an archive key that has expired
+	// since it signed (as the corpus' E), as during a key rollover — and
+	// the second is the current one, the signer's.
 	//
-	// This exercises the verifyAnyTrusted loop: a "stale" signature
-	// fails crypto, the loop must move on to the "current" one.
-	// Without per-packet iteration the verifier would fail at the
-	// stale packet rather than discovering the current one.
+	// This exercises the verifyAnyTrusted loop: the stale packet fails
+	// its check there (ErrKeyExpired), and the loop must move on to the
+	// current one. Without per-packet iteration the verifier would fail
+	// at the stale packet rather than discovering the current one. (The
+	// stale packet used to be the signer's own signature of another
+	// text; a bad signature from a known key now fails S1 before this
+	// loop runs: TestVerifier_MultiSig_StaleAndCurrentRejects. E's good
+	// signature passes S1, as gpgv's EXPKEYSIG passes apt.)
 	signer := newTestEntity(t, "Signer", "signer@example.com")
-	keyring := newKeyring(t, signer)
+	stale := newExpiredEntity(t, "Stale", "stale@example.com")
+	keyring := newKeyring(t, signer, stale)
 	v, _ := NewVerifier(VerifierConfig{
 		Keyring:          keyring,
 		RequireSignature: true,
@@ -502,8 +528,13 @@ func TestVerifier_MultiSig_StaleAndCurrent(t *testing.T) {
 
 	// Build the real block over fakeReleasePlaintext.
 	realBlock := clearsignWith(t, signer, []byte(fakeReleasePlaintext))
-	// Build a "stale" sig over different cleartext.
-	staleBlock := clearsignWith(t, signer, []byte("Origin: STALE\n"))
+	// Build the stale key's signature of the same text, made while it
+	// was valid (its first second).
+	staleBlock := clearsignAt(t, stale, []byte(fakeReleasePlaintext), stale.PrimaryKey.CreationTime)
+	// Premise: the stale packet alone fails verifyAnyTrusted's check.
+	if _, err := v.VerifyInline(context.Background(), newSuite(), staleBlock); !errors.Is(err, pgperrors.ErrKeyExpired) {
+		t.Fatalf("test premise: the stale key's signature alone: %v; want verifyAnyTrusted's ErrKeyExpired", err)
+	}
 
 	combined, err := buildMultiSigBlock(realBlock, staleBlock)
 	if err != nil {
@@ -519,11 +550,37 @@ func TestVerifier_MultiSig_StaleAndCurrent(t *testing.T) {
 	}
 }
 
+// TestVerifier_MultiSig_StaleAndCurrentRejects: TestVerifier_MultiSig_
+// StaleAndCurrent's former shape, a stale signature by the trusted key
+// (over another text) before the current one, is refused: a bad signature
+// from a known key beside a good one is fatal, as apt's BADSIG is (S1,
+// ErrBadSignature; the corpus' i_badsig_badfirst).
+func TestVerifier_MultiSig_StaleAndCurrentRejects(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	v, _ := NewVerifier(VerifierConfig{
+		Keyring:          newKeyring(t, signer),
+		RequireSignature: true,
+		Logger:           silentLogger(),
+	})
+	realBlock := clearsignWith(t, signer, []byte(fakeReleasePlaintext))
+	staleBlock := clearsignWith(t, signer, []byte("Origin: STALE\n"))
+	combined, err := buildMultiSigBlock(realBlock, staleBlock)
+	if err != nil {
+		t.Fatalf("buildMultiSigBlock: %v", err)
+	}
+	got, err := v.VerifyInline(context.Background(), newSuite(), combined)
+	if !errors.Is(err, ErrBadSignature) || ClassifyVerifyErr(err) != "bad_signature" || got != nil {
+		t.Fatalf("got %q, err %v (reason %q); want ErrBadSignature (bad_signature)", got, err, ClassifyVerifyErr(err))
+	}
+}
+
 func TestVerifier_MultiSig_AllStaleRejects(t *testing.T) {
-	// Inverse of the above: every signature in the block is over
-	// stale cleartext, so none verify against the block's actual
-	// cleartext. The verifier must reject — the loop must NOT
-	// accept on the basis of a packet's IssuerFingerprint alone.
+	// Inverse of TestVerifier_MultiSig_StaleAndCurrent: every signature
+	// in the block is over stale cleartext, so none verify against the
+	// block's actual cleartext. The verifier must reject — never on the
+	// basis of a packet's IssuerFingerprint alone. Since S1, a signature
+	// from a known key that fails is refused before S2's loop runs
+	// (ErrBadSignature, bad_signature).
 	signer := newTestEntity(t, "Signer", "signer@example.com")
 	keyring := newKeyring(t, signer)
 	v, _ := NewVerifier(VerifierConfig{
@@ -543,8 +600,303 @@ func TestVerifier_MultiSig_AllStaleRejects(t *testing.T) {
 		t.Fatalf("substituteSignatures: %v", err)
 	}
 
-	if _, err := v.VerifyInline(context.Background(), newSuite(), combined); err == nil {
-		t.Fatal("expected rejection when all signatures are over stale cleartext")
+	if _, err := v.VerifyInline(context.Background(), newSuite(), combined); !errors.Is(err, ErrBadSignature) || ClassifyVerifyErr(err) != "bad_signature" {
+		t.Fatalf("err = %v (reason %q); want ErrBadSignature (bad_signature) when all signatures are over stale cleartext", err, ClassifyVerifyErr(err))
+	}
+}
+
+// TestVerifyInline_ABadSignatureFromAKnownKeyRejects: S1 (DN-5,
+// requireKnownSignaturesVerify), the 2026-09 security review's VC-1. An
+// InRelease that carries, beside A's good signature, a signature that names
+// A and does not verify — A's signature of another text — is refused in
+// either order (ErrBadSignature, reason bad_signature), as gpgv's BADSIG
+// makes every gpgv-based apt refuse it (the corpus' i_badsig_badfirst and
+// i_badsig_goodfirst). S2 alone accepts both, on the good packet.
+func TestVerifyInline_ABadSignatureFromAKnownKeyRejects(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t, signer), RequireSignature: true, Logger: silentLogger()})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	good := signaturePacketsOf(t, clearsignWith(t, signer, []byte(fakeReleasePlaintext)))
+	bad := signaturePacketsOf(t, clearsignWith(t, signer, []byte("Origin: Other\n")))
+	for name, packets := range map[string][][]byte{
+		"bad first":  {bad, good},
+		"good first": {good, bad},
+	} {
+		got, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, packets...))
+		if !errors.Is(err, ErrBadSignature) || ClassifyVerifyErr(err) != "bad_signature" || got != nil {
+			t.Errorf("%s: got %q, err %v (reason %q); want ErrBadSignature (bad_signature)", name, got, err, ClassifyVerifyErr(err))
+		}
+	}
+}
+
+// TestVerifyInline_AKnownKeyOutsideThePinsStillCounts: S1's "known" is the
+// host keyring, not the suite's trust set (DN-5). A pin for the suite's host
+// names A only; the keyring also holds C; an InRelease with A's good
+// signature and C's bad one is refused (ErrBadSignature): a client that
+// installed C, which the cache holds, sees gpgv's BADSIG from it. The pin's
+// S2 alone accepts it (C's packet is outside the trust set; A's verifies).
+func TestVerifyInline_AKnownKeyOutsideThePinsStillCounts(t *testing.T) {
+	a := newTestEntity(t, "A", "a@example.com")
+	c := newTestEntity(t, "C", "c@example.com")
+	pin := SignerPin{
+		HostRegex:    regexp.MustCompile(`^archive\.example\.com$`),
+		Fingerprints: map[string]struct{}{upperFP(a.PrimaryKey.Fingerprint): {}},
+	}
+	v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t, a, c), Pins: []SignerPin{pin}, RequireSignature: true, Logger: silentLogger()})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	good := signaturePacketsOf(t, clearsignWith(t, a, []byte(fakeReleasePlaintext)))
+	cGood := signaturePacketsOf(t, clearsignWith(t, c, []byte(fakeReleasePlaintext)))
+	cBad := signaturePacketsOf(t, clearsignWith(t, c, []byte("Origin: Other\n")))
+	// Premises: the pin trusts A for the suite and not C.
+	if _, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, good)); err != nil {
+		t.Fatalf("test premise: A's good signature alone: %v; want it accepted under the pin", err)
+	}
+	if _, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, cGood)); !errors.Is(err, ErrUntrustedSigner) {
+		t.Fatalf("test premise: C's good signature alone: %v; want ErrUntrustedSigner (C is outside the pin)", err)
+	}
+	got, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, good, cBad))
+	if !errors.Is(err, ErrBadSignature) || ClassifyVerifyErr(err) != "bad_signature" || got != nil {
+		t.Fatalf("A's good signature and C's bad one: got %q, err %v (reason %q); want ErrBadSignature (bad_signature): C is in the host keyring",
+			got, err, ClassifyVerifyErr(err))
+	}
+}
+
+// TestVerifyInline_AnExpiredKeysGoodSignatureBesideAGoodOneAdopts: a good
+// signature from a known key that has expired since it signed passes S1 —
+// go-crypto verifies it and reports ErrKeyExpired, gpgv's EXPKEYSIG, which
+// apt ignores beside a good signature — so E's good signature beside A's is
+// adopted in either order (the corpus' i_expired_good_plus_good and
+// i_good_plus_expired_good). E's alone is still refused, by S2, not S1
+// (i_expired_only).
+func TestVerifyInline_AnExpiredKeysGoodSignatureBesideAGoodOneAdopts(t *testing.T) {
+	a := newTestEntity(t, "A", "a@example.com")
+	e := newExpiredEntity(t, "E", "e@example.com")
+	v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t, a, e), RequireSignature: true, Logger: silentLogger()})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	// E signs at its creation, inside its one-second lifetime.
+	eSigned := clearsignAt(t, e, []byte(fakeReleasePlaintext), e.PrimaryKey.CreationTime)
+	eGood := signaturePacketsOf(t, eSigned)
+	aGood := signaturePacketsOf(t, clearsignWith(t, a, []byte(fakeReleasePlaintext)))
+	// Premise: go-crypto verifies E's signature over M and reports the
+	// expiry.
+	m, _ := inlineParts(t, eSigned)
+	if got, _, verr := openpgp.VerifyDetachedSignature(openpgp.EntityList{e}, bytes.NewReader(m), bytes.NewReader(eGood), nil); got == nil || !errors.Is(verr, pgperrors.ErrKeyExpired) {
+		t.Fatalf("test premise: go-crypto on E's signature: signature %v, err %v; want the signature and ErrKeyExpired", got != nil, verr)
+	}
+	for name, packets := range map[string][][]byte{
+		"expired first":  {eGood, aGood},
+		"expired second": {aGood, eGood},
+	} {
+		plain, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, packets...))
+		if err != nil || !bytes.Equal(plain, []byte(fakeReleasePlaintext)) {
+			t.Errorf("%s: got %q, err %v; want the Release adopted", name, plain, err)
+		}
+	}
+	_, err = v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, eGood))
+	if !errors.Is(err, pgperrors.ErrKeyExpired) || errors.Is(err, ErrBadSignature) {
+		t.Fatalf("E's signature alone: err %v (reason %q); want S2's refusal, ErrKeyExpired (crypto_verify_failed), not S1's",
+			err, ClassifyVerifyErr(err))
+	}
+}
+
+// TestVerifyInline_ACriticalNotationIsRefusedByP4: a signature that carries
+// a critical notation is refused by layer P (P4: a critical subpacket 20,
+// which gpgv 2.2's can_handle_critical takes only for notations it knows,
+// and refuses as BADSIG otherwise), in either order beside a good one and
+// on the bypass too (the corpus' xi_crit_plus_good and xi_crit_only). S1
+// would refuse it next (go-crypto verifies it and reports a SignatureError:
+// the premise below): before the hybrid verifier S1 was what refused it.
+func TestVerifyInline_ACriticalNotationIsRefusedByP4(t *testing.T) {
+	a := newTestEntity(t, "A", "a@example.com")
+	critSigned := clearsignWithConfig(t, a, []byte(fakeReleasePlaintext), &packet.Config{
+		DefaultHash: crypto.SHA256,
+		Time:        time.Now,
+		SignatureNotations: []*packet.Notation{
+			{Name: "crit@example.invalid", Value: []byte("1"), IsCritical: true, IsHumanReadable: true},
+		},
+	})
+	crit := signaturePacketsOf(t, critSigned)
+	good := signaturePacketsOf(t, clearsignWith(t, a, []byte(fakeReleasePlaintext)))
+	// Premise: go-crypto verifies the signature over M and reports the
+	// notation.
+	m, _ := inlineParts(t, inlineWithSignatures(t, good))
+	if got, _, verr := openpgp.VerifyDetachedSignature(openpgp.EntityList{a}, bytes.NewReader(m), bytes.NewReader(crit), nil); got == nil || !errors.As(verr, new(pgperrors.SignatureError)) {
+		t.Fatalf("test premise: go-crypto on the critical-notation signature: signature %v, err %v; want the signature and a SignatureError", got != nil, verr)
+	}
+	for _, anySigner := range []bool{false, true} {
+		v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t, a), RequireSignature: true, AcceptAnySigner: anySigner, Logger: silentLogger()})
+		if err != nil {
+			t.Fatalf("NewVerifier: %v", err)
+		}
+		for name, packets := range map[string][][]byte{
+			"critical alone":  {crit},
+			"critical first":  {crit, good},
+			"critical second": {good, crit},
+		} {
+			got, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, packets...))
+			if !errors.Is(err, ErrMalformedClearsign) || ruleOf(err) != "P4" || got != nil {
+				t.Errorf("accept_any_signer=%v, %s: got %q, err %v (rule %q); want ErrMalformedClearsign from P4", anySigner, name, got, err, ruleOf(err))
+			}
+		}
+	}
+}
+
+// TestRequireKnownSignaturesVerify_ASignatureErrorFails pins S1's other
+// clause, which no corpus row reaches now that P4 refuses a critical
+// notation on the packet: a known key's packet that verifies with a
+// SignatureError fails S1 (DN-5, DN-11). go-crypto also reports one for an
+// unknown critical notation on the key's own self-signature
+// (checkMessageSignatureDetails), which is what this key carries; its data
+// signature carries none, so layer P passes the packet. Beside A's good
+// packet it is refused (ErrBadSignature), in either order; S2 alone would
+// accept A's.
+func TestRequireKnownSignaturesVerify_ASignatureErrorFails(t *testing.T) {
+	a := newTestEntity(t, "A", "a@example.com")
+	n, err := openpgp.NewEntity("N", "", "n@example.com", &packet.Config{
+		Algorithm:   packet.PubKeyAlgoRSA,
+		RSABits:     2048,
+		DefaultHash: crypto.SHA256,
+		SignatureNotations: []*packet.Notation{
+			{Name: "crit@example.invalid", Value: []byte("1"), IsCritical: true, IsHumanReadable: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewEntity: %v", err)
+	}
+	v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t, a, n), RequireSignature: true, Logger: silentLogger()})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	nSig := signaturePacketsOf(t, clearsignWith(t, n, []byte(fakeReleasePlaintext)))
+	aSig := signaturePacketsOf(t, clearsignWith(t, a, []byte(fakeReleasePlaintext)))
+	// Premises: layer P passes N's packet; go-crypto verifies it with N's
+	// key as the keyring loaded it and reports a SignatureError.
+	m, pkts := inlineParts(t, inlineWithSignatures(t, nSig))
+	keys := v.keyring.EntityList().KeysByIdUsage(pkts[0].issuer, packet.KeyFlagSign)
+	if len(keys) != 1 {
+		t.Fatalf("test premise: the keyring holds %d keys with N's key ID, want 1", len(keys))
+	}
+	if got, _, verr := openpgp.VerifyDetachedSignature(openpgp.EntityList{keys[0].Entity}, bytes.NewReader(m), bytes.NewReader(pkts[0].raw), nil); got == nil || !errors.As(verr, new(pgperrors.SignatureError)) {
+		t.Fatalf("test premise: go-crypto on N's signature: signature %v, err %v; want the signature and a SignatureError", got != nil, verr)
+	}
+	for name, packets := range map[string][][]byte{
+		"N first":  {nSig, aSig},
+		"N second": {aSig, nSig},
+	} {
+		got, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, packets...))
+		if !errors.Is(err, ErrBadSignature) || ClassifyVerifyErr(err) != "bad_signature" || got != nil {
+			t.Errorf("%s: got %q, err %v (reason %q); want ErrBadSignature (bad_signature)", name, got, err, ClassifyVerifyErr(err))
+		}
+	}
+}
+
+// TestVerifyInline_AnIssuerFingerprintNamingAnotherKeyIsRefusedByP4 pins
+// P4's one-issuer rule on the shape that S1's contradiction rule (DN-5,
+// rulings HD-3 and HD-14, deleted with s1Issuer) was written for. X's
+// signing subkey signs with a hashed issuer fingerprint that names X's
+// primary key (the signer controls the hashed area); go-crypto's hashed
+// issuer key ID names the subkey. go-crypto takes its issuer from the last
+// issuer subpacket it parses, gpgv from the hashed fingerprint (measured
+// 2026-10-29 with the oracle's in-container.sh: every gpgv-based apt
+// refuses such a shape as BADSIG, debian:13's sqv accepts it). As signed,
+// the fingerprint's key ID is not the 16's; with an unhashed 16 naming the
+// subkey added (no key needed), go-crypto even verifies the packet (the
+// premise below). Layer P refuses both, as ErrMalformedClearsign, on the
+// bypass too: a packet names one issuer, which every reader takes.
+func TestVerifyInline_AnIssuerFingerprintNamingAnotherKeyIsRefusedByP4(t *testing.T) {
+	x := newTestEntity(t, "X", "x@example.com")
+	if err := x.AddSigningSubkey(&packet.Config{
+		Algorithm: packet.PubKeyAlgoRSA,
+		RSABits:   2048,
+		Time:      func() time.Time { return time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC) },
+	}); err != nil {
+		t.Fatalf("AddSigningSubkey: %v", err)
+	}
+	sub := x.Subkeys[len(x.Subkeys)-1]
+	// The subkey signs; its private key names X's primary key as the
+	// issuer fingerprint while it signs (clearsign takes the issuer from
+	// the signing key).
+	fpr := sub.PublicKey.Fingerprint
+	sub.PublicKey.Fingerprint = x.PrimaryKey.Fingerprint
+	signed := clearsignWithConfig(t, &openpgp.Entity{PrivateKey: sub.PrivateKey}, []byte(fakeReleasePlaintext),
+		&packet.Config{DefaultHash: crypto.SHA256, Time: time.Now})
+	sub.PublicKey.Fingerprint = fpr
+	asSigned := signaturePacketsOf(t, signed)
+	unhashed16 := append([]byte{9, 16}, binary.BigEndian.AppendUint64(nil, sub.PublicKey.KeyId)...)
+	withSecond16 := withUnhashedSubpacket(t, asSigned, unhashed16)
+
+	// Premise: go-crypto verifies the packet with the unhashed 16 added
+	// (it looks the key up by that 16, the last issuer subpacket).
+	m, _ := inlineParts(t, clearsignWith(t, x, []byte(fakeReleasePlaintext)))
+	if got, _, verr := openpgp.VerifyDetachedSignature(openpgp.EntityList{x}, bytes.NewReader(m), bytes.NewReader(withSecond16), nil); got == nil || verr != nil {
+		t.Fatalf("test premise: go-crypto on the packet: signature %v, err %v; want it verified (by the unhashed key ID)", got != nil, verr)
+	}
+	for _, anySigner := range []bool{false, true} {
+		v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t, x), RequireSignature: true, AcceptAnySigner: anySigner, Logger: silentLogger()})
+		if err != nil {
+			t.Fatalf("NewVerifier: %v", err)
+		}
+		for name, pkt := range map[string][]byte{
+			"its fingerprint names X's primary key":    asSigned,
+			"and a second issuer key ID, the subkey's": withSecond16,
+		} {
+			got, err := v.VerifyInline(context.Background(), newSuite(), inlineWithSignatures(t, pkt))
+			if !errors.Is(err, ErrMalformedClearsign) || ruleOf(err) != "P4" || got != nil {
+				t.Errorf("accept_any_signer=%v, %s: got %q, err %v (rule %q); want ErrMalformedClearsign from P4", anySigner, name, got, err, ruleOf(err))
+			}
+		}
+	}
+}
+
+// TestRequireKnownSignaturesVerify_AKeyIDCollisionDoesNotFailAValidSignature:
+// S1 verifies each packet against one keyring entity at a time (DN-5). Two
+// entities share the signer's key ID, the colliding one loaded first, and
+// the signer's valid signature passes. go-crypto's VerifyDetachedSignature
+// over both hashes the message once and tries each candidate key with that
+// one hash, which only the first can pass, so the whole keyring at once
+// fails it (the premise below). The test calls requireKnownSignaturesVerify
+// directly: VerifyInline's S2 (verifyAnyTrusted, unchanged) keeps that
+// quirk and refuses this anchor (crypto_verify_failed; ruling HD-10,
+// recorded Open). The collision is made as TestVerifier_ShortKeyID_
+// AmbiguousKeyID makes it: the collider's KeyId patched, the keyring built
+// by hand (a load would recompute the key ID).
+func TestRequireKnownSignaturesVerify_AKeyIDCollisionDoesNotFailAValidSignature(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	collider := newTestEntity(t, "Collider", "collider@example.com")
+	collider.PrimaryKey.KeyId = signer.PrimaryKey.KeyId
+	keyring := &Keyring{
+		entries: []KeyringEntry{
+			{Entity: collider, PrimaryFingerprint: upperFP(collider.PrimaryKey.Fingerprint)},
+			{Entity: signer, PrimaryFingerprint: upperFP(signer.PrimaryKey.Fingerprint)},
+		},
+		entities: openpgp.EntityList{collider, signer},
+		fingerprints: map[string]struct{}{
+			upperFP(collider.PrimaryKey.Fingerprint): {},
+			upperFP(signer.PrimaryKey.Fingerprint):   {},
+		},
+	}
+	v, err := NewVerifier(VerifierConfig{Keyring: keyring, RequireSignature: true, Logger: silentLogger()})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	m, pkts := inlineParts(t, clearsignWith(t, signer, []byte(fakeReleasePlaintext)))
+	if got, _, err := openpgp.VerifyDetachedSignature(keyring.EntityList(), bytes.NewReader(m), bytes.NewReader(pkts[0].raw), nil); got != nil || err == nil {
+		t.Fatalf("test premise: go-crypto over the whole keyring, collider first: signature %v, err %v; want it to fail the valid signature", got != nil, err)
+	}
+	if err := v.requireKnownSignaturesVerify(m, pkts); err != nil {
+		t.Fatalf("a valid signature, a key-ID collider loaded first: %v; want it passed", err)
+	}
+	// Each entity is still checked: the signer's signature of another text,
+	// which no entity holding the key ID verifies, fails.
+	_, other := inlineParts(t, clearsignWith(t, signer, []byte("Origin: Other\n")))
+	if err := v.requireKnownSignaturesVerify(m, other); !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("a bad signature, a key-ID collider loaded first: %v; want ErrBadSignature", err)
 	}
 }
 
@@ -683,11 +1035,27 @@ func TestClassifyVerifyErr(t *testing.T) {
 		{"unpinned_suite", ErrUnpinnedSuite, "unpinned_suite"},
 		{"missing_signature", ErrMissingSignature, "missing_signature"},
 		{"malformed_clearsign", ErrMalformedClearsign, "malformed_clearsign"},
-		{"malformed_clearsign_decoder_panic", fmt.Errorf("x: %w", errClearsignPanicked), "malformed_clearsign"},
+		{
+			"malformed_clearsign_as_verify_inline_wraps_a_rule",
+			fmt.Errorf("%w: %w", ErrMalformedClearsign, refuse("A4", "line 7: 80 base64 characters, the limit is 76")),
+			"malformed_clearsign",
+		},
+		{"malformed_signature", ErrMalformedSignature, "malformed_signature"},
+		{
+			"malformed_signature_as_verify_detached_wraps_a_rule",
+			fmt.Errorf("%w: %w", ErrMalformedSignature, refuse("T4", "the file ends inside the signature armor")),
+			"malformed_signature",
+		},
 		{"short_keyid", ErrShortKeyID, "short_keyid"},
 		{"untrusted_signer", ErrUntrustedSigner, "untrusted_signer"},
 		{"ambiguous_keyid", ErrAmbiguousKeyID, "ambiguous_keyid"},
 		{"no_usable_signature", ErrNoUsableSignature, "no_usable_signature"},
+		{"bad_signature", ErrBadSignature, "bad_signature"},
+		{
+			"bad_signature_as_s1_wraps_it",
+			fmt.Errorf("%w: issuer %016X", ErrBadSignature, uint64(0x0123456789ABCDEF)),
+			"bad_signature",
+		},
 		{
 			"wrapped_untrusted_signer_walks_chain",
 			errors.New("adoption_gpg_failed: " + ErrUntrustedSigner.Error()),
@@ -997,12 +1365,15 @@ func TestVerifier_AcceptAnySigner_LogsOncePerSuite(t *testing.T) {
 }
 
 // TestVerifier_AcceptAnySigner_MalformedSignatureBody_StillRejected
-// asserts the requireParseableSignature guard for the inline bypass.
-// clearsign.Decode validates the BEGIN/END envelope, and armor.Decode
-// validates base64 framing, but neither proves the armored body
-// contains a parseable OpenPGP signature packet. Without the strict
+// asserts the inline bypass refuses an armored body that is no packet.
+// The envelope (layer T) and the base64 (layer A) are sound, but neither
+// proves the armored body holds a signature packet. Without a strict
 // guard, a clearsigned envelope whose armored body is garbage would
-// silently adopt under the bypass.
+// silently adopt under the bypass. The guard was a parseable-signature
+// check, then F6 (structural, so on the bypass too); layer P is the same
+// code on both paths and refuses it (P1: no packet header), as
+// ErrMalformedClearsign. An armor with no packet at all is layer A's
+// (TestVerifyInline_AcceptAnySigner_EmptyArmorStillRejected).
 func TestVerifier_AcceptAnySigner_MalformedSignatureBody_StillRejected(t *testing.T) {
 	other := newTestEntity(t, "Other", "other@example.com")
 	keyring := newKeyring(t, other)
@@ -1027,8 +1398,42 @@ func TestVerifier_AcceptAnySigner_MalformedSignatureBody_StillRejected(t *testin
 	}
 
 	_, err = v.VerifyInline(context.Background(), newSuite(), body)
-	if err == nil {
-		t.Fatal("expected error on clearsigned envelope with malformed signature body under accept_any_signer")
+	if !errors.Is(err, ErrMalformedClearsign) || ruleOf(err) != "P1" {
+		t.Fatalf("err = %v (rule %q); want ErrMalformedClearsign from P1 on clearsigned envelope with malformed signature body under accept_any_signer", err, ruleOf(err))
+	}
+}
+
+// TestVerifyInline_AcceptAnySigner_EmptyArmorStillRejected is the inline
+// twin of TestVerifyDetached_AcceptAnySigner_EmptyArmorStillRejected: an
+// InRelease whose signature armor holds no packet at all (go-crypto's
+// armor writer gives it a CRC line and no base64 line) is refused in both
+// modes by layer A (A4: no base64 line), as ErrMalformedClearsign, before
+// the trust set is read. Layer T passes it (the premise below): the
+// bypass's "at least one signature packet" is layer A's and P's.
+func TestVerifyInline_AcceptAnySigner_EmptyArmorStillRejected(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	keyring := newKeyring(t, signer)
+	body, err := assembleClearsignedBlock([]byte(fakeReleasePlaintext), nil)
+	if err != nil {
+		t.Fatalf("assembleClearsignedBlock: %v", err)
+	}
+	if _, err := apttext.Inline(body); err != nil {
+		t.Fatalf("test premise: layer T refuses the empty armor: %v", err)
+	}
+	for _, anySigner := range []bool{false, true} {
+		v, err := NewVerifier(VerifierConfig{
+			Keyring:          keyring,
+			RequireSignature: true,
+			AcceptAnySigner:  anySigner,
+			Logger:           silentLogger(),
+		})
+		if err != nil {
+			t.Fatalf("NewVerifier: %v", err)
+		}
+		got, err := v.VerifyInline(context.Background(), newSuite(), body)
+		if !errors.Is(err, ErrMalformedClearsign) || ruleOf(err) != "A4" || got != nil {
+			t.Errorf("accept_any_signer=%v: got %q, err %v (rule %q); want ErrMalformedClearsign from A4", anySigner, got, err, ruleOf(err))
+		}
 	}
 }
 

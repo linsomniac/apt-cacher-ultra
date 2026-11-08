@@ -25,6 +25,11 @@ const (
 	// never-adopted suite stays unadopted, an established unsigned suite
 	// keeps its last snapshot. A paced, visible state, never a failed check.
 	ReasonUnsignedDisabled = "unsigned_disabled"
+	// ReasonSignerDowngrade: the candidate has lost the strong signer the
+	// suite's current anchor has (the hardening plan's Task 9d; the
+	// adopter's signer downgrade guard). The suite is behind upstream: its
+	// lag shows, as for the phase E reasons.
+	ReasonSignerDowngrade = "signer_downgrade"
 
 	// ReasonPanic marks the record of an adoption that panicked. It is a
 	// failure, but the restart reset leaves it alone (spec C7): retrying
@@ -35,11 +40,16 @@ const (
 var refusalReasons = []string{
 	ReasonUpstreamOlder, ReasonRollbackRefused, ReasonUnsignedDowngradeRefused,
 	ReasonUnsignedUnconfirmed, ReasonUnsignedTooLarge, ReasonAnchorAbsent, ReasonUnsignedDisabled,
+	ReasonSignerDowngrade,
 }
 
 // IsRefusalReason reports whether a persisted adoption_fail_reason is a
 // refusal state rather than a failure.
 func IsRefusalReason(reason string) bool { return slices.Contains(refusalReasons, reason) }
+
+// RefusalReasons returns the refusal reasons, a closed enum: the label set
+// of acu_adoption_refused_total{reason} (freshness).
+func RefusalReasons() []string { return slices.Clone(refusalReasons) }
 
 // ErrInvalidAdoptionFailure rejects a record without a content key, a
 // reason or a positive streak count, before any SQL runs.

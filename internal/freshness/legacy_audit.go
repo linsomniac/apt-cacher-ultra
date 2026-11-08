@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
+
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
@@ -210,9 +212,11 @@ func RunLegacyTrustAudit(ctx context.Context, c *cache.Cache, logger *slog.Logge
 // legacyAuditRefusalTail ends every pre-flight refusal.
 //
 // AIDEV-NOTE: the final review's R5 #2 / R7 #2. main runs the audit after
-// cache.Open, which has already committed the v7 migration, so a refusal
-// changes nothing of the audit's own but the database is no longer one
-// 1.0.x opens ("schema version 7 is newer than this binary supports"): an
+// cache.Open, which has already committed the migrations up to
+// cache.CurrentSchemaVersion, so a refusal changes nothing of the audit's
+// own but the database is no longer one 1.0.x opens ("database schema
+// version N is newer than this binary supports (6)", N being
+// CurrentSchemaVersion: internal/cache/schema.go): an
 // operator who rolls the package back needs the cache.db copy the release
 // notes tell them to take before upgrading. The R5 re-review: the way back
 // starts by stopping the daemon — a refused start runs again every 5 s
@@ -450,6 +454,101 @@ func classifyLegacyInline(blob []byte) legacyVerdict {
 		}
 	}
 	return legacyVerdict{outcome: cache.LegacyAuditKeep}
+}
+
+// inReleasePlaintext returns the signed plaintext of a stored InRelease as
+// go-crypto's clearsign decoder reads it, without re-verifying the
+// signature: the legacy audit's reading (classifyLegacyInline).
+//
+// AIDEV-NOTE: R-1. Never ParseRelease the raw envelope: lines placed
+// after a forged "=CRC" line inside the signature armor, or as
+// colon-bearing armor headers, are part of the stored bytes but were never
+// signed (both verify with go-crypto v1.4.1). A body without a clearsign
+// marker is an error since phase D (the plain-text fallback served only
+// test fixtures; VerifyInline never adopts plain text, and the startup
+// audit quarantines legacy plain-text snapshots). The marker test is
+// bytes.Contains, never HasPrefix: snapshots adopted before phase D may
+// hold whitespace before the marker (ruling R-D2 now refuses that at
+// adoption). A decode failure is an error, never a raw parse; the decode
+// sees aptpath.DecodableClearsign(blob) (R-D2) and runs under recover(): a
+// stored blob cannot trigger I-1, but the audit must never crash the
+// daemon.
+//
+// AIDEV-NOTE: moved here from reconcile.go by Task 9b's fix round (the
+// re-review's V-RI1): reconcile reads a stored InRelease with apt's own
+// splitter now (inReleaseMessage, internal/apttext), as adoption does
+// since Task 9b. The audit keeps go-crypto's reading, which is safe: it
+// judges snapshots adopted before Task 9b, by a verifier that verified
+// and parsed exactly this plaintext, so it asks whether declarations lie
+// outside the text their adoption read; it keeps ruling R-D2's tolerance
+// of whitespace before the marker, which TestClassifyLegacyInline pins;
+// and it only keeps or quarantines a snapshot, never derives members for
+// one.
+func inReleasePlaintext(blob []byte) (text []byte, err error) {
+	if !bytes.Contains(blob, []byte("-----BEGIN PGP SIGNED MESSAGE-----")) {
+		return nil, errors.New("legacy audit: stored InRelease is not clearsigned")
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			text, err = nil, fmt.Errorf("legacy audit: clearsign decode panicked: %v", r)
+		}
+	}()
+	decodable := aptpath.DecodableClearsign(blob)
+	block, _ := clearsign.Decode(decodable)
+	if block == nil {
+		return nil, errors.New("legacy audit: stored InRelease is not a valid clearsigned message")
+	}
+	// AIDEV-NOTE: go-crypto v1.4.1's Decode panicked on a message without a
+	// line of signed text (I-1), which the recover above made this error
+	// (malformed_envelope, LegacyAuditQuarantine); it decoded a text of one
+	// empty or blank line to "", which ParseRelease refuses (unparseable,
+	// LegacyAuditQuarantineSigned, which marks the suite signed-seen).
+	// v1.5.0 decodes both to an empty plaintext. The audit keeps v1.4.1's
+	// verdicts, so the bump changes no outcome (the third re-review's
+	// V-R3M3): no line of text is this error, one empty line is "".
+	if len(block.Plaintext) == 0 && !hasSignedTextLine(decodable) {
+		return nil, errors.New("legacy audit: stored InRelease has no signed text")
+	}
+	return block.Plaintext, nil
+}
+
+// hasSignedTextLine reports whether the clearsigned message in b, which
+// go-crypto's clearsign.Decode read, has a line of signed text: whether the
+// line after its header block is other than its signature's BEGIN line.
+// The lines are go-crypto's (clearsignLine), its message found where
+// Decode finds it: at the start of b, or after a LF.
+func hasSignedTextLine(b []byte) bool {
+	const marker = "-----BEGIN PGP SIGNED MESSAGE-----"
+	i := 0
+	if !bytes.HasPrefix(b, []byte(marker)) {
+		if i = bytes.Index(b, []byte("\n"+marker)); i < 0 {
+			return false
+		}
+		i++
+	}
+	_, rest := clearsignLine(b[i:]) // the marker's line
+	for len(rest) > 0 {
+		var line []byte
+		if line, rest = clearsignLine(rest); len(bytes.TrimSpace(line)) == 0 {
+			break // the header block's end
+		}
+	}
+	line, _ := clearsignLine(rest)
+	return !bytes.Equal(line, []byte("-----BEGIN PGP SIGNATURE-----"))
+}
+
+// clearsignLine is go-crypto's clearsign getLine: b's line before its first
+// LF, a CR before the LF dropped, and the rest after it.
+func clearsignLine(b []byte) (line, rest []byte) {
+	i := bytes.IndexByte(b, '\n')
+	if i < 0 {
+		return b, nil
+	}
+	j := i + 1
+	if i > 0 && b[i-1] == '\r' {
+		i--
+	}
+	return b[:i], b[j:]
 }
 
 // clearsignCanonical returns b with every line canonicalised exactly as

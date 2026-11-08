@@ -13,13 +13,15 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
 )
 
 // Standard apt keyring directories. Modern apt installs split trust
@@ -49,7 +51,9 @@ const (
 // KeyringEntry is one loaded entity with its source attribution.
 // SourcePath is either an absolute file path on disk, or the
 // pseudo-path "embedded:<name>" for keys baked into the binary via
-// EmbeddedSource. Exposed for the admin status page.
+// EmbeddedSource: the first source the key was read from, when it was
+// read more than once (its copies are merged: LoadKeyringWithEmbedded).
+// Exposed for the admin status page.
 type KeyringEntry struct {
 	Entity             *openpgp.Entity
 	PrimaryFingerprint string   // uppercase 40-char hex
@@ -70,7 +74,20 @@ type Keyring struct {
 	// every key (primary + subkeys) in entities. Used by trust-set
 	// narrowing and by the IssuerFingerprint check in the verifier.
 	fingerprints map[string]struct{}
+
+	// uncountable holds the keys and subkeys, by uppercase fingerprint, that
+	// S2 must not count, each with why (keyFile.uncountable, the reader's
+	// marks under ruling R2: a revocation or a newer binding the cache
+	// cannot read, which gpgv honours), a mark on a primary key extended to
+	// its subkeys. S1 knows them as it knows every key (uncountableKey).
+	uncountable map[string]keyMarks
 }
+
+// uncountableKey says why S2 must not count the key or subkey whose
+// uppercase fingerprint is fp (uncountable) at now, the verifier's clock
+// (any of its marks holding: a direct-key expiry's holds from the moment
+// the key expires), nil when it may.
+func (k *Keyring) uncountableKey(fp string, now time.Time) error { return k.uncountable[fp].at(now) }
 
 // Empty reports whether the keyring loaded zero entities.
 func (k *Keyring) Empty() bool { return len(k.entities) == 0 }
@@ -172,54 +189,110 @@ func LoadKeyring(dirs []string, logger *slog.Logger) (*Keyring, error) {
 
 // LoadKeyringWithEmbedded extends LoadKeyring by also merging in
 // keys baked into the binary as EmbeddedSource entries. On-disk dirs
-// load first (in slice order); embedded sources load last. Dedup is
-// by primary-key fingerprint, first-seen wins — so a key present on
-// disk takes precedence over the bundled copy of the same key, and
-// its SourcePath in the resulting Entries reflects the disk path the
-// operator actually staged.
+// load first (in slice order); embedded sources load last. A key read
+// more than once (two files, two copies in one file, a disk copy and
+// the bundled one) is one entity, each later copy merged into the
+// first (mergeEntity); its entry's SourcePath is the first copy's, so
+// a key present on disk shows the disk path the operator staged.
 func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *slog.Logger) (*Keyring, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	// AIDEV-NOTE: dedupe by primary-key fingerprint. apt's keyring
-	// directories overlap (operators sometimes symlink keys into
-	// multiple paths) and the embedded set can overlap with disk
-	// copies; the same key bytes parsed twice as distinct *Entity
-	// values would be picked twice by openpgp's signature
-	// verification — wasted work, not a correctness bug, but we
-	// filter at load time anyway.
-	seen := make(map[string]struct{})
+	// AIDEV-NOTE: one entity per primary-key fingerprint, each later copy
+	// of a key merged into the first (the re-review's V-R2C2). apt's
+	// keyring directories overlap (a key symlinked into two paths, a
+	// vendor's file beside an older copy, the bundled set beside a disk
+	// copy), and one file can hold a key twice (a concatenated export).
+	// The loader kept the first copy and dropped the rest, which is
+	// harmless only for identical copies: vendors add signing subkeys
+	// (google's key held eight in the survey, about one a year), and an
+	// older copy read first hid the new one — the cache refused an anchor
+	// every apt accepts (untrusted_signer: gpgv finds the keyblock holding
+	// the subkey, sqv reads every certificate it is given), and S1 did not
+	// see a bad signature by the subkey beside a good one, which the five
+	// gpgv-based apt refuse. Merged rather than kept as separate entities:
+	// a key stays one entity for the short-keyid fallback (which refuses a
+	// key ID two entities claim), Subset and the admin listing; and a
+	// revocation in any copy counts, as after gpg's import (which merges a
+	// keyblock's signatures so) and in sqv (which merges the certificates
+	// it is given) — kept apart, a copy without it read first would still
+	// verify. A subkey's binding and an identity's self-signature are the
+	// newest of the copies' (go-crypto's rule within one copy, gpg's after
+	// a merge). Two residual gaps, both measured (the third re-review's
+	// kr10: P a primary key that expired and was renewed, K its signing
+	// subkey):
+	//   - gpgv reads only the first keyblock that holds the key ID, so where
+	//     an older copy read first has P expired and a later one renews it,
+	//     gpgv refuses an anchor by K that the cache accepts (sqv agrees
+	//     with the cache: kr10_renew_old_first); a client that cannot use the
+	//     key fails with or without the cache, as with V-R2M3's gaps.
+	//   - the third re-review's V-R3M1, open (docs/open-decisions.md, *Open*:
+	//     "The key reader reads more than some apt reads"): from a
+	//     copy holding K with P expired and a renewed copy without K, the
+	//     merged key verifies an anchor by K (K's binding from the one, P's
+	//     renewal from the other), which all six apt refuse (sqv: K "is not
+	//     bound") and each copy alone refuses too (kr10_mixed_*, either
+	//     order). sqv does not agree with the cache here. It is no
+	//     attacker's lever: it needs the vendor's own signature by K, and
+	//     every client of that keyring refuses every anchor by K, so the
+	//     cache's adopting one changes nothing a client accepts. Counting a
+	//     packet only when some single copy holding its issuer verifies it
+	//     too would close it without reopening V-R2C2.
+	seen := make(map[string]int) // primary fingerprint -> its index in entries
 	var entries []KeyringEntry
-	fingerprints := make(map[string]struct{})
+	uncountable := make(map[string]keyMarks)
 
-	addEntities := func(parsed openpgp.EntityList, source string) {
-		for _, e := range parsed {
+	// logMarks names, at start, each key or subkey the reader marked in one
+	// file (keyring_key_marked, INFO; the final review 2's D2-M8): its
+	// fingerprint, its marks and the file, so an operator can check the
+	// key before its vendor's next adoption fails on it
+	// (crypto_verify_failed). field is "path" for a file, "name" for an
+	// embedded source, as keyring_file_truncated's.
+	logMarks := func(parsed *keyFile, field, value string) {
+		fps := make([]string, 0, len(parsed.uncountable))
+		for fp := range parsed.uncountable {
+			fps = append(fps, fp)
+		}
+		slices.Sort(fps)
+		for _, fp := range fps {
+			marks := make([]string, 0, len(parsed.uncountable[fp]))
+			for _, m := range parsed.uncountable[fp] {
+				s := m.why.Error()
+				if !m.from.IsZero() {
+					s += " (from " + m.from.UTC().Format(time.RFC3339) + ")"
+				}
+				marks = append(marks, s)
+			}
+			logger.Info("keyring_key_marked",
+				"fingerprint", fp,
+				"mark", strings.Join(marks, "; "),
+				field, value,
+			)
+		}
+	}
+
+	addEntities := func(parsed *keyFile, source string) {
+		// Every mark from every copy of a key is kept (keyMarks: the
+		// union), as a revocation in any copy counts (the merge below).
+		for fp, ms := range parsed.uncountable {
+			uncountable[fp] = uncountable[fp].union(ms)
+		}
+		for _, e := range parsed.entities {
 			if e == nil || e.PrimaryKey == nil {
 				continue
 			}
 			fp := upperFP(e.PrimaryKey.Fingerprint)
-			if _, dup := seen[fp]; dup {
+			if i, dup := seen[fp]; dup {
+				mergeEntity(entries[i].Entity, e)
 				continue
 			}
-			seen[fp] = struct{}{}
-
-			subFPs := make([]string, 0, len(e.Subkeys))
-			fingerprints[fp] = struct{}{}
-			for _, sub := range e.Subkeys {
-				if sub.PublicKey != nil {
-					subFP := upperFP(sub.PublicKey.Fingerprint)
-					fingerprints[subFP] = struct{}{}
-					subFPs = append(subFPs, subFP)
-				}
-			}
-
+			seen[fp] = len(entries)
 			entries = append(entries, KeyringEntry{
 				Entity:             e,
 				PrimaryFingerprint: fp,
 				PrimaryUID:         firstUID(e),
 				SourcePath:         source,
-				SubkeyFingerprints: subFPs,
 			})
 		}
 	}
@@ -256,6 +329,31 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 				continue
 			}
 			path := filepath.Join(dir, name)
+			// AIDEV-NOTE: the fourth re-review's V-R4M1: the loader opened
+			// anything that was not a directory. open(2) of a FIFO waits for
+			// a writer, so a FIFO named .gpg in a keyring directory blocked
+			// the start forever (apt-key and apt 3 block on it too), and a
+			// symlink to /dev/zero (its stat's size 0) was read to the cap,
+			// 828 MiB, at every start. os.Stat follows a symlink and opens
+			// nothing; only a regular file (a symlinked one included:
+			// /usr/share/keyrings is full of them) is read.
+			fi, err := os.Stat(path)
+			if err != nil {
+				logger.Warn("keyring_file_skipped",
+					"path", path,
+					"reason", "stat_failed",
+					"err", err,
+				)
+				continue
+			}
+			if !fi.Mode().IsRegular() {
+				logger.Warn("keyring_file_skipped",
+					"path", path,
+					"reason", "not_regular_file",
+					"mode", fi.Mode().String(),
+				)
+				continue
+			}
 			parsed, err := parseKeyringFile(path)
 			if err != nil {
 				logger.Warn("keyring: parse failed; skipping file",
@@ -264,6 +362,15 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 				)
 				continue
 			}
+			if parsed.broken != nil {
+				// The key the junk interrupts, and what follows, is not
+				// read, as gpgv does not read it (readKeyring).
+				logger.Warn("keyring_file_truncated",
+					"path", path,
+					"err", parsed.broken,
+				)
+			}
+			logMarks(parsed, "path", path)
 			addEntities(parsed, path)
 		}
 	}
@@ -277,19 +384,105 @@ func LoadKeyringWithEmbedded(dirs []string, embedded []EmbeddedSource, logger *s
 			)
 			continue
 		}
+		if parsed.broken != nil {
+			logger.Warn("keyring_file_truncated",
+				"name", es.Name,
+				"err", parsed.broken,
+			)
+		}
+		logMarks(parsed, "name", es.Name)
 		addEntities(parsed, "embedded:"+es.Name)
 	}
 
+	// The fingerprints last: a merge adds subkeys to an entry already
+	// listed. Every mark on a primary key marks every subkey of the merged
+	// entity too: a signature by a subkey of a revoked key is REVKEYSIG too.
+	fingerprints := make(map[string]struct{})
 	entities := make(openpgp.EntityList, 0, len(entries))
-	for _, e := range entries {
-		entities = append(entities, e.Entity)
+	for i := range entries {
+		e := entries[i].Entity
+		fingerprints[entries[i].PrimaryFingerprint] = struct{}{}
+		var fromPrimary keyMarks
+		for _, m := range uncountable[entries[i].PrimaryFingerprint] {
+			fromPrimary = fromPrimary.add(keyMark{
+				why:  fmt.Errorf("its primary key %s: %w", entries[i].PrimaryFingerprint, m.why),
+				from: m.from,
+			})
+		}
+		subFPs := make([]string, 0, len(e.Subkeys))
+		for _, sub := range e.Subkeys {
+			if sub.PublicKey != nil {
+				subFP := upperFP(sub.PublicKey.Fingerprint)
+				fingerprints[subFP] = struct{}{}
+				subFPs = append(subFPs, subFP)
+				if len(fromPrimary) > 0 {
+					uncountable[subFP] = uncountable[subFP].union(fromPrimary)
+				}
+			}
+		}
+		entries[i].SubkeyFingerprints = subFPs
+		entities = append(entities, e)
 	}
 
 	return &Keyring{
 		entries:      entries,
 		entities:     entities,
 		fingerprints: fingerprints,
+		uncountable:  uncountable,
 	}, nil
+}
+
+// mergeEntity folds dup, a later copy of e's key (the same primary
+// fingerprint, so the same key packet), into e, as gpg's import merges
+// keyblocks: the union of the copies' subkeys (by fingerprint) and
+// identities (by name), and of every revocation and signature, a subkey's
+// binding, an identity's self-signature and the key's direct-key
+// self-signature each the newest of the copies' (go-crypto's rule within
+// one copy: a later one only if strictly newer). go-crypto verified every
+// self-signature of both copies against the one primary key as it read
+// them, so the union holds no signature it did not. e and dup are the
+// loader's own, freshly parsed; dup is not used after.
+func mergeEntity(e, dup *openpgp.Entity) {
+	newer := func(have, cand *packet.Signature) *packet.Signature {
+		if cand != nil && (have == nil || cand.CreationTime.After(have.CreationTime)) {
+			return cand
+		}
+		return have
+	}
+	e.Revocations = append(e.Revocations, dup.Revocations...)
+	e.Signatures = append(e.Signatures, dup.Signatures...)
+	e.SelfSignature = newer(e.SelfSignature, dup.SelfSignature)
+	if e.Identities == nil {
+		e.Identities = make(map[string]*openpgp.Identity, len(dup.Identities))
+	}
+	for name, id := range dup.Identities {
+		have, ok := e.Identities[name]
+		if !ok || have == nil {
+			e.Identities[name] = id
+			continue
+		}
+		if id == nil {
+			continue
+		}
+		have.Revocations = append(have.Revocations, id.Revocations...)
+		have.Signatures = append(have.Signatures, id.Signatures...)
+		have.SelfSignature = newer(have.SelfSignature, id.SelfSignature)
+	}
+	for _, sub := range dup.Subkeys {
+		if sub.PublicKey == nil {
+			continue
+		}
+		i := slices.IndexFunc(e.Subkeys, func(s openpgp.Subkey) bool {
+			return s.PublicKey != nil && bytes.Equal(s.PublicKey.Fingerprint, sub.PublicKey.Fingerprint)
+		})
+		if i < 0 {
+			e.Subkeys = append(e.Subkeys, sub)
+			continue
+		}
+		have := &e.Subkeys[i]
+		have.Revocations = append(have.Revocations, sub.Revocations...)
+		have.Sig = newer(have.Sig, sub.Sig)
+	}
 }
 
 // firstUID returns the entity's first user-id identity string
@@ -303,54 +496,4 @@ func firstUID(e *openpgp.Entity) string {
 		}
 	}
 	return ""
-}
-
-// parseKeyringFile reads one keyring file. The decoder probes the
-// content for the ASCII-armor header; binary keyrings (sequences of
-// public-key packets) decode through ReadKeyRing directly.
-func parseKeyringFile(path string) (openpgp.EntityList, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = f.Close() }()
-	return parseKeyringReader(f)
-}
-
-// parseKeyringBytes parses an in-memory keyring blob (used for
-// embedded sources). Same armor-probe behavior as parseKeyringFile.
-func parseKeyringBytes(b []byte) (openpgp.EntityList, error) {
-	return parseKeyringReader(bytes.NewReader(b))
-}
-
-func parseKeyringReader(r io.Reader) (openpgp.EntityList, error) {
-	// Buffer enough of the head to detect armor and rewind without
-	// seeking (works on any io.Reader if needed).
-	head := make([]byte, 64)
-	n, err := io.ReadFull(r, head)
-	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("read head: %w", err)
-	}
-	head = head[:n]
-
-	if seeker, ok := r.(io.Seeker); ok {
-		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("rewind: %w", err)
-		}
-	} else {
-		r = io.MultiReader(bytes.NewReader(head), r)
-	}
-
-	if bytes.Contains(head, []byte("-----BEGIN PGP")) {
-		entities, err := openpgp.ReadArmoredKeyRing(r)
-		if err != nil {
-			return nil, fmt.Errorf("armored: %w", err)
-		}
-		return entities, nil
-	}
-	entities, err := openpgp.ReadKeyRing(r)
-	if err != nil {
-		return nil, fmt.Errorf("binary: %w", err)
-	}
-	return entities, nil
 }

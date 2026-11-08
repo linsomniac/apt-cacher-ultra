@@ -141,13 +141,15 @@ func TestCheck_TransportFailureCountsAsFailed(t *testing.T) {
 	}
 }
 
-// Deferred minor B-33: the Release.gpg GET of a detached check runs under
-// the check deadline: a signature that stalls ends the check at
-// checkDeadline (spec C4: D in the latency bound), not later.
-func TestCheck_DetachedSignatureStallEndsAtTheCheckDeadline(t *testing.T) {
+// Legacy refresh invalidates the pair without waiting for a new signature:
+// the next client miss fetches it under the existing trust-upstream policy.
+func TestCheck_LegacyDetachedRefreshDoesNotWaitForSignature(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		fc := newFakeCache()
 		seedDetachedSuite(fc, "h")
+		row := fc.suites[keyOf("http", "h", "/r/dists/x")]
+		row.CurrentSnapshotID = nil
+		fc.putSuite(row)
 		up := simtest.NewUpstream()
 		up.Set("http://h/r/dists/x/Release", simtest.Serve([]byte("a new Release\n")))
 		up.Set("http://h/r/dists/x/Release.gpg", simtest.Stall())
@@ -157,11 +159,11 @@ func TestCheck_DetachedSignatureStallEndsAtTheCheckDeadline(t *testing.T) {
 		}
 		start := time.Now()
 		rep := c.check(context.Background(), SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/r/dists/x"}, checkOpts{})
-		if d := time.Since(start); d != checkDeadline {
-			t.Fatalf("the check took %v, want the %v check deadline", d, checkDeadline)
+		if d := time.Since(start); d != 0 {
+			t.Fatalf("check took %v", d)
 		}
 		if rep.result != "changed" {
-			t.Fatalf("result %q, want changed (the signature fetch failed; retried later)", rep.result)
+			t.Fatalf("result %q", rep.result)
 		}
 	})
 }

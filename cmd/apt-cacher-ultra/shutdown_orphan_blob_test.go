@@ -219,12 +219,16 @@ func TestServe_GracefulShutdown_FetchMidStream_NoOrphanBlob(t *testing.T) {
 			t.Errorf("serveListeners: %v", err)
 		}
 		// Drain budget 500ms + lifecycle-ctx cancel propagation
-		// + http transport teardown. 5s is the regression
-		// ceiling — TotalTimeout (30s) firing instead means the
-		// lifecycle-ctx chain regressed and fetch outlived
-		// shutdown.
-		if dur := time.Since(shutdownStart); dur > 5*time.Second {
-			t.Errorf("serveListeners returned in %v; expected sub-second after lifecycleCtx cancel", dur)
+		// + http transport teardown: under a second unloaded (0.91–0.96 s
+		// a whole run, -race, the final review 2's D2-M7).
+		//
+		// AIDEV-NOTE: the 15 s Fatalf below is what catches the
+		// lifecycle-ctx regression (TotalTimeout, 30 s, firing because a
+		// fetch outlived shutdown). This bound only flags load: it was 5 s
+		// and failed once at 5.44 s on a loaded machine
+		// (docs/open-decisions.md), so it is 12 s, short of the Fatalf.
+		if dur := time.Since(shutdownStart); dur > 12*time.Second {
+			t.Errorf("serveListeners returned in %v; want well under 12 s after lifecycleCtx cancel (about a second unloaded; 15 s is the regression)", dur)
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatalf("serveListeners did not return after shutdown — leader fetch may have outlived lifecycle cancel")

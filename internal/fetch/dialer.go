@@ -153,6 +153,15 @@ func newTransport(opts Options, deny []netip.Prefix, tracker *unreachableTracker
 		TLSHandshakeTimeout:   opts.ConnectTimeout,
 		ExpectContinueTimeout: 1 * time.Second,
 		TLSClientConfig:       tlsCfg,
+		// AIDEV-NOTE: the 2026-09 security review's VA-3/VA-4 (ruling HD-5).
+		// With compression enabled Go asks every upstream for gzip and
+		// decodes it in transit: the decoded body has ContentLength -1, which
+		// skipped the size check, and a resumed download (Go does not ask for
+		// gzip on a Range request) appended compressed bytes to a decoded
+		// prefix. The cache stores and serves bytes as the upstream sent
+		// them, never with a Content-Encoding, so it must not ask for any —
+		// as apt's own http method does not. The HTTP/2 transport honours it.
+		DisableCompression: true,
 	}
 	if proxyURL != nil {
 		transport.OnProxyConnectResponse = func(_ context.Context, _ *url.URL, _ *http.Request, resp *http.Response) error {
