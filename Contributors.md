@@ -10,3 +10,4 @@ Sam Parkes (@Sam-Parkes)
 Venkat (@venkatamutyala) -- flat repository support is based on their PR #8
 Laurent Corbes (@lcaflc) -- admin TLS and ACME support is based on their PRs #20/#21; empty repository index handling is based on their PR #22
 @grifferz -- requested X-Forwarded-For support in issue #15
+Scott Hyndman (@shyndman) -- prepared statement reuse for faster snapshot adoption in PR #28
