@@ -442,7 +442,7 @@ VALUES (?, ?, ?, ?)`)
 		if err != nil {
 			return fmt.Errorf("CommitAdoption: prepare member insert: %w", err)
 		}
-		defer memberStmt.Close()
+		defer func() { _ = memberStmt.Close() }()
 
 		for _, m := range members {
 			if !validBlobHash(m.BlobHash) {
@@ -468,7 +468,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, 0)`)
 		if err != nil {
 			return fmt.Errorf("CommitAdoption: prepare skipped member insert: %w", err)
 		}
-		defer skippedStmt.Close()
+		defer func() { _ = skippedStmt.Close() }()
 
 		for _, s := range skipped {
 			if !validBlobHash(s.DeclaredSHA256) {
@@ -492,7 +492,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 		if err != nil {
 			return fmt.Errorf("CommitAdoption: prepare package_hash insert: %w", err)
 		}
-		defer packageStmt.Close()
+		defer func() { _ = packageStmt.Close() }()
 
 		for _, p := range packageHashes {
 			if !validBlobHash(p.DeclaredSHA256) {
