@@ -1,7 +1,6 @@
 package freshness
 
 import (
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -3316,25 +3315,7 @@ func (a *Adopter) readPackagesBlob(memberPath, blobHash string) ([]byte, error) 
 	defer func() { _ = f.Close() }()
 
 	if strings.HasSuffix(memberPath, ".gz") {
-		gr, err := gzip.NewReader(f)
-		if err != nil {
-			return nil, fmt.Errorf("gzip: %w", err)
-		}
-		defer func() { _ = gr.Close() }()
-		// io.LimitReader caps at exactly the limit; if the actual
-		// content reaches the cap, treat that as a bomb and abort.
-		// Add 1 byte of slack so we can distinguish "exactly cap"
-		// from "would have exceeded cap".
-		limited := io.LimitReader(gr, maxDecompressedPackagesBytes+1)
-		body, err := io.ReadAll(limited)
-		if err != nil {
-			return nil, fmt.Errorf("decompress: %w", err)
-		}
-		if int64(len(body)) > maxDecompressedPackagesBytes {
-			return nil, fmt.Errorf("decompressed Packages.gz size exceeds %d-byte cap (bomb defense)",
-				maxDecompressedPackagesBytes)
-		}
-		return body, nil
+		return readGzipPackagesBlob(f, maxDecompressedPackagesBytes)
 	}
 	if strings.HasSuffix(memberPath, ".xz") {
 		// Phase 3: ulikunitz/xz pure-Go reader. Same size-cap posture
