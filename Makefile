@@ -1,4 +1,4 @@
-.PHONY: build test test-race lint shellcheck check-deps check-deps-test fmt deb e2e e2e-flat e2e-live deb-test apt-repo-test clean
+.PHONY: build test test-race lint shellcheck check-deps check-deps-test fmt deb e2e e2e-flat e2e-live e2e-apt-oracle e2e-apt-oracle-old deb-test apt-repo-test clean
 
 GO        ?= go
 BIN       := apt-cacher-ultra
@@ -48,7 +48,7 @@ lint: shellcheck
 # they flag (0.9.0, GitHub's ubuntu-latest, reports an SC2015 that 0.11.0
 # does not), so CI's lint job and every checkout run this one version.
 SHELLCHECK_IMAGE := koalaman/shellcheck:v0.11.0
-SHELL_SCRIPTS    := e2e/flat/*.sh e2e/live/*.sh e2e/deb/*.sh packaging/scripts/*.sh scripts/smoke-test-docker.sh scripts/check-no-legacy-openpgp.sh scripts/test-check-no-legacy-openpgp.sh
+SHELL_SCRIPTS    := e2e/flat/*.sh e2e/live/*.sh e2e/apt-oracle/*.sh e2e/deb/*.sh packaging/scripts/*.sh scripts/smoke-test-docker.sh scripts/check-no-legacy-openpgp.sh scripts/test-check-no-legacy-openpgp.sh
 
 shellcheck:
 	docker run --rm -v "$(CURDIR):/mnt:ro" -w /mnt $(SHELLCHECK_IMAGE) -x $(SHELL_SCRIPTS)
@@ -89,6 +89,26 @@ e2e-flat:
 # run removes a container of its name first, a running one too).
 e2e-live:
 	bash e2e/live/run.sh
+
+# The manual apt oracle (e2e/apt-oracle/README.md): the real apt of the six
+# client images, each in a container without network, on the verifier's
+# signature-shape corpus (internal/gpg/testdata/aptshapes), compared with the
+# verdicts recorded beside it; a difference is "apt changed" and fails.
+# About 90 seconds on 12 cores with the images cached. Run by hand before
+# every release, after `docker pull` of the eleven images (the README's
+# "Running it" gives the loop: a cached tag is never refreshed, so without
+# it the run measures the old images and passes by construction), after a
+# go-crypto upgrade and after a change to internal/gpg's armor or
+# signature checks, never in CI. E2E_APT_ORACLE_IMAGES picks some
+# of the six; bash e2e/apt-oracle/run.sh --record re-records the verdicts.
+# e2e-apt-oracle-old is the same for the five older client images
+# (debian:10, ubuntu:20.04, 18.04, 16.04 and 14.04: verdicts-old.txt), about
+# 100 seconds; the release gate runs both.
+e2e-apt-oracle:
+	bash e2e/apt-oracle/run.sh
+
+e2e-apt-oracle-old:
+	bash e2e/apt-oracle/run.sh --old
 
 # SPEC §14 step 3 .deb install validation: build the .deb in a
 # golang stage, then install on each Ubuntu LTS target and verify

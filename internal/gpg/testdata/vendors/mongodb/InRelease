@@ -1,0 +1,46 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+Origin: mongodb
+Label: mongodb
+Suite: jammy/mongodb-org/7.0
+Architectures: amd64 arm64
+Components: multiverse
+Date: Mon, 26 Oct 2026 20:07:32 +0000
+MD5Sum:
+ 3e02c23d2c2b628a9a78edddcce3e69e          1289872 multiverse/binary-amd64/Packages
+ 9d9b517c48467e01b338d2a3b3d3ff7c           138441 multiverse/binary-amd64/Packages.gz
+ 0178b258cdcebb5d86893736cb1bf50e          1282766 multiverse/binary-arm64/Packages
+ 6c3721832c36296a3c684e4d469f0989           136746 multiverse/binary-arm64/Packages.gz
+SHA1:
+ e82954cb887adf16fd8323ec0ef8c8e773640225          1289872 multiverse/binary-amd64/Packages
+ 88048c4aec65fec9e8fc6e28de60d0f9e6eef2a9           138441 multiverse/binary-amd64/Packages.gz
+ bef574d5e64a7661e35ddea09a99482164037b05          1282766 multiverse/binary-arm64/Packages
+ 1eed7cc542143e51eb0cc255bc151fcd7ce545e8           136746 multiverse/binary-arm64/Packages.gz
+SHA256:
+ 9fa459668d7f8787afe899e2acfa174ae0ea80e772424acd6aa90288c5b42aa7          1289872 multiverse/binary-amd64/Packages
+ 424217dd70abd9b66170556ac7e2158cc79d9673ecd8a79e449ce344c460ac55           138441 multiverse/binary-amd64/Packages.gz
+ 2dd5341b587c5040e6579b35e13e188f679865068fc884fa3c702de0913728a4          1282766 multiverse/binary-arm64/Packages
+ 7f850eb14921d221618391dfd27094ec7905387c562016d9e523abc2563e17b0           136746 multiverse/binary-arm64/Packages.gz
+SHA512:
+ 4dd62975c96aa5d8c1dd0ccddd377a2c495b402d74c0c5be4acc1641d5f49cfde6101d9691ab431db0d703fe6b45f7bed16666d25d538f2f4d9ca68ba674cdd9          1289872 multiverse/binary-amd64/Packages
+ 30109b6433ee48e681ac9a90379296604b57cc004b16900d4b3d92c1dd1e40d1f912a00f214ff0079fa4a7a7bc6e234b51d2bafaff0c0a482660cdadba89f6b3           138441 multiverse/binary-amd64/Packages.gz
+ 40b3c3b116d92d04129b30d47d8b7d9d13c32ac7ecb95796efe183834ae1e076b79257deac8b8eb3d759cad2bcf25f42ddeefd4a5e8c79229685497923283895          1282766 multiverse/binary-arm64/Packages
+ c7003a42e4628116b74da2d706b2ba995918702f411c0169e52f23188b002283b54b5dfb9566a8922cfdca96433e494773fd7a1ec878bee7c87d32fc20d8d8e8           136746 multiverse/binary-arm64/Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+iQJKBAEBCAA0FiEE5YgwIB992CzYCKqEFg0muxeFujgFAmrfswUWHHBhY2thZ2lu
+Z0Btb25nb2RiLmNvbQAKCRAWDSa7F4W6OIykD/9QQkmrdu/n/0KBe3iZrgJUtiHl
+JqYGYTZ30GChQDPk42gkaixmIeP5CUSrXh/To4tdGwjJ01Gyt3wWCb6KZuhcLIYa
+efL0rsmDFlINbvzbnEJHbrkmyudKQelcP0XU5c7930SLKUQ5RbXZxL4I1h21CV9X
+kJoJ+QSahha2meTXg0zM4DApmoj7XEEbd8hOrlyfK4fL0uAlje0VxG6kSCteAQVw
+O12ZZdU+fN4TwTLT5j2MJ5CrEVBToQliZaTlDS93yn9kp/ldv1m3GHQchSki/tZk
+wcA0lWM5OlDGY/NwSSWCUMM78iVlpWbHN6zOBQkJuZ4QkNzianc4/BwJPuhAmb9P
+mnUNkero9Row7yi6o3DDKLMmSuGgOiBUnhFl1RNvdsG84yUgzXeM+ehmCU3be4e3
+LIxnndXUtlq5DAYhN+GmocKz2vMIrwItXRT0S5ijGzwEsd/uXM53OjyaMH/iHCQd
+yMZBAyZauFiWXWjrendveT43mfgce6EEjYh5dpElgkanomYtXPowFqj0BclUlDtK
+AcG8tF/Gyl/7rPLBEfk5syqrCKqMIhIycfKQr6fGw5qAkYYuBR9zFQGivk2MMMSn
+24pPZZQxmBXu3yPGTh3EKTExrvgQmiREeff7Tl4duKH5q0f4ighEnwoKLk5lyNrb
+0L/yoH0UiMnWWnjAuw==
+=aP8d
+-----END PGP SIGNATURE-----

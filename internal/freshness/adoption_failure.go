@@ -119,6 +119,7 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 	}
 	if refusal {
 		c.logger.Info("adoption_refused", attrs...)
+		adoptionRefusedTotal.Inc(reason) // a closed enum: cache.IsRefusalReason
 	}
 	// Spec C7: adoption_deferred marks a state transition, not every attempt.
 	if cur.AdoptionFailCount == 0 || cur.AdoptionFailReason == nil || *cur.AdoptionFailReason != reason {

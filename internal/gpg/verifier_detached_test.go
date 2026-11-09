@@ -9,16 +9,21 @@ import (
 	"testing"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
+	pgperrors "github.com/ProtonMail/go-crypto/openpgp/errors"
 )
 
 // VerifyDetached covers SPEC2 §7.6.3's "detached Release + Release.gpg"
 // path. The structural and trust-set logic mirrors VerifyInline (and
 // reuses verifyAnyTrusted), so these tests focus on:
-//   - both armored and binary signature inputs
+//   - armored signature inputs, and the refusal of binary ones
 //   - tampered Release / tampered signature rejection
 //   - empty-input guards (programmer-error category, not a fail-open)
 //   - per-suite pin propagation
-//   - multi-signature packet handling (concat'd binary signatures)
+//   - multi-signature packet handling (signature packets concatenated in
+//     one armor block)
+//
+// The shapes apt refuses (F0–F6) are held to apt's measured verdicts by
+// TestVerifier_FollowsTheAptShapeTable (aptshape_test.go).
 
 func TestVerifyDetached_HappyPath_Armored(t *testing.T) {
 	signer := newTestEntity(t, "Signer", "signer@example.com")
@@ -45,24 +50,38 @@ func TestVerifyDetached_HappyPath_Armored(t *testing.T) {
 	}
 }
 
-func TestVerifyDetached_HappyPath_Binary(t *testing.T) {
+// TestVerifyDetached_RefusesABinarySignature (formerly
+// TestVerifyDetached_HappyPath_Binary, which pinned acceptance): a binary
+// Release.gpg is refused as ErrMalformedSignature, as apt 2.2 to 3.2
+// refuse it ("Detached signature file … is in unsupported binary format";
+// the corpus' d_binary) — F1, the armor's BEGIN line at byte 0 — and on
+// the accept_any_signer bypass too, F1 being structural. The same packets
+// armored verify: only the form is refused.
+func TestVerifyDetached_RefusesABinarySignature(t *testing.T) {
 	signer := newTestEntity(t, "Signer", "signer@example.com")
 	keyring := newKeyring(t, signer)
-	v, _ := NewVerifier(VerifierConfig{
-		Keyring:          keyring,
-		RequireSignature: true,
-		Logger:           silentLogger(),
-	})
-
 	release := []byte(fakeReleasePlaintext)
 	sig := detachSignWith(t, signer, release, false /*binary*/)
 
-	got, err := v.VerifyDetached(context.Background(), newSuite(), release, sig)
-	if err != nil {
-		t.Fatalf("VerifyDetached: %v", err)
-	}
-	if !bytes.Equal(got, release) {
-		t.Fatalf("Release passthrough mismatch")
+	for _, anySigner := range []bool{false, true} {
+		v, err := NewVerifier(VerifierConfig{
+			Keyring:          keyring,
+			RequireSignature: true,
+			AcceptAnySigner:  anySigner,
+			Logger:           silentLogger(),
+		})
+		if err != nil {
+			t.Fatalf("NewVerifier: %v", err)
+		}
+		got, err := v.VerifyDetached(context.Background(), newSuite(), release, sig)
+		if !errors.Is(err, ErrMalformedSignature) || ClassifyVerifyErr(err) != "malformed_signature" || got != nil {
+			t.Errorf("accept_any_signer=%v: got %q, err %v (reason %q); want ErrMalformedSignature (malformed_signature)",
+				anySigner, got, err, ClassifyVerifyErr(err))
+		}
+		got, err = v.VerifyDetached(context.Background(), newSuite(), release, armorSignature(t, sig))
+		if err != nil || !bytes.Equal(got, release) {
+			t.Errorf("accept_any_signer=%v: the same signature armored: got %q, err %v; want the Release", anySigner, got, err)
+		}
 	}
 }
 
@@ -154,13 +173,20 @@ func TestVerifyDetached_TamperedSignature(t *testing.T) {
 
 	// Bit-flip a late byte in the signature packet — early bytes
 	// would corrupt the packet header itself; we want a body byte so
-	// the packet still parses but the cryptographic check fails.
+	// the packet still parses but the cryptographic check fails. The
+	// tampered packet is armored afterwards (a binary Release.gpg is
+	// refused before any cryptographic check), with the checksum of the
+	// tampered bytes, so the structural checks pass and the
+	// cryptographic one is what refuses it: S1's, since the packet names
+	// a key in the host keyring (ErrBadSignature, bad_signature; it was
+	// verifyAnyTrusted's SignatureError, crypto_verify_failed, before S1).
 	tampered := make([]byte, len(sig))
 	copy(tampered, sig)
 	tampered[len(tampered)-5] ^= 0x01
 
-	if _, err := v.VerifyDetached(context.Background(), newSuite(), release, tampered); err == nil {
-		t.Fatal("expected verification failure on tampered signature")
+	_, err := v.VerifyDetached(context.Background(), newSuite(), release, armorSignature(t, tampered))
+	if !errors.Is(err, ErrBadSignature) || ClassifyVerifyErr(err) != "bad_signature" {
+		t.Fatalf("err = %v (reason %q); want S1's ErrBadSignature (bad_signature)", err, ClassifyVerifyErr(err))
 	}
 }
 
@@ -269,8 +295,8 @@ func TestVerifyDetached_GarbageSignatureBytes(t *testing.T) {
 		context.Background(), newSuite(),
 		[]byte(fakeReleasePlaintext),
 		[]byte("not a valid pgp signature, just ASCII text"),
-	); err == nil {
-		t.Fatal("expected error on garbage signature input")
+	); !errors.Is(err, ErrMalformedSignature) || ruleOf(err) != "T1" {
+		t.Fatalf("garbage signature input: %v (rule %q); want ErrMalformedSignature, refused by T1 (no BEGIN line)", err, ruleOf(err))
 	}
 }
 
@@ -299,18 +325,27 @@ Q0gIKKkPxQv/RJUL/BQEbZE76q+vKyEfnRzwZ8BWBqoIHGYjcdaRXz5cVOmu0Nd9
 		context.Background(), newSuite(),
 		[]byte(fakeReleasePlaintext), armoredOther,
 	)
-	if err == nil {
-		t.Fatal("expected error on wrong-armor-type input")
+	if !errors.Is(err, ErrMalformedSignature) || ruleOf(err) != "T1" {
+		t.Fatalf("wrong-armor-type input: %v (rule %q); want ErrMalformedSignature, refused by T1 (no signature BEGIN line)", err, ruleOf(err))
 	}
 }
 
-func TestVerifyDetached_MultiSig_Binary_StaleAccompaniesCurrent(t *testing.T) {
+func TestVerifyDetached_MultiSig_Armored_StaleAccompaniesCurrent(t *testing.T) {
 	// Real Release.gpg may bundle multiple signatures (e.g. during a
 	// key rollover, both old and new keys sign). The verifier must
 	// accept on whichever packet pairs (a) trusted IssuerFingerprint
-	// with (b) cryptographic verification — and reject the rest.
+	// with (b) cryptographic verification — and walk past the rest.
+	// (Formerly …_MultiSig_Binary_…: the packets are now armored, one
+	// block, since a binary Release.gpg is refused before this loop.)
+	// The stale packet is the old key's, which has expired since it
+	// signed: it passes S1 (gpgv's EXPKEYSIG, which apt ignores beside a
+	// good signature) and fails verifyAnyTrusted's check
+	// (ErrKeyExpired). It used to be the signer's own signature of
+	// another text, which S1 now refuses:
+	// TestVerifyDetached_MultiSig_Armored_StaleAndCurrentRejects.
 	signer := newTestEntity(t, "Signer", "signer@example.com")
-	keyring := newKeyring(t, signer)
+	old := newExpiredEntity(t, "Old", "old@example.com")
+	keyring := newKeyring(t, signer, old)
 	v, _ := NewVerifier(VerifierConfig{
 		Keyring:          keyring,
 		RequireSignature: true,
@@ -318,16 +353,21 @@ func TestVerifyDetached_MultiSig_Binary_StaleAccompaniesCurrent(t *testing.T) {
 	})
 
 	release := []byte(fakeReleasePlaintext)
-	stale := []byte("Origin: Stale\n")
 
 	good := detachSignWith(t, signer, release, false /*binary*/)
-	bad := detachSignWith(t, signer, stale, false)
+	// The old key's signature of the same Release, made while it was
+	// valid (its first second).
+	stale := detachSignAt(t, old, release, old.PrimaryKey.CreationTime)
+	// Premise: the stale packet alone fails verifyAnyTrusted's check.
+	if _, err := v.VerifyDetached(context.Background(), newSuite(), release, armorSignature(t, stale)); !errors.Is(err, pgperrors.ErrKeyExpired) {
+		t.Fatalf("test premise: the old key's signature alone: %v; want verifyAnyTrusted's ErrKeyExpired", err)
+	}
 
-	// Concat: bad first (so the verifier must walk past it) then good.
-	combined := append([]byte{}, bad...)
-	combined = append(combined, good...)
+	// Concat: stale first (so the verifier must walk past it) then good,
+	// armored as one block.
+	combined := joined(stale, good)
 
-	got, err := v.VerifyDetached(context.Background(), newSuite(), release, combined)
+	got, err := v.VerifyDetached(context.Background(), newSuite(), release, armorSignature(t, combined))
 	if err != nil {
 		t.Fatalf("multi-sig verify failed: %v", err)
 	}
@@ -336,10 +376,34 @@ func TestVerifyDetached_MultiSig_Binary_StaleAccompaniesCurrent(t *testing.T) {
 	}
 }
 
+// TestVerifyDetached_MultiSig_Armored_StaleAndCurrentRejects:
+// TestVerifyDetached_MultiSig_Armored_StaleAccompaniesCurrent's former
+// shape, a stale signature by the trusted key (over another text) before
+// the current one, is refused: a bad signature from a known key beside a
+// good one is fatal, as apt's BADSIG is (S1, ErrBadSignature; the corpus'
+// d_badsig_badfirst).
+func TestVerifyDetached_MultiSig_Armored_StaleAndCurrentRejects(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	v, _ := NewVerifier(VerifierConfig{
+		Keyring:          newKeyring(t, signer),
+		RequireSignature: true,
+		Logger:           silentLogger(),
+	})
+	release := []byte(fakeReleasePlaintext)
+	good := detachSignWith(t, signer, release, false /*binary*/)
+	bad := detachSignWith(t, signer, []byte("Origin: Stale\n"), false)
+	got, err := v.VerifyDetached(context.Background(), newSuite(), release, armorSignature(t, joined(bad, good)))
+	if !errors.Is(err, ErrBadSignature) || ClassifyVerifyErr(err) != "bad_signature" || got != nil {
+		t.Fatalf("got %q, err %v (reason %q); want ErrBadSignature (bad_signature)", got, err, ClassifyVerifyErr(err))
+	}
+}
+
 func TestVerifyDetached_MultiSig_AllStaleRejects(t *testing.T) {
-	// Inverse of the above: every signature is over stale cleartext,
-	// so no packet verifies against the actual Release. The loop must
-	// not accept on IssuerFingerprint alone.
+	// Inverse of TestVerifyDetached_MultiSig_Armored_StaleAccompaniesCurrent:
+	// every signature is over stale cleartext, so no packet verifies
+	// against the actual Release. The verifier must not accept on
+	// IssuerFingerprint alone; since S1, a signature from a known key that
+	// fails is refused before S2's loop runs (ErrBadSignature).
 	signer := newTestEntity(t, "Signer", "signer@example.com")
 	keyring := newKeyring(t, signer)
 	v, _ := NewVerifier(VerifierConfig{
@@ -357,8 +421,69 @@ func TestVerifyDetached_MultiSig_AllStaleRejects(t *testing.T) {
 	combined := append([]byte{}, bad1...)
 	combined = append(combined, bad2...)
 
-	if _, err := v.VerifyDetached(context.Background(), newSuite(), release, combined); err == nil {
-		t.Fatal("expected rejection when all signatures are over stale cleartext")
+	// Armored as one block: a binary Release.gpg would be refused before
+	// any cryptographic check, and this test would pass vacuously.
+	_, err := v.VerifyDetached(context.Background(), newSuite(), release, armorSignature(t, combined))
+	if !errors.Is(err, ErrBadSignature) || ClassifyVerifyErr(err) != "bad_signature" {
+		t.Fatalf("err = %v (reason %q); want ErrBadSignature (bad_signature) when all signatures are over stale cleartext",
+			err, ClassifyVerifyErr(err))
+	}
+}
+
+// TestVerifyDetached_ABadSignatureFromAKnownKeyRejects is the detached twin
+// of TestVerifyInline_ABadSignatureFromAKnownKeyRejects (S1, VC-1): a
+// Release.gpg that carries, beside A's good signature, A's signature of
+// another text is refused in either order (ErrBadSignature, bad_signature;
+// the corpus' d_badsig_badfirst and d_badsig_goodfirst).
+func TestVerifyDetached_ABadSignatureFromAKnownKeyRejects(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t, signer), RequireSignature: true, Logger: silentLogger()})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	release := []byte(fakeReleasePlaintext)
+	good := detachSignWith(t, signer, release, false /*binary*/)
+	bad := detachSignWith(t, signer, []byte("Origin: Other\n"), false)
+	for name, packets := range map[string][]byte{
+		"bad first":  joined(bad, good),
+		"good first": joined(good, bad),
+	} {
+		got, err := v.VerifyDetached(context.Background(), newSuite(), release, armorSignature(t, packets))
+		if !errors.Is(err, ErrBadSignature) || ClassifyVerifyErr(err) != "bad_signature" || got != nil {
+			t.Errorf("%s: got %q, err %v (reason %q); want ErrBadSignature (bad_signature)", name, got, err, ClassifyVerifyErr(err))
+		}
+	}
+}
+
+// TestVerifyDetached_AKnownKeyOutsideThePinsStillCounts is the detached
+// twin of TestVerifyInline_AKnownKeyOutsideThePinsStillCounts: S1's "known"
+// is the host keyring, so C's bad signature beside A's good one is refused
+// although the suite's pin names A only.
+func TestVerifyDetached_AKnownKeyOutsideThePinsStillCounts(t *testing.T) {
+	a := newTestEntity(t, "A", "a@example.com")
+	c := newTestEntity(t, "C", "c@example.com")
+	pin := SignerPin{
+		HostRegex:    regexp.MustCompile(`^archive\.example\.com$`),
+		Fingerprints: map[string]struct{}{upperFP(a.PrimaryKey.Fingerprint): {}},
+	}
+	v, err := NewVerifier(VerifierConfig{Keyring: newKeyring(t, a, c), Pins: []SignerPin{pin}, RequireSignature: true, Logger: silentLogger()})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	release := []byte(fakeReleasePlaintext)
+	good := detachSignWith(t, a, release, false /*binary*/)
+	// Premises: the pin trusts A for the suite and not C.
+	if _, err := v.VerifyDetached(context.Background(), newSuite(), release, armorSignature(t, good)); err != nil {
+		t.Fatalf("test premise: A's good signature alone: %v; want it accepted under the pin", err)
+	}
+	if _, err := v.VerifyDetached(context.Background(), newSuite(), release, detachSignWith(t, c, release, true)); !errors.Is(err, ErrUntrustedSigner) {
+		t.Fatalf("test premise: C's good signature alone: %v; want ErrUntrustedSigner (C is outside the pin)", err)
+	}
+	cBad := detachSignWith(t, c, []byte("Origin: Other\n"), false)
+	got, err := v.VerifyDetached(context.Background(), newSuite(), release, armorSignature(t, joined(good, cBad)))
+	if !errors.Is(err, ErrBadSignature) || ClassifyVerifyErr(err) != "bad_signature" || got != nil {
+		t.Fatalf("A's good signature and C's bad one: got %q, err %v (reason %q); want ErrBadSignature (bad_signature): C is in the host keyring",
+			got, err, ClassifyVerifyErr(err))
 	}
 }
 
@@ -424,11 +549,12 @@ func TestVerifyDetached_AcceptAnySigner_NoPin_PassThrough(t *testing.T) {
 }
 
 // TestVerifyDetached_AcceptAnySigner_RawGarbage_StillRejected asserts
-// the requireParseableSignature guard catches raw non-armored garbage
-// under 64 KiB: decodeMaybeArmoredSignature only size-caps non-armored
-// input, so without the packet-parse check, arbitrary bytes would
-// propagate untouched through the bypass branch into the pool. This
-// regression case was missed by the original
+// raw non-armored garbage under 64 KiB is refused on the bypass branch,
+// never propagated untouched into the pool. It was the bypass's
+// parseable-signature guard's case while the decoder passed non-armored
+// input through; since the shape checks (now layer T's T1: no BEGIN line,
+// apt's NODATA) it is ErrMalformedSignature before any packet is parsed.
+// This regression case was missed by the original
 // TestVerifyDetached_AcceptAnySigner_GarbageSignature_StillRejected,
 // which only exercised the armored-frame structural rejection.
 func TestVerifyDetached_AcceptAnySigner_RawGarbage_StillRejected(t *testing.T) {
@@ -449,8 +575,35 @@ func TestVerifyDetached_AcceptAnySigner_RawGarbage_StillRejected(t *testing.T) {
 	garbage := []byte("not a valid pgp signature, just plain text bytes")
 
 	_, err = v.VerifyDetached(context.Background(), newSuite(), release, garbage)
-	if err == nil {
-		t.Fatal("expected error on raw non-armored garbage Release.gpg under accept_any_signer")
+	if !errors.Is(err, ErrMalformedSignature) || ruleOf(err) != "T1" {
+		t.Fatalf("err = %v (rule %q); want ErrMalformedSignature from T1 on raw non-armored garbage Release.gpg under accept_any_signer", err, ruleOf(err))
+	}
+}
+
+// TestVerifyDetached_AcceptAnySigner_EmptyArmorStillRejected: an armor
+// that holds no packet at all is refused in both modes by layer A (A4: no
+// base64 line), as ErrMalformedSignature, before the trust set is read; the
+// bypass's "at least one signature packet" is layer A's and P's (A4 decodes
+// to one byte or more, P1 to one packet or more).
+func TestVerifyDetached_AcceptAnySigner_EmptyArmorStillRejected(t *testing.T) {
+	signer := newTestEntity(t, "Signer", "signer@example.com")
+	keyring := newKeyring(t, signer)
+	release := []byte(fakeReleasePlaintext)
+	empty := []byte("-----BEGIN PGP SIGNATURE-----\n\n-----END PGP SIGNATURE-----\n")
+	for _, anySigner := range []bool{false, true} {
+		v, err := NewVerifier(VerifierConfig{
+			Keyring:          keyring,
+			RequireSignature: true,
+			AcceptAnySigner:  anySigner,
+			Logger:           silentLogger(),
+		})
+		if err != nil {
+			t.Fatalf("NewVerifier: %v", err)
+		}
+		got, err := v.VerifyDetached(context.Background(), newSuite(), release, empty)
+		if !errors.Is(err, ErrMalformedSignature) || ruleOf(err) != "A4" || got != nil {
+			t.Errorf("accept_any_signer=%v: got %q, err %v (rule %q); want ErrMalformedSignature from A4", anySigner, got, err, ruleOf(err))
+		}
 	}
 }
 
@@ -474,14 +627,14 @@ func TestVerifyDetached_AcceptAnySigner_GarbageSignature_StillRejected(t *testin
 	}
 
 	release := []byte(fakeReleasePlaintext)
-	// "Garbage" that starts with an armor frame so decodeMaybeArmoredSignature
-	// tries armor.Decode first; the armor frame is malformed (no body),
-	// triggering the decode error path.
+	// "Garbage" inside an armor frame: layer T passes it (no line outside
+	// the block, none inside starting with "-"), layer A refuses it (A2:
+	// a line that is no armor header, and no empty line before a body).
 	garbage := []byte("-----BEGIN PGP SIGNATURE-----\nthis is not a real signature\n-----END PGP SIGNATURE-----\n")
 
 	_, err = v.VerifyDetached(context.Background(), newSuite(), release, garbage)
-	if err == nil {
-		t.Fatal("expected decode error on garbage Release.gpg under accept_any_signer")
+	if !errors.Is(err, ErrMalformedSignature) || ruleOf(err) != "A2" {
+		t.Fatalf("err = %v (rule %q); want ErrMalformedSignature from A2 on garbage Release.gpg under accept_any_signer", err, ruleOf(err))
 	}
 }
 
@@ -526,3 +679,16 @@ func TestVerifyDetached_AcceptAnySigner_WithMatchingPin_StillEnforced(t *testing
 // detachSignWith, etc. — keep imports honest.
 var _ = openpgp.NewEntity
 var _ = filepath.Join
+
+// TestMalformedSentinels_ClaimNoAptVerdict: the malformed_* sentinels'
+// texts begin every structural refusal's log line, deviations included
+// (shapes every apt accepts and the cache's canonical grammar refuses), so
+// they must name what the cache refuses and claim nothing of apt (the Task
+// 9c review's 9c-M10; the controller's ruling R-9c-1).
+func TestMalformedSentinels_ClaimNoAptVerdict(t *testing.T) {
+	for _, err := range []error{ErrMalformedClearsign, ErrMalformedSignature} {
+		if regexp.MustCompile(`\bapt\b`).MatchString(err.Error()) {
+			t.Errorf("%q claims an apt verdict; name what the cache refuses", err.Error())
+		}
+	}
+}

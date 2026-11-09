@@ -84,10 +84,14 @@ func TestReparseSnapshotRelease_UndecodableEnvelopeFailsClosed(t *testing.T) {
 
 // R-1: until phase D the verifier accepted whitespace before the BEGIN
 // marker (ruling R-D2 now refuses it), so snapshots adopted earlier can
-// hold such an envelope: the clearsign detection must find a marker
-// anywhere (never HasPrefix), and the injection must be ignored for a
-// whitespace-prefixed envelope too.
-func TestReparseSnapshotRelease_IgnoresInjectionWithLeadingWhitespace(t *testing.T) {
+// hold such an envelope. Reconcile reads a stored InRelease as adoption
+// does since Task 9b (the re-review's V-RI1: apt's own splitter,
+// internal/apttext), which refuses it, as every client's apt does: so
+// reconcile fails closed on it — an error, no members — and the injection
+// is never parsed. (Until Task 9b's fix round reconcile decoded it with
+// go-crypto and parsed the signed member; the startup audit still reads
+// it that way, TestClassifyLegacyInline.)
+func TestReparseSnapshotRelease_LeadingWhitespaceFailsClosed(t *testing.T) {
 	env := newAdoptionTestEnv(t)
 	genuine := "Origin: Test\nSuite: noble\nSHA256:\n " + strings.Repeat("a", 64) + " 10 main/binary-amd64/Packages\n"
 	signed := clearsignForTest(t, genuine)
@@ -96,8 +100,8 @@ func TestReparseSnapshotRelease_IgnoresInjectionWithLeadingWhitespace(t *testing
 	tampered := append(append(append([]byte("\n \n"), signed[:idx]...), evil...), signed[idx:]...)
 	id := storeInlineSnapshot(t, env, tampered)
 	got, err := env.adopter.reparseSnapshotRelease(context.Background(), id)
-	if err != nil || len(got) != 1 || got[0].Path != "main/binary-amd64/Packages" {
-		t.Fatalf("declared = %+v, err=%v; want only the signed member", got, err)
+	if err == nil || len(got) != 0 || !strings.Contains(err.Error(), "not a valid clearsigned message") {
+		t.Fatalf("declared = %+v, err=%v; want an error naming the envelope and no members", got, err)
 	}
 }
 
@@ -139,9 +143,13 @@ func TestReparseSnapshotRelease_IgnoresInjectionInACRLFEnvelope(t *testing.T) {
 }
 
 // Deferred minor A-34: a declaration placed in the signed message's own
-// header block (beside "Hash:") makes the envelope undecodable — an error,
-// never a parse of the raw bytes.
-func TestReparseSnapshotRelease_HeaderBlockInjectionFailsClosed(t *testing.T) {
+// header block (beside "Hash:") is never parsed. apt's splitter reads the
+// header block as headers whatever their content and leaves them out of M
+// (T2), as adoption does since Task 9b (the corpus' xi_cleartext_comment_hdr
+// is adopted: every apt accepts it), so reconcile parses the signed member
+// alone (the re-review's V-RI1). (go-crypto's decoder refused the envelope,
+// and reconcile failed closed on it until Task 9b's fix round.)
+func TestReparseSnapshotRelease_IgnoresHeaderBlockInjection(t *testing.T) {
 	env := newAdoptionTestEnv(t)
 	genuine := "Origin: Test\nSuite: noble\nSHA256:\n " + strings.Repeat("a", 64) + " 10 main/binary-amd64/Packages\n"
 	signed := clearsignForTest(t, genuine)
@@ -151,8 +159,8 @@ func TestReparseSnapshotRelease_HeaderBlockInjectionFailsClosed(t *testing.T) {
 		"SHA256: "+strings.Repeat("d", 64)+" 10 main/binary-evilarch/Packages\n"...), signed[lineEnd:]...)
 	id := storeInlineSnapshot(t, env, tampered)
 	got, err := env.adopter.reparseSnapshotRelease(context.Background(), id)
-	if err == nil || len(got) != 0 {
-		t.Fatalf("got %d members, err=%v; want a decode error and no members", len(got), err)
+	if err != nil || len(got) != 1 || got[0].Path != "main/binary-amd64/Packages" {
+		t.Fatalf("declared = %+v, err=%v; want only the signed member", got, err)
 	}
 }
 

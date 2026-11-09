@@ -1,0 +1,18 @@
+Origin: cloud-sdk
+Label: cloud-sdk
+Suite: cloud-sdk
+Codename: cloud-sdk
+Date: Wed, 28 Oct 2026 19:00:42 UTC
+Architectures: all amd64 arm64 i386
+Components: main
+Description: Virtual Repository pointing to cloud-sdk-bullseye
+MD5Sum:
+ 47bd5d458cf4852af49f80c1af87343d 301279 main/binary-all/Packages
+ 288768f707be1e145bef3a4c50163c24 971856 main/binary-amd64/Packages
+ 270c4e4e00bf80f62409397582986ee7 730041 main/binary-arm64/Packages
+ 1b6065a2ed3440a67cec19c4e972e431 170583 main/binary-i386/Packages
+SHA256:
+ e46371ec907fa56c58040654a0f063f835d1437c4e7723066d6a11e2c076ebec 301279 main/binary-all/Packages
+ d2c3894ba66fc09b833b1867bbb63c64e0193d3949f7090ccc959ab85c0bf694 971856 main/binary-amd64/Packages
+ ed43e759fd2795479e926c2feeb425094db545bb7770deac5e365d7933b4da4c 730041 main/binary-arm64/Packages
+ b79c94eee5e8f49de4a2a46647a98649b39be5dacaef0d1607e9e92206f6ff1c 170583 main/binary-i386/Packages

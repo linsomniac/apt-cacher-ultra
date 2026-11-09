@@ -100,20 +100,15 @@ func (c *Cache) ListSuiteMetadataRows(ctx context.Context, key SuiteKey) ([]URLP
 // with the response's validators (nil stores NULL), and reports whether
 // it did. It never writes last_requested_at or request_count, and it sets
 // last_fetched_at only when the blob changes, to MAX(now, previous + 1)
-// (plan design note 13: a replacement within the second of the previous
-// fetch still moves Last-Modified forward). A row that changed since the
+// (preserving local replacement order). A row that changed since the
 // caller read it — a miss stored newer bytes, url_path GC deleted it — is
 // left alone (false): the refresh never overwrites what a client's own
 // fetch just stored. Like the miss path's upsert it changes no blob
 // refcount: blob GC finds a url_path row's blob through its NOT EXISTS
 // clause.
 //
-// AIDEV-NOTE: ruling R-G3. url_path-served metadata answers Last-Modified
-// = max(pool mtime, last_fetched_at) (the handler's urlPathModTime), and
-// adoptionStampTx's first-adoption floor stays above it only while no
-// pool file is newer than its row's last_fetched_at: the caller finalizes
-// the pool file before this stamps the row, as runFetch does. Keep that
-// order.
+// Finalize the pool file before this call: fetch timestamps describe completed
+// writes. Response dates come from upstream metadata, independently of them.
 func (c *Cache) RefreshURLPathBlob(ctx context.Context, scheme, host, path, old, newHash string, etag, lastmod *string) (bool, error) {
 	if !validBlobHash(old) || !validBlobHash(newHash) {
 		return false, fmt.Errorf("RefreshURLPathBlob: %w", ErrInvalidHash)
@@ -121,7 +116,12 @@ func (c *Cache) RefreshURLPathBlob(ctx context.Context, scheme, host, path, old,
 	now := nowUnix()
 	updated := false
 	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
-		res, err := conn.ExecContext(ctx, `
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		res, err := tx.ExecContext(ctx, `
 UPDATE url_path
    SET blob_hash        = ?,
        upstream_etag    = ?,
@@ -136,6 +136,18 @@ UPDATE url_path
 		n, err := res.RowsAffected()
 		if err != nil {
 			return fmt.Errorf("RefreshURLPathBlob: rows: %w", err)
+		}
+		if n > 0 {
+			date := ""
+			if lastmod != nil {
+				date = HTTPDate(*lastmod)
+			}
+			if _, err := tx.ExecContext(ctx, putRepresentationSQL, scheme, host, path, newHash, date, now); err != nil {
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return err
 		}
 		updated = n > 0
 		return nil

@@ -402,20 +402,32 @@ func TestSnapshotGC_ReapsSkippedMemberRows(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := c.RunSnapshotGCBatch(ctx, 10, 3600, 0)
+	res, err := c.RunSnapshotGCBatch(ctx, 10, 3600, 0, true)
 	if err != nil {
 		t.Fatalf("RunSnapshotGCBatch: %v", err)
 	}
 	if res.DisplacedReaped != 1 {
 		t.Fatalf("displaced_reaped = %d, want 1", res.DisplacedReaped)
 	}
-	var n int
-	if err := c.db.QueryRow(
-		`SELECT count(*) FROM snapshot_skipped_member WHERE snapshot_id = ?`, id,
-	).Scan(&n); err != nil {
-		t.Fatalf("count skip rows: %v", err)
+	skipRows := func() int {
+		t.Helper()
+		var n int
+		if err := c.db.QueryRow(
+			`SELECT count(*) FROM snapshot_skipped_member WHERE snapshot_id = ?`, id,
+		).Scan(&n); err != nil {
+			t.Fatalf("count skip rows: %v", err)
+		}
+		return n
 	}
-	if n != 0 {
+	// A periodic tick's sub-job B retires the displaced snapshot, its rows
+	// kept, and sub-job C deletes them (DN-7 of the GC and upstream
+	// hardening plan).
+	assertRetired(t, c, []int64{id}, []int64{id2})
+	if n := skipRows(); n != 1 {
+		t.Fatalf("snapshot_skipped_member rows for the retired snapshot = %d, want 1 (sub-job C's to delete)", n)
+	}
+	drainRetired(t, c)
+	if n := skipRows(); n != 0 {
 		t.Errorf("snapshot_skipped_member rows for reaped snapshot = %d, want 0", n)
 	}
 }

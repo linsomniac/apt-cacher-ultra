@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
@@ -389,6 +390,7 @@ func TestCheck_NotModified_BumpsTimestamps(t *testing.T) {
 		Path:            "/dists/noble/InRelease",
 		BlobHash:        &bh,
 		UpstreamURL:     srv.URL + "/dists/noble/InRelease",
+		UpstreamETag:    &etag,
 		IsMetadata:      true,
 	})
 
@@ -1167,7 +1169,8 @@ func TestCheck_RecoversWhenAnchorMissingButSnapshotPresent(t *testing.T) {
 	}
 	c.Check(context.Background(), "http", "127.0.0.1", "/dists/noble-updates")
 
-	// 1. No longer frozen: last_check_at / last_success_at advanced to now.
+	// The check ran, but a deployment with adoption disabled cannot safely
+	// replace an adopted snapshot. Keep success unchanged and count a failure.
 	got, ok := fc.suite("http", "127.0.0.1", "/dists/noble-updates")
 	if !ok {
 		t.Fatal("suite_freshness missing")
@@ -1175,8 +1178,8 @@ func TestCheck_RecoversWhenAnchorMissingButSnapshotPresent(t *testing.T) {
 	if got.LastCheckAt == nil || *got.LastCheckAt != now.Unix() {
 		t.Fatalf("last_check_at not advanced: got %v want %d (suite still frozen)", got.LastCheckAt, now.Unix())
 	}
-	if got.LastSuccessAt == nil || *got.LastSuccessAt != now.Unix() {
-		t.Errorf("last_success_at not advanced: got %v want %d", got.LastSuccessAt, now.Unix())
+	if got.LastSuccessAt == nil || *got.LastSuccessAt != then || got.CheckFailCount != 1 {
+		t.Errorf("adoption-disabled snapshot refresh falsely reported success: %+v", got)
 	}
 	// 2. The change was observed (upstream rolled forward).
 	if got.InReleaseChangeSeenAt == nil {
@@ -1683,9 +1686,9 @@ func TestCheck_Phase1DetachedFallback_OnInRelease404(t *testing.T) {
 		t.Fatal(err)
 	}
 	rep := c.check(context.Background(), SuiteRef{CanonicalScheme: "http", CanonicalHost: "127.0.0.1", SuitePath: "/dists/noble"}, checkOpts{})
-	for _, name := range []string{"InRelease", "Release", "Release.gpg"} {
-		if n := len(up.Calls("http://127.0.0.1/dists/noble/" + name)); n != 1 {
-			t.Fatalf("%s requested %d times, want 1 (the 404, then the detached check)", name, n)
+	for name, want := range map[string]int{"InRelease": 1, "Release": 1, "Release.gpg": 0} {
+		if n := len(up.Calls("http://127.0.0.1/dists/noble/" + name)); n != want {
+			t.Fatalf("%s requested %d times, want %d (legacy refresh invalidates without fetching a signature)", name, n, want)
 		}
 	}
 	lines := logRecords(t, logs, "freshness_check")
@@ -2261,4 +2264,39 @@ func TestCheck_UntrackedSuiteIsNotChecked(t *testing.T) {
 	if locks != 0 {
 		t.Fatalf("lock map holds %d entries, want 0", locks)
 	}
+}
+
+func (f *fakeCache) InvalidateLegacyMetadata(ctx context.Context, suite cache.SuiteKey, anchor, oldHash string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.putErr != nil {
+		return f.putErr
+	}
+	if row := f.suites[keyOf(suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath)]; row.CurrentSnapshotID != nil {
+		return fmt.Errorf("adopted suite requires adoption to refresh")
+	}
+	for k, u := range f.urls {
+		if u.CanonicalScheme == suite.CanonicalScheme && u.CanonicalHost == suite.CanonicalHost && aptpath.SuitePath(u.Path) == suite.SuitePath && !strings.Contains(u.Path, "/by-hash/") {
+			delete(f.urls, k)
+		}
+	}
+	return nil
+}
+
+func (f *fakeCache) RefreshURLPathBlob(_ context.Context, scheme, host, path, old, newHash string, etag, lastmod *string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.putErr != nil {
+		return false, f.putErr
+	}
+	key := keyOf(scheme, host, path)
+	row, ok := f.urls[key]
+	if !ok || row.BlobHash == nil || *row.BlobHash != old {
+		return false, nil
+	}
+	row.BlobHash = &newHash
+	row.UpstreamETag = etag
+	row.UpstreamLastMod = lastmod
+	f.urls[key] = row
+	return true, nil
 }

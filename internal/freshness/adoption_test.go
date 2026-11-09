@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -94,6 +96,7 @@ type fakeFetcher struct {
 	responses map[string][]byte
 	errFor    map[string]error // optional per-URL error injection
 	seen      []string         // every URL Fetch was called with, in order
+	targets   []fetch.Target   // every target Fetch was called with, in order
 	calls     atomic.Int32
 }
 
@@ -105,6 +108,14 @@ func (f *fakeFetcher) requested() []string {
 	out := make([]string, len(f.seen))
 	copy(out, f.seen)
 	return out
+}
+
+// fetchTargets returns the targets Fetch saw, newest-last: each
+// download's URL and its MaxBytes.
+func (f *fakeFetcher) fetchTargets() []fetch.Target {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fetch.Target(nil), f.targets...)
 }
 
 func newFakeFetcher() *fakeFetcher {
@@ -145,6 +156,7 @@ func (f *fakeFetcher) Fetch(ctx context.Context, target *fetch.Target, dst fetch
 	f.calls.Add(1)
 	f.mu.Lock()
 	f.seen = append(f.seen, target.URL)
+	f.targets = append(f.targets, *target)
 	body, ok := f.responses[target.URL]
 	if errInj, has := f.errFor[target.URL]; has {
 		f.mu.Unlock()
@@ -3308,5 +3320,351 @@ func TestAdopter_MultiArch_AllowlistKeepsSourcePseudoArch(t *testing.T) {
 	}
 	if strings.Contains(out, `"architecture":"source"`) {
 		t.Errorf("source Sources should not be skipped (it is in the allowlist), got:\n%s", out)
+	}
+}
+
+// TestAdoptMember_LimitsTheDownloadToTheDeclaredSize: a member's download
+// is limited to its declared size (fetch.Target.MaxBytes, ruling HD-5), on
+// the by-hash probe and on the plain path; a member declared empty gets
+// one byte, since 0 is no limit.
+func TestAdoptMember_LimitsTheDownloadToTheDeclaredSize(t *testing.T) {
+	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
+	for _, tc := range []struct {
+		name string
+		body []byte
+		want int64
+	}{
+		{"declared 1234 bytes", bytes.Repeat([]byte("m"), 1234), 1234},
+		{"declared empty", []byte{}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newAdoptionTestEnv(t)
+			m := ReleaseMember{Path: "main/i18n/Translation-en", SHA256: shaOf(tc.body), Size: int64(len(tc.body))}
+			byHashURL := base + "main/i18n/by-hash/SHA256/" + m.SHA256
+			env.fetcher.fail503(byHashURL) // the probe fails, so the plain path runs too
+			env.fetcher.put(base+m.Path, tc.body)
+
+			if _, err := env.adopter.adoptMember(context.Background(), env.suite, m, true); err != nil {
+				t.Fatalf("adoptMember: %v", err)
+			}
+			targets := env.fetcher.fetchTargets()
+			if len(targets) != 2 {
+				t.Fatalf("fetched %d targets, want 2 (the by-hash probe, then the plain path): %+v", len(targets), targets)
+			}
+			for i, wantURL := range []string{byHashURL, base + m.Path} {
+				if targets[i].URL != wantURL || targets[i].MaxBytes != tc.want {
+					t.Errorf("fetch %d: URL %s, MaxBytes %d; want URL %s, MaxBytes %d",
+						i, targets[i].URL, targets[i].MaxBytes, wantURL, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// countingFetcher passes each Fetch to a real fetch.Client with the
+// fetch's dst wrapped to count the bytes the client writes into it
+// (written, summed over its fetches). A write that would take a fetch past
+// ceiling is refused: a safety stop that only a cache ignoring
+// fetch.Target.MaxBytes reaches, so that against an upstream that never
+// ends such a cache fails at once instead of filling the disk.
+type countingFetcher struct {
+	inner   AdoptionFetcher
+	ceiling int64
+	written atomic.Int64
+}
+
+func (f *countingFetcher) Fetch(ctx context.Context, target *fetch.Target, dst fetch.FetchDst) (*fetch.FetchResult, error) {
+	cd := &countingDst{FetchDst: dst, ceiling: f.ceiling}
+	res, err := f.inner.Fetch(ctx, target, cd)
+	f.written.Add(cd.n)
+	return res, err
+}
+
+// countingDst is a fetch.FetchDst that counts the bytes written through it
+// and refuses a write that would take it past ceiling.
+type countingDst struct {
+	fetch.FetchDst
+	ceiling int64
+	n       int64
+}
+
+func (d *countingDst) Write(p []byte) (int, error) {
+	if d.n+int64(len(p)) > d.ceiling {
+		return 0, fmt.Errorf("countingDst: safety ceiling of %d bytes", d.ceiling)
+	}
+	n, err := d.FetchDst.Write(p)
+	d.n += int64(n)
+	return n, err
+}
+
+// TestAdoptMember_AMemberLongerThanDeclaredStopsAtItsSize: an upstream
+// that serves a member longer than its Release declares — chunked, so no
+// declared length gives it away, and without end — has the download
+// stopped at the declared size (the 2026-09 security review's A-2, ruling
+// HD-5). The cache takes in exactly the declared size and the one byte
+// that shows the body runs over; the member fails as a fetch failure
+// naming fetch.ErrBodyTooLarge; nothing of it stays in pool/ or tmp/. And
+// the cache stops reading the upstream: adoptMember returns within 15 s
+// (a passing run takes about 0.25 s), where a cache that kept reading the
+// endless body past its dst — draining it to reuse the connection, say —
+// would read on until its 30 s context ended. The upstream then sees a
+// failed write once the cache has closed the connection. What the upstream
+// wrote is only logged: loopback socket buffers take in an amount that
+// varies by host and load (ruling HD-12). Without the cap the cache reads
+// on until countingFetcher's safety ceiling.
+func TestAdoptMember_AMemberLongerThanDeclaredStopsAtItsSize(t *testing.T) {
+	const declared = 1 << 20                                // the member's declared size
+	chunk := bytes.Repeat([]byte("Package: padded\n"), 256) // 4 KiB
+	// The declared member is the body's first MiB: what follows is the
+	// excess an upstream pads it with, without end.
+	m := ReleaseMember{
+		Path:   "main/binary-amd64/Packages",
+		SHA256: shaOf(bytes.Repeat(chunk, declared/len(chunk))),
+		Size:   declared,
+	}
+	suite := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.example.com", SuitePath: "/debian/dists/stable"}
+
+	var requests atomic.Int32
+	var wrote atomic.Int64
+	writeFailed := make(chan error, 1)
+	// The upstream is reached as a forward proxy (internal/fetch's
+	// upstream_proxy_test.go): adoption builds a member's URL from
+	// suite.CanonicalHost, with no port, and Fetch requires the URL's host
+	// to be that host. The body never ends: the handler writes until a
+	// write fails, as it does once the cache has closed the connection.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/debian/dists/stable/main/binary-amd64/Packages" {
+			http.NotFound(w, r)
+			return
+		}
+		requests.Add(1)
+		flusher := w.(http.Flusher)
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush() // headers out first: the body goes chunked
+		for {
+			n, err := w.Write(chunk)
+			wrote.Add(int64(n))
+			if err != nil {
+				select {
+				case writeFailed <- err:
+				default:
+				}
+				return
+			}
+			flusher.Flush()
+		}
+	}))
+	// Closing the client connections first ends a handler still writing
+	// (the test has failed), so Close never waits on it.
+	defer func() {
+		srv.CloseClientConnections()
+		srv.Close()
+	}()
+
+	client, err := fetch.New(fetch.Options{Proxy: srv.URL, AllowedHostRegex: []string{`^archive\.example\.com$`}})
+	if err != nil {
+		t.Fatalf("fetch.New: %v", err)
+	}
+	counting := &countingFetcher{inner: client, ceiling: 16 * declared}
+	env := newAdoptionTestEnv(t)
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:       env.cache,
+		Fetcher:     counting,
+		Verifier:    passThroughVerifier{},
+		HostLimiter: hostsem.New(8),
+		Logger:      discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err = ad.adoptMember(ctx, suite, m, false)
+	// A bound on time, not on the upstream's bytes (ruling HD-12): with a
+	// margin of some 50 times a passing run, it fails only a cache that
+	// keeps reading the endless body until its context ends.
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
+		t.Errorf("adoptMember took %s, want at most 15s: the cache kept reading the endless body past its limit", elapsed)
+	}
+	if got := counting.written.Load(); got != declared+1 {
+		t.Errorf("the cache took in %d bytes, want exactly %d (the declared size and the one byte that shows the body runs over)",
+			got, declared+1)
+	}
+	if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
+		t.Errorf("adoptMember error = %v, want ErrAdoptionMemberFetchFailed", err)
+	}
+	var me *AdoptionMemberError
+	if !errors.As(err, &me) {
+		t.Errorf("adoptMember error = %v, want an *AdoptionMemberError", err)
+	} else if !strings.Contains(me.Detail, fetch.ErrBodyTooLarge.Error()) {
+		t.Errorf("member error detail = %q, want it to name %q", me.Detail, fetch.ErrBodyTooLarge.Error())
+	}
+	if n := blobsInPool(t, env.cache); n != 0 {
+		t.Errorf("pool/ holds %d files, want none", n)
+	}
+	if tmp, err := os.ReadDir(filepath.Join(env.cache.Dir(), "tmp")); err != nil || len(tmp) != 0 {
+		t.Errorf("tmp/ holds %d files (err %v), want none", len(tmp), err)
+	}
+
+	select {
+	case werr := <-writeFailed:
+		t.Logf("the upstream wrote %d bytes before a write failed: %v", wrote.Load(), werr)
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the upstream was still writing 10s after adoptMember returned (%d bytes so far): the cache did not stop reading",
+			wrote.Load())
+	}
+	if got := requests.Load(); got != 1 {
+		t.Errorf("upstream saw %d requests for the member, want 1", got)
+	}
+}
+
+// newRealClientAdopter is an Adopter over a fresh cache whose member
+// fetches go through a real fetch.Client to srv, reached as a forward
+// proxy for archive.example.com, as in
+// TestAdoptMember_AMemberLongerThanDeclaredStopsAtItsSize (fakeFetcher
+// ignores fetch.Target.MaxBytes).
+func newRealClientAdopter(t *testing.T, srv *httptest.Server) (*Adopter, *cache.Cache) {
+	t.Helper()
+	client, err := fetch.New(fetch.Options{Proxy: srv.URL, AllowedHostRegex: []string{`^archive\.example\.com$`}})
+	if err != nil {
+		t.Fatalf("fetch.New: %v", err)
+	}
+	env := newAdoptionTestEnv(t)
+	ad, err := NewAdopter(AdoptionConfig{
+		Cache:       env.cache,
+		Fetcher:     client,
+		Verifier:    passThroughVerifier{},
+		HostLimiter: hostsem.New(8),
+		Logger:      discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewAdopter: %v", err)
+	}
+	return ad, env.cache
+}
+
+// TestAdoptMember_AByHashFileLongerThanDeclaredFallsBackToThePlainPath: a
+// by-hash URL that serves a file longer than the member's declared size (a
+// newer file, say) fails the probe with fetch.ErrBodyTooLarge — chunked, or
+// refused at its Content-Length — and adoption falls back to the plain
+// path, as after any failure of the probe's upstream or bytes: the member
+// adopts with its declared hash, after the probe and the plain path's
+// request, and nothing is left in tmp/ (the hardening plan's final review,
+// F-M2; ruling HD-5).
+func TestAdoptMember_AByHashFileLongerThanDeclaredFallsBackToThePlainPath(t *testing.T) {
+	for _, declared := range []bool{false, true} {
+		t.Run(fmt.Sprintf("by-hash Content-Length=%t", declared), func(t *testing.T) {
+			body := bytes.Repeat([]byte("Package: declared\n"), 600) // 10,800 bytes
+			longer := append(append([]byte(nil), body...), bytes.Repeat([]byte("Package: newer\n"), 600)...)
+			m := ReleaseMember{Path: "main/binary-amd64/Packages", SHA256: shaOf(body), Size: int64(len(body))}
+			suite := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.example.com", SuitePath: "/debian/dists/stable"}
+			byHash := "/debian/dists/stable/main/binary-amd64/by-hash/SHA256/" + m.SHA256
+			plain := "/debian/dists/stable/main/binary-amd64/Packages"
+
+			var (
+				mu   sync.Mutex
+				seen []string
+			)
+			requests := func() []string {
+				mu.Lock()
+				defer mu.Unlock()
+				return append([]string(nil), seen...)
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				seen = append(seen, r.URL.Path)
+				mu.Unlock()
+				switch r.URL.Path {
+				case byHash:
+					if declared {
+						w.Header().Set("Content-Length", fmt.Sprint(len(longer)))
+					} else {
+						w.WriteHeader(http.StatusOK)
+						w.(http.Flusher).Flush() // headers out first: the body goes chunked
+					}
+					_, _ = w.Write(longer)
+				case plain:
+					w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+					_, _ = w.Write(body)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			ad, c := newRealClientAdopter(t, srv)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			hash, err := ad.adoptMember(ctx, suite, m, true)
+			if err != nil {
+				t.Fatalf("adoptMember: %v (requests %v), want the plain path's bytes adopted", err, requests())
+			}
+			if hash != m.SHA256 {
+				t.Errorf("adopted hash %s, want the declared %s", hash, m.SHA256)
+			}
+			if got := requests(); len(got) != 2 || got[0] != byHash || got[1] != plain {
+				t.Errorf("requests %v, want the by-hash probe, then the plain path", got)
+			}
+			if tmp, err := os.ReadDir(filepath.Join(c.Dir(), "tmp")); err != nil || len(tmp) != 0 {
+				t.Errorf("tmp/ holds %d files (err %v), want none", len(tmp), err)
+			}
+			if n := blobsInPool(t, c); n != 1 {
+				t.Errorf("pool/ holds %d files, want 1 (the declared member)", n)
+			}
+		})
+	}
+}
+
+// TestAdoptMember_APlainPathMemberShortOfItsDeclaredSizeIsRefused: a
+// Release that declares a member's right SHA-256 with a Size larger than
+// the file (self-inconsistent; apt checks a file's size against its
+// Release too) has the member refused on the plain path whatever its
+// framing: with a Content-Length, by the size check against the response;
+// chunked, where no length is declared, by verifyMember's check against the
+// declared Size, as on the by-hash probe. Before, verifyMember checked the
+// response's Content-Length, so a chunked body was checked by its hash
+// alone and adopted (the hardening plan's final review, F-M6).
+func TestAdoptMember_APlainPathMemberShortOfItsDeclaredSizeIsRefused(t *testing.T) {
+	for _, declared := range []bool{false, true} {
+		t.Run(fmt.Sprintf("Content-Length=%t", declared), func(t *testing.T) {
+			body := bytes.Repeat([]byte("Package: real\n"), 500) // 7,000 bytes
+			m := ReleaseMember{Path: "main/binary-amd64/Packages", SHA256: shaOf(body), Size: int64(len(body)) + 100}
+			suite := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.example.com", SuitePath: "/debian/dists/stable"}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/debian/dists/stable/main/binary-amd64/Packages" {
+					http.NotFound(w, r)
+					return
+				}
+				if declared {
+					w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+				} else {
+					w.WriteHeader(http.StatusOK)
+					w.(http.Flusher).Flush() // headers out first: the body goes chunked
+				}
+				_, _ = w.Write(body)
+			}))
+			defer srv.Close()
+			ad, c := newRealClientAdopter(t, srv)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_, err := ad.adoptMember(ctx, suite, m, false)
+			if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
+				t.Fatalf("adoptMember error = %v, want ErrAdoptionMemberFetchFailed: the file is %d bytes, its Release declares %d",
+					err, len(body), m.Size)
+			}
+			var me *AdoptionMemberError
+			if !errors.As(err, &me) || !strings.Contains(me.Detail, "7000") || !strings.Contains(me.Detail, "7100") {
+				t.Errorf("adoptMember error = %v, want an *AdoptionMemberError whose detail names both sizes", err)
+			}
+			if n := blobsInPool(t, c); n != 0 {
+				t.Errorf("pool/ holds %d files, want none", n)
+			}
+			if tmp, err := os.ReadDir(filepath.Join(c.Dir(), "tmp")); err != nil || len(tmp) != 0 {
+				t.Errorf("tmp/ holds %d files (err %v), want none", len(tmp), err)
+			}
+		})
 	}
 }

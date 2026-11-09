@@ -103,13 +103,11 @@ func firstPeriodicTick(t *testing.T, g *gc.GC) {
 
 // Spec §7 C9: a reaped suite whose client returns before any GC tick
 // re-adopts its unchanged upstream content within one check — the retired
-// snapshot with the same natural key refuses nothing — and the GC tick
+// snapshot with the same natural key refuses nothing — and the GC pass
 // that then deletes the retired snapshot leaves the new one whole. The
-// startup GC pass, which runs before the listeners serve, leaves the
-// retired snapshot (ruling PF-15: no sub-job C there); the first periodic
-// tick deletes it, since the startup pass here reaches no deadline (one
-// whose blob pass did would leave sub-job C to a later tick: the passes
-// resume in rotation).
+// startup GC pass deletes it (its sub-job C, since issue #14 re-ruled
+// ruling PF-15), and neither it nor the first periodic tick touches the
+// new snapshot.
 func TestDoD_ReturnBeforeGCReadoptsWithinOneCheck(t *testing.T) {
 	ctx := context.Background()
 	r := newRetryRig(t, time.Minute)
@@ -132,13 +130,10 @@ func TestDoD_ReturnBeforeGCReadoptsWithinOneCheck(t *testing.T) {
 	if err := g.StartupPass(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.cache.GetSuiteSnapshot(ctx, old.SnapshotID); err != nil {
-		t.Fatalf("the startup GC pass deleted the retired snapshot (%v): it runs no sub-job C", err)
+	if _, err := r.cache.GetSuiteSnapshot(ctx, old.SnapshotID); !errors.Is(err, cache.ErrNotFound) {
+		t.Fatalf("the retired snapshot survived the startup GC pass (%v), whose sub-job C deletes it", err)
 	}
 	firstPeriodicTick(t, g)
-	if _, err := r.cache.GetSuiteSnapshot(ctx, old.SnapshotID); !errors.Is(err, cache.ErrNotFound) {
-		t.Fatalf("the retired snapshot survived the first periodic GC tick (%v)", err)
-	}
 	m, err := r.cache.GetSnapshotMember(ctx, snap.SnapshotID, "main/binary-amd64/Packages")
 	if err != nil {
 		t.Fatalf("the new snapshot lost its Packages member: %v", err)

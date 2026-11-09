@@ -215,7 +215,9 @@ type SuiteSnapshot struct {
 	// snapshot of its suite not yet retired when the suite's row is deleted
 	// — reaped, evicted at the cap, or forgotten (deleteSuiteTx,
 	// retireSuiteSnapshotsTx) — or alone when the legacy trust audit
-	// quarantines it (quarantineSnapshotTx). Sub-job C deletes it.
+	// quarantines it (quarantineSnapshotTx), or retired by GC sub-job B
+	// beyond gc.keep_displaced (RunSnapshotGCBatch in a periodic tick; DN-7
+	// of the GC and upstream hardening plan). Sub-job C deletes it.
 	RetiredAt *int64
 
 	// PackageCoverageComplete is the SPEC3 §7.5.4 per-snapshot proof

@@ -8,12 +8,10 @@
 //   - On periodic ticks (T2): scan known suites and check those whose
 //     last_success_at has aged past freshness.periodic_refresh.
 //
-// Phase 1 deliberately does not adopt newly-observed InRelease bytes:
-// doing so without atomically refreshing every referenced index would
-// open a hash-mismatch window for any client mid-update. Instead, the
-// Checker records the observation in inrelease_change_seen_at and the
-// cache keeps serving the consistent older set. Phase 2's atomic-flip
-// transaction will adopt.
+// Without adoption, a changed anchor invalidates the suite's mutable URL
+// metadata atomically. Later requests fetch current upstream bytes, under the
+// existing trust-upstream policy. Adopted snapshots are published only through
+// the verified adoption pipeline and never invalidated by that legacy path.
 package freshness
 
 import (
@@ -57,9 +55,9 @@ const defaultMaxInReleaseBytes int64 = 4 << 20
 
 // defaultMaxReleaseGPGBytes caps the Release.gpg body read after a
 // detached Release change is observed. Real Release.gpg files are
-// 1–2 KiB; 64 KiB matches the ceiling decodeMaybeArmoredSignature
-// uses post-armor and bounds the cost of a hostile upstream that
-// pads the file.
+// 1–2 KiB; 64 KiB matches the ceiling the verifier's armor layer puts
+// on the decoded signature (internal/gpg's armorMaxPacketBytes) and
+// bounds the cost of a hostile upstream that pads the file.
 const defaultMaxReleaseGPGBytes int64 = 64 << 10
 
 // checkDeadline bounds the upstream part of one freshness check (spec C4,
@@ -71,6 +69,8 @@ const checkDeadline = 2 * time.Minute
 // Defined as an interface so tests can supply a fake without standing
 // up an on-disk cache.
 type Cache interface {
+	RefreshURLPathBlob(ctx context.Context, scheme, host, path, old, newHash string, etag, lastmod *string) (bool, error)
+	InvalidateLegacyMetadata(ctx context.Context, key cache.SuiteKey, anchorPath, oldHash string) error
 	GetSuiteFreshness(ctx context.Context, scheme, host, suitePath string) (*cache.SuiteFreshness, error)
 	// HasSuiteRow is I-4's row gate before a lock-map entry is stored: one
 	// indexed existence read (SELECT 1), cheaper than GetSuiteFreshness.
@@ -374,6 +374,7 @@ type adoptionRequest struct {
 	// Detached form (form == adoptionFormDetached):
 	releaseBytes []byte
 	sigBytes     []byte
+	sigLastmod   string
 
 	// Validators captured from whichever metadata file the freshness
 	// checker conditional-GETs next time (Release in detached mode,
@@ -725,10 +726,10 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
 	declared, needReconcile, err := c.adopter.reconcilePending(ctx, rp.suite, rp.snapshotID)
 	if err != nil {
 		// A fail-closed anchor (R-1 decode error) must be visible, not a
-		// silent non-heal.
-		c.logger.Warn("adoption_reconcile_failed",
-			"canonical_host", rp.suite.CanonicalHost, "suite_path", rp.suite.SuitePath,
-			"snapshot_id", rp.snapshotID, "stage", "decision", "err", err)
+		// silent non-heal: WARN once per snapshot, every failure counted.
+		c.logReconcileFailure(ctx, "decision", rp.suite, rp.snapshotID, err)
+	} else {
+		c.adopter.clearReconcileFailure(rp.snapshotID)
 	}
 	out.needReconcile, out.declared = needReconcile, declared
 	if !out.needRepair && !out.needReconcile {
@@ -794,12 +795,35 @@ func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
 			// on-demand path (Reconcile) so a fail-closed anchor (R-1
 			// decode error) is visible, not a silent non-heal.
 			if _, err := c.adopter.reconcileSnapshot(rctx, rp.suite, rp.snapshotID, declared, false); err != nil {
-				c.logger.Warn("adoption_reconcile_failed",
-					"canonical_host", rp.suite.CanonicalHost, "suite_path", rp.suite.SuitePath,
-					"snapshot_id", rp.snapshotID, "stage", "heal", "err", err)
+				c.logReconcileFailure(rctx, "heal", rp.suite, rp.snapshotID, err)
 			}
 		}
 	}()
+}
+
+// logReconcileFailure logs and counts a failed reconcile of snapshotID at
+// stage: "decision" (planRepair: an unchanged check's reconcilePending),
+// "heal" (spawnRepair) or "on_demand" (Reconcile). Every failure is counted
+// (acu_adoption_reconcile_failed_total{stage}); a heal's or an on-demand
+// one is logged at WARN each time, a decision's at WARN once per snapshot
+// and at DEBUG after, until a decision on it succeeds.
+//
+// AIDEV-NOTE: the re-review's V-R2M1: a snapshot whose reconcile can never
+// succeed (a stored anchor apt's split refuses, which the legacy audit
+// keeps under ruling R-D2) fails its decision on every confirmed-unchanged
+// check, and the WARN fired each time, forever on a frozen suite. The memo
+// (Adopter.reconcileFailedSnapshots) is keyed by snapshot ID, so a suite's
+// next adoption warns afresh; a decision that succeeds clears its entry,
+// and each reaper run drops the entries of snapshots no longer current.
+func (c *Checker) logReconcileFailure(ctx context.Context, stage string, suite SuiteRef, snapshotID int64, err error) {
+	adoptionReconcileFailedTotal.Inc(stage)
+	level := slog.LevelWarn
+	if stage == "decision" && !c.adopter.firstReconcileFailure(snapshotID) {
+		level = slog.LevelDebug
+	}
+	c.logger.Log(ctx, level, "adoption_reconcile_failed",
+		"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath,
+		"snapshot_id", snapshotID, "stage", stage, "err", err)
 }
 
 // WaitForAdoptions blocks until every in-flight adoption goroutine
@@ -1070,17 +1094,16 @@ func (c *Checker) snapshotAnchorHash(ctx context.Context, snapshotID int64, file
 	return &v
 }
 
-// hasReleaseURLRow reports whether url_path has rows for both Release
-// and Release.gpg under (scheme, host, suitePath). Used by the inline
-// path's 404 fallback to decide whether a detached retry is even
-// possible — without both rows, the detached fetch would skip with a
-// "no cached Release url_path" debug log anyway.
+// hasReleaseURLRow checks for a legacy Release baseline. Adoption additionally
+// requires the detached signature row; trust-upstream refresh needs only Release.
 func (c *Checker) hasReleaseURLRow(ctx context.Context, scheme, host, suitePath string) bool {
 	if _, err := c.cache.LookupURL(ctx, scheme, host, suitePath+releaseFilename); err != nil {
 		return false
 	}
-	if _, err := c.cache.LookupURL(ctx, scheme, host, suitePath+releaseGPGFilename); err != nil {
-		return false
+	if c.adopter != nil {
+		if _, err := c.cache.LookupURL(ctx, scheme, host, suitePath+releaseGPGFilename); err != nil {
+			return false
+		}
 	}
 	return true
 }
@@ -1325,9 +1348,7 @@ func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string)
 		rctx, cancel := context.WithTimeout(c.lifetimeCtx, c.maxAdoptionDuration)
 		defer cancel()
 		if _, err := c.adopter.ReconcileSnapshot(rctx, suite, snapID, true); err != nil {
-			c.logger.Warn("adoption_reconcile_failed",
-				"canonical_host", host, "suite_path", suitePath,
-				"snapshot_id", snapID, "stage", "on_demand", "err", err)
+			c.logReconcileFailure(rctx, "on_demand", suite, snapID, err)
 		}
 	}()
 	return true

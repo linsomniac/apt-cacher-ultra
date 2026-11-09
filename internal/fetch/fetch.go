@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/upstreamproxy"
+	"github.com/linsomniac/apt-cacher-ultra/internal/usage"
 )
 
 // Sentinel errors. Callers identify retryable-vs-fatal failures with
@@ -44,6 +46,7 @@ var (
 	ErrInvalidURL          = errors.New("fetch: invalid target URL")
 	ErrRedirectBlocked     = errors.New("fetch: upstream redirect blocked")
 	ErrCacheWriteFailed    = errors.New("fetch: cache write failed")
+	ErrBodyTooLarge        = errors.New("fetch: response body exceeds the size expected")
 )
 
 // StatusError carries the upstream HTTP status code from any non-success
@@ -87,7 +90,8 @@ const defaultUserAgent = "apt-cacher-ultra/0.1"
 // timeouts mean "no timeout" at the transport level and rely on
 // TotalTimeout (set by Defaults) for the overall budget.
 type Options struct {
-	Proxy            string // explicit HTTP(S) proxy URL; empty means direct; may contain credentials
+	Usage            *usage.Collector // optional aggregate accounting shared with the cache handler
+	Proxy            string           // explicit HTTP(S) proxy URL; empty means direct; may contain credentials
 	ConnectTimeout   time.Duration
 	TotalTimeout     time.Duration
 	IdleReadTimeout  time.Duration // currently informational; per-byte read timeouts are a Phase 2 candidate.
@@ -150,6 +154,13 @@ type Client struct {
 type Target struct {
 	CanonicalHost string
 	URL           string
+
+	// MaxBytes, when > 0, is the most body bytes the fetch accepts: a
+	// response whose declared length exceeds it fails before its body is
+	// read, and a body that runs past it fails as soon as it does, both
+	// with ErrBodyTooLarge, which is not retried. 0 is no limit. Only
+	// Fetch honours it: Conditional ignores it and takes its own maxBody.
+	MaxBytes int64
 }
 
 // FetchDst is the destination for the response body. Truncate must reset
@@ -168,15 +179,30 @@ type FetchDst interface {
 // Status is always 200 on success — the internal resume mechanics (a
 // 206 partial response or a validator-induced restart) are hidden from
 // the caller. An upstream 204 is normalized to an empty 200 response,
-// discarding any partial download. ContentLength is the declared full
-// object size, or -1 when the initial response length was unknown; a
-// normalized 204 always has ContentLength 0.
+// discarding any partial download, and sets NoContent. ContentLength is
+// the declared full object size, or -1 when the initial response length
+// was unknown; a normalized 204 always has ContentLength 0.
 type FetchResult struct {
 	Status        int
 	ContentType   string
 	ContentLength int64
 	ETag          string
 	LastModified  string
+
+	// NoContent reports that upstream answered 204 No Content, so the
+	// (empty) body is the 204's, not a 200's. Fetch accepts a 204 for
+	// every caller; each caller decides by its class whether an empty
+	// object is acceptable (see the AIDEV-NOTE in doAttempt).
+	NoContent bool
+}
+
+// UpstreamStatus is the status upstream answered with, for logs and the
+// X-Upstream-Status header: 204 for a NoContent result, otherwise Status.
+func (r *FetchResult) UpstreamStatus() int {
+	if r.NoContent {
+		return http.StatusNoContent
+	}
+	return r.Status
 }
 
 // New constructs a Client from validated upstream options.
@@ -211,6 +237,9 @@ func New(opts Options) (*Client, error) {
 	allowDowngrade := opts.AllowHTTPSToHTTPRedirect
 	tracker := newUnreachableTracker(opts.UnreachableCooldown, opts.UnreachableProbeTimeout, opts.now)
 	transport := newTransport(opts, deny, tracker, proxyURL)
+	if opts.Usage != nil {
+		transport = usage.Transport{Base: transport, Usage: opts.Usage}
+	}
 	ua := opts.UserAgent
 	if ua == "" {
 		ua = defaultUserAgent
@@ -293,8 +322,10 @@ func New(opts Options) (*Client, error) {
 
 // Fetch streams target.URL into dst, applying SPEC §6.6 hardening (host
 // allowlist + deny-CIDR check) and SPEC §6.3 resumable retries.
-// A 204 No Content is a successful empty fetch; callers remain responsible
-// for checking the body against any declared size and hash.
+// A 204 No Content is a successful empty fetch with FetchResult.NoContent
+// set (counted as outcome no_content); callers decide whether an empty
+// object is acceptable for what they fetched, and remain responsible for
+// checking the body against any declared size and hash.
 //
 // Errors are classified for callers via errors.Is:
 //
@@ -313,6 +344,12 @@ func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (resul
 	host := hostLabel(target)
 	defer func() {
 		outcome := ClassifyFetchOutcome(retErr)
+		// F2-M3: an upstream 204 is a success Fetch counts apart, so
+		// an operator can see it (ClassifyFetchOutcome sees only the
+		// error, and a 204's is nil).
+		if retErr == nil && result != nil && result.NoContent {
+			outcome = "no_content"
+		}
 		fetchTotal.Inc(outcome, host)
 		fetchDurationSeconds.Observe(time.Since(start).Seconds(), outcome, host)
 	}()
@@ -416,6 +453,7 @@ func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (resul
 				ContentLength: initial.ContentLength,
 				ETag:          initial.ETag,
 				LastModified:  initial.LastModified,
+				NoContent:     initial.NoContent,
 			}, nil
 		}
 		if !isRetryable(err) {
@@ -503,6 +541,24 @@ func (c *Client) doAttempt(
 		// 204 cannot supply the remainder of a Range request. Reset the
 		// bytes and hash state before reporting success. A local reset
 		// failure must not be retried as an upstream failure.
+		//
+		// AIDEV-NOTE: the maintainer's rulings of 2026-11-05 (final
+		// review 2's F2-I1, D2-M2, F2-M3 and F2-R1-M1; the history and
+		// the rule not to flip are in handler.runFetch's AIDEV-NOTE).
+		// Fetch accepts a 204 for every caller but marks it NoContent;
+		// the callers decide by class. An empty success only for
+		// indexes and metadata: the adoption path's Release members
+		// (verifyMember checks their declared size and hashes, so a
+		// member declared size 0 is the one a 204 can satisfy), the
+		// handler's metadata recovery (runSnapshotMemberFetch, declared
+		// hash) and the client path's proxy.IsMetadata paths that are
+		// no anchor (runFetch). For a .deb or any other package file,
+		// and for an anchor (InRelease, Release, Release.gpg), a 204 is
+		// an upstream error, as before commit 3a6d5ba: runFetch answers
+		// 502 and caches nothing (ErrUpstreamNoContent), and hot
+		// prefetch counts a failed warm. Status stays 200 so the resume
+		// loop above treats the 204 as fresh headers; UpstreamStatus
+		// reports the 204.
 		if dst.Written() > 0 {
 			if err := dst.Truncate(); err != nil {
 				return out, fmt.Errorf("%w: truncate dst on 204: %v", ErrCacheWriteFailed, err)
@@ -510,8 +566,13 @@ func (c *Client) doAttempt(
 		}
 		out.Status = http.StatusOK
 		out.ContentLength = 0
+		out.NoContent = true
 		return out, nil
 	case http.StatusOK:
+		if target.MaxBytes > 0 && resp.ContentLength > target.MaxBytes {
+			return out, fmt.Errorf("%w: declared %d bytes, at most %d expected",
+				ErrBodyTooLarge, resp.ContentLength, target.MaxBytes)
+		}
 		if sendRange {
 			// Server invalidated our resume (If-Range mismatch or just
 			// ignored the Range header). SPEC §6.3: "the partial file is
@@ -520,7 +581,7 @@ func (c *Client) doAttempt(
 				return out, fmt.Errorf("%w: truncate dst on restart: %v", ErrCacheWriteFailed, err)
 			}
 		}
-		if err := streamBody(resp, dst); err != nil {
+		if err := streamBody(resp, dst, target.MaxBytes); err != nil {
 			return out, err
 		}
 		if resp.ContentLength > 0 && dst.Written() != resp.ContentLength {
@@ -557,8 +618,14 @@ func (c *Client) doAttempt(
 			return out, fmt.Errorf("%w: 206 last=%d >= total=%d",
 				ErrInvalidContentRange, last, total)
 		}
+		// last is an index: the resumed object ends at byte last+1, so a
+		// resume that reaches exactly MaxBytes passes.
+		if target.MaxBytes > 0 && (total > target.MaxBytes || last >= target.MaxBytes) {
+			return out, fmt.Errorf("%w: 206 Content-Range %q, at most %d bytes expected",
+				ErrBodyTooLarge, resp.Header.Get("Content-Range"), target.MaxBytes)
+		}
 		out.ContentLength = total
-		if err := streamBody(resp, dst); err != nil {
+		if err := streamBody(resp, dst, target.MaxBytes); err != nil {
 			return out, err
 		}
 		// The response covered [first, last] inclusive. Combined with
@@ -590,10 +657,33 @@ func (c *Client) doAttempt(
 // (e.g. disk full) from an upstream-side fault. Without this distinction
 // io.Copy returns the first error from either side; the outer retry loop
 // would then re-attempt on a cache write failure that won't recover by
-// re-asking the upstream.
-func streamBody(resp *http.Response, dst io.Writer) error {
-	_, err := io.Copy(&writeErrTagger{w: dst}, resp.Body)
-	return err
+// re-asking the upstream. With max > 0 it reads at most one byte past max
+// and fails with ErrBodyTooLarge when dst then holds more than max bytes.
+func streamBody(resp *http.Response, dst FetchDst, max int64) error {
+	src := io.Reader(resp.Body)
+	if max > 0 {
+		// max bounds what dst holds in all: a resume's prefix counts.
+		left := max - dst.Written()
+		if left < 0 {
+			left = 0
+		}
+		// AIDEV-NOTE: one byte past max tells "runs over" from "ends
+		// there", but at math.MaxInt64 that byte would wrap the limit
+		// negative and LimitReader would read nothing; no body runs past
+		// that max anyway (TestFetch_MaxBytesAtMaxInt64ReadsTheWholeBody).
+		n := left
+		if n < math.MaxInt64 {
+			n++
+		}
+		src = io.LimitReader(resp.Body, n)
+	}
+	if _, err := io.Copy(&writeErrTagger{w: dst}, src); err != nil {
+		return err
+	}
+	if max > 0 && dst.Written() > max {
+		return fmt.Errorf("%w: more than %d bytes", ErrBodyTooLarge, max)
+	}
+	return nil
 }
 
 // writeErrTagger wraps an io.Writer so any Write error is wrapped with
@@ -669,9 +759,13 @@ func parseContentRange(s string) (int64, int64, int64, error) {
 	return first, last, total, nil
 }
 
-// isRetryable reports whether err merits another attempt. Allowlist,
-// deny-range, ctx-cancel, 4xx are not retryable. 5xx, header anomalies,
-// size mismatches, and generic IO/net errors are.
+// isRetryable reports whether err merits another attempt. Not retryable:
+// an allowlist or deny-range refusal, a cancelled or expired context, an
+// upstream status other than 5xx (a 4xx, or a blocked redirect's 3xx), a
+// 407 from the configured proxy, a blocked redirect, an invalid URL, a
+// failed cooldown probe (ErrHostUnreachable), a cache write failure and a
+// body over Target.MaxBytes. Retryable: 5xx, header anomalies, size
+// mismatches, and generic IO/net errors.
 func isRetryable(err error) bool {
 	if err == nil {
 		return false
@@ -714,6 +808,12 @@ func isRetryable(err error) bool {
 		// SPEC §11 row 14: a cache-side write failure (disk full, I/O
 		// error) won't get better by re-asking upstream. Surface it
 		// fast so the handler can log loudly and 502.
+		return false
+	}
+	if errors.Is(err, ErrBodyTooLarge) {
+		// The upstream declared or sent more than the caller expects (for
+		// adoption, more than the Release declares): asking again only
+		// downloads the excess again (ruling HD-5).
 		return false
 	}
 	return true

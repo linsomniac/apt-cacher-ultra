@@ -59,7 +59,8 @@ type SuiteRef struct {
 //
 //   - VerifyInline accepts a clearsigned InRelease blob (the body
 //     between BEGIN PGP SIGNED MESSAGE / END PGP SIGNATURE markers).
-//     Returns the cleartext between the markers.
+//     Returns the signed text as apt's own splitter reads it (the
+//     hardening plan's DN-11: what the client's apt parses).
 //   - VerifyDetached accepts a Release file plus its detached
 //     Release.gpg signature. Returns releaseBytes verbatim — the
 //     Release file IS the verified plaintext, so there is nothing to
@@ -71,6 +72,33 @@ type SuiteRef struct {
 type Verifier interface {
 	VerifyInline(ctx context.Context, suite SuiteRef, inRelease []byte) ([]byte, error)
 	VerifyDetached(ctx context.Context, suite SuiteRef, releaseBytes, sigBytes []byte) ([]byte, error)
+}
+
+// Signers is what a SignerVerifier reports about the signatures of an
+// anchor it verified, for the signer downgrade guard (signer_guard.go):
+// Strong is the uppercase fingerprint of the first counted packet's
+// signing key that is strong (internal/gpg's strongSigner), "" when none
+// is; Counted names the counted packets' signing keys in packet order, up
+// to and including the strong one, each one not strong with why;
+// Uncounted names every packet examined that did not count (its issuer,
+// "fpr:<fingerprint>" or "keyid:<key ID>", and why: a key the keyring
+// lacks, a discount, a failed verification), and the packets the
+// verifier's rules left unchecked. Under accept_any_signer's bypass no
+// packet is verified, and all three are empty.
+type Signers struct {
+	Strong    string
+	Counted   []string
+	Uncounted []string
+}
+
+// SignerVerifier is a Verifier that also reports an anchor's Signers: the
+// two methods return what VerifyInline and VerifyDetached return, and the
+// Signers. The production verifier (internal/gpg) is one; the Adopter's
+// signer downgrade guard stands down for a Verifier that is not (the
+// tests' pass-through fakes).
+type SignerVerifier interface {
+	VerifyInlineSigners(ctx context.Context, suite SuiteRef, inRelease []byte) ([]byte, Signers, error)
+	VerifyDetachedSigners(ctx context.Context, suite SuiteRef, releaseBytes, sigBytes []byte) ([]byte, Signers, error)
 }
 
 // AdoptionFetcher is the subset of *fetch.Client the Adopter uses to
@@ -120,6 +148,12 @@ var (
 	// to an adopted snapshot of the suite that is no longer current: a
 	// flapping mirror must not flip the cache backwards.
 	ErrAdoptionRollbackRefused = errors.New("adoption_rollback_refused")
+
+	// ErrAdoptionSignerDowngrade is the refusal of a candidate that has
+	// lost the strong signer the suite's current anchor has (the hardening
+	// plan's Task 9d, ruling HD-19; signer_guard.go): an on-path strip of a
+	// strong signature beside a weak one. A refusal state, not a failure.
+	ErrAdoptionSignerDowngrade = errors.New("adoption_signer_downgrade")
 
 	// ErrAdoptionReleaseDateInFuture fails a candidate dated more than
 	// maxReleaseDateSkew ahead of the cache's clock (apt: "not valid
@@ -589,6 +623,10 @@ type Adopter struct {
 	verifier Verifier
 	hostSem  *hostsem.Sem
 
+	// signers is verifier as a SignerVerifier, nil when it is not one: the
+	// signer downgrade guard (signer_guard.go) then stands down.
+	signers SignerVerifier
+
 	// maxConcurrent and maxDuration configure the Checker's admission and
 	// run deadline (spec C4); the Adopter itself never waits for a slot.
 	maxConcurrent int
@@ -689,6 +727,14 @@ type Adopter struct {
 	// maxDecompressedBytes overrides maxDecompressedPackagesBytes in
 	// tests when > 0 so bomb-defense tests don't have to allocate >256 MiB.
 	maxDecompressedBytes int64
+	// reconcileFailedSnapshots memoizes the snapshot IDs whose reconcile
+	// decision failed and was logged at WARN (Checker.logReconcileFailure),
+	// so a snapshot that can never reconcile warns once per process rather
+	// than on every unchanged check (the re-review's V-R2M1). A decision
+	// that succeeds clears its entry; each reaper run drops the entries of
+	// snapshots that are no suite's current one (sweepReconcileMemo).
+	reconcileFailedSnapshots sync.Map // map[int64]struct{}
+
 	logger *slog.Logger
 	now    func() time.Time
 }
@@ -762,10 +808,22 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 			required[arch] = struct{}{}
 		}
 	}
+	// AIDEV-NOTE: the task review's 9d-M2. A Verifier that reports no
+	// signers (not a SignerVerifier: a decorator around internal/gpg's, a
+	// test fake) turns the signer downgrade guard off; it stands down
+	// rather than fail, and says so once, here, so that a wiring change
+	// cannot switch it off unseen.
+	signers, isSignerVerifier := cfg.Verifier.(SignerVerifier)
+	if !isSignerVerifier {
+		logger.Warn("adoption_signer_guard_unavailable",
+			"verifier", fmt.Sprintf("%T", cfg.Verifier),
+		)
+	}
 	return &Adopter{
 		cache:                   cfg.Cache,
 		fetcher:                 cfg.Fetcher,
 		verifier:                cfg.Verifier,
+		signers:                 signers,
 		hostSem:                 cfg.HostLimiter,
 		maxConcurrent:           cfg.MaxConcurrent,
 		maxDuration:             maxDur,
@@ -979,6 +1037,7 @@ type adoptionPayload struct {
 	// releaseBytes and releaseHash alone.
 	releaseBytes   []byte
 	sigBytes       []byte
+	sigLastmod     string
 	releaseHash    string // sha256 of releaseBytes (set in step 2)
 	releaseGPGHash string // sha256 of sigBytes (set in step 2)
 
@@ -1011,9 +1070,10 @@ func (a *Adopter) Run(ctx context.Context, suite SuiteRef, inRelease []byte, eta
 
 // RunDetached executes the §7.5 adoption flow for a detached-form
 // suite. releaseBytes is the Release file body, sigBytes is the
-// Release.gpg body (armored or binary). etag/lastmod are validators
-// from the Release fetch response; subsequent freshness checks
-// conditional-GET Release with these.
+// Release.gpg body: one ASCII-armored signature block, since the
+// verifier refuses a binary one (malformed_signature), as apt does.
+// etag/lastmod are validators from the Release fetch response;
+// subsequent freshness checks conditional-GET Release with these.
 //
 // SPEC2 §7.6.3 calls for both forms; this is the "Release +
 // Release.gpg" branch invoked when an upstream returns 404 on
@@ -1044,6 +1104,7 @@ func (a *Adopter) runRequest(ctx context.Context, req *adoptionRequest, hooks ru
 		p.inlineBytes = req.bytes
 	case adoptionFormDetached:
 		p.releaseBytes, p.sigBytes = req.releaseBytes, req.sigBytes
+		p.sigLastmod = req.sigLastmod
 	case adoptionFormUnsigned:
 		p.releaseBytes = req.releaseBytes
 	}
@@ -1086,20 +1147,28 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	priorForm, hadPrior := formOfSnapshot(prior)
 
 	// Step 1: GPG verify. The Verifier returns the verified Release-
-	// style plaintext (the cleartext between BEGIN/END markers in a
-	// clearsigned InRelease, or releaseBytes verbatim in detached
-	// mode). Both paths converge on "verified Release-equivalent text"
-	// for the §7.5 step 3 parse.
+	// style plaintext (a clearsigned InRelease's signed text, as apt's
+	// splitter reads it, or releaseBytes verbatim in detached mode).
+	// Both paths converge on "verified Release-equivalent text" for the
+	// §7.5 step 3 parse.
+	// With a SignerVerifier, the same verification also reports the
+	// anchor's signers, for the downgrade guard at Step 4b; the unsigned
+	// form has none.
 	var (
 		releaseText []byte
 		verifyErr   error
+		signers     Signers
 	)
-	switch p.form {
-	case adoptionFormInline:
+	switch {
+	case p.form == adoptionFormInline && a.signers != nil:
+		releaseText, signers, verifyErr = a.signers.VerifyInlineSigners(ctx, suite, p.inlineBytes)
+	case p.form == adoptionFormInline:
 		releaseText, verifyErr = a.verifier.VerifyInline(ctx, suite, p.inlineBytes)
-	case adoptionFormDetached:
+	case p.form == adoptionFormDetached && a.signers != nil:
+		releaseText, signers, verifyErr = a.signers.VerifyDetachedSigners(ctx, suite, p.releaseBytes, p.sigBytes)
+	case p.form == adoptionFormDetached:
 		releaseText, verifyErr = a.verifier.VerifyDetached(ctx, suite, p.releaseBytes, p.sigBytes)
-	case adoptionFormUnsigned:
+	case p.form == adoptionFormUnsigned:
 		// Spec C5: unsigned eligibility takes the verification's place —
 		// the first never-downgrade point, before anything is downloaded.
 		// Nothing verifies the text: it never vouches a .deb (Step 8).
@@ -1191,6 +1260,20 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	if p.form == adoptionFormUnsigned {
 		if err := unsignedCap(len(members)); err != nil {
 			return err
+		}
+	}
+
+	// Record headers only after the anchor bytes passed verification.
+	anchorPath, anchorHash := "Release", p.releaseHash
+	if p.form == adoptionFormInline {
+		anchorPath, anchorHash = "InRelease", p.inlineHash
+	}
+	if err := a.cache.PutRepresentation(ctx, suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath+"/"+anchorPath, anchorHash, lastmod); err != nil {
+		return fmt.Errorf("%w: anchor response metadata: %v", ErrAdoptionDBFailed, err)
+	}
+	if p.form == adoptionFormDetached {
+		if err := a.cache.PutRepresentation(ctx, suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath+"/Release.gpg", p.releaseGPGHash, p.sigLastmod); err != nil {
+			return fmt.Errorf("%w: signature response metadata: %v", ErrAdoptionDBFailed, err)
 		}
 	}
 
@@ -1288,6 +1371,24 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			"suite_path", suite.SuitePath,
 			"snapshot_id", snapshotID,
 		)
+	}
+
+	// Step 4b (Task 9d): the signer downgrade guard, after the rollback
+	// refusal and before any member download: a candidate that has lost
+	// the current anchor's strong signer is refused (signer_downgrade;
+	// signer_guard.go). The candidate row it leaves is an orphan, as any
+	// failure after Step 4 leaves one (reused at the next attempt, deleted
+	// by GC).
+	//
+	// AIDEV-NOTE: the task review's 9d-M1. The guard sits after Step 4's
+	// rollback check, not before it: content equal to an adopted, displaced
+	// snapshot (a flapping mirror serving an older weak-only anchor again)
+	// must stay rollback_refused (no lag shown, the cache is current), not
+	// become signer_downgrade (a strip WARN, lag shown). Moving it back
+	// before the insert reclassifies that rollback
+	// (TestSignerGuard_ARollbackStaysRollbackRefused).
+	if err := a.signerGuard(ctx, suite, prior, signers); err != nil {
+		return err
 	}
 
 	// SPEC4 §7.5.1 Rule 1 race-window extension: track the in-flight
@@ -2153,6 +2254,20 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 	return a.fetchMemberURL(ctx, suite, m, m.Path)
 }
 
+// memberMaxBytes is a member download's limit (fetch.Target.MaxBytes): its
+// declared size (ruling HD-5), so a member's download stops at most one
+// byte past what its Release declares — for an unsigned Release, what the
+// repository itself declares: the fetch reads the declared size and one
+// byte more, which shows the body runs over, and fails. A member declared
+// empty gets one byte, since 0 means no limit: any byte means it is not
+// the declared member, which verifyMember rejects.
+func memberMaxBytes(m ReleaseMember) int64 {
+	if m.Size < 1 {
+		return 1
+	}
+	return m.Size
+}
+
 // tryByHashFetch attempts to fetch a member from its content-addressed
 // by-hash URL (byHashRelPath). It is a probe: unlike fetchMemberURL it
 // emits no adoption_member_skipped WARN, increments no skip metric, and —
@@ -2172,6 +2287,7 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 	target := &fetch.Target{
 		CanonicalHost: suite.CanonicalHost,
 		URL:           buildMemberURL(suite, byHashRelPath),
+		MaxBytes:      memberMaxBytes(m),
 	}
 	// A local fault (the temp blob, the blob row) is ErrAdoptionDBFailed,
 	// as on the plain path, so the caller fails the member instead of
@@ -2181,7 +2297,8 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 		return "", fmt.Errorf("%w: NewTempBlob %s: %v", ErrAdoptionDBFailed, byHashRelPath, err)
 	}
 	defer func() { _ = w.Abort() }() // no-op once a Finalize* wins
-	if _, err := a.fetcher.Fetch(ctx, target, w); err != nil {
+	res, err := a.fetcher.Fetch(ctx, target, w)
+	if err != nil {
 		return "", err // by-hash 404 (pruned), transport, etc. — silent fallback
 	}
 	hashHex, err := verifyMember(w, m, m.Size, a.rehashPooledBlob(suite, m))
@@ -2191,13 +2308,22 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 	if err := a.cache.PutBlob(ctx, hashHex, w.Written()); err != nil {
 		return "", fmt.Errorf("%w: PutBlob %s: %v", ErrAdoptionDBFailed, hashHex, err)
 	}
+	if err := a.cache.PutRepresentation(ctx, suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath+"/"+byHashRelPath, hashHex, res.LastModified); err != nil {
+		return "", fmt.Errorf("%w: member response metadata: %v", ErrAdoptionDBFailed, err)
+	}
+	// The verified by-hash object also supplies the declared member bytes.
+	if err := a.cache.PutRepresentation(ctx, suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath+"/"+m.Path, hashHex, res.LastModified); err != nil {
+		return "", fmt.Errorf("%w: member response metadata: %v", ErrAdoptionDBFailed, err)
+	}
 	return hashHex, nil
 }
 
 // fetchMemberURL fetches one Release member from a specific suite-
 // relative URL (either the plain declared path or its by-hash alias),
-// verifies the bytes against the member's declared Size + SHA256, and
-// PutBlobs them. The host slot is held by the caller (adoptMember).
+// stopping its download at most one byte past its declared size
+// (memberMaxBytes), verifies the bytes against the member's declared Size
+// + SHA256, and PutBlobs them. The host slot is held by the caller
+// (adoptMember).
 //
 // Error semantics are the authoritative member-fetch rules: a 404/410
 // returns errAdoptionMemberSkipped (SPEC2 §7.5.2 "declared but does not
@@ -2213,6 +2339,7 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 	target := &fetch.Target{
 		CanonicalHost: suite.CanonicalHost,
 		URL:           upstreamURL,
+		MaxBytes:      memberMaxBytes(m),
 	}
 
 	w, err := newMemberWriter(a.cache)
@@ -2274,12 +2401,23 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 	// Content-Length internally, so the case where they diverge is
 	// genuinely abnormal — surface it as a member-fetch error rather
 	// than a hash mismatch (the bytes might still hash correctly,
-	// but a length mismatch is its own integrity violation).
+	// but a length mismatch is its own integrity violation). Only a
+	// shorter declared length can trip it: a longer one, declared or
+	// sent, already failed the fetch with fetch.ErrBodyTooLarge
+	// (memberMaxBytes). A shorter body sent without a Content-Length
+	// (chunked) fails verifyMember's size check below instead.
 	if m.Size > 0 && res.ContentLength > 0 && res.ContentLength != m.Size {
 		return "", newMemberErr(ErrAdoptionMemberFetchFailed, m.Path,
 			fmt.Sprintf("served %d vs declared %d", res.ContentLength, m.Size))
 	}
 
+	// AIDEV-NOTE: the declared Size, as tryByHashFetch passes, never the
+	// response's ContentLength (the hardening plan's final review, F-M6):
+	// a chunked response has none (-1), which skipped the size check, so a
+	// Release declaring the right hash with too large a Size adopted the
+	// member here when it came chunked, and was refused when it came with a
+	// Content-Length. A correct member is exactly m.Size bytes; m.Size 0 (a
+	// member declared empty) still skips the check, its hash deciding.
 	// Use the Release's size: an empty 204 or an unknown response length
 	// must not disable verification of a declared nonzero member size.
 	hashHex, err := verifyMember(w, m, m.Size, a.rehashPooledBlob(suite, m))
@@ -2311,6 +2449,9 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 	}
 	if err := a.cache.PutBlob(ctx, hashHex, w.Written()); err != nil {
 		return "", fmt.Errorf("%w: PutBlob %s: %v", ErrAdoptionDBFailed, hashHex, err)
+	}
+	if err := a.cache.PutRepresentation(ctx, suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath+"/"+relPath, hashHex, res.LastModified); err != nil {
+		return "", fmt.Errorf("%w: member response metadata: %v", ErrAdoptionDBFailed, err)
 	}
 	return hashHex, nil
 }

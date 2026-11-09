@@ -70,8 +70,9 @@ WHERE snapshot_id = ? AND path = ?`
 // member only an older displaced snapshot holds is not found. limit <= 0
 // returns nothing.
 //
-// AIDEV-NOTE: retired snapshots (quarantined at upgrade, or reaped from
-// phase F) never serve, so the retired_at filter is load-bearing.
+// AIDEV-NOTE: retired snapshots (quarantined at upgrade, reaped from phase
+// F, or retired by GC sub-job B beyond gc.keep_displaced: DN-7) never serve,
+// so the retired_at filter is load-bearing.
 func (c *Cache) DisplacedSnapshotMembers(ctx context.Context, scheme, host, suitePath, path string, currentID int64, limit int) ([]SnapshotMember, error) {
 	if limit <= 0 {
 		return nil, nil

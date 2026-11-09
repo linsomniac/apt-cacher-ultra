@@ -37,6 +37,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy"
 	"github.com/linsomniac/apt-cacher-ultra/internal/proxy/tlsmitm"
+	"github.com/linsomniac/apt-cacher-ultra/internal/usage"
 
 	"crypto/tls"
 )
@@ -508,12 +509,14 @@ func serveListeners(
 	// until they complete (we have not yet called Serve on any
 	// listener). When gc.enabled = false, gcsvc.StartupPass returns
 	// immediately and the periodic goroutine below is never started.
-	// The one-shot pass runs no snapshot-GC sub-job C (ruling PF-15):
-	// retired snapshots never serve, so a backlog of them after a burst
-	// of reaps must not keep the listeners closed; the periodic ticks
-	// delete them, normally the first (a later one when an earlier pass,
-	// the startup pass's blob pass say, hit its deadline: the passes
-	// resume in rotation).
+	// The one-shot pass runs snapshot-GC sub-job C too, within its
+	// snapshot deadline (ruling PF-15, re-ruled by the maintainer on
+	// 2026-11-05 for issue #14), so a restart deletes the retired
+	// snapshots again; a start with a retired backlog may keep the
+	// listeners closed up to gc.max_tick_duration, the bound ruling HD-7
+	// already accepts for its sub-job B. What its budget leaves, the
+	// retired run (hourly while a backlog lasts) and the periodic ticks
+	// delete.
 	gcsvc, err := gc.New(gc.Config{
 		Cache:                 c,
 		Logger:                logger,
@@ -536,8 +539,13 @@ func serveListeners(
 	if err := gcsvc.StartupPass(ctx); err != nil {
 		// A startup-pass failure (DB error, fs error reading pool/)
 		// is loud but not fatal — the daemon can still serve. Log
-		// and continue; the next periodic tick retries the GC pass,
-		// and the next process restart re-runs the pool scan.
+		// and continue. A failed pool scan ends the startup pass
+		// before its GC passes, and the next process restart re-runs
+		// it. A failed GC pass did not keep the passes after it from
+		// running (ruling HD-15): each failed pass logged its own
+		// gc_tick_failed, the startup pass its gc_run_complete, and
+		// err is the first failure. The periodic ticks run every
+		// pass again, the failed one included.
 		logger.Warn("gc startup pass failed", "err", err)
 	}
 
@@ -546,7 +554,30 @@ func serveListeners(
 		return fmt.Errorf("build proxy parser: %w", err)
 	}
 
+	usageStats, err := usage.New(ctx, c)
+	if err != nil {
+		return fmt.Errorf("initialize usage statistics: %w", err)
+	}
+	usageCtx, usageCancel := context.WithCancel(context.Background())
+	usageDone := make(chan struct{})
+	go func() {
+		defer close(usageDone)
+		usageStats.Run(usageCtx, logger)
+	}()
+	// Registered before producer cleanup defers: the final absolute snapshot
+	// lands after request/adoption drain and before the cache is closed.
+	defer func() {
+		usageCancel()
+		<-usageDone
+		flushCtx, cancel := context.WithTimeout(context.Background(), usage.CheckpointTimeout)
+		defer cancel()
+		if err := usageStats.Flush(flushCtx); err != nil {
+			logger.Warn("usage_final_checkpoint_failed", "err", err)
+		}
+	}()
+
 	fetchClient, err := fetch.New(fetch.Options{
+		Usage:                    usageStats,
 		Proxy:                    cfg.Upstream.Proxy,
 		ConnectTimeout:           cfg.Upstream.ConnectTimeout.Duration,
 		TotalTimeout:             cfg.Upstream.TotalTimeout.Duration,
@@ -608,7 +639,9 @@ func serveListeners(
 		return fmt.Errorf("build suite reaper: %w", err)
 	}
 
-	h, err := handler.New(handlerConfig(cfg, parser, c, fetchClient, hostLimiter, logger, freshChecker, adopter))
+	hcfg := handlerConfig(cfg, parser, c, fetchClient, hostLimiter, logger, freshChecker, adopter)
+	hcfg.Usage = usageStats
+	h, err := handler.New(hcfg)
 	if err != nil {
 		return fmt.Errorf("build handler: %w", err)
 	}
@@ -655,6 +688,7 @@ func serveListeners(
 	var adminSrv *admin.Server
 	if cfg.Admin.Enabled {
 		adminSrv, err = admin.New(admin.Config{
+			Usage:                   usageStats,
 			Cache:                   c,
 			HealthCheck:             probe.Failure,
 			GC:                      gcsvc,

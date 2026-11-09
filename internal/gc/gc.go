@@ -2,9 +2,10 @@
 // blobs, orphan/displaced suite_snapshot rows, and pool/ orphan files.
 //
 // Architecture: a single dedicated goroutine runs the periodic tick
-// loop (gc.interval delay after completion). Each tick computes a wall-clock
-// deadline (gc.max_tick_duration) once at the top, then resumes URL-path,
-// snapshot, and blob passes in order under that shared deadline.
+// loop (gc.interval delay after completion). Each tick splits its
+// wall-clock budget (gc.max_tick_duration) once at the top into a deadline
+// per pass (passDeadlines), then resumes URL-path, snapshot, and blob
+// passes in order, each under its own deadline (issue #14).
 // Snapshot before blob because snapshot DELETEs remove the FK
 // references that the blob pass's NOT EXISTS reachability predicate
 // consults — running them in the reverse order would leave one tick of
@@ -63,9 +64,9 @@ type Config struct {
 	// Enabled.
 	SnapshotBatchSize int
 
-	// MaxTickDuration is the per-tick wall-clock budget shared
-	// across both passes (gc.max_tick_duration). Must be > 0 when
-	// Enabled.
+	// MaxTickDuration is the per-tick wall-clock budget, split into
+	// the passes' deadlines (gc.max_tick_duration; passDeadlines). Must
+	// be > 0 when Enabled.
 	MaxTickDuration time.Duration
 
 	// BlobGrace is the "since refcount reached 0" grace
@@ -116,12 +117,15 @@ type GC struct {
 	store gcStore
 
 	// nextPass preserves progress through URL-path → snapshot → blob work.
-	// Even the final batch of a pass can exceed the shared tick deadline;
-	// resume at the following pass next tick instead of restarting URL scans
-	// and indefinitely starving snapshot/blob cleanup. A pass that panicked
-	// moves it too, past that pass (skipPanickedPass, review M-1 of the H1
-	// plan). Only the GC goroutine touches this, after the sequential
-	// startup pass.
+	// A url-path or snapshot pass that hits its deadline moves it on, and
+	// its tick goes on to the passes after it (issue #14); a blob pass that
+	// hits its deadline leaves it at the blob pass for the next tick. Either
+	// way no pass restarts its work ahead of the others and starves them
+	// (the url-path pass resumes at urlPathCursor). A pass that panicked
+	// moves it too, past that pass, for the next tick (skipPanickedPass); one
+	// that failed moves it past that pass in its own tick, whose passes after
+	// it then run (passFailed, ruling HD-15). Only the GC goroutine touches
+	// this, after the sequential startup pass.
 	nextPass pass
 
 	// lastRunMu guards lastRun. Writes happen at the end of each
@@ -132,11 +136,13 @@ type GC struct {
 	lastRun   *LastRunSummary
 
 	// urlPathCursor persists the url_path GC scan position across ticks.
-	// A pass that hits the per-tick deadline before draining saves its
-	// place here and resumes next tick, instead of restarting from the
-	// beginning — which would rescan the same prefix forever, never reach
-	// rows later in (scheme,host,path) order, and starve the snapshot/blob
-	// passes that run after it. Reset to empty once a pass drains. Touched
+	// A pass that hits its deadline before draining saves its place here
+	// and resumes at the next tick that reaches it, instead of restarting
+	// from the beginning — which would rescan the same prefix forever and
+	// never reach rows later in (scheme,host,path) order. Its deadline no
+	// longer ends the tick (issue #14): the snapshot and blob passes run
+	// after it. It lives in memory, so every start begins a fresh scan.
+	// Reset to empty once a pass drains. Touched
 	// only by the tick goroutine (StartupPass runs before Run starts), so
 	// no lock is needed.
 	urlPathCursor struct{ scheme, host, path string }
@@ -159,9 +165,11 @@ const (
 )
 
 // phaseStartup is runTick's phase for StartupPass's one-shot pass, the
-// pass main runs before any listener serves. The snapshot pass runs no
-// sub-job C in it (runSnapshotPass, ruling PF-15); the periodic ticks
-// ("periodic") do.
+// pass main runs before any listener serves. Its snapshot pass's sub-job
+// B deletes the displaced snapshots beyond keep_displaced; the periodic
+// ticks' ("periodic") B only retires those snapshots, for C to delete (DN-7
+// of the GC and upstream hardening plan). Both run sub-job C (ruling PF-15,
+// re-ruled for issue #14: runSnapshotPass).
 const phaseStartup = "startup"
 
 // LastRunSummary is the SPEC5 §9.6 / §9.7.8 in-memory captured copy
@@ -268,13 +276,23 @@ func New(cfg Config) (*GC, error) {
 
 // StartupPass runs the SPEC4 §4.2 step 5 (pool/ orphan scan) and step
 // 6 (one-shot GC pass) sequence. Blocks until both complete or ctx is
-// cancelled. Returns the first error encountered; partial progress is
-// preserved (DB rows / pool files reaped before cancel are real). The
-// one-shot pass runs no snapshot-GC sub-job C (spec C9's retired
-// snapshots): Run does, an hour after the start when gc.interval is longer
-// (retiredRun), and the periodic ticks, normally the first — a later one
-// when an earlier pass, this one's blob pass say, hits its deadline, since
-// the passes resume in rotation (ruling PF-15, runSnapshotPass).
+// cancelled. Returns the first error encountered: a failed pool scan's,
+// which ends it before the one-shot pass, or the first failed pass's, once
+// the passes after it have run too (runTick, ruling HD-15: a failed pass
+// no longer ends the one-shot pass, so a daemon restarted more often than
+// gc.interval, which never runs a periodic tick, still runs every pass at
+// every start) and the pass has written its gc_run_complete line, metrics
+// and last-run summary, as a periodic tick does: each failed pass logged
+// its own gc_tick_failed line (runTick), and main logs the returned first
+// failure as the startup pass's (the fix wave's follow-up of HD-15).
+// Partial progress is preserved (DB rows / pool files reaped before cancel
+// are real). The one-shot pass runs snapshot-GC sub-job C (spec C9's
+// retired snapshots) within its snapshot deadline, so a start with a
+// retired backlog may wait up to max_tick_duration before the listeners
+// open, the bound ruling HD-7 accepts (ruling PF-15, re-ruled for issue
+// #14: runSnapshotPass); what its budget leaves, Run's retired run (an hour
+// after the start when gc.interval is longer, hourly while a backlog lasts)
+// and the periodic ticks delete.
 //
 // Order matters: pool scan runs first so its
 // `gc_pool_orphans_repaired` count reflects only pre-existing orphan
@@ -304,15 +322,13 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 		return fmt.Errorf("gc startup: pool scan: %w", err)
 	}
 
-	// Step 6: one-shot GC pass — without snapshot-GC sub-job C, which Run
-	// runs an hour after the start (retiredRun) and in the periodic ticks
-	// (ruling PF-15: runSnapshotPass).
+	// Step 6: one-shot GC pass, sub-job C included (ruling PF-15, re-ruled
+	// for issue #14: runSnapshotPass). A failed pass is returned after the
+	// line, the metrics and the summary below, which report what the passes
+	// that ran did, as a periodic tick's do.
 	passesDone = false
-	tick, err := g.runTick(ctx, phaseStartup)
+	tick, tickErr := g.runTick(ctx, phaseStartup)
 	passesDone = true
-	if err != nil {
-		return fmt.Errorf("gc startup: tick: %w", err)
-	}
 
 	duration := time.Since(start)
 	endUnix := wallclock.Unix()
@@ -373,6 +389,9 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 		PoolUnlinkErrors:        tick.poolUnlinkErrors + scan.unlinkErrors,
 		DeadlineReached:         tick.deadlineReached,
 	})
+	if tickErr != nil {
+		return fmt.Errorf("gc startup: tick: %w", tickErr)
+	}
 	return nil
 }
 
@@ -381,8 +400,26 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 // long tick cannot leave a pending timer firing that starts work again
 // immediately, even when an individual batch exceeds the tick budget.
 // When `gc.interval` is longer than an hour, Run also deletes the retired
-// snapshots once, an hour after the start (retiredRun; the final review's
-// R3 #2).
+// snapshots an hour after the start (retiredRun; the final review's R3 #2),
+// and again an hour after any retired run or periodic tick whose sub-job C
+// stopped at its deadline with retired snapshots left (issue #14), until
+// one drains them.
+//
+// AIDEV-NOTE: issue #14 (the hardening plan's final review 2, G2-I2; the
+// maintainer's decision of 2026-11-05). Since DN-7 a periodic tick's
+// sub-job B only retires the displaced snapshots beyond keep_displaced, and
+// chunked sub-job C deletes them, 1.6-2.3x slower than main's one
+// transaction; with C run once a day (the default gc.interval) and once an
+// hour after a start, a sustained displacement rate above one budget's C
+// capacity grew the retired backlog without bound. Re-arming the retired
+// run hourly while a run or a tick's snapshot pass ends at its deadline
+// gives C up to 24 budgets a day while a backlog lasts, each bounded and
+// chunked as before, on this goroutine (never beside a tick): no new knob,
+// goroutine or table. A tick's snapshot deadline re-arms it even when only
+// A ∪ B had work left; that run then finds nothing retired and costs one
+// SELECT. Never re-armed after a failure or a panic (no hourly retry
+// storm: the next periodic tick retries C, as before), nor when gc.interval
+// is an hour or less, whose ticks already come hourly.
 //
 // When Enabled = false, returns immediately — the goroutine is not
 // started.
@@ -393,11 +430,23 @@ func (g *GC) Run(ctx context.Context) {
 	t := time.NewTimer(g.cfg.Interval)
 	defer t.Stop()
 	// nil when gc.interval is an hour or less: no separate run, since the
-	// first periodic tick, within the hour, normally runs sub-job C itself.
-	var retiredDue <-chan time.Time
+	// periodic ticks, within the hour, run sub-job C themselves.
+	var (
+		rt         *time.Timer
+		retiredDue <-chan time.Time
+	)
 	if g.cfg.Interval > retiredRunAfterStart {
-		rt := time.NewTimer(retiredRunAfterStart)
+		rt = time.NewTimer(retiredRunAfterStart)
 		defer rt.Stop()
+		retiredDue = rt.C
+	}
+	// rearmRetired arms the retired run an hour from now, unless it is off
+	// or already armed.
+	rearmRetired := func() {
+		if rt == nil || retiredDue != nil {
+			return
+		}
+		rt.Reset(retiredRunAfterStart)
 		retiredDue = rt.C
 	}
 
@@ -410,12 +459,16 @@ func (g *GC) Run(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			g.retiredRun(ctx)
+			if g.retiredRun(ctx) {
+				rearmRetired()
+			}
 		case <-t.C:
 			if ctx.Err() != nil {
 				return
 			}
-			g.periodicTick(ctx)
+			if g.periodicTick(ctx) {
+				rearmRetired()
+			}
 			t.Reset(g.cfg.Interval)
 		}
 	}
@@ -429,16 +482,20 @@ func (g *GC) Run(ctx context.Context) {
 // summary stay inside the recovered function, so a tick that panicked
 // leaves acu_gc_last_run_unixtime as it was: its age is the alert. A
 // panic in a pass moves the rotation past that pass (skipPanickedPass).
-func (g *GC) periodicTick(ctx context.Context) {
+// It reports snapshotBacklog, for Run's retired run (issue #14): its
+// snapshot pass stopped at its deadline with work left; false when a pass
+// panicked.
+func (g *GC) periodicTick(ctx context.Context) (snapshotBacklog bool) {
 	passesDone := false
 	defer g.skipPanickedPass(&passesDone)
 	defer g.recoverPanic("tick")
 	start := time.Now()
-	tick, err := g.runTick(ctx, "periodic")
+	// Each failed pass logged its own WARN gc_tick_failed as it failed
+	// (runTick's failed); the first failure, which runTick returns, is for
+	// StartupPass's caller, so a tick logs none of its own for it.
+	tick, _ := g.runTick(ctx, "periodic")
 	passesDone = true
-	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		g.cfg.Logger.Warn("gc_tick_failed", "err", err)
-	}
+	snapshotBacklog = tick.snapshotDeadlineReached
 	duration := time.Since(start)
 	endUnix := wallclock.Unix()
 	g.cfg.Logger.Info("gc_run_complete",
@@ -498,31 +555,42 @@ func (g *GC) periodicTick(ctx context.Context) {
 		PoolUnlinkErrors:        tick.poolUnlinkErrors,
 		DeadlineReached:         tick.deadlineReached,
 	})
+	return snapshotBacklog
 }
 
-// gcStore is what the snapshot pass and the pool scan call on the cache
-// (design note 18 of the H1 plan): a seam, so tests reach sub-job C's
-// deadline and chunk size without a 10,000-row fixture (deferred minors
-// F-1, F-2) and make a tick or a pool-scan job panic (F-21). New sets it
-// to Config.Cache; the url_path and blob passes keep Config.Cache.
+// gcStore is what the url-path pass, the snapshot pass and the pool scan
+// call on the cache (design note 18 of the H1 plan): a seam, so tests reach
+// sub-job C's deadline and chunk size without a 10,000-row fixture
+// (deferred minors F-1, F-2), make a tick or a pool-scan job panic (F-21),
+// and slow the url-path pass's batches past its deadline (issue #14's
+// fix), and count the blob pass's once-a-tick representation prune (the
+// merge review's M-I1). New sets it to Config.Cache; the blob pass's batches
+// keep Config.Cache.
 type gcStore interface {
-	RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGraceSeconds int64, keepDisplaced int) (cache.SnapshotGCBatchResult, error)
+	RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds, holdSeconds int64, maxVersions int, afterScheme, afterHost, afterPath string) (cache.URLPathGCBatchResult, error)
+	RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGraceSeconds int64, keepDisplaced int, retireDisplaced bool) (cache.SnapshotGCBatchResult, error)
 	RunRetiredSnapshotGCChunk(ctx context.Context, maxRows int) (reaped int, more bool, err error)
 	HashKnown(ctx context.Context, hash string) (bool, error)
+	PruneRepresentationMetadata(ctx context.Context, limit int) (int, error)
 }
 
 // skipPanickedPass is deferred by periodicTick before its recoverPanic,
 // and by StartupPass before its recoverPanicInto, so it runs after the
 // recover: when the passes did not finish (a recovered panic), it moves
 // the rotation past the pass in progress — g.nextPass, which runTick
-// advances only when a pass completes — so a pass that panics on every
-// tick cannot starve the passes after it: the blob pass keeps reclaiming
-// disk while a sub-job's bug waits for its fix (review M-1 of the H1
-// plan).
+// advances only when a pass completes or fails (passFailed), never when
+// one panics — so a pass that panics on every tick cannot starve the
+// passes after it: the blob pass keeps reclaiming disk while a sub-job's
+// bug waits for its fix (review M-1 of the H1 plan).
 func (g *GC) skipPanickedPass(passesDone *bool) {
 	if *passesDone {
 		return
 	}
+	g.skipPass()
+}
+
+// skipPass moves the rotation past the pass in progress (g.nextPass).
+func (g *GC) skipPass() {
 	switch g.nextPass {
 	case urlPathPass:
 		g.nextPass = snapshotPass
@@ -531,6 +599,39 @@ func (g *GC) skipPanickedPass(passesDone *bool) {
 	default:
 		g.nextPass = urlPathPass
 	}
+}
+
+// passFailed is runTick's step for a pass that failed: it moves the
+// rotation past that pass, as skipPanickedPass does for a panic, unless the
+// GC's context has ended (a shutdown stopped the pass; it did not fail),
+// and returns the pass's error, which runTick returns when no earlier pass
+// of the tick failed.
+//
+// AIDEV-NOTE: the H3 final review R3 #5 and ruling HD-15 (the GC and
+// upstream hardening plan's final review, G-I1 and G-M5). Before R3 #5
+// only a panic moved the rotation: a pass that returned an error at every
+// tick (a fault limited to its tables) was retried first at every tick,
+// and the passes after it — the blob pass, which reclaims disk — never
+// ran; the only sign was WARN gc_tick_failed per tick. R3 #5 moved the
+// rotation past a failed pass but still ended the tick there, so a failing
+// pass ran every other tick, and a daemon restarted more often than
+// gc.interval, whose every start begins the rotation afresh and which
+// never runs a periodic tick, still never ran the passes after it. Since
+// HD-15 a failed pass no longer ends its tick: runTick goes on to the
+// passes after it, each under its own deadline, in the startup pass and in a
+// periodic tick alike, and returns the first failure; a failing pass is
+// retried at every tick, and the others keep their full cadence. Safe:
+// each pass re-checks its own predicates (the blob pass's reachability
+// holds whatever the url-path or snapshot pass did or failed to do). Each
+// failed pass logs its own WARN gc_tick_failed, as it fails (runTick's
+// failed), and a startup pass in which one failed still writes its
+// gc_run_complete line (StartupPass): the fix wave's follow-up. A failed
+// url-path pass resumes, next time, at the cursor its last deadline saved.
+func (g *GC) passFailed(ctx context.Context, err error) error {
+	if ctx.Err() == nil {
+		g.skipPass()
+	}
+	return err
 }
 
 // recoverPanic is deferred by each unit of work of GC's goroutines — a
@@ -587,25 +688,113 @@ type tickResult struct {
 	urlPathRowsReaped      int
 	poolUnlinkErrors       int
 	deadlineReached        bool
-	urlPath                urlPathResult
-	urlPathDuration        time.Duration
-	snapshotDuration       time.Duration
-	blobDuration           time.Duration
+	// snapshotDeadlineReached: the snapshot pass stopped at its deadline
+	// with work left (A ∪ B, or sub-job C); Run re-arms its retired run.
+	snapshotDeadlineReached bool
+	urlPath                 urlPathResult
+	urlPathDuration         time.Duration
+	snapshotDuration        time.Duration
+	blobDuration            time.Duration
 }
 
-// runTick resumes ordered URL-path, snapshot, and blob passes under a
-// single shared deadline. A completed pass is not repeated until all
-// following passes have drained, even if that takes multiple ticks.
+// tickDeadlines are one tick's three pass deadlines (passDeadlines).
+type tickDeadlines struct {
+	urlPath, snapshot, blob time.Time
+}
+
+// passDeadlines splits one tick's budget, T = start + budget
+// (gc.max_tick_duration), into its passes' deadlines, with f = budget/5:
+// the url-path pass ends by T-2f, the snapshot pass by T-f and the blob
+// pass by T. A pass that begins the tick may use the time up to its own
+// deadline; the passes after it keep at least their floors (f each).
+//
+// AIDEV-NOTE: issue #14 (the hardening plan's final review 2, G2-I1; the
+// maintainer's decision of 2026-11-05). One shared deadline let the first
+// pass with a backlog spend it all, and its deadline ended the tick, so the
+// blob pass, the only one that frees disk, never ran while the snapshot
+// pass's backlog lasted. With the floors, and a deadline that moves the
+// rotation on (runTick), every pass gets a turn in every tick. The floors
+// are checked between batches, so one batch that overruns eats into the
+// next pass's floor; batches are far shorter than f at any sane budget.
+// If url_path scans need more than 3f, a smaller f (budget/10) is the dial.
+func passDeadlines(start time.Time, budget time.Duration) tickDeadlines {
+	end := start.Add(budget)
+	f := budget / 5
+	return tickDeadlines{urlPath: end.Add(-2 * f), snapshot: end.Add(-f), blob: end}
+}
+
+// runTick resumes ordered URL-path, snapshot, and blob passes, each under
+// its own deadline in the tick's budget (passDeadlines). A completed pass
+// is not repeated until all following passes have drained, even if that
+// takes multiple ticks. A url-path or snapshot pass that hits its deadline
+// does not end the tick (issue #14): the rotation moves past it, as for a
+// failed pass, and the passes after it run under their own deadlines; the
+// url-path pass resumes at its saved cursor, the snapshot pass re-selects,
+// at the next tick that reaches them. A blob pass that hits its deadline
+// leaves the rotation at the blob pass, so the next tick runs it first,
+// with the whole budget. A pass that fails while ctx lives does not end the
+// tick (ruling HD-15): it logs WARN gc_tick_failed, passFailed moves the
+// rotation past it, as if it had completed, and the passes after it run;
+// runTick returns the tick's first failure. A pass that fails once ctx has
+// ended (a shutdown) ends the tick at once, the rotation as it is, and logs
+// nothing.
+//
+// AIDEV-NOTE: issue #14 (the hardening plan's final review 2, G2-I1; the
+// maintainer's decision of 2026-11-05) extends ruling HD-15 to deadlines.
+// Until then a deadline ended the tick with the rotation at the pass that
+// ran out, so while the snapshot pass had more work than one budget (sub-job
+// C's backlog, say) every tick ended in it, and neither the blob pass, the
+// only one that frees disk, nor the url-path pass ran; at a start, whose
+// url-path cursor is empty (it lives in memory), a scan longer than the
+// budget kept every start from the passes after it. Safe for HD-15's
+// reason: each pass re-checks its own predicates (the blob pass's
+// reachability holds whatever the passes before it did or did not finish).
+// A tick that reaches a deadline still reports deadline_reached; for a busy
+// cache that is now a steady state while the backlog drains, not a sign
+// that nothing was freed.
 //
 // `phase` is phaseStartup ("startup", StartupPass) or "periodic" (Run).
 // It labels the gc_tick_deadline_reached events, so an operator can
-// correlate, and it selects behaviour: in phaseStartup the snapshot pass
-// runs no sub-job C (runSnapshotPass, ruling PF-15); any other phase runs
-// it.
+// correlate, and it selects behaviour: in phaseStartup the snapshot pass's
+// sub-job B deletes the displaced snapshots; in any other phase its B
+// retires them for C to delete (DN-7 of the GC and upstream hardening
+// plan). Both run sub-job C (runSnapshotPass; ruling PF-15, re-ruled for
+// issue #14).
 func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
-	deadline := time.Now().Add(g.cfg.MaxTickDuration)
+	deadlines := passDeadlines(time.Now(), g.cfg.MaxTickDuration)
 
-	var res tickResult
+	var (
+		res tickResult
+		// firstErr is the tick's first failure, what runTick returns.
+		firstErr error
+	)
+	// failed takes a pass that failed with err: passFailed moves the
+	// rotation past it unless ctx has ended, err is kept unless an earlier
+	// pass of this tick failed first, and, while ctx lives, the pass logs
+	// WARN gc_tick_failed. It reports whether the tick goes on: not once ctx
+	// has ended, which never comes undone, so a tick whose rotation
+	// passFailed left as it was always ends there.
+	//
+	// AIDEV-NOTE: passFailed's test: a pass stopped by the end of ctx (a
+	// shutdown) did not fail, whatever its error's shape, and logs nothing.
+	// Each pass that fails logs its own line here, as it fails, in the
+	// startup pass and a periodic tick alike — and nowhere else, so each
+	// failure is logged once — so a second failed pass is not hidden behind
+	// the first, nor a failure behind a shutdown later in the tick (ruling
+	// HD-15's follow-up in the hardening plan's final fix wave). runTick
+	// returns the first for StartupPass's caller, which logs it once more,
+	// as the startup pass's failure.
+	failed := func(err error) bool {
+		e := g.passFailed(ctx, err)
+		if firstErr == nil {
+			firstErr = e
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		g.cfg.Logger.Warn("gc_tick_failed", "err", e)
+		return true
+	}
 
 	// URL-path TTL pass — runs first so any refcount decrements
 	// land before the same-tick blob pass evaluates reachability.
@@ -624,47 +813,53 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 				maxV = 3
 			}
 			start := time.Now()
-			urls, urlPathDeadline, err := g.runURLPathPass(ctx, deadline, phase, ttl, hold, maxV)
+			urls, urlPathDeadline, err := g.runURLPathPass(ctx, deadlines.urlPath, phase, ttl, hold, maxV)
 			res.urlPathDuration = time.Since(start)
 			res.urlPath = urls
 			res.urlPathRowsReaped += urls.deleted
 			if urlPathDeadline {
 				res.deadlineReached = true
 			}
-			if err != nil {
-				return res, err
+			switch {
+			case err != nil: // passFailed moves the rotation to the snapshot pass
+				if !failed(err) {
+					return res, firstErr
+				}
+			default: // drained, or its deadline saved the cursor: the tick goes on (issue #14)
+				g.nextPass = snapshotPass
 			}
-			if urlPathDeadline {
-				return res, nil
-			}
+		} else {
+			g.nextPass = snapshotPass // the pass is off
 		}
-		g.nextPass = snapshotPass
 	}
 
 	// Snapshot pass.
 	if g.nextPass == snapshotPass {
 		start := time.Now()
-		snap, snapDeadline, err := g.runSnapshotPass(ctx, deadline, phase)
+		snap, snapDeadline, err := g.runSnapshotPass(ctx, deadlines.snapshot, phase)
 		res.snapshotDuration = time.Since(start)
 		res.orphanCandidatesReaped += snap.batch.OrphanReaped
 		res.displacedReaped += snap.batch.DisplacedReaped
 		res.retiredReaped += snap.retired
 		if snapDeadline {
 			res.deadlineReached = true
+			res.snapshotDeadlineReached = true
 		}
-		if err != nil {
-			return res, err
+		switch {
+		case err != nil: // passFailed moves the rotation to the blob pass
+			if !failed(err) {
+				return res, firstErr
+			}
+		default: // drained, or its deadline left work for the next tick: the tick goes on (issue #14)
+			g.nextPass = blobPass
 		}
-		if snapDeadline {
-			return res, nil
-		}
-		g.nextPass = blobPass
 	}
 
-	// Blob pass receives the same deadline. Even an empty final snapshot
-	// batch can finish past it; preserve blobPass for the next tick then.
+	// Blob pass, until the tick's end: at least the budget's last fifth.
+	// When it hits its deadline the rotation stays here, so the next tick
+	// resumes the blob pass first.
 	start := time.Now()
-	blob, blobDeadline, blobUnlinkErrs, err := g.runBlobPass(ctx, deadline, phase)
+	blob, blobDeadline, blobUnlinkErrs, err := g.runBlobPass(ctx, deadlines.blob, phase)
 	res.blobDuration = time.Since(start)
 	res.blobsReaped += blob.count
 	res.bytesReclaimed += blob.bytes
@@ -672,14 +867,14 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 	if blobDeadline {
 		res.deadlineReached = true
 	}
-	if err != nil {
-		return res, err
-	}
-	if !blobDeadline {
+	switch {
+	case err != nil: // the last pass: the tick ends either way
+		failed(err)
+	case !blobDeadline:
 		g.nextPass = urlPathPass
 	}
 
-	return res, nil
+	return res, firstErr
 }
 
 // blobResult bundles the blob pass's reap counts.

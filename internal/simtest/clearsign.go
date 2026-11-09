@@ -13,8 +13,10 @@ const fakeSignatureBlock = "-----BEGIN PGP SIGNATURE-----\n\nwsBcBAABCAAQBQJmAAA
 // ClearsignedFixture wraps text — the Release text of an InRelease — in a
 // clearsign envelope (spec §7 "Fixtures"): the first line is the marker
 // apt requires, so the handler's sniff (spec C3) counts the body as signed
-// metadata; clearsign.Decode returns text — less its final newline, and
-// with each line's trailing spaces and tabs trimmed — as the plaintext, so
+// metadata; apt's splitter (internal/apttext, which reconcile reads a
+// stored InRelease with) and go-crypto's clearsign.Decode (the startup
+// audit's reading) both return text — less its final newline, and with
+// each line's trailing spaces and tabs trimmed — as the signed text, so
 // reconcile parses it; a pass-through verifier hands the whole envelope to
 // ParseRelease, which skips the armor lines. The signature is a fixed
 // fake: tests that verify signatures sign for real. A line of text that

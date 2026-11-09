@@ -6,6 +6,7 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
+	"github.com/linsomniac/apt-cacher-ultra/internal/apttext"
 )
 
 // Deferred minor D-7: text with a line that begins with "-" panics — its
@@ -19,8 +20,9 @@ func TestClearsignedFixture_PanicsOnADashLine(t *testing.T) {
 	ClearsignedFixture("Origin: x\n- y\n")
 }
 
-// The fixture is what spec C3's sniff and reconcile's decoder take for a
-// clearsigned InRelease, and its plaintext is the text it wraps.
+// The fixture is what spec C3's sniff, reconcile's reading (apt's
+// splitter) and the startup audit's (go-crypto's decoder) take for a
+// clearsigned InRelease, and its signed text is the text it wraps.
 func TestClearsignedFixture(t *testing.T) {
 	cases := []struct{ text, plain string }{
 		{"Origin: x\nSHA256:\n 0123 1 main/Packages\n", "Origin: x\nSHA256:\n 0123 1 main/Packages"},
@@ -40,6 +42,10 @@ func TestClearsignedFixture(t *testing.T) {
 		}
 		if string(b.Plaintext) != c.plain {
 			t.Fatalf("plaintext = %q, want %q", b.Plaintext, c.plain)
+		}
+		cs, err := apttext.SplitClearsigned(f)
+		if err != nil || string(cs.Message) != c.plain {
+			t.Fatalf("apt's split: M = %q, %v; want %q", cs.Message, err, c.plain)
 		}
 	}
 }

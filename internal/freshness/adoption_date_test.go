@@ -192,6 +192,7 @@ func TestClassify_RefusalsAndNewOutcomes(t *testing.T) {
 	}{
 		{fmt.Errorf("%w: x", ErrAdoptionUpstreamOlder), "refused", cache.ReasonUpstreamOlder},
 		{fmt.Errorf("%w: %w", ErrAdoptionRollbackRefused, cache.ErrSnapshotNaturalKeyAdopted), "refused", cache.ReasonRollbackRefused},
+		{fmt.Errorf("%w: x", ErrAdoptionSignerDowngrade), "refused", cache.ReasonSignerDowngrade},
 		{fmt.Errorf("%w: x", ErrAdoptionReleaseDateInFuture), "release_date_in_future", "release_date_in_future"},
 		{ErrAdoptionPanicked, "panicked", cache.ReasonPanic},
 		{fmt.Errorf("fetch: %w", context.DeadlineExceeded), "timed_out", "timed_out"},

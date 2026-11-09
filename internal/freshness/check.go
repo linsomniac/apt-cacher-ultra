@@ -33,7 +33,7 @@ import (
 //     row's anchor_form (snap.Form): inline, detached or unsigned
 //     (Dispatch 1 and 2). The check then issues a conditional GET against
 //     InRelease (inline) or Release (detached, unsigned).
-//   - Without an adopter (Phase 1, observation only) a first-ever check
+//   - Without an adopter (legacy invalidation) a first-ever check
 //     tries inline first; if the inline GET 404s AND a Release url_path
 //     row exists, it falls back to the detached path, as before phase E
 //     (TestCheck_Phase1DetachedFallback_OnInRelease404).
@@ -489,7 +489,7 @@ func signedForm(form cache.AnchorForm) bool {
 // when a slot was free (out.lease holds it), or queued with no request
 // when none was — the suite's last_success_at then keeps its previous
 // value (prevSuccess). With no adopter wired nothing is admitted and req
-// is returned as it is (Phase 1 observes and adopts nothing).
+// is returned as it is; legacy changes are handled before admission.
 //
 // AIDEV-NOTE: a queued result is what the scheduler parks a suite on
 // (isQueuedResult). A client check's queued result leaves the change
@@ -592,6 +592,17 @@ func (c *Checker) checkInline(ctx, fetchCtx context.Context, out *checkOutcome, 
 	gate := c.retryGateFor(cur, now)
 	c.applyClamp(ctx, cur, gate, now)
 	etag, lastmod := gate.validators(cur)
+	if c.adopter == nil && cur.CurrentSnapshotID == nil {
+		// Legacy validators must describe the row actually being served,
+		// never a sibling Release fetch that re-stamped the suite.
+		etag, lastmod = "", ""
+		if urlRow.UpstreamETag != nil {
+			etag = *urlRow.UpstreamETag
+		}
+		if urlRow.UpstreamLastMod != nil {
+			lastmod = *urlRow.UpstreamLastMod
+		}
+	}
 
 	// SPEC §9.3: bound concurrent upstream calls to host. Without
 	// this, distinct suites on the same host all run Conditional in
@@ -652,7 +663,13 @@ func (c *Checker) checkInline(ctx, fetchCtx context.Context, out *checkOutcome, 
 		return nil, nil, false
 	}
 
+	if err := c.refreshLegacyValidators(ctx, cur, urlRow, res, cachedHash); err != nil {
+		c.failCheck(ctx, out, cur, suite, nowUnix, "inline", err)
+		return nil, nil, false
+	}
+
 	prevSuccess := cur.LastSuccessAt
+	prevFailCount := cur.CheckFailCount
 	cur.LastCheckAt = &nowUnix
 	cur.LastSuccessAt = &nowUnix
 	cur.CheckFailCount = 0
@@ -684,6 +701,19 @@ func (c *Checker) checkInline(ctx, fetchCtx context.Context, out *checkOutcome, 
 			"upstream_hash", newHash,
 		)
 		e.result = "changed"
+		if c.adopter == nil {
+			if err := c.cache.InvalidateLegacyMetadata(ctx, cache.SuiteKey(suite), inReleasePath, cachedHash); err != nil {
+				cur.LastSuccessAt = prevSuccess
+				cur.CheckFailCount = prevFailCount
+				if c.endedByShutdown(ctx, suite, "invalidate legacy metadata", err) {
+					return nil, nil, false
+				}
+				c.logger.Warn("legacy_metadata_refresh_failed", "err", err, "canonical_host", host, "suite_path", suitePath)
+				c.failCheck(ctx, out, cur, suite, nowUnix, "inline", err)
+				return nil, nil, false
+			}
+			return nil, c.finishCheck(ctx, out, cur, suite, e), false
+		}
 		// The body is bounded by maxBody (§7.2 cap, default 4 MiB),
 		// so retaining it through the goroutine handoff is acceptable.
 		req = &adoptionRequest{
@@ -717,7 +747,11 @@ func (c *Checker) checkInline(ctx, fetchCtx context.Context, out *checkOutcome, 
 // the result is then deferred (its content key covers the signature), and
 // an upstream that ignores validators pays it on every deferred check
 // (deferred minor B-25: an accepted cost). The Release.gpg GET runs under
-// fetchCtx, the check deadline (TestCheck_DetachedSignatureStallEndsAtTheCheckDeadline).
+// fetchCtx, the check deadline. B-33's TestCheck_DetachedSignatureStallEndsAtTheCheckDeadline
+// pinned it until main's 0c6d2c0 rewrote that test for the no-adopter path
+// (TestCheck_LegacyDetachedRefreshDoesNotWaitForSignature); the adopter
+// path is unpinned now (docs/open-decisions.md, Open: the merge review's
+// M-M5).
 func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, now time.Time, nowUnix int64) (*adoptionRequest, *repairRequest) {
 	scheme, host, suitePath := suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath
 
@@ -748,25 +782,29 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 		)
 		return nil, nil
 	}
-	releaseGPGURL, err := c.cache.LookupURL(ctx, scheme, host, releaseGPGPath)
-	switch {
-	case errors.Is(err, cache.ErrNotFound):
-		if cur.CurrentSnapshotID == nil {
-			c.logger.Debug("freshness: no cached Release.gpg url_path, skipping detached",
+	var releaseGPGURL *cache.URLPath
+	if c.adopter != nil || cur.CurrentSnapshotID != nil {
+		releaseGPGURL, err = c.cache.LookupURL(ctx, scheme, host, releaseGPGPath)
+		switch {
+		case errors.Is(err, cache.ErrNotFound):
+			if cur.CurrentSnapshotID == nil {
+				c.logger.Debug("freshness: no cached Release.gpg url_path, skipping detached",
+					"canonical_host", host,
+					"suite_path", suitePath,
+				)
+				return nil, nil
+			}
+			gpgHash := c.snapshotAnchorHash(ctx, *cur.CurrentSnapshotID, releaseGPGFilename)
+			releaseGPGURL = c.reconstructAnchor(ctx, scheme, host, suitePath, releaseGPGPath, *cur.CurrentSnapshotID, gpgHash, nowUnix)
+		case err != nil:
+			c.logger.Warn("freshness: lookup Release.gpg url_path failed",
+				"err", err,
 				"canonical_host", host,
 				"suite_path", suitePath,
 			)
 			return nil, nil
 		}
-		gpgHash := c.snapshotAnchorHash(ctx, *cur.CurrentSnapshotID, releaseGPGFilename)
-		releaseGPGURL = c.reconstructAnchor(ctx, scheme, host, suitePath, releaseGPGPath, *cur.CurrentSnapshotID, gpgHash, nowUnix)
-	case err != nil:
-		c.logger.Warn("freshness: lookup Release.gpg url_path failed",
-			"err", err,
-			"canonical_host", host,
-			"suite_path", suitePath,
-		)
-		return nil, nil
+
 	}
 
 	cachedHash, signedCurrent := c.baseline(ctx, cur, suite, releaseURL, "Release")
@@ -781,6 +819,17 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 	gate := c.retryGateFor(cur, now)
 	c.applyClamp(ctx, cur, gate, now)
 	etag, lastmod := gate.validators(cur)
+	if c.adopter == nil && cur.CurrentSnapshotID == nil {
+		// An inline-to-detached fallback must never send InRelease's
+		// validators for Release: a shared mirror date could hide a change.
+		etag, lastmod = "", ""
+		if releaseURL.UpstreamETag != nil {
+			etag = *releaseURL.UpstreamETag
+		}
+		if releaseURL.UpstreamLastMod != nil {
+			lastmod = *releaseURL.UpstreamLastMod
+		}
+	}
 
 	releaseSlot, err := c.hostSem.Acquire(fetchCtx, host)
 	if err != nil {
@@ -830,7 +879,13 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 		return nil, nil
 	}
 
+	if err := c.refreshLegacyValidators(ctx, cur, releaseURL, res, cachedHash); err != nil {
+		c.failCheck(ctx, out, cur, suite, nowUnix, "detached", err)
+		return nil, nil
+	}
+
 	prevSuccess := cur.LastSuccessAt
+	prevFailCount := cur.CheckFailCount
 	cur.LastCheckAt = &nowUnix
 	cur.LastSuccessAt = &nowUnix
 	cur.CheckFailCount = 0
@@ -847,6 +902,20 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 		e.result, e.clearRecord = result, clearRec && !lateralHeld
 	} else {
 		setChangeSeen(cur, nowUnix)
+		if c.adopter == nil {
+			if err := c.cache.InvalidateLegacyMetadata(ctx, cache.SuiteKey(suite), releasePath, cachedHash); err != nil {
+				cur.LastSuccessAt = prevSuccess
+				cur.CheckFailCount = prevFailCount
+				if c.endedByShutdown(ctx, suite, "invalidate legacy metadata", err) {
+					return nil, nil
+				}
+				c.logger.Warn("legacy_metadata_refresh_failed", "err", err, "canonical_host", host, "suite_path", suitePath)
+				c.failCheck(ctx, out, cur, suite, nowUnix, "detached", err)
+				return nil, nil
+			}
+			e.result = "changed"
+			return nil, c.finishCheck(ctx, out, cur, suite, e)
+		}
 		// The content key covers the signature, so Release.gpg is fetched
 		// before the gate can compare (no validators: the signature is
 		// bound to this Release).
@@ -902,6 +971,7 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 				key:          key,
 				releaseBytes: res.Body,
 				sigBytes:     gpgRes.Body,
+				sigLastmod:   gpgRes.LastModified,
 				etag:         res.ETag,
 				lastmod:      res.LastModified,
 			}
@@ -912,4 +982,20 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 		e.reason = gate.reason
 	}
 	return req, c.finishCheck(ctx, out, cur, suite, e)
+}
+
+// An unchanged 200 may rotate validators. Update only the exact cached row,
+// keeping client interest counters and concurrent replacements intact.
+func (c *Checker) refreshLegacyValidators(ctx context.Context, cur *cache.SuiteFreshness, row *cache.URLPath, res *fetch.ConditionalResult, hash string) error {
+	if c.adopter != nil || cur.CurrentSnapshotID != nil || res.Status != 200 || bodyHash(res) != hash {
+		return nil
+	}
+	ok, err := c.cache.RefreshURLPathBlob(ctx, row.CanonicalScheme, row.CanonicalHost, row.Path, hash, hash, nonEmpty(res.ETag), nonEmpty(res.LastModified))
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return cache.ErrMetadataChanged
+	}
+	return nil
 }

@@ -402,8 +402,9 @@ WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &form, &adopted
 			return ErrSnapshotAlreadyAdopted
 		}
 		// AIDEV-NOTE: a retired snapshot (quarantined by the legacy trust
-		// audit, spec §6.1, or reaped from phase F) must never become
-		// current again — its pins were released when it was retired.
+		// audit, spec §6.1, reaped from phase F, or retired by GC sub-job B
+		// beyond gc.keep_displaced: DN-7) must never become current again —
+		// its pins were released when it stopped being current.
 		if retiredAt.Valid {
 			return fmt.Errorf("%w: snapshot_id=%d", ErrSnapshotRetired, snapshotID)
 		}
@@ -435,6 +436,14 @@ WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &form, &adopted
 		// Step 2: insert snapshot_member rows. Each member is validated
 		// against its declared invariants before we touch SQLite — a bad
 		// row should fail loud, not be smuggled past hash validation.
+		memberStmt, err := tx.PrepareContext(ctx, `
+INSERT INTO snapshot_member (snapshot_id, path, blob_hash, declared_sha256)
+VALUES (?, ?, ?, ?)`)
+		if err != nil {
+			return fmt.Errorf("CommitAdoption: prepare member insert: %w", err)
+		}
+		defer func() { _ = memberStmt.Close() }()
+
 		for _, m := range members {
 			if !validBlobHash(m.BlobHash) {
 				return fmt.Errorf("CommitAdoption: member %q blob_hash %w", m.Path, ErrInvalidHash)
@@ -442,10 +451,7 @@ WHERE snapshot_id = ?`, snapshotID).Scan(&scheme, &host, &suite, &form, &adopted
 			if !validBlobHash(m.DeclaredSHA256) {
 				return fmt.Errorf("CommitAdoption: member %q declared_sha256 %w", m.Path, ErrInvalidHash)
 			}
-			if _, err := tx.ExecContext(ctx, `
-INSERT INTO snapshot_member (snapshot_id, path, blob_hash, declared_sha256)
-VALUES (?, ?, ?, ?)`,
-				snapshotID, m.Path, m.BlobHash, m.DeclaredSHA256); err != nil {
+			if _, err := memberStmt.ExecContext(ctx, snapshotID, m.Path, m.BlobHash, m.DeclaredSHA256); err != nil {
 				return fmt.Errorf("CommitAdoption: insert member %q: %w", m.Path, err)
 			}
 		}
@@ -455,14 +461,20 @@ VALUES (?, ?, ?, ?)`,
 		// anchor a later repair fetch verifies bytes against, so a
 		// malformed value must abort the flip, not ride along.
 		skipNow := nowUnix()
+		skippedStmt, err := tx.PrepareContext(ctx, `
+INSERT INTO snapshot_skipped_member
+  (snapshot_id, path, declared_sha256, size, reason, detail, skipped_at, retry_count)
+VALUES (?, ?, ?, ?, ?, ?, ?, 0)`)
+		if err != nil {
+			return fmt.Errorf("CommitAdoption: prepare skipped member insert: %w", err)
+		}
+		defer func() { _ = skippedStmt.Close() }()
+
 		for _, s := range skipped {
 			if !validBlobHash(s.DeclaredSHA256) {
 				return fmt.Errorf("CommitAdoption: skipped member %q declared_sha256 %w", s.Path, ErrInvalidHash)
 			}
-			if _, err := tx.ExecContext(ctx, `
-INSERT INTO snapshot_skipped_member
-  (snapshot_id, path, declared_sha256, size, reason, detail, skipped_at, retry_count)
-VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+			if _, err := skippedStmt.ExecContext(ctx,
 				snapshotID, s.Path, s.DeclaredSHA256, s.Size, s.Reason, s.Detail, skipNow); err != nil {
 				return fmt.Errorf("CommitAdoption: insert skipped member %q: %w", s.Path, err)
 			}
@@ -472,15 +484,21 @@ VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
 		// added package_name and architecture columns; rows whose
 		// stanza didn't declare both end up with empty strings, which
 		// the SPEC3 §7.5.3 hot-set query filters out.
+		packageStmt, err := tx.PrepareContext(ctx, `
+INSERT INTO package_hash (canonical_scheme, canonical_host, path,
+                          declared_sha256, snapshot_id,
+                          package_name, architecture, version, flat_filename)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		if err != nil {
+			return fmt.Errorf("CommitAdoption: prepare package_hash insert: %w", err)
+		}
+		defer func() { _ = packageStmt.Close() }()
+
 		for _, p := range packageHashes {
 			if !validBlobHash(p.DeclaredSHA256) {
 				return fmt.Errorf("CommitAdoption: package_hash %q declared_sha256 %w", p.Path, ErrInvalidHash)
 			}
-			if _, err := tx.ExecContext(ctx, `
-INSERT INTO package_hash (canonical_scheme, canonical_host, path,
-                          declared_sha256, snapshot_id,
-                          package_name, architecture, version, flat_filename)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			if _, err := packageStmt.ExecContext(ctx,
 				p.CanonicalScheme, p.CanonicalHost, p.Path,
 				p.DeclaredSHA256, snapshotID,
 				p.PackageName, p.Architecture, p.Version, p.FlatFilename); err != nil {
@@ -489,7 +507,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		}
 
 		now := nowUnix()
-		// Spec C8 (monotonic Last-Modified): the adoption stamp, taken
+		// Keep the adoption ordering stamp monotonic, taken
 		// before Step 3c re-seeds the url_path anchor rows with now.
 		stamp, err := adoptionStampTx(ctx, tx, scheme, host, suite, now)
 		if err != nil {
@@ -516,18 +534,21 @@ INSERT INTO url_path
   (canonical_scheme, canonical_host, path, blob_hash, upstream_url,
    is_metadata, last_requested_at, request_count, last_fetched_at,
    upstream_etag, upstream_lastmod)
-VALUES (?, ?, ?, ?, ?, 0, NULL, 0, ?, NULL, NULL)
+VALUES (?, ?, ?, ?, ?, 0, NULL, 0, ?, NULL,
+ (SELECT last_modified FROM representation_metadata WHERE canonical_scheme = ? AND canonical_host = ? AND path = ? AND blob_hash = ?))
 ON CONFLICT(canonical_scheme, canonical_host, path) DO UPDATE SET
   blob_hash       = excluded.blob_hash,
   upstream_url    = excluded.upstream_url,
   last_fetched_at = excluded.last_fetched_at,
+  upstream_etag = NULL,
+  upstream_lastmod = excluded.upstream_lastmod,
   -- Re-warming re-establishes the row with a fresh blob; clear any
   -- hold-grace drop stamp so it isn't reaped at a stale pre-re-warm
   -- deadline (matches PutURLPath/TouchURLPath). last_requested_at /
   -- request_count are still intentionally omitted to preserve hotness.
   dropped_at      = NULL`,
 				up.CanonicalScheme, up.CanonicalHost, up.Path,
-				up.BlobHash, up.UpstreamURL, now); err != nil {
+				up.BlobHash, up.UpstreamURL, now, up.CanonicalScheme, up.CanonicalHost, up.Path, up.BlobHash); err != nil {
 				return fmt.Errorf("CommitAdoption: prefetched url_path %q: %w", up.Path, err)
 			}
 		}
@@ -677,10 +698,8 @@ UPDATE suite_freshness
 			return fmt.Errorf("%w: %s://%s%s", ErrSuiteGone, scheme, host, suite)
 		}
 
-		// Step 7: mark the new snapshot adopted with the spec C8 stamp:
-		// `now` (the commit moment Step 3a also uses) unless the previous
-		// anchor's stamp is not older, which keeps a client's
-		// If-Modified-Since from hiding the flip.
+		// Step 7: mark the snapshot with its monotonic ordering stamp.
+		// Response validators use content hashes and upstream dates.
 		if _, err := tx.ExecContext(ctx, `
 UPDATE suite_snapshot SET adopted_at = ? WHERE snapshot_id = ?`,
 			stamp, snapshotID); err != nil {
@@ -740,54 +759,23 @@ UPDATE blob
 	return nil
 }
 
-// adoptionStampTx returns the adopted_at a commit at now stamps (spec C8,
-// monotonic Last-Modified): max(now, the newest adopted_at of any snapshot
-// of the suite + 1) — current, displaced or retired, while it is still
-// there — and, for a suite with no current snapshot (a first adoption, or
-// one after a quarantine or a reap), also above the newest last_fetched_at
-// of the suite's InRelease/Release/Release.gpg url_path rows + 1 — those
-// rows are what clients were served, with that Last-Modified or older.
-// The handler serves snapshot anchors with adopted_at as their
-// Last-Modified (never the pool file's mtime), so a client's
-// If-Modified-Since from the previous anchor gets a 200 after a flip,
-// whatever the clock does — within the residual below.
+// adoptionStampTx preserves the monotonic per-suite ordering of snapshots,
+// including displaced and retired snapshots that still exist. GC and retained
+// by-hash lookups depend on that order even across backward clock steps.
+// Keep the historical first-adoption floor above existing anchor fetch stamps;
+// call before Step 3c re-seeds those rows. This is local bookkeeping, never an
+// HTTP Last-Modified date. Content ETags make client validation independent of
+// clock steps, same-second flips, reaping and snapshot recovery.
 //
-// AIDEV-NOTE: call it before CommitAdoption Step 3c, which re-seeds the
-// anchor rows' last_fetched_at with now. adopted_at can now lead the wall
-// clock (by 1 s per same-second flip, by up to a backward step's length
-// after one), so the floor is every snapshot of the suite, not only the
-// current one (deferred minor C-11): once current_snapshot_id is cleared
-// (a quarantine) or the row deleted (a reap, an eviction, POST /forget —
-// the re-created suite starts without one), the suite's remaining
-// snapshots may lead the clock, and a stamp below theirs would misorder
-// GC's keep_displaced ranking and retained by-hash's newest-first window,
-// and could answer a client's If-Modified-Since from a retired snapshot
-// 304. Stamps are strictly increasing per suite, so those readers need
-// only their order; the legacy audit's markSnapshotBaseTx
-// (legacy_audit.go) reads one as a wall-clock stamp, and the clock-step
-// rule (internal/freshness/clockstep.go, spec C4) lists adopted_at as a
-// past-event stamp — no gate reads it that way, so a stamp in the future
-// is harmless there. Residual (the Task 5 review's minor 1): the floor
-// covers only the snapshots still present. Sub-job C deletes a retired
-// snapshot at a periodic GC tick (normally the next; a startup GC pass
-// deletes none: ruling PF-15), a reap or /forget deletes the anchor rows,
-// and Step 3c seeds them with now, so after a backward step longer than
-// the time from a reap (or /forget) to the re-adoption, with that periodic
-// tick in between, the re-adoption can stamp below the reaped snapshot
-// again and a client holding that anchor gets a 304 until a later flip is
-// stamped above it. C-11's own readers do not care then (the row is
-// gone); a durable per-suite floor needs a schema change, which phase F
-// forbids.
-//
-// AIDEV-NOTE: ruling R-G3 (phase G). url_path-served metadata answers
-// Last-Modified = max(pool mtime, last_fetched_at) (the handler's
-// urlPathModTime), so the first-adoption floor below (the anchors'
-// MAX(last_fetched_at) + 1) passes every url_path anchor's Last-Modified
-// only while no pool file is newer than its row's last_fetched_at:
-// runFetch and the anchorless refresh (RefreshURLPathBlob) finalize the
-// pool file before they stamp the row. Keep that order; blob mtimes are
-// not folded into this floor
-// (TestServeHTTP_AMissStampsItsRowAfterItsPoolFile).
+// AIDEV-NOTE: rulings C-11 and R-G3, after #17/#18 (0c6d2c0). The floor is
+// every snapshot of the suite still present, not only the current one
+// (C-11): stamps can lead the wall clock, and GC's keep_displaced ranking
+// and retained by-hash's newest-first window read their order. The
+// first-adoption floor over the anchors' MAX(last_fetched_at) + 1 no longer
+// protects a client-visible date (Last-Modified is upstream's, validation is
+// by content ETag), and no reader compares adopted_at with last_fetched_at;
+// runFetch and RefreshURLPathBlob still stamp a row only after its pool file
+// is final (R-G3). Check both before dropping the floor.
 func adoptionStampTx(ctx context.Context, tx *sql.Tx, scheme, host, suite string, now int64) (int64, error) {
 	var newest, current sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `

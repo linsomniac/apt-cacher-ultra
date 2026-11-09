@@ -1,17 +1,15 @@
 package freshness
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 
-	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
-
-	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
+	"github.com/linsomniac/apt-cacher-ultra/internal/apttext"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
 
@@ -46,22 +44,39 @@ func (a *Adopter) ReconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 	return a.reconcileSnapshot(ctx, suite, snapshotID, nil, force)
 }
 
-// sweepReconcileMemo drops every reconciledSnapshots entry whose snapshot
-// is not in current — the suites' current snapshots, as the reaper's run
-// listed them (spec C9) — and reports how many it dropped. A displaced
-// snapshot never becomes current again, so its entry is dead; one adopted
-// after the listing may lose a fresh entry, which costs it one extra parse
-// of its Release on its next unchanged check.
+// sweepReconcileMemo drops every reconciledSnapshots and
+// reconcileFailedSnapshots entry whose snapshot is not in current — the
+// suites' current snapshots, as the reaper's run listed them (spec C9) —
+// and reports how many it dropped. A displaced snapshot never becomes
+// current again, so its entry is dead; one adopted after the listing may
+// lose a fresh entry, which costs it one extra parse of its Release on its
+// next unchanged check (or one more WARN of a failing decision).
 func (a *Adopter) sweepReconcileMemo(current map[int64]bool) int {
 	n := 0
-	a.reconciledSnapshots.Range(func(k, _ any) bool {
-		if id, ok := k.(int64); !ok || !current[id] {
-			a.reconciledSnapshots.Delete(k)
-			n++
-		}
-		return true
-	})
+	for _, memo := range []*sync.Map{&a.reconciledSnapshots, &a.reconcileFailedSnapshots} {
+		memo.Range(func(k, _ any) bool {
+			if id, ok := k.(int64); !ok || !current[id] {
+				memo.Delete(k)
+				n++
+			}
+			return true
+		})
+	}
 	return n
+}
+
+// firstReconcileFailure records that snapshotID's reconcile decision failed
+// and reports whether it is the first failure since the process started or
+// since a decision on it last succeeded (the one logged at WARN).
+func (a *Adopter) firstReconcileFailure(snapshotID int64) bool {
+	_, seen := a.reconcileFailedSnapshots.LoadOrStore(snapshotID, struct{}{})
+	return !seen
+}
+
+// clearReconcileFailure forgets snapshotID's failed decision: a decision on
+// it succeeded, so a failure that recurs is said again.
+func (a *Adopter) clearReconcileFailure(snapshotID int64) {
+	a.reconcileFailedSnapshots.Delete(snapshotID)
 }
 
 // reconcileSnapshot is ReconcileSnapshot; a non-nil declared must be
@@ -201,9 +216,9 @@ func (a *Adopter) reconcilePending(ctx context.Context, suite SuiteRef, snapshot
 // exact bytes adoption verified. Intact is not the same as signed: an
 // InRelease envelope also carries regions outside the signature (armor
 // headers, lines after the armor CRC), so for InRelease
-// inReleasePlaintext limits the parse to the signed plaintext (R-1). A
-// detached Release is covered whole by its Release.gpg and is parsed
-// as-is.
+// inReleaseMessage limits the parse to the signed text, M, as adoption
+// parsed it (R-1; V-RI1). A detached Release is covered whole by its
+// Release.gpg and is parsed as-is.
 // Callers MUST treat the returned []ReleaseMember as the authoritative
 // declared set — do not accept member declarations from any other source.
 // Handing the set down within one tick (reconcilePending → spawnRepair →
@@ -239,7 +254,7 @@ func (a *Adopter) reparseSnapshotRelease(ctx context.Context, snapshotID int64) 
 				name, got, mem.BlobHash)
 		}
 		if name == "InRelease" {
-			text, err := inReleasePlaintext(blob)
+			text, err := inReleaseMessage(blob)
 			if err != nil {
 				return nil, err
 			}
@@ -250,42 +265,54 @@ func (a *Adopter) reparseSnapshotRelease(ctx context.Context, snapshotID int64) 
 	return nil, fmt.Errorf("reconcile: snapshot %d has no InRelease/Release member", snapshotID)
 }
 
-// inReleasePlaintext returns the signed plaintext of a stored InRelease
-// without re-verifying the signature (the bytes were verified at adoption
-// and are content-addressed; re-verification would also fail after a
-// legitimate keyring change).
+// inReleaseMessage returns M, the signed text of a stored InRelease as
+// apt's splitter reads it (internal/apttext, layer T), without
+// re-verifying the signature (the bytes were verified at adoption and are
+// content-addressed; re-verification would also fail after a legitimate
+// keyring change). It is what the verifier returned at adoption and the
+// adopter parsed the snapshot's members from: layer T's Inline adds
+// refusals to apt's split and never changes M.
 //
 // AIDEV-NOTE: R-1. Never ParseRelease the raw envelope: lines placed
 // after a forged "=CRC" line inside the signature armor, or as
 // colon-bearing armor headers, are part of the stored bytes but were never
-// signed (both verify with go-crypto v1.4.1). A body without a clearsign
-// marker is an error since phase D (the plain-text fallback served only
-// test fixtures; VerifyInline never adopts plain text, and the startup
+// signed. M is the signed text alone: the split stops at the signature's
+// BEGIN line and drops the cleartext headers. A body without a clearsign
+// marker on its first line is an error (the plain-text fallback is gone
+// since phase D: VerifyInline never adopts plain text, and the startup
 // audit quarantines legacy plain-text snapshots — one it deferred fails
-// its reconcile here, closed, until a later start audits it). The marker
-// test is bytes.Contains, never HasPrefix: snapshots adopted before phase
-// D may hold whitespace before the marker (ruling R-D2 now refuses that at
-// adoption). A decode failure is an error, never a raw parse; the decode
-// sees aptpath.DecodableClearsign(blob) (R-D2) and runs under recover():
-// a stored blob cannot trigger I-1, but reconcile must never crash the
+// its reconcile here, closed, until a later start audits it), and so is
+// any other envelope apt's split refuses: never a raw parse.
+//
+// AIDEV-NOTE: the re-review's V-RI1. Until Task 9b's fix round this read
+// go-crypto's clearsign plaintext (with aptpath.DecodableClearsign for a
+// marker line with trailing blanks, ruling R-D2) while adoption parsed
+// layer T's M: they disagreed on anchors the hybrid verifier adopts (a
+// cleartext "Comment:" header, CRs before a line's end, blanks after the
+// signature's BEGIN line), so reconcile failed on every tick of such a
+// snapshot and never healed its missing members
+// (TestReconcile_ReadsEveryAdoptedCorpusAnchorAsAdoptionDid). A snapshot
+// adopted before phase D with whitespace before its marker, which apt's
+// split refuses (and so does every client's apt), no longer reconciles:
+// it fails closed, as above, until the next adoption replaces it. The
+// startup audit still reads legacy envelopes as their adoption did
+// (legacy_audit.go, inReleasePlaintext). The split runs under recover():
+// a stored blob cannot make it panic, but reconcile must never crash the
 // daemon.
-func inReleasePlaintext(blob []byte) (text []byte, err error) {
-	if !bytes.Contains(blob, []byte("-----BEGIN PGP SIGNED MESSAGE-----")) {
-		return nil, errors.New("reconcile: stored InRelease is not clearsigned")
-	}
+func inReleaseMessage(blob []byte) (text []byte, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			text, err = nil, fmt.Errorf("reconcile: clearsign decode panicked: %v", r)
+			text, err = nil, fmt.Errorf("reconcile: splitting the stored InRelease panicked: %v", r)
 		}
 	}()
-	block, _ := clearsign.Decode(aptpath.DecodableClearsign(blob))
-	// An empty cleartext cannot be an InRelease. go-crypto v1.5.2 returns
-	// an empty block where older versions panicked; keep the audit's existing
-	// malformed-envelope verdict, without marking the suite as seen signed.
-	if block == nil || len(block.Plaintext) == 0 {
-		return nil, errors.New("reconcile: stored InRelease is not a valid clearsigned message")
+	cs, err := apttext.SplitClearsigned(blob)
+	switch {
+	case errors.Is(err, apttext.ErrNotClearsigned):
+		return nil, errors.New("reconcile: stored InRelease is not clearsigned")
+	case err != nil:
+		return nil, fmt.Errorf("reconcile: stored InRelease is not a valid clearsigned message: %w", err)
 	}
-	return block.Plaintext, nil
+	return cs.Message, nil
 }
 
 // missingRequestableMembers returns the declared ReleaseMembers belonging
