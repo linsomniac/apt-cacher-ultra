@@ -113,6 +113,10 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Fixed
 
+- Adopt gzip repository indexes with trailing NUL padding, as served by
+  ClickHouse, while retaining concatenated-member support, CRC/size checks,
+  the cumulative decompression cap and verification of the complete stored
+  bytes. Thanks to Scott Hyndman (@shyndman) for PR #26 and report #25.
 - Preserve upstream Last-Modified dates per URL and content, and use content
   ETags for conditional responses to prevent stale date-only responses (#17).
 - Refresh mutable repository metadata when snapshot adoption is disabled,

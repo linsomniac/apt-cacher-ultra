@@ -1,9 +1,6 @@
 package freshness
 
 import (
-	"bufio"
-	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -724,9 +721,6 @@ type Adopter struct {
 	// by the suite table rather than by every snapshot id the process saw.
 	reconciledSnapshots sync.Map // map[int64]struct{}
 
-	// maxDecompressedBytes overrides maxDecompressedPackagesBytes in
-	// tests when > 0 so bomb-defense tests don't have to allocate >256 MiB.
-	maxDecompressedBytes int64
 	// reconcileFailedSnapshots memoizes the snapshot IDs whose reconcile
 	// decision failed and was logged at WARN (Checker.logReconcileFailure),
 	// so a snapshot that can never reconcile warns once per process rather
@@ -3313,13 +3307,6 @@ func repoRootFromSuitePath(suitePath string) (string, bool) {
 // readPackagesBlob opens the pool blob for a Packages member and
 // returns its decompressed bytes (or raw bytes for plain Packages).
 // Reads are size-capped against gzip-bomb amplification.
-func (a *Adopter) decompressedPackagesCap() int64 {
-	if a.maxDecompressedBytes > 0 {
-		return a.maxDecompressedBytes
-	}
-	return maxDecompressedPackagesBytes
-}
-
 func (a *Adopter) readPackagesBlob(memberPath, blobHash string) ([]byte, error) {
 	f, err := os.Open(a.cache.BlobPath(blobHash))
 	if err != nil {
@@ -3327,9 +3314,8 @@ func (a *Adopter) readPackagesBlob(memberPath, blobHash string) ([]byte, error) 
 	}
 	defer func() { _ = f.Close() }()
 
-	capBytes := a.decompressedPackagesCap()
 	if strings.HasSuffix(memberPath, ".gz") {
-		return readGzipPackagesBlob(f, capBytes)
+		return readGzipPackagesBlob(f, maxDecompressedPackagesBytes)
 	}
 	if strings.HasSuffix(memberPath, ".xz") {
 		// Phase 3: ulikunitz/xz pure-Go reader. Same size-cap posture
@@ -3339,99 +3325,28 @@ func (a *Adopter) readPackagesBlob(memberPath, blobHash string) ([]byte, error) 
 		if err != nil {
 			return nil, fmt.Errorf("xz: %w", err)
 		}
-		limited := io.LimitReader(xr, capBytes+1)
+		limited := io.LimitReader(xr, maxDecompressedPackagesBytes+1)
 		body, err := io.ReadAll(limited)
 		if err != nil {
 			return nil, fmt.Errorf("decompress: %w", err)
 		}
-		if int64(len(body)) > capBytes {
+		if int64(len(body)) > maxDecompressedPackagesBytes {
 			return nil, fmt.Errorf("decompressed Packages.xz size exceeds %d-byte cap (bomb defense)",
-				capBytes)
+				maxDecompressedPackagesBytes)
 		}
 		return body, nil
 	}
 	// Plain Packages — also size-cap the read to bound a hostile-
 	// upstream signed-but-huge file (matches the gzip path's posture).
-	limited := io.LimitReader(f, capBytes+1)
+	limited := io.LimitReader(f, maxDecompressedPackagesBytes+1)
 	body, err := io.ReadAll(limited)
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(body)) > capBytes {
-		return nil, fmt.Errorf("plain Packages exceeds %d-byte cap", capBytes)
+	if int64(len(body)) > maxDecompressedPackagesBytes {
+		return nil, fmt.Errorf("plain Packages exceeds %d-byte cap", maxDecompressedPackagesBytes)
 	}
 	return body, nil
-}
-
-// readGzipPackagesBlob decompresses a .gz Packages/Sources index blob while
-// tolerating trailing NUL (0x00) padding after the final gzip member trailer
-// (used by publishers such as packages.clickhouse.com that zero-pad index
-// files to a block boundary before signing InRelease). Genuine concatenated
-// multi-member gzip streams remain supported, non-NUL trailing garbage still
-// fails with gzip.ErrHeader, and total decompressed output stays capped at
-// capBytes.
-func readGzipPackagesBlob(r io.Reader, capBytes int64) ([]byte, error) {
-	br := bufio.NewReader(r)
-	gr, err := gzip.NewReader(br)
-	if err != nil {
-		return nil, fmt.Errorf("gzip: %w", err)
-	}
-	defer func() { _ = gr.Close() }()
-
-	var out bytes.Buffer
-	remainingCap := capBytes + 1
-	for {
-		gr.Multistream(false)
-		n, err := io.Copy(&out, io.LimitReader(gr, remainingCap))
-		if err != nil {
-			return nil, fmt.Errorf("decompress: %w", err)
-		}
-		remainingCap -= n
-		if remainingCap <= 0 {
-			return nil, fmt.Errorf("decompressed Packages.gz size exceeds %d-byte cap (bomb defense)",
-				capBytes)
-		}
-		hasMore, err := hasNextGzipMember(br)
-		if err != nil {
-			return nil, fmt.Errorf("decompress: %w", err)
-		}
-		if !hasMore {
-			return out.Bytes(), nil
-		}
-		if err := gr.Reset(br); err != nil {
-			return nil, fmt.Errorf("decompress: %w", err)
-		}
-	}
-}
-
-// hasNextGzipMember inspects the bytes following a completed gzip member.
-// If the reader is at EOF or contains only 0x00 padding through EOF, it
-// returns (false, nil). If a non-NUL byte is encountered before any NUL
-// byte, it leaves the byte unread in br so gzip.Reader.Reset can parse the
-// next member header (or return gzip.ErrHeader). If a non-NUL byte appears
-// after one or more NUL padding bytes, it returns gzip.ErrHeader directly.
-func hasNextGzipMember(br *bufio.Reader) (bool, error) {
-	sawNul := false
-	for {
-		b, err := br.ReadByte()
-		if errors.Is(err, io.EOF) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		if b == 0 {
-			sawNul = true
-			continue
-		}
-		if sawNul {
-			return false, gzip.ErrHeader
-		}
-		if err := br.UnreadByte(); err != nil {
-			return false, err
-		}
-		return true, nil
-	}
 }
 
 // buildMemberURL constructs the upstream URL for a suite-relative

@@ -1369,40 +1369,6 @@ func TestAdopter_PackageHash_NonStandardSuiteSkips(t *testing.T) {
 	}
 }
 
-func TestAdopter_PackageHash_GzipBombDefense(t *testing.T) {
-	// A small gzip stream that decompresses to >256 MiB should be
-	// rejected before it can exhaust memory. We can't actually
-	// generate 256 MiB of zeros at test time without burning memory,
-	// so synthesize one by directly slicing the cap from the helper —
-	// here we exercise the threshold logic with a 64 MiB body.
-	// AIDEV-NOTE: this test exercises the size-cap check using a
-	// crafted gzip whose decompressed output overflows the configured
-	// limit. We dial maxDecompressedPackagesBytes in via a small
-	// override to keep the test under a few MiB of RAM.
-	env := newAdoptionTestEnv(t)
-
-	// Construct the bomb: a single gzip stream of 1 MiB of zero
-	// bytes. We then run adoption with a custom limit.
-	const bombSize = 1 << 20 // 1 MiB decompressed
-	zeros := make([]byte, bombSize)
-	gz := gzipBytes(zeros)
-	releaseText, _ := makeRelease(map[string][]byte{
-		"main/binary-amd64/Packages.gz": gz,
-	})
-	env.fetcher.put("http://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages.gz", gz)
-
-	// Adoption succeeds at the member level (the bomb is signed),
-	// then fails at parse step because the decompressed content
-	// has no Packages stanzas. Either ErrAdoptionParseFailed (no
-	// stanzas error from ParsePackages) or a bomb-defense error
-	// from readPackagesBlob is acceptable — both indicate adoption
-	// declined to trust the input.
-	err := env.adopter.Run(context.Background(), env.suite, releaseText, "", "")
-	if !errors.Is(err, ErrAdoptionParseFailed) {
-		t.Errorf("got %v, want ErrAdoptionParseFailed", err)
-	}
-}
-
 func TestAdopter_PackageHash_GzipDecompressionWorks(t *testing.T) {
 	// End-to-end check that gzip decompression actually happens — the
 	// happy path test covers it, but this isolates the decompression
@@ -1438,10 +1404,8 @@ func TestAdopter_PackageHash_GzipDecompressionWorks(t *testing.T) {
 }
 
 func TestAdopter_PackageHash_GzipTrailingNulPadding(t *testing.T) {
-	// Upstream publishers (e.g. packages.clickhouse.com) pad Packages.gz
-	// with trailing NUL (0x00) bytes to a block boundary before signing
-	// InRelease. Adoption must accept trailing NUL padding after a valid
-	// gzip member, matching GNU gzip and libapt-pkg behavior.
+	// ClickHouse serves Packages.gz with trailing NUL bytes covered by its
+	// InRelease hash. Adoption accepts that padding after a valid member.
 	env := newAdoptionTestEnv(t)
 	debHash := strings.Repeat("e", 64)
 	stanzas := fakePackagesStanzas(map[string]string{
@@ -1456,8 +1420,11 @@ func TestAdopter_PackageHash_GzipTrailingNulPadding(t *testing.T) {
 	if err := env.adopter.Run(context.Background(), env.suite, releaseText, "", ""); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	sf, _ := env.cache.GetSuiteFreshness(context.Background(),
+	sf, err := env.cache.GetSuiteFreshness(context.Background(),
 		env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if sf.CurrentSnapshotID == nil {
 		t.Fatal("adoption didn't flip pointer")
 	}
@@ -1469,6 +1436,11 @@ func TestAdopter_PackageHash_GzipTrailingNulPadding(t *testing.T) {
 	}
 	if ph.DeclaredSHA256 != debHash {
 		t.Errorf("declared = %s, want %s", ph.DeclaredSHA256, debHash)
+	}
+	// Padding remains part of the content-addressed blob served to clients.
+	cached, err := os.ReadFile(env.cache.BlobPath(shaOf(gz)))
+	if err != nil || !bytes.Equal(cached, gz) {
+		t.Fatalf("cached padded blob changed: %v", err)
 	}
 }
 
@@ -1503,8 +1475,11 @@ func TestAdopter_PackageHash_GzipConcatenatedMultiMember(t *testing.T) {
 			if err := env.adopter.Run(context.Background(), env.suite, releaseText, "", ""); err != nil {
 				t.Fatalf("Run: %v", err)
 			}
-			sf, _ := env.cache.GetSuiteFreshness(context.Background(),
+			sf, err := env.cache.GetSuiteFreshness(context.Background(),
 				env.suite.CanonicalScheme, env.suite.CanonicalHost, env.suite.SuitePath)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if sf.CurrentSnapshotID == nil {
 				t.Fatal("adoption didn't flip pointer")
 			}
@@ -1559,52 +1534,6 @@ func TestAdopter_PackageHash_GzipTrailingGarbageRejected(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestAdopter_PackageHash_GzipMultiMemberCapBoundary(t *testing.T) {
-	// Cumulative decompressed size across concatenated gzip members must
-	// permit exactly capBytes and reject capBytes+1 with the bomb-defense
-	// error (not merely a parser failure).
-	hashA := strings.Repeat("a", 64)
-	hashB := strings.Repeat("b", 64)
-	stanzaA := fakePackagesStanzas(map[string]string{
-		"pool/main/a/alpha/alpha.deb": hashA,
-	})
-	stanzaB := fakePackagesStanzas(map[string]string{
-		"pool/main/b/beta/beta.deb": hashB,
-	})
-	totalBytes := int64(len(stanzaA) + len(stanzaB))
-	gz := append(gzipBytes(stanzaA), gzipBytes(stanzaB)...)
-
-	t.Run("exact_cap_succeeds", func(t *testing.T) {
-		env := newAdoptionTestEnv(t)
-		env.adopter.maxDecompressedBytes = totalBytes
-		releaseText, _ := makeRelease(map[string][]byte{
-			"main/binary-amd64/Packages.gz": gz,
-		})
-		env.fetcher.put("http://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages.gz", gz)
-
-		if err := env.adopter.Run(context.Background(), env.suite, releaseText, "", ""); err != nil {
-			t.Fatalf("Run at exact cap (%d bytes): %v", totalBytes, err)
-		}
-	})
-
-	t.Run("one_byte_over_cap_rejected", func(t *testing.T) {
-		env := newAdoptionTestEnv(t)
-		env.adopter.maxDecompressedBytes = totalBytes - 1
-		releaseText, _ := makeRelease(map[string][]byte{
-			"main/binary-amd64/Packages.gz": gz,
-		})
-		env.fetcher.put("http://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages.gz", gz)
-
-		err := env.adopter.Run(context.Background(), env.suite, releaseText, "", "")
-		if !errors.Is(err, ErrAdoptionParseFailed) {
-			t.Fatalf("got %v, want ErrAdoptionParseFailed", err)
-		}
-		if !strings.Contains(err.Error(), "bomb defense") {
-			t.Errorf("got %v, want bomb-defense cap error", err)
-		}
-	})
 }
 
 func TestRepoRootFromSuitePath(t *testing.T) {
