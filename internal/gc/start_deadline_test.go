@@ -3,6 +3,7 @@ package gc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 	"time"
@@ -234,4 +235,80 @@ func TestRunURLPathPass_ABatchNeverStartedEndsAtTheDeadlineAndKeepsTheCursor(t *
 	if limit := deadline.Sub(start) + startDeadlineSlack; elapsed > limit {
 		t.Fatalf("the pass took %v, want at most %v: it waited for the writer", elapsed, limit)
 	}
+}
+
+// A shutdown (ctx cancelled) while a pass's write waits behind the writer
+// with its start deadline is a shutdown, never a failure nor a deadline:
+// the write returns ctx.Err(), not cache.ErrWriteNotStarted, so the pass
+// logs neither gc_tick_failed nor gc_tick_deadline_reached and returns at
+// the cancel, well before its deadline. The url-path and snapshot passes
+// leave the rotation as it is (passFailed's test). retiredRun, cancelled
+// while its chunk waits, reports no backlog (no hourly re-arm) and logs no
+// failure.
+func TestShutdown_WhileAGCWriteWaitsOnItsStartDeadlineIsNotAFailure(t *testing.T) {
+	const cancelAfter = 100 * time.Millisecond
+	for _, tc := range []struct {
+		name string
+		pass pass
+	}{
+		{"url_path", urlPathPass},
+		{"snapshot", snapshotPass},
+		{"blob", blobPass},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := openTestCache(t)
+			logger, buf := captureLogger()
+			g := startDeadlineGC(t, c, logger, 2*time.Second)
+			g.cfg.URLPathTTL = time.Hour // the url-path pass runs
+			g.nextPass = tc.pass
+
+			start := time.Now()
+			holdGCWriter(t, c, start.Add(5*time.Second))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			time.AfterFunc(cancelAfter, cancel)
+			_, err := g.runTick(ctx, "periodic")
+			elapsed := time.Since(start)
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Fatalf("runTick: %v, want nil or the shutdown's context.Canceled", err)
+			}
+			if errors.Is(err, cache.ErrWriteNotStarted) {
+				t.Fatalf("runTick: %v; a shutdown is not a start deadline", err)
+			}
+			noTickFailed(t, buf)
+			if ev := gcEvents(t, buf, "gc_tick_deadline_reached"); len(ev) != 0 {
+				t.Fatalf("gc_tick_deadline_reached lines %v: a shutdown is not a deadline", ev)
+			}
+			if tc.pass != blobPass && g.nextPass != tc.pass {
+				t.Fatalf("rotation at pass %d, want %d: a shutdown leaves it as it is", g.nextPass, tc.pass)
+			}
+			if limit := cancelAfter + startDeadlineSlack; elapsed > limit {
+				t.Fatalf("the tick took %v, want at most %v: it waited past the shutdown", elapsed, limit)
+			}
+		})
+	}
+
+	t.Run("retired", func(t *testing.T) {
+		c := openTestCache(t)
+		logger, buf := captureLogger()
+		g := startDeadlineGC(t, c, logger, 2*time.Second)
+
+		start := time.Now()
+		holdGCWriter(t, c, start.Add(5*time.Second))
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		time.AfterFunc(cancelAfter, cancel)
+		if g.retiredRun(ctx) {
+			t.Fatal("retiredRun = true after a shutdown, want false: no hourly re-arm")
+		}
+		elapsed := time.Since(start)
+		noTickFailed(t, buf)
+		runs := gcEvents(t, buf, "gc_retired_run_complete")
+		if len(runs) != 1 || runs[0]["deadline_reached"] != false {
+			t.Fatalf("gc_retired_run_complete lines %v, want one with deadline_reached false", runs)
+		}
+		if limit := cancelAfter + startDeadlineSlack; elapsed > limit {
+			t.Fatalf("the run took %v, want at most %v: it waited past the shutdown", elapsed, limit)
+		}
+	})
 }
