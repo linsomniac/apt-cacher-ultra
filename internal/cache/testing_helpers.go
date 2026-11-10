@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // DeleteSnapshotMembersForTest removes snapshot_member rows for the given
@@ -155,4 +156,42 @@ func MigrateToVersionForTest(ctx context.Context, dir string, version int) error
 		}
 	}
 	return nil
+}
+
+// HoldWriterForTest occupies the writer goroutine: it submits an op that
+// blocks until release is called (or ctx is cancelled) and returns once
+// that op is running, so every write submitted afterwards queues behind
+// it. release is idempotent. Tests use it to put a write in the queue
+// behind a busy writer (issue #14: a GC batch queued behind adoption
+// commits). If the op never starts (the cache is closed, or ctx ends
+// first) it returns that error and no hold. TEST-ONLY.
+//
+// AIDEV-NOTE: exported for internal/gc's start-deadline tests (issue #14
+// Tier 1a). The op also ends on its ctx so a cancelled hold cannot wedge
+// the writer, and so Close cannot hang on it once ctx is done.
+func (c *Cache) HoldWriterForTest(ctx context.Context) (release func(), err error) {
+	started := make(chan struct{})
+	gate := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- c.submitWrite(ctx, func(opCtx context.Context, _ *sql.Conn) error {
+			close(started)
+			select {
+			case <-gate:
+			case <-opCtx.Done():
+			}
+			return nil
+		})
+	}()
+	select {
+	case <-started:
+		var once sync.Once
+		return func() { once.Do(func() { close(gate) }) }, nil
+	case err := <-done:
+		if err == nil {
+			// The op ran and already ended on its cancelled ctx.
+			err = ctx.Err()
+		}
+		return nil, fmt.Errorf("HoldWriterForTest: no hold: %w", err)
+	}
 }
