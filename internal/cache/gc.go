@@ -447,7 +447,8 @@ func placeholders(n int) string {
 // Re-measure before raising it.
 const retiredChunkRows = 10_000
 
-// effectiveChunkRows is the rows one sub-job C transaction deletes for a
+// effectiveChunkRows is the rows one sub-job C (or, since 2026-11-09,
+// sub-job D: issue #14 follow-up Tier 2) transaction deletes for a
 // requested maxRows: retiredChunkRows for 0 or less — what the snapshot
 // pass asks for — and maxRows otherwise (deferred minor F-2: the default
 // is pinned here without a 10,001-row fixture, which takes some 5 s under
@@ -564,6 +565,119 @@ SELECT snapshot_id FROM suite_snapshot
 		return 0, false, werr
 	}
 	return gotReaped, gotMore, nil
+}
+
+// displacedPackageHashSelectSQL is sub-job D's candidate SELECT: the
+// oldest adopted, non-retired, non-current snapshot that still has a
+// package_hash row.
+const displacedPackageHashSelectSQL = `
+SELECT ss.snapshot_id FROM suite_snapshot ss
+ WHERE ss.adopted_at IS NOT NULL AND ss.retired_at IS NULL
+   AND ss.snapshot_id NOT IN (SELECT current_snapshot_id FROM suite_freshness WHERE current_snapshot_id IS NOT NULL)
+   AND EXISTS (SELECT 1 FROM package_hash p WHERE p.snapshot_id = ss.snapshot_id)
+ ORDER BY ss.snapshot_id
+ LIMIT 1`
+
+// RunDisplacedPackageHashChunk is one writer transaction of snapshot-GC
+// sub-job D (issue #14 follow-up, Tier 2): it takes the oldest displaced
+// snapshot — adopted, not retired, not any suite's current one — that
+// still has package_hash rows, and deletes up to maxRows of them. Nothing
+// else goes: the snapshot's header, snapshot_member and
+// snapshot_skipped_member rows stay (forensics, the rollback check and
+// retained by-hash serving read them), and so a displaced snapshot kept by
+// gc.keep_displaced keeps its headers and index files, not its package
+// list. It reports the rows it deleted and more = false only when no such
+// snapshot was left at the start of the call; the snapshot pass calls it
+// until then (or its deadline). maxRows <= 0 means retiredChunkRows. A
+// snapshot still queued in legacy_trust_audit is not excluded: the audit
+// never reads package_hash. Unadopted candidates and orphans hold no rows
+// (only CommitAdoption inserts them, in the transaction that adopts), and
+// the adopted_at term keeps D off them regardless.
+//
+// AIDEV-NOTE: the audit argument (spec "Audit: who reads package_hash",
+// re-verified 2026-11-09). Deleting a displaced snapshot's package_hash
+// rows changes no reader's answer:
+//   - every reader is current-only — vouching (declaredExactSQL,
+//     declaredBySuffixSQL), ListIntegrityCandidates, the url_path mirror
+//     match and topNVersionSetTx, coverage and host/arch stats — or reads
+//     a snapshot that is current when it reads it: ComputeHotSet's stage 1
+//     reads the pre-flip prior (still current until the flip that follows
+//     displaces it), reconcile's insertPackageHashTx probe reads the
+//     snapshot InsertReconciledMembers checks is current in the same
+//     writer transaction. flatRowsExistSQL (Open) may open false when only
+//     displaced flat rows existed, which is correct: they are never read.
+//     GetPackageHash has no non-test caller.
+//   - a displaced snapshot never becomes current again: CommitAdoption, the
+//     only writer that points current_snapshot_id at a snapshot, commits
+//     only an unadopted candidate (the AIDEV-NOTE at
+//     RunRetiredSnapshotGCChunk).
+//   - the blob pass's reachability predicate does not read package_hash
+//     (url_path, snapshot_member and suite_snapshot only), and the legacy
+//     trust audit, the rollback check and by-hash serving from a displaced
+//     snapshot read suite_snapshot and snapshot_member.
+//
+// TestPackageHashReaders_AnswerTheSameAfterTheStrip
+// (displaced_package_hash_test.go) pins this. A new reader of displaced
+// package_hash rows must change it — and D — first.
+//
+// AIDEV-NOTE: EXPLAIN QUERY PLAN of displacedPackageHashSelectSQL
+// (2026-11-09; TestRunDisplacedPackageHashChunk_TheExistsUsesTheSnapshotIndex
+// pins the EXISTS line):
+//
+//	SCAN ss
+//	LIST SUBQUERY 1
+//	SCAN suite_freshness
+//	CREATE BLOOM FILTER
+//	SEARCH p EXISTS USING COVERING INDEX idx_package_hash_snapshot (snapshot_id=?)
+//
+// suite_snapshot is walked in snapshot_id order (headers only: a few per
+// suite, plus the retired ones C has not deleted yet) and each adopted,
+// non-retired, non-current header costs one probe of
+// idx_package_hash_snapshot, so a displaced snapshot already stripped
+// (kept by keep_displaced) costs one index probe a call, never a
+// package_hash scan. No index was added (no schema change).
+//
+// The chunk's DELETE is sub-job C's shape (rowid IN (… LIMIT ?)), so one
+// transaction holds the writer for one chunk of one snapshot, as C's does.
+func (c *Cache) RunDisplacedPackageHashChunk(ctx context.Context, maxRows int) (rows int, more bool, err error) {
+	maxRows = effectiveChunkRows(maxRows)
+	// The op writes gotRows/gotMore, never the named results: on a ctx/close
+	// path submitWrite returns before the op ends (see InsertCandidateSnapshot).
+	var gotRows int
+	var gotMore bool
+	werr := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("RunDisplacedPackageHashChunk: begin: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		var id int64
+		err = tx.QueryRowContext(ctx, displacedPackageHashSelectSQL).Scan(&id)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return tx.Commit() // nothing displaced holds rows: gotMore stays false
+		case err != nil:
+			return fmt.Errorf("RunDisplacedPackageHashChunk: select: %w", err)
+		}
+		res, err := tx.ExecContext(ctx, `DELETE FROM package_hash WHERE rowid IN (SELECT rowid FROM package_hash
+ WHERE snapshot_id = ? LIMIT ?)`, id, maxRows)
+		if err != nil {
+			return fmt.Errorf("RunDisplacedPackageHashChunk: delete snapshot %d: %w", id, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("RunDisplacedPackageHashChunk: delete snapshot %d: %w", id, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("RunDisplacedPackageHashChunk: commit: %w", err)
+		}
+		gotRows, gotMore = int(n), true
+		return nil
+	})
+	if werr != nil {
+		return 0, false, werr
+	}
+	return gotRows, gotMore, nil
 }
 
 // HashKnown reports whether a blob row exists for hash. Used by the
