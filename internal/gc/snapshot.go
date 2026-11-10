@@ -44,8 +44,9 @@ type snapshotPassResult struct {
 // after a burst of reaps (a large suite's snapshots hold some 70-100k
 // package_hash rows each, and a reap retires its current and displaced
 // ones) could keep every listener closed up to max_tick_duration. But
-// since DN-7 a periodic B only retires the displaced snapshots, and the
-// startup B selects none that is retired, so with no C at a start a
+// since DN-7 a periodic B only retires the displaced snapshots (the
+// startup B did too from 2026-11-09, Tier 1b; until then it deleted them),
+// and the startup B selects none that is retired, so with no C at a start a
 // restart deleted nothing a periodic B had retired, nor a reaped suite's,
 // and under a sustained displacement rate the retired backlog grew without
 // bound where 1.0.x and main kept up, and a restart, the 1.0.x users'
@@ -54,8 +55,11 @@ type snapshotPassResult struct {
 // max_tick_duration), and its blob pass reclaims their blobs in the same
 // start. The cost: a start with a retired backlog may wait up to
 // max_tick_duration before the listeners open, the bound ruling HD-7
-// already accepts for B's one-transaction deletes at a start; C only
-// fills the budget B leaves. The startup C deletes the snapshots the
+// already accepted for B's one-transaction deletes at a start; C only
+// fills the budget B leaves. Since 2026-11-09 (issue #14 follow-up, Tier
+// 1b) the startup B only retires too, so the HD-7 bound now covers C's
+// chunks, not B's deletes, and the start deadline bounds every startup
+// write. The startup C deletes the snapshots the
 // startup trust audit quarantined, as the periodic C does under spec C9
 // (a quarantine retires its snapshot; the audit runs before the startup
 // pass, so they now go at the start that quarantined them; a quarantined
