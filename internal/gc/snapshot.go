@@ -315,8 +315,8 @@ func (d snapshotPassDeadline) reached() bool {
 // (notStarted). ctx is the caller's wctx: it carries dl's deadline as its
 // writes' start deadline (cache.WithWriteStartDeadline). The snapshot pass
 // runs it after sub-jobs A and B, at a start and in the periodic ticks;
-// retiredRun runs it alone, an hour after the start and hourly while a
-// backlog lasts.
+// retiredRun runs it before sub-job D, an hour after the start and hourly
+// while a backlog lasts.
 func (g *GC) runSubJobC(ctx context.Context, dl snapshotPassDeadline, batchesRun *int) (retired int, deadlineHit bool, err error) {
 	for {
 		if err := ctx.Err(); err != nil {

@@ -478,22 +478,6 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   on a staging host before deciding; a chunk under 10,000 rows is a change
   to spec C9 (pinned by
   `TestRunRetiredSnapshotGCChunk_TheChunkIsTenThousandRows`).
-- **No metric counts a failed GC pass** (raised 2026-10-29, the hardening
-  plan's final review, G-M6; unchanged since 1.0.x). A pass that fails at
-  every tick never pages: its tick still logs `gc_run_complete` and sets
-  `acu_gc_last_run_unixtime`, so the GC alert in the 1.1.0 release notes,
-  on that gauge's age, stays quiet, and WARN `gc_tick_failed` is the only
-  sign (`docs/log-fields.md`); since the final fix wave's follow-up a
-  startup pass in which a pass failed sets the gauge too, so one that fails
-  at every start of a daemon that never runs a periodic tick never pages
-  either, and the status page's *Last GC* cell, which reads the same
-  last-run summary, shows that run with its partial counts where it showed
-  "no GC run yet" (the final review's G re-review, RR-M1). Since ruling
-  HD-15 the passes after a failed one run (*Decided*,
-  below), but the failed pass's own work waits until its fault is fixed.
-  Class none: operability. Recommendation: a counter,
-  `acu_gc_pass_failures_total{pass}`, and an alert line on it in the
-  release notes, in a later release.
 - **A vouched `.deb` is stored unchecked when the read after its download
   fails** (raised 2026-10-28, the hardening plan's Task 4 review, Minor 3;
   the posture predates that plan). When the read before a `.deb` miss's
@@ -985,8 +969,13 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   growing with the table, once a tick and once at each start. Measured by
   the GC lens (G2-PR-M1): about 3 µs of writer hold per owned date — 0.7 s
   at 200,000 cached URLs, past 2 s at about 650,000–700,000, 3.1 s at
-  1,000,000. No log line or metric reports the prune's count or duration
-  today. Class none: performance. Recommendation: if a real cache nears
+  1,000,000. Update 2026-11-09 (the issue #14 follow-up): the metric has
+  been added, so the question can now be answered from a real cache
+  (`gc_run_complete`'s `representation_rows_pruned` and
+  `representation_prune_ms`, `acu_gc_representation_rows_pruned_total`,
+  and a `pass="representation_prune"` sample of
+  `acu_gc_pass_duration_seconds`); the keyset is still open. Class none:
+  performance. Recommendation: if a real cache nears
   that size, keyset the scan on `observed_at` (resume after the last row
   examined), as the merge review suggested, and add the prune's count and
   duration to the blob pass's tick line.
@@ -1038,6 +1027,101 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   `TestRunHotPrefetch_NoContentIsAFailure`,
   `TestFetch_NoContentIsEmptySuccess` and `TestFetch_NoContentOnlyForA204`.
 
+- **Issue #14 follow-up: displaced snapshots' package rows stripped, GC
+  writes start-bounded, failed passes crit** (the maintainer, 2026-11-09:
+  worked for 1.1.0, spec `docs/superpowers/specs/2026-11-09-issue-14-gc-followup-design.md`,
+  Tiers 1 and 2; Tier 3, a per-suite package set written by diff, needs a
+  schema migration and is revisited later). Why: the `package_hash` table
+  holds every snapshot's whole package list, about three quarters of it
+  displaced snapshots' rows that no production query reads (the spec's
+  audit), and each row makes every adoption insert and every delete dearer;
+  a GC batch queued behind adoption commits ran late and ate the blob
+  pass's share (the issue #14 entry's G2-RR1-M1); and a failed GC pass was
+  visible only as WARN `gc_tick_failed`. What changed, each its own commit:
+  (1) a writer operation can carry a start deadline
+  (`cache.WithWriteStartDeadline`, `ErrWriteNotStarted`): each GC pass's
+  store calls carry the pass's deadline, an op not started by then is given
+  up and never runs, and one that started runs to completion; the error is
+  "deadline reached", never a failure (no `gc_tick_failed`, no failure
+  count). (2) Startup sub-job B retires the displaced snapshots beyond
+  `gc.keep_displaced` and sub-job C deletes them, 10,000 rows a transaction,
+  as a periodic tick does: **this supersedes ruling HD-7's one-transaction
+  startup delete** (which the issue #14 entry's part (3) and ruling PF-15
+  had already left the startup pass able to avoid), so a start counts a
+  displaced snapshot twice, in `displaced_reaped` and in `retired_reaped`.
+  (3) Sub-job D, `RunDisplacedPackageHashChunk`, deletes an adopted,
+  non-retired, non-current snapshot's `package_hash` rows (never the header,
+  members or skipped members), the oldest snapshot first, 10,000 rows a
+  transaction; it runs after C in the snapshot pass and in the retired run,
+  so `gc.keep_displaced` now keeps displaced snapshots' headers and index
+  files, not their package lists. Ruling HD-15 now applies within the
+  sub-jobs: a failing one logs its own `gc_tick_failed` and the ones after
+  it still run, so a C stuck on one snapshot never stops D. (4) Visibility:
+  `acu_gc_pass_failures_total{pass}` (`url_path`, `snapshot`, `blob`,
+  `retired`, `pool_scan`), `LastRunSummary.FailedPasses`, status JSON
+  `gc.last_run_failed_passes`, a *Failed passes* row on the GC panel,
+  `acu_gc_displaced_package_rows_deleted_total`, and the representation
+  prune's count and duration (`representation_rows_pruned` and
+  `representation_prune_ms` on `gc_run_complete`,
+  `acu_gc_representation_rows_pruned_total`, a
+  `pass="representation_prune"` duration sample). **A failed pass on the last
+  run makes the GC vital crit (DEGRADED)**, which reverses §9.1 of
+  `docs/admin-ui-spec.md`'s "no GC state is crit" (and the issue #14
+  AIDEV-NOTE in `vitalState`, updated, not removed); the maintainer
+  accepted that a transient failure stays crit until the next periodic tick
+  or start replaces the last-run summary, up to `gc.interval`. A failed
+  `retiredRun` reaches the counter and its WARN, not the summary. Closes
+  the entry "No metric counts a failed GC pass" (raised 2026-10-29, the
+  hardening plan's final review, G-M6; unchanged since 1.0.x), which asked
+  for exactly this counter and an alert line: `increase(acu_gc_pass_failures_total[1d]) > 0`
+  is in the 1.1.0 release notes. Not changed: `retiredChunkRows` and
+  `representationPruneRows` (10,000), the schema, and the database file's
+  size (the freed pages are reused; `VACUUM` stays optional and offline).
+  Pinned by `TestSubmitWrite_AQueuedOpAbandonedAtItsStartDeadlineNeverRuns`,
+  `TestSubmitWrite_AnOpStartedBeforeItsDeadlineRunsToCompletion`,
+  `TestSubmitWrite_StartDeadlineRaceRunsAtMostOnceAndReportsTruthfully`,
+  `TestRunTick_ASnapshotBatchStuckBehindTheWriterEndsAtItsDeadline`,
+  `TestRunTick_ABlobBatchStuckBehindTheWriterEndsAtTheTickDeadline`,
+  `TestRunSnapshotPass_AFirstBatchNeverStartedIsADeadlineNotADrain`,
+  `TestShutdown_WhileAGCWriteWaitsOnItsStartDeadlineIsNotAFailure`,
+  `TestStartupPass_RetiresTheDisplacedAndCDeletesThem`,
+  `TestRunSnapshotGCBatch_AlwaysRetiresTheDisplaced`,
+  `TestRunDisplacedPackageHashChunk_StripsOnlyAdoptedNonCurrentUnretired`,
+  `TestRunDisplacedPackageHashChunk_NeverTouchesAnUnadoptedSnapshot`,
+  `TestRunDisplacedPackageHashChunk_ChunksALargeSnapshot`,
+  `TestPackageHashReaders_AnswerTheSameAfterTheStrip` (the audit's
+  pin: every reader answers the same after the strip),
+  `TestRunSnapshotPass_RunsDAfterC`, `TestRunSnapshotPass_AFailingCStillRunsD`,
+  `TestRetiredRun_RunsDAndReArmsOnItsBacklog`,
+  `TestPeriodicTick_StripsDisplacedPackageRowsOnARealCache`,
+  `TestRunTick_RecordsEachFailedPass`, `TestStartupPass_RecordsEachFailedPass`,
+  `TestRetiredRun_CountsAFailure`, `TestRunTick_ANotStartedWriteIsNotAFailure`,
+  `TestRunBlobPass_ReportsThePrunesCountAndDuration`, and in
+  `internal/admin` `TestVitalState` and `TestGoldenGCShowsFailedPassesAndPrune`.
+  Measured (2026-11-09, `docs/superpowers/plans/2026-11-09-issue-14-gc-followup-evidence.md`,
+  the env-gated harnesses `ACU_LONGRUN=1` and `ACU_BENCH=1`; before is
+  18f652e plus the harnesses, after is the branch's end; a loaded 12-thread
+  laptop, so about 30% noise between runs). The `package_hash` benchmark,
+  base k=4 (3.36M rows, today's table) against k=1 (0.84M rows, the
+  stripped steady state): insert of 70,000 rows 1.488 s against 1.289 s,
+  chunked delete of 70,000 rows 1.138 s against 839 ms (a 10,000-row chunk
+  163 ms against 120 ms), database file 1172 MiB against 320 MiB as seeded
+  (the real file keeps its size). The long run (70,000 rows a snapshot, a
+  3 s budget, four suites, three "days" of 16 concurrent adoptions, then
+  eight restarts): blobs reaped on day 1 51 (was 0); ticks and startups
+  end at their budget, at most 3.02 s (was 5.13 s on day 1 and 24.66 s and
+  12.13 s at the first two restarts); day 3 0 s (was 2.86 s). **Worse, or
+  not shown:** at the end of the 3 s run 82 snapshots, 163 blobs and 5.73M
+  `package_hash` rows were left (was 68, 135 and 4.73M), and the table did
+  not shrink: in that workload C always has retired snapshots left, so the
+  pass hits its deadline before D gets time, and the harness runs no hourly
+  retired runs. The strip's effect on the table is pinned by the tests
+  above, not shown by the harness; at a 30 s budget the restarts drain the
+  backlog (snapshots 73 to 19, `package_hash` 5.06M to 1.30M) by C's
+  deletes, with D still behind C. **To revisit with Tier 3:** whether D
+  should run before C's whole-snapshot deletes when a snapshot's rows are
+  what C would delete anyway, and the benchmark and a real cache's
+  `acu_gc_displaced_package_rows_deleted_total` as the measure.
 - **Issue #14: GC frees disk again on a busy cache, and the retired backlog
   stays bounded** (the maintainer, 2026-11-05: worked for 1.1.0, all three
   parts of a consult's design; raised 2026-09-28 as GitHub issue #14, and
@@ -1117,7 +1201,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   `TestStartupPass_RunsSubJobCWithinItsSnapshotDeadline` and
   `TestStartupPass_DeletesRetiredSnapshotsAndReapsTheirBlobs`. Not done:
   making C's delete cheaper (the consult measured no gain from a larger
-  page cache; the rest is schema work).
+  page cache; the rest is schema work); see the 2026-11-09 follow-up,
+  "Issue #14 follow-up: displaced snapshots' package rows stripped, GC
+  writes start-bounded, failed passes crit", below.
 - **A GC pass that fails at every tick no longer starves the passes after
   it** (the maintainer, 2026-10-28: worked for 1.1.0; raised 2026-10-27, the
   H3 final review R3 #5, and again 2026-10-29, the hardening plan's final
@@ -1161,10 +1247,14 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   `retired_at` in one `UPDATE`, and sub-job C deletes them, 10,000 rows a
   transaction, normally in the same snapshot pass; every reader that serves,
   vouches or judges history filters `retired_at` or reads current snapshots
-  only. The startup pass still deletes them at once (ruling HD-7): it runs
-  before the freshness scheduler and the listeners, so it holds up no other
-  writer and no request, and a daemon that never lives
-  min(1 h, `gc.interval`) still deletes them at every start. A snapshot
+  only. Until 2026-11-09 the startup pass still deleted them at once
+  (ruling HD-7): it runs before the freshness scheduler and the listeners,
+  so it holds up no other writer and no request, and a daemon that never
+  lives min(1 h, `gc.interval`) still deleted them at every start. Changed
+  2026-11-09 (the issue #14 follow-up, see its *Decided* entry below): the
+  startup pass's sub-job B now retires them and sub-job C deletes them in
+  10,000-row chunks, as a periodic tick does; HD-7's one-transaction
+  startup delete is superseded. A snapshot
   retired so counts twice, in `displaced_reaped` and then in
   `retired_reaped`. Measured in the hardening plan's Task 2 (six displaced
   snapshots of 70,000 `package_hash` rows, 700,000 in the table; no `-race`;
