@@ -157,6 +157,9 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   run that ends with `deadline_reached=true` is now normal while a
   backlog drains: the status page shows it as a warning (WATCHING), no
   longer DEGRADED.
+- A GC pass gives up a database write it cannot start before its deadline,
+  so a busy writer no longer pushes GC past `gc.max_tick_duration`
+  (issue #14).
 - Upstream downloads are no longer decompressed in transit (a gzip-encoded
   body skipped the size check, and a resumed one could be corrupted), and
   adoption stops a member's download at the size its `Release` declares.

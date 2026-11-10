@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
 
 // runURLPathPass implements the URL-path TTL reap (SPEC4 §5 fourth
@@ -16,7 +18,10 @@ import (
 // Per-batch behavior mirrors the snapshot pass: SELECT-inside-tx +
 // per-row DELETE + refcount UPDATE, batched at gc.batch_size, capped
 // by the url-path pass's deadline in the tick (passDeadlines: three
-// fifths of gc.max_tick_duration when it begins the tick).
+// fifths of gc.max_tick_duration when it begins the tick). The deadline is
+// also each batch's start deadline: a batch still queued behind the writer
+// at the deadline never runs, and the pass ends there, its cursor before
+// that batch (issue #14 Tier 1a: notStarted).
 //
 // Returns cumulative evaluated/stamped/cleared/deleted row counts, a
 // deadline-reached flag, and an error iff a DB-level failure occurred.
@@ -48,27 +53,38 @@ func (g *GC) runURLPathPass(ctx context.Context, deadline time.Time, phase strin
 	// It resumes from g.urlPathCursor (where a prior deadline-truncated tick
 	// left off) and is reset to empty only once a pass fully drains.
 	curScheme, curHost, curPath := g.urlPathCursor.scheme, g.urlPathCursor.host, g.urlPathCursor.path
+	// reached is the pass's deadline branch: between batches, and for a
+	// batch the writer never started before the deadline (notStarted).
+	reached := func() (urlPathResult, bool, error) {
+		// Persist the cursor so the next tick resumes here instead of
+		// rescanning the prefix already visited this tick.
+		g.urlPathCursor.scheme, g.urlPathCursor.host, g.urlPathCursor.path = curScheme, curHost, curPath
+		g.cfg.Logger.Info("gc_tick_deadline_reached",
+			"phase", phase,
+			"which", "url_path",
+			"batches_completed", batchesRun,
+			"rows_scanned_this_tick", acc.scanned,
+			"rows_reaped_this_tick", acc.deleted,
+			"rows_stamped_this_tick", acc.stamped,
+			"rows_cleared_this_tick", acc.cleared,
+		)
+		return acc, true, nil
+	}
+	// The batches' writes must start by the deadline (issue #14 Tier 1a:
+	// notStarted's AIDEV-NOTE).
+	wctx := cache.WithWriteStartDeadline(ctx, deadline)
 	for {
 		if err := ctx.Err(); err != nil {
 			return acc, false, nil
 		}
 		if !time.Now().Before(deadline) {
-			// Persist the cursor so the next tick resumes here instead of
-			// rescanning the prefix already visited this tick.
-			g.urlPathCursor.scheme, g.urlPathCursor.host, g.urlPathCursor.path = curScheme, curHost, curPath
-			g.cfg.Logger.Info("gc_tick_deadline_reached",
-				"phase", phase,
-				"which", "url_path",
-				"batches_completed", batchesRun,
-				"rows_scanned_this_tick", acc.scanned,
-				"rows_reaped_this_tick", acc.deleted,
-				"rows_stamped_this_tick", acc.stamped,
-				"rows_cleared_this_tick", acc.cleared,
-			)
-			return acc, true, nil
+			return reached()
 		}
 
-		res, err := g.store.RunURLPathGCBatch(ctx, g.cfg.BatchSize, ttlSeconds, holdSeconds, maxVersions, curScheme, curHost, curPath)
+		res, err := g.store.RunURLPathGCBatch(wctx, g.cfg.BatchSize, ttlSeconds, holdSeconds, maxVersions, curScheme, curHost, curPath)
+		if notStarted(err) {
+			return reached() // the batch never ran: the cursor stays before it
+		}
 		if err != nil {
 			return acc, false, fmt.Errorf("url_path gc batch: %w", err)
 		}

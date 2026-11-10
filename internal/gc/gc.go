@@ -634,6 +634,26 @@ func (g *GC) passFailed(ctx context.Context, err error) error {
 	return err
 }
 
+// notStarted reports whether err is a write the writer goroutine never
+// started before the pass's start deadline (cache.ErrWriteNotStarted): the
+// op never ran, and the pass's deadline has passed (submitWrite gives up at
+// its start deadline, never before). A pass takes its deadline branch for
+// it, never passFailed (issue #14 Tier 1a).
+//
+// AIDEV-NOTE: the start-deadline pattern (issue #14 Tier 1a, G2-RR1-M1,
+// 2026-11-09). Each pass derives wctx := cache.WithWriteStartDeadline(ctx,
+// deadline) once, from its own pass deadline (retiredRun: its own), and
+// gives wctx to every store or cache write it makes; at each call site
+// notStarted(err) takes the pass's deadline branch (gc_tick_deadline_reached,
+// deadlineHit = true, no error). Check it on the store call's own error,
+// before the pass wraps it; the cache returns submitWrite's error unwrapped
+// and the passes wrap with %w, so errors.Is holds either way. A new write
+// call site (sub-job D, say) must follow it, or a write queued behind the
+// writer runs past its pass's deadline again.
+func notStarted(err error) bool {
+	return errors.Is(err, cache.ErrWriteNotStarted)
+}
+
 // recoverPanic is deferred by each unit of work of GC's goroutines — a
 // periodic tick, a pool-scan job, the pool-scan producer: it logs a
 // recovered panic as ERROR gc_panicked (where, panic, and the stack the
@@ -716,6 +736,10 @@ type tickDeadlines struct {
 // rotation on (runTick), every pass gets a turn in every tick. The floors
 // are checked between batches, so one batch that overruns eats into the
 // next pass's floor; batches are far shorter than f at any sane budget.
+// Since 2026-11-09 (issue #14 Tier 1a, G2-RR1-M1) a batch's wait behind
+// the writer no longer counts toward that overrun: each pass's deadline is
+// also its writes' start deadline (notStarted), so the overrun is bounded
+// by the one op the writer had already started at the deadline.
 // If url_path scans need more than 3f, a smaller f (budget/10) is the dial.
 func passDeadlines(start time.Time, budget time.Duration) tickDeadlines {
 	end := start.Add(budget)
@@ -732,12 +756,15 @@ func passDeadlines(start time.Time, budget time.Duration) tickDeadlines {
 // url-path pass resumes at its saved cursor, the snapshot pass re-selects,
 // at the next tick that reaches them. A blob pass that hits its deadline
 // leaves the rotation at the blob pass, so the next tick runs it first,
-// with the whole budget. A pass that fails while ctx lives does not end the
-// tick (ruling HD-15): it logs WARN gc_tick_failed, passFailed moves the
-// rotation past it, as if it had completed, and the passes after it run;
-// runTick returns the tick's first failure. A pass that fails once ctx has
-// ended (a shutdown) ends the tick at once, the rotation as it is, and logs
-// nothing.
+// with the whole budget. Each pass's deadline is also the start deadline of
+// its writes (cache.WithWriteStartDeadline): a write still queued behind the
+// writer goroutine at the deadline never runs, and the pass ends there as at
+// its deadline, never as a failure (notStarted). A pass that fails while ctx
+// lives does not end the tick (ruling HD-15): it logs WARN gc_tick_failed,
+// passFailed moves the rotation past it, as if it had completed, and the
+// passes after it run; runTick returns the tick's first failure. A pass that
+// fails once ctx has ended (a shutdown) ends the tick at once, the rotation
+// as it is, and logs nothing.
 //
 // AIDEV-NOTE: issue #14 (the hardening plan's final review 2, G2-I1; the
 // maintainer's decision of 2026-11-05) extends ruling HD-15 to deadlines.
@@ -751,7 +778,19 @@ func passDeadlines(start time.Time, budget time.Duration) tickDeadlines {
 // reachability holds whatever the passes before it did or did not finish).
 // A tick that reaches a deadline still reports deadline_reached; for a busy
 // cache that is now a steady state while the backlog drains, not a sign
-// that nothing was freed.
+// that nothing was freed. Updated 2026-11-09 for issue #14 Tier 1a
+// (G2-RR1-M1): the deadlines are checked between batches, so a batch
+// submitted just before its pass's deadline but queued behind the writer
+// (adoption commits, a large transaction) used to wait there, run late, and
+// eat the next pass's share; the blob pass could then run past the tick's
+// budget. Now each pass gives its writes its deadline as their start
+// deadline (cache.WithWriteStartDeadline; notStarted's AIDEV-NOTE): a batch
+// can no longer overrun its pass while it waits behind the writer, and the
+// overrun G2-RR1-M1 describes is bounded by one op the writer had already
+// started at the deadline (a started op is never interrupted).
+// cache.ErrWriteNotStarted is the deadline (gc_tick_deadline_reached,
+// deadline_reached, the rotation moved as at any deadline), never a
+// failure: no gc_tick_failed and no passFailed.
 //
 // `phase` is phaseStartup ("startup", StartupPass) or "periodic" (Run).
 // It labels the gc_tick_deadline_reached events, so an operator can

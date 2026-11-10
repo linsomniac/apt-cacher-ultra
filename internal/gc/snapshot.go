@@ -98,7 +98,9 @@ type snapshotPassResult struct {
 // Returns:
 //   - the cumulative counts (orphan, displaced, retired),
 //   - whether the deadline tripped (true means the pass exited
-//     between batches with backlog remaining; runTick then moves the
+//     between batches with backlog remaining, or at a batch or chunk
+//     the writer never started before the deadline, its start deadline
+//     (issue #14 Tier 1a: notStarted); runTick then moves the
 //     rotation to the blob pass, which runs in the same tick, under its
 //     own share of the budget, and the next tick that reaches this pass
 //     re-selects — A ∪ B, then C: issue #14),
@@ -111,21 +113,29 @@ func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase stri
 		acc        snapshotPassResult
 		batchesRun int
 	)
-	expired := g.snapshotDeadline(deadline, phase, &batchesRun)
+	dl := g.snapshotDeadline(deadline, phase, &batchesRun)
+	// Every write of the pass, A ∪ B's batches and C's chunks, must start by
+	// the deadline (issue #14 Tier 1a: notStarted's AIDEV-NOTE).
+	wctx := cache.WithWriteStartDeadline(ctx, deadline)
 	for {
 		if err := ctx.Err(); err != nil {
 			return acc, false, nil
 		}
-		if expired() {
+		if dl.expired() {
 			return acc, true, nil
 		}
 
-		batch, err := g.store.RunSnapshotGCBatch(ctx,
+		batch, err := g.store.RunSnapshotGCBatch(wctx,
 			g.cfg.SnapshotBatchSize,
 			staleGraceSeconds,
 			g.cfg.KeepDisplaced,
 			phase != phaseStartup,
 		)
+		if notStarted(err) {
+			// The batch never ran: the deadline, not a batch that found
+			// nothing (A ∪ B drained), so neither counted nor followed by C.
+			return acc, dl.reached(), nil
+		}
 		if err != nil {
 			return acc, false, fmt.Errorf("snapshot gc batch: %w", err)
 		}
@@ -138,45 +148,74 @@ func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase stri
 		}
 	}
 	// Sub-job C, at a start too (ruling PF-15 re-ruled, issue #14).
-	retired, deadlineHit, err := g.runSubJobC(ctx, expired, &batchesRun)
+	retired, deadlineHit, err := g.runSubJobC(wctx, dl, &batchesRun)
 	acc.retired += retired
 	return acc, deadlineHit, err
 }
 
-// snapshotDeadline returns the snapshot pass's deadline test: false before
-// deadline; after it, true, once gc_tick_deadline_reached is logged.
-func (g *GC) snapshotDeadline(deadline time.Time, phase string, batchesRun *int) func() bool {
-	return func() bool {
-		if time.Now().Before(deadline) {
-			return false
-		}
-		g.cfg.Logger.Info("gc_tick_deadline_reached",
-			"phase", phase,
-			"which", "snapshot",
-			"batches_completed", *batchesRun,
-			"bytes_reclaimed_this_tick", int64(0),
-		)
-		return true
+// snapshotPassDeadline is the snapshot pass's deadline (and retiredRun's),
+// with its gc_tick_deadline_reached line: expired is its test between
+// writes, reached its branch for a write the writer never started before
+// it (notStarted).
+type snapshotPassDeadline struct {
+	g          *GC
+	at         time.Time
+	phase      string
+	batchesRun *int
+}
+
+// snapshotDeadline returns the snapshot pass's deadline at deadline, for
+// phase, whose line reports *batchesRun.
+func (g *GC) snapshotDeadline(deadline time.Time, phase string, batchesRun *int) snapshotPassDeadline {
+	return snapshotPassDeadline{g: g, at: deadline, phase: phase, batchesRun: batchesRun}
+}
+
+// expired is false before the deadline; after it, true, once
+// gc_tick_deadline_reached is logged.
+func (d snapshotPassDeadline) expired() bool {
+	if time.Now().Before(d.at) {
+		return false
 	}
+	return d.reached()
+}
+
+// reached logs gc_tick_deadline_reached and returns true: the pass ends at
+// its deadline. The pass calls it directly for a write the writer never
+// started before the deadline (notStarted): that deadline has passed, so
+// the clock is not consulted again.
+func (d snapshotPassDeadline) reached() bool {
+	d.g.cfg.Logger.Info("gc_tick_deadline_reached",
+		"phase", d.phase,
+		"which", "snapshot",
+		"batches_completed", *d.batchesRun,
+		"bytes_reclaimed_this_tick", int64(0),
+	)
+	return true
 }
 
 // runSubJobC is snapshot GC sub-job C (spec C9): it deletes the retired
 // snapshots, one per writer transaction in bounded chunks, until none is
-// left, ctx ends, or expired reports the deadline (deadlineHit: backlog
-// left). The snapshot pass runs it after sub-jobs A and B, at a start and
-// in the periodic ticks; retiredRun runs it alone, an hour after the start
-// and hourly while a backlog lasts.
-func (g *GC) runSubJobC(ctx context.Context, expired func() bool, batchesRun *int) (retired int, deadlineHit bool, err error) {
+// left, ctx ends, or dl's deadline comes (deadlineHit: backlog left): dl
+// expired between chunks, or a chunk the writer never started before it
+// (notStarted). ctx is the caller's wctx: it carries dl's deadline as its
+// writes' start deadline (cache.WithWriteStartDeadline). The snapshot pass
+// runs it after sub-jobs A and B, at a start and in the periodic ticks;
+// retiredRun runs it alone, an hour after the start and hourly while a
+// backlog lasts.
+func (g *GC) runSubJobC(ctx context.Context, dl snapshotPassDeadline, batchesRun *int) (retired int, deadlineHit bool, err error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return retired, false, nil
 		}
-		if expired() {
+		if dl.expired() {
 			return retired, true, nil
 		}
 		// 0: the cache's own chunk (retiredChunkRows, 10,000 rows a
 		// transaction), never a larger number (deferred minor F-2).
 		reaped, more, err := g.store.RunRetiredSnapshotGCChunk(ctx, 0)
+		if notStarted(err) {
+			return retired, dl.reached(), nil // the chunk never ran: backlog may be left
+		}
 		if err != nil {
 			return retired, false, fmt.Errorf("retired snapshot gc chunk: %w", err)
 		}
@@ -233,8 +272,13 @@ func (g *GC) retiredRun(ctx context.Context) (backlog bool) {
 	defer g.recoverPanic("retired")
 	start := time.Now()
 	batchesRun := 0
-	retired, deadlineHit, err := g.runSubJobC(ctx,
-		g.snapshotDeadline(start.Add(g.cfg.MaxTickDuration), phaseRetired, &batchesRun), &batchesRun)
+	deadline := start.Add(g.cfg.MaxTickDuration)
+	// Its chunks must start by its own deadline (issue #14 Tier 1a: a chunk
+	// queued behind the writer then never runs; the run ends there and
+	// reports a backlog, so Run re-arms it).
+	wctx := cache.WithWriteStartDeadline(ctx, deadline)
+	retired, deadlineHit, err := g.runSubJobC(wctx,
+		g.snapshotDeadline(deadline, phaseRetired, &batchesRun), &batchesRun)
 	// AIDEV-NOTE: passFailed's test: a run stopped by the end of ctx (a
 	// shutdown) did not fail, whatever its error's shape.
 	if err != nil && ctx.Err() == nil {
@@ -249,6 +293,9 @@ func (g *GC) retiredRun(ctx context.Context) (backlog bool) {
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
 	// deadlineHit is false after a failed chunk or a shutdown
-	// (runSubJobC): no hourly retry storm.
+	// (runSubJobC): no hourly retry storm. It is true after a chunk the
+	// writer never started before the deadline (notStarted): whether a
+	// backlog is left is unknown, and a re-armed run that finds none costs
+	// one SELECT.
 	return deadlineHit
 }

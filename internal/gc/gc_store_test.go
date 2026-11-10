@@ -32,7 +32,7 @@ import (
 type fakeStore struct {
 	mu          sync.Mutex
 	cache       *cache.Cache  // the url-path batches' (useCache)
-	urlSleep    time.Duration // each url-path batch takes this long first (virtual time in a bubble)
+	urlSleep    time.Duration // each url-path batch takes this long once its real batch has run (virtual time in a bubble)
 	urlBatches  int           // RunURLPathGCBatch calls
 	prunes      int           // PruneRepresentationMetadata calls (delegated to cache)
 	pruneErrs   bool          // PruneRepresentationMetadata fails
@@ -55,11 +55,15 @@ func (f *fakeStore) useCache(c *cache.Cache) { f.cache = c }
 func (f *fakeStore) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds, holdSeconds int64, maxVersions int,
 	afterScheme, afterHost, afterPath string,
 ) (cache.URLPathGCBatchResult, error) {
-	time.Sleep(f.urlSleep)
 	f.mu.Lock()
 	f.urlBatches++
 	f.mu.Unlock()
-	return f.cache.RunURLPathGCBatch(ctx, batchSize, ttlSeconds, holdSeconds, maxVersions, afterScheme, afterHost, afterPath)
+	// The batch runs, then takes urlSleep: a started batch that runs long.
+	// A sleep before the call would model a wait in the writer's queue,
+	// which the pass's start deadline now cuts short (issue #14 Tier 1a).
+	res, err := f.cache.RunURLPathGCBatch(ctx, batchSize, ttlSeconds, holdSeconds, maxVersions, afterScheme, afterHost, afterPath)
+	time.Sleep(f.urlSleep)
+	return res, err
 }
 
 func (f *fakeStore) PruneRepresentationMetadata(ctx context.Context, limit int) (int, error) {
