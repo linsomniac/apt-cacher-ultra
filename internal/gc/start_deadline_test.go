@@ -112,8 +112,8 @@ func TestRunTick_ASnapshotBatchStuckBehindTheWriterEndsAtItsDeadline(t *testing.
 	if err != nil {
 		t.Fatalf("runTick: %v; a write not started before its deadline is not a failure", err)
 	}
-	if !res.snapshotDeadlineReached {
-		t.Fatal("snapshotDeadlineReached = false, want true: the snapshot pass's batch never started before its deadline")
+	if !res.deadlineReached {
+		t.Fatal("deadlineReached = false, want true: the snapshot pass's batch never started before its deadline")
 	}
 	noTickFailed(t, buf)
 	if line := deadlineLine(t, buf, "snapshot"); line["batches_completed"] != float64(0) {
@@ -197,22 +197,18 @@ func TestRunSnapshotPass_AFirstBatchNeverStartedIsADeadlineNotADrain(t *testing.
 }
 
 // retiredRun's chunk that never started before its deadline (start +
-// max_tick_duration) is its deadline: the run reports deadline_reached and
-// a backlog, so Run re-arms it an hour later; a re-armed run that then
-// finds nothing retired costs one SELECT. Before the fix the chunk waited
-// for the writer, ran late, found nothing and reported no backlog.
-func TestRetiredRun_AChunkNeverStartedReArms(t *testing.T) {
+// max_tick_duration) is its deadline: the run reports deadline_reached,
+// never a failure. Before the fix the chunk waited for the writer, ran
+// late, found nothing and reported no deadline.
+func TestRetiredRun_AChunkNeverStartedIsItsDeadline(t *testing.T) {
 	c := openTestCache(t)
 	logger, buf := captureLogger()
 	g := startDeadlineGC(t, c, logger, 200*time.Millisecond)
 
 	start := time.Now()
 	holdGCWriter(t, c, start.Add(g.cfg.MaxTickDuration+time.Second))
-	backlog := g.retiredRun(context.Background())
+	g.retiredRun(context.Background())
 	elapsed := time.Since(start)
-	if !backlog {
-		t.Fatal("retiredRun = false, want a backlog: its chunk never started before the deadline")
-	}
 	runs := gcEvents(t, buf, "gc_retired_run_complete")
 	if len(runs) != 1 || runs[0]["deadline_reached"] != true {
 		t.Fatalf("gc_retired_run_complete lines %v, want one with deadline_reached true", runs)
@@ -262,8 +258,7 @@ func TestRunURLPathPass_ABatchNeverStartedEndsAtTheDeadlineAndKeepsTheCursor(t *
 // logs neither gc_tick_failed nor gc_tick_deadline_reached and returns at
 // the cancel, well before its deadline. The url-path and snapshot passes
 // leave the rotation as it is (passFailed's test). retiredRun, cancelled
-// while its chunk waits, reports no backlog (no hourly re-arm) and logs no
-// failure.
+// while its chunk waits, reports no deadline and logs no failure.
 func TestShutdown_WhileAGCWriteWaitsOnItsStartDeadlineIsNotAFailure(t *testing.T) {
 	const cancelAfter = 100 * time.Millisecond
 	for _, tc := range []struct {
@@ -317,9 +312,7 @@ func TestShutdown_WhileAGCWriteWaitsOnItsStartDeadlineIsNotAFailure(t *testing.T
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		time.AfterFunc(cancelAfter, cancel)
-		if g.retiredRun(ctx) {
-			t.Fatal("retiredRun = true after a shutdown, want false: no hourly re-arm")
-		}
+		g.retiredRun(ctx)
 		elapsed := time.Since(start)
 		noTickFailed(t, buf)
 		runs := gcEvents(t, buf, "gc_retired_run_complete")

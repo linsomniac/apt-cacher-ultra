@@ -314,8 +314,8 @@ func New(cfg Config) (*GC, error) {
 // open, the bound ruling HD-7 accepted for B's one-transaction deletes, which
 // bounds C's chunks now that B only retires (2026-11-09, issue #14 follow-up
 // Tier 1b; ruling PF-15, re-ruled for issue #14: runSnapshotPass); what its budget leaves, Run's retired run (an hour
-// after the start when gc.interval is longer, hourly while a backlog lasts)
-// and the periodic ticks delete.
+// after the start when gc.interval is longer, then hourly) and the
+// periodic ticks delete.
 //
 // Order matters: pool scan runs first so its
 // `gc_pool_orphans_repaired` count reflects only pre-existing orphan
@@ -437,9 +437,8 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 // When `gc.interval` is longer than an hour, Run also deletes the retired
 // snapshots an hour after the start (retiredRun; the final review's R3 #2),
 // and strips the displaced snapshots' package rows (sub-job D, issue #14
-// follow-up Tier 2), and again an hour after any retired run or periodic
-// tick whose sub-job C or D stopped at its deadline with work left (issue
-// #14), until one drains them.
+// follow-up Tier 2), and again every hour after that, an hour after the
+// previous run ended (issue #14; unconditional since 2026-11-10).
 //
 // AIDEV-NOTE: issue #14 (the hardening plan's final review 2, G2-I2; the
 // maintainer's decision of 2026-11-05). Since DN-7 a periodic tick's
@@ -463,6 +462,19 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 // hourly, not daily. A run whose C failed goes on to D (HD-15 within the
 // run); it re-arms only on D's deadline, so a failing C is retried hourly
 // only while D has rows left.
+// Superseded 2026-11-10 (the maintainer's decision, the follow-up's final
+// review I-1): the run re-arms hourly unconditionally, an hour after the
+// previous run ended, whatever it left: drained, at a deadline, failed or
+// panicked. Under the conditional re-arm a suite displaced several times a
+// day between periodic ticks kept its displaced package_hash rows until the
+// next tick (a day by default), so the table shrank about 2x, not 4x; and
+// a site whose upstreams update often should not need a shorter gc.interval
+// for that. On a quiet site the run finds nothing and costs one SELECT per
+// sub-job. The cost, accepted: a C or D that fails at every call logs one
+// WARN gc_tick_failed an hour (and counts once an hour in
+// acu_gc_pass_failures_total{pass="retired"}), not one a day. The periodic
+// ticks do not move the hourly schedule: a run may come minutes after a
+// tick, and find little.
 //
 // When Enabled = false, returns immediately — the goroutine is not
 // started.
@@ -472,8 +484,9 @@ func (g *GC) Run(ctx context.Context) {
 	}
 	t := time.NewTimer(g.cfg.Interval)
 	defer t.Stop()
-	// nil when gc.interval is an hour or less: no separate run, since the
-	// periodic ticks, within the hour, run sub-job C themselves.
+	// retiredDue stays nil when gc.interval is an hour or less: no separate
+	// run, since the periodic ticks, within the hour, run sub-jobs C and D
+	// themselves.
 	var (
 		rt         *time.Timer
 		retiredDue <-chan time.Time
@@ -483,35 +496,22 @@ func (g *GC) Run(ctx context.Context) {
 		defer rt.Stop()
 		retiredDue = rt.C
 	}
-	// rearmRetired arms the retired run an hour from now, unless it is off
-	// or already armed.
-	rearmRetired := func() {
-		if rt == nil || retiredDue != nil {
-			return
-		}
-		rt.Reset(retiredRunAfterStart)
-		retiredDue = rt.C
-	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-retiredDue:
-			retiredDue = nil
 			if ctx.Err() != nil {
 				return
 			}
-			if g.retiredRun(ctx) {
-				rearmRetired()
-			}
+			g.retiredRun(ctx)
+			rt.Reset(retiredRunAfterStart)
 		case <-t.C:
 			if ctx.Err() != nil {
 				return
 			}
-			if g.periodicTick(ctx) {
-				rearmRetired()
-			}
+			g.periodicTick(ctx)
 			t.Reset(g.cfg.Interval)
 		}
 	}
@@ -525,10 +525,9 @@ func (g *GC) Run(ctx context.Context) {
 // summary stay inside the recovered function, so a tick that panicked
 // leaves acu_gc_last_run_unixtime as it was: its age is the alert. A
 // panic in a pass moves the rotation past that pass (skipPanickedPass).
-// It reports snapshotBacklog, for Run's retired run (issue #14): its
-// snapshot pass stopped at its deadline with work left; false when a pass
-// panicked.
-func (g *GC) periodicTick(ctx context.Context) (snapshotBacklog bool) {
+// It no longer reports a backlog for Run's retired run: that run comes
+// hourly whatever a tick left (issue #14, 2026-11-10).
+func (g *GC) periodicTick(ctx context.Context) {
 	passesDone := false
 	defer g.skipPanickedPass(&passesDone)
 	defer g.recoverPanic("tick")
@@ -538,7 +537,6 @@ func (g *GC) periodicTick(ctx context.Context) (snapshotBacklog bool) {
 	// StartupPass's caller, so a tick logs none of its own for it.
 	tick, _ := g.runTick(ctx, "periodic")
 	passesDone = true
-	snapshotBacklog = tick.snapshotDeadlineReached
 	duration := time.Since(start)
 	endUnix := wallclock.Unix()
 	g.cfg.Logger.Info("gc_run_complete",
@@ -606,7 +604,6 @@ func (g *GC) periodicTick(ctx context.Context) (snapshotBacklog bool) {
 		RepresentationRowsPruned:    tick.representationRowsPruned,
 		RepresentationPruneSeconds:  tick.representationPruneDuration.Seconds(),
 	})
-	return snapshotBacklog
 }
 
 // gcStore is what the url-path pass, the snapshot pass and the pool scan
@@ -763,14 +760,10 @@ type tickResult struct {
 	urlPathRowsReaped           int
 	poolUnlinkErrors            int
 	deadlineReached             bool
-	// snapshotDeadlineReached: the snapshot pass stopped at its deadline
-	// with work left (A ∪ B, sub-job C or sub-job D); Run re-arms its
-	// retired run.
-	snapshotDeadlineReached bool
-	urlPath                 urlPathResult
-	urlPathDuration         time.Duration
-	snapshotDuration        time.Duration
-	blobDuration            time.Duration
+	urlPath                     urlPathResult
+	urlPathDuration             time.Duration
+	snapshotDuration            time.Duration
+	blobDuration                time.Duration
 	// representationRowsPruned and representationPruneDuration are the
 	// blob pass's representation prune's (blobResult; issue #14 follow-up,
 	// Tier 1c).
@@ -982,7 +975,6 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 		res.displacedPackageRowsDeleted += snap.packageRowsStripped
 		if snapDeadline {
 			res.deadlineReached = true
-			res.snapshotDeadlineReached = true
 		}
 		if snap.failureLogged { // counted by subJobRun.next as it logged it; named here whatever ctx says now
 			failedPass("snapshot")

@@ -515,8 +515,7 @@ func serveListeners(
 	// snapshots again; a start with a retired backlog may keep the
 	// listeners closed up to gc.max_tick_duration, the bound ruling HD-7
 	// already accepts for its sub-job B. What its budget leaves, the
-	// retired run (hourly while a backlog lasts) and the periodic ticks
-	// delete.
+	// retired run (hourly) and the periodic ticks delete.
 	gcsvc, err := gc.New(gc.Config{
 		Cache:                 c,
 		Logger:                logger,

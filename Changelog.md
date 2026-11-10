@@ -121,14 +121,22 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   `acu_adoption_reconcile_failed_total{stage}` counts every failure.
 - GC deletes displaced snapshots' package lists (their `package_hash`
   rows), 10,000 rows a transaction, at its next run that reaches them (a
-  start, the periodic run every `gc.interval`, or the hourly run while a
-  backlog lasts), instead of keeping `gc.keep_displaced` snapshots' worth
-  per suite; between runs a suite that adopts several times a day still
-  holds those it displaced since the last. `gc.keep_displaced` now keeps
+  start, the periodic run every `gc.interval`, or the hourly retired run),
+  instead of keeping `gc.keep_displaced` snapshots' worth per suite;
+  within the hour a suite that adopts several times an hour still holds
+  those it displaced since the last run. `gc.keep_displaced` now keeps
   displaced snapshots' headers and index files, not their package lists.
   The database file keeps its size (SQLite reuses the pages); an offline
   `VACUUM` is optional. A failing GC sub-job no longer stops the ones after
   it (issue #14).
+- When `gc.interval` is longer than an hour, the retired run (which
+  deletes retired snapshots and strips displaced snapshots' package lists)
+  now runs every hour, not only while it has a backlog, so a cache whose
+  upstreams update several times a day sheds those rows within the hour
+  instead of at the next daily run. On a quiet cache a run finds nothing
+  and costs two small queries; a GC sub-job that fails at every call now
+  logs `gc_tick_failed` (and counts in `acu_gc_pass_failures_total`) once
+  an hour, not once a day (issue #14).
 - Built with Go 1.27; `golang.org/x/net`, `x/text`, `x/crypto`, `x/sys`,
   `github.com/cloudflare/circl` and `github.com/ProtonMail/go-crypto`
   updated (`govulncheck`: no known vulnerability the code reaches).
@@ -175,7 +183,7 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   reported by Skibbi (@skibbipl)): a pass that runs out of
   `gc.max_tick_duration` no longer ends the run, so the pass that deletes
   unused files is no longer skipped behind the others; retired snapshots
-  left over are deleted hourly until none is left, and at every start. A
+  left over are deleted hourly, and at every start. A
   run that ends with `deadline_reached=true` is now normal while a
   backlog drains: the status page shows it as a warning (WATCHING), no
   longer DEGRADED.

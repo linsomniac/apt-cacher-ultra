@@ -43,7 +43,7 @@ type snapshotPassResult struct {
 // snapshots B retired — in chunks of at most 10,000
 // rows per writer transaction, in the startup pass and the periodic ticks
 // alike (ruling PF-15, re-ruled for issue #14), as does retiredRun, an
-// hour after the start and hourly while a backlog lasts. Then sub-job D
+// hour after the start and then hourly. Then sub-job D
 // (issue #14 follow-up Tier 2) strips the displaced snapshots'
 // package_hash rows, 10,000 rows a writer transaction, keeping their
 // headers, members and skipped members, as does retiredRun after its C.
@@ -100,8 +100,8 @@ type snapshotPassResult struct {
 // and answer 502 to its suite's index requests until it re-adopts the suite
 // (its member refetch fails closed when upstream has changed); the 1.1.0
 // release notes say so. What a
-// start leaves, the periodic ticks and retiredRun delete: hourly while a
-// backlog lasts (Run). Retired rows never serve meanwhile.
+// start leaves, the periodic ticks and retiredRun delete: hourly (Run).
+// Retired rows never serve meanwhile.
 //
 // AIDEV-NOTE: rulings HD-4, HD-7 (DN-7 of the GC and upstream hardening
 // plan; the H3 final review R3 #4), HD-7 superseded in part 2026-11-09
@@ -315,8 +315,8 @@ func (d snapshotPassDeadline) reached() bool {
 // (notStarted). ctx is the caller's wctx: it carries dl's deadline as its
 // writes' start deadline (cache.WithWriteStartDeadline). The snapshot pass
 // runs it after sub-jobs A and B, at a start and in the periodic ticks;
-// retiredRun runs it before sub-job D, an hour after the start and hourly
-// while a backlog lasts.
+// retiredRun runs it before sub-job D, an hour after the start and then
+// hourly.
 func (g *GC) runSubJobC(ctx context.Context, dl snapshotPassDeadline, batchesRun *int) (retired int, deadlineHit bool, err error) {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -377,21 +377,22 @@ func (g *GC) runSubJobD(ctx context.Context, dl snapshotPassDeadline, batchesRun
 }
 
 // retiredRunAfterStart is when, after the start, Run deletes the retired
-// snapshots (retiredRun), if gc.interval is longer, and how long after a
-// run or a periodic tick that left a backlog it runs again (issue #14).
+// snapshots (retiredRun), if gc.interval is longer, and how long after each
+// run it runs again (issue #14; unconditional since 2026-11-10).
 const retiredRunAfterStart = time.Hour
 
 // phaseRetired labels retiredRun's gc_tick_deadline_reached line.
 const phaseRetired = "retired"
 
 // retiredRun runs sub-job C, then sub-job D (issue #14 follow-up Tier 2),
-// retiredRunAfterStart after the start (Run), within max_tick_duration, and
-// logs INFO gc_retired_run_complete. It reports backlog: C stopped at its
-// deadline with retired snapshots left, or D with displaced package rows
-// left, so Run runs it again an hour later (issue #14: hourly while a
-// backlog lasts); false when it drained them, D failed, it panicked or was
-// stopped by ctx (a failed C goes on to D, whose outcome decides). A panic is recovered (gc_panicked, where=retired); the
-// periodic ticks are not affected.
+// retiredRunAfterStart after the start (Run) and hourly after that, within
+// max_tick_duration, and logs INFO gc_retired_run_complete, whose
+// deadline_reached says C stopped at its deadline with retired snapshots
+// left, or D with displaced package rows left (a failed C goes on to D).
+// Until 2026-11-10 that was also its result, and Run re-ran it an hour later
+// only then (issue #14: hourly while a backlog lasts); Run now re-runs it
+// hourly whatever it left. A panic is recovered (gc_panicked,
+// where=retired); the periodic ticks are not affected.
 //
 // AIDEV-NOTE: the final review's R3 #2. Sub-job C ran only in the periodic
 // ticks (the startup pass skipped it, ruling PF-15, until issue #14's
@@ -419,7 +420,7 @@ const phaseRetired = "retired"
 // left and what was retired since.
 // Since issue #14 it also repeats hourly while a backlog lasts (Run's
 // AIDEV-NOTE): once a process could not keep up with a sustained
-// displacement rate.
+// displacement rate. Since 2026-11-10 it repeats hourly, backlog or not.
 //
 // AIDEV-NOTE: issue #14 follow-up Tier 2, 2026-11-09. The run is no longer
 // C alone: D runs after C, so the hourly runs strip the displaced
@@ -430,14 +431,17 @@ const phaseRetired = "retired"
 // own gc_tick_failed. The cost, accepted: while D still has a backlog a C
 // that fails at every call is retried with it hourly, one WARN an hour,
 // until D drains; a run whose last sub-job failed still does not re-arm.
-func (g *GC) retiredRun(ctx context.Context) (backlog bool) {
+// Superseded 2026-11-10 (Run's AIDEV-NOTE): the run re-arms hourly
+// whatever it left, so a C or D that fails at every call logs one WARN an
+// hour for as long as it fails.
+func (g *GC) retiredRun(ctx context.Context) {
 	defer g.recoverPanic("retired")
 	start := time.Now()
 	batchesRun := 0
 	deadline := start.Add(g.cfg.MaxTickDuration)
 	// Its chunks must start by its own deadline (issue #14 Tier 1a: a chunk
-	// queued behind the writer then never runs; the run ends there and
-	// reports a backlog, so Run re-arms it).
+	// queued behind the writer then never runs; the run ends there with
+	// deadline_reached, and the next hourly run goes on).
 	wctx := cache.WithWriteStartDeadline(ctx, deadline)
 	dl := g.snapshotDeadline(deadline, phaseRetired, &batchesRun)
 	// AIDEV-NOTE: passFailed's test: a run stopped by the end of ctx (a
@@ -466,11 +470,11 @@ func (g *GC) retiredRun(ctx context.Context) (backlog bool) {
 		"deadline_reached", deadlineHit,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
-	// deadlineHit is the last sub-job's that ran: C's when it stopped at the
-	// deadline (D never ran), else D's. It is false after a failed chunk or
-	// a shutdown (runSubJobC, runSubJobD): no hourly retry storm. It is true
-	// after a chunk the writer never started before the deadline
-	// (notStarted): whether a backlog is left is unknown, and a re-armed run
-	// that finds none costs one SELECT per sub-job.
-	return deadlineHit
+	// deadlineHit (deadline_reached) is the last sub-job's that ran: C's
+	// when it stopped at the deadline (D never ran), else D's. It is false
+	// after a failed chunk or a shutdown (runSubJobC, runSubJobD). It is
+	// true after a chunk the writer never started before the deadline
+	// (notStarted): whether a backlog is left is unknown. Until 2026-11-10
+	// it decided whether Run re-ran the run an hour later; the run now comes
+	// hourly regardless.
 }

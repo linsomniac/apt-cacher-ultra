@@ -452,7 +452,8 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   final review 2, G2-I2): it assumed a later tick catches up, and under a
   sustained displacement rate none did, so the backlog grew without bound;
   it is decided under *Decided*, issue #14 (the startup pass runs C, and
-  the retired run repeats hourly while a backlog lasts). What stays open:
+  the retired run repeats hourly while a backlog lasts; since 2026-11-10
+  hourly, backlog or not). What stays open:
   sub-job C deletes the oldest retired snapshot first
   (`RunRetiredSnapshotGCChunk`, `internal/cache/gc.go`), so one whose chunk
   fails at every call stops the deletion of every later retired snapshot,
@@ -461,8 +462,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   C did (the hardening plan's final review, G-M1: probed with a trigger
   standing in for a fault confined to one snapshot's rows, the only cause
   the review found; WARN `gc_tick_failed` with `retired snapshot gc
-  chunk:` shows it). A failing retired run is not repeated hourly (no
-  retry storm); the next periodic tick retries. Class none: disk only,
+  chunk:` shows it). Since 2026-11-10 a failing retired run is repeated
+  hourly with the rest (one WARN an hour; the maintainer accepted it, see
+  *Decided*, the retired run comes hourly); until then it was not. Class none: disk only,
   since a retired snapshot never serves. Recommendation: leave it; if a
   chunk is seen to fail at every call, let C step past a snapshot whose
   chunk failed for the rest of its pass.
@@ -1027,6 +1029,34 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   `TestRunHotPrefetch_NoContentIsAFailure`,
   `TestFetch_NoContentIsEmptySuccess` and `TestFetch_NoContentOnlyForA204`.
 
+- **Issue #14 follow-up: the retired run comes every hour** (the
+  maintainer, 2026-11-10, the follow-up's final review I-1). When
+  `gc.interval` is longer than an hour, `Run` re-runs `retiredRun` (sub-jobs
+  C then D) an hour after the previous run ended, whatever it left: drained,
+  at its deadline, failed or panicked. It used to re-arm only when C or D
+  stopped at its deadline (or a periodic tick's snapshot pass did), so a
+  suite displaced several times a day between periodic ticks kept its
+  displaced `package_hash` rows until the next tick, daily by default, and
+  the table shrank about 2x rather than 4x. Why (the maintainer): upstreams
+  that update often, many upstreams, or disk pressure call for more
+  frequent GC, and on a lightly used cache an hourly run has little to do.
+  An idle run costs one SELECT per sub-job. Not changed: the periodic tick
+  (URL-path, snapshot and blob passes, so file reclaim) still runs every
+  `gc.interval`; at an interval of an hour or less there is still no
+  separate run. Cost, accepted: a C or D that fails at every call logs one
+  WARN `gc_tick_failed` an hour and counts once an hour in
+  `acu_gc_pass_failures_total{pass="retired"}`, where it was retried only
+  at the next periodic tick (this reverses the "no hourly retry storm" of
+  the issue #14 entry's part (2) below). The periodic ticks do not move the
+  hourly schedule, so a run may come minutes after a tick and find little.
+  `retiredRun` and `periodicTick` no longer return a backlog flag (the
+  `deadline_reached` field of `gc_retired_run_complete` still reports it).
+  Pinned by `TestRun_RepeatsTheRetiredRunHourly`,
+  `TestPeriodicTick_ItsBacklogIsDeletedByTheNextHourlyRetiredRun`,
+  `TestRun_AFailedRetiredRunIsRepeatedHourly`,
+  `TestRun_NoRetiredRunWhenTheIntervalIsAnHourOrLess` and
+  `TestRun_TheRetiredBacklogStaysBoundedUnderASustainedDisplacementRate`.
+
 - **Issue #14 follow-up: displaced snapshots' package rows stripped, GC
   writes start-bounded, failed passes crit** (the maintainer, 2026-11-09:
   worked for 1.1.0, spec `docs/superpowers/specs/2026-11-09-issue-14-gc-followup-design.md`,
@@ -1092,7 +1122,8 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   `TestPackageHashReaders_AnswerTheSameAfterTheStrip` (the audit's
   pin: every reader answers the same after the strip),
   `TestRunSnapshotPass_RunsDAfterC`, `TestRunSnapshotPass_AFailingCStillRunsD`,
-  `TestRetiredRun_RunsDAndReArmsOnItsBacklog`,
+  `TestRetiredRun_RunsDAndReArmsOnItsBacklog` (now
+  `TestRetiredRun_RunsDUntilItsDeadline`),
   `TestPeriodicTick_StripsDisplacedPackageRowsOnARealCache`,
   `TestRunTick_RecordsEachFailedPass`, `TestStartupPass_RecordsEachFailedPass`,
   `TestRetiredRun_CountsAFailure`, `TestRunTick_ANotStartedWriteIsNotAFailure`,
@@ -1151,7 +1182,8 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   deadline with work left, never after a failure or a panic and not when
   `gc.interval` is an hour or less: up to 24 bounded, chunked budgets a day
   while a backlog lasts, with no new key, goroutine or schema change
-  (commit 9d0e8ad); (3) ruling PF-15 is re-ruled: the startup pass runs C
+  (commit 9d0e8ad; superseded 2026-11-10: it now re-arms hourly whatever
+  the run left, failures included, see the entry above); (3) ruling PF-15 is re-ruled: the startup pass runs C
   after A ∪ B within its snapshot deadline and its blob pass reclaims their
   blobs, so a start with a retired backlog may wait up to
   `max_tick_duration` before the listeners open, the bound HD-7 accepts
@@ -1198,7 +1230,8 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   `TestRunTick_SnapshotDeadlineDefersBlobPass`, which pinned the
   starvation), `TestRun_RepeatsTheRetiredRunHourlyWhileABacklogRemains`,
   `TestPeriodicTick_ASnapshotDeadlineArmsTheRetiredRun`,
-  `TestRun_AFailedRetiredRunIsNotRepeatedHourly`,
+  `TestRun_AFailedRetiredRunIsNotRepeatedHourly` (these three rewritten
+  2026-11-10 for the unconditional hourly run, see the entry above),
   `TestRun_TheRetiredBacklogStaysBoundedUnderASustainedDisplacementRate`,
   `TestStartupPass_RunsSubJobCWithinItsSnapshotDeadline` and
   `TestStartupPass_DeletesRetiredSnapshotsAndReapsTheirBlobs`. Not done:

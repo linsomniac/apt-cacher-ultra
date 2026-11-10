@@ -142,18 +142,16 @@ func TestRunSnapshotPass_AFailingBatchStillRunsCAndD(t *testing.T) {
 }
 
 // The retired run runs D after C, so the hourly runs strip too, and reports
-// a backlog — Run re-arms it an hour later — when D stops at its deadline
-// with rows left: two 30 s D chunks in its 1 min budget, then the deadline.
-func TestRetiredRun_RunsDAndReArmsOnItsBacklog(t *testing.T) {
+// deadline_reached when D stops at its deadline with rows left: two 30 s D
+// chunks in its 1 min budget, then the deadline.
+func TestRetiredRun_RunsDUntilItsDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		logger, buf := captureLogger()
 		f := &fakeStore{dChunksMore: 1000, dChunkSleep: 30 * time.Second}
 		g, _ := storeGC(t, f, 2, logger)
 		g.cfg.MaxTickDuration = time.Minute
 		before := gcMetricValue(t, "acu_gc_displaced_package_rows_deleted_total")
-		if !g.retiredRun(context.Background()) {
-			t.Fatal("retiredRun = false, want a backlog: D stopped at its deadline with rows left")
-		}
+		g.retiredRun(context.Background())
 		if want := []string{"C", "D", "D"}; !reflect.DeepEqual(f.calls, want) {
 			t.Fatalf("store calls %v, want %v: C, then D until its deadline", f.calls, want)
 		}
@@ -174,7 +172,7 @@ func TestRetiredRun_RunsDAndReArmsOnItsBacklog(t *testing.T) {
 
 // The retired run gets the snapshot pass's treatment: a C that fails no
 // longer stops D, and each logs its own WARN gc_tick_failed. A run that
-// failed and drained D reports no backlog (no hourly retry storm).
+// failed and drained D reports no deadline.
 func TestRetiredRun_AFailingCStillRunsD(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -190,9 +188,7 @@ func TestRetiredRun_AFailingCStillRunsD(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			logger, buf := captureLogger()
 			g, _ := storeGC(t, tc.store, 2, logger)
-			if g.retiredRun(context.Background()) {
-				t.Fatal("retiredRun = true, want false: it failed and D drained")
-			}
+			g.retiredRun(context.Background())
 			if !reflect.DeepEqual(tc.store.calls, tc.calls) {
 				t.Fatalf("store calls %v, want %v", tc.store.calls, tc.calls)
 			}
@@ -206,8 +202,8 @@ func TestRetiredRun_AFailingCStillRunsD(t *testing.T) {
 				}
 			}
 			runs := gcEvents(t, buf, "gc_retired_run_complete")
-			if len(runs) != 1 {
-				t.Fatalf("gc_retired_run_complete lines %v, want one", runs)
+			if len(runs) != 1 || runs[0]["deadline_reached"] != false {
+				t.Fatalf("gc_retired_run_complete lines %v, want one with deadline_reached false: it failed and D drained", runs)
 			}
 		})
 	}
@@ -216,8 +212,8 @@ func TestRetiredRun_AFailingCStillRunsD(t *testing.T) {
 // A D chunk the writer never started before the deadline
 // (cache.ErrWriteNotStarted) is the deadline, never a failure (issue #14
 // Tier 1a's pattern): the snapshot pass returns deadlineHit and no error,
-// the retired run reports a backlog, neither logs gc_tick_failed, and each
-// logs one gc_tick_deadline_reached.
+// the retired run reports deadline_reached, neither logs gc_tick_failed, and
+// each logs one gc_tick_deadline_reached.
 func TestSubJobD_AChunkNeverStartedIsTheDeadline(t *testing.T) {
 	t.Run("snapshot pass", func(t *testing.T) {
 		logger, buf := captureLogger()
@@ -232,8 +228,9 @@ func TestSubJobD_AChunkNeverStartedIsTheDeadline(t *testing.T) {
 	t.Run("retired run", func(t *testing.T) {
 		logger, buf := captureLogger()
 		g, _ := storeGC(t, &fakeStore{dChunkNotStarted: true}, 2, logger)
-		if !g.retiredRun(context.Background()) {
-			t.Fatal("retiredRun = false, want a backlog: D's chunk never started before the deadline")
+		g.retiredRun(context.Background())
+		if runs := gcEvents(t, buf, "gc_retired_run_complete"); len(runs) != 1 || runs[0]["deadline_reached"] != true {
+			t.Fatalf("gc_retired_run_complete lines %v, want one with deadline_reached true: D's chunk never started before the deadline", runs)
 		}
 		noTickFailed(t, buf)
 		deadlineLine(t, buf, "snapshot")
@@ -284,8 +281,9 @@ func TestSubJobs_AShutdownStopsTheLaterSubJobs(t *testing.T) {
 		defer cancel()
 		f := &fakeStore{chunkErrs: true, chunkHook: cancel, dChunksMore: 2}
 		g, _ := storeGC(t, f, 2, logger)
-		if g.retiredRun(ctx) {
-			t.Fatal("retiredRun = true after a shutdown, want false: no hourly re-arm")
+		g.retiredRun(ctx)
+		if runs := gcEvents(t, buf, "gc_retired_run_complete"); len(runs) != 1 || runs[0]["deadline_reached"] != false {
+			t.Fatalf("gc_retired_run_complete lines %v, want one with deadline_reached false after a shutdown", runs)
 		}
 		if want := []string{"C"}; !reflect.DeepEqual(f.calls, want) {
 			t.Fatalf("store calls %v, want %v: no D after the shutdown", f.calls, want)
