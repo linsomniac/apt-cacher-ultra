@@ -399,8 +399,8 @@ func indexTargetGroup(suitePath, p string) (group, arch string, ok bool) {
 // missingRequestableIndexGroups is the SPEC6_8 pre-publish serve-contract
 // guard. It returns the sorted set of IndexTarget group keys the signed
 // Release DECLARED for an architecture a configured client would actually
-// request — every arch in the allowlist, plus the always-required "all"
-// pseudo-arch (arch-independent packages apt fetches on every host) — but
+// request — every arch in the allowlist (or "source" with no filter), plus
+// the always-required "all" pseudo-arch (architecture-independent packages) — but
 // which the adopted snapshot does NOT serve (zero compression variants
 // fetched). A non-empty result means committing this snapshot would make
 // the cache answer an authoritative "not in snapshot" 404 for a file apt
@@ -413,7 +413,10 @@ func indexTargetGroup(suitePath, p string) (group, arch string, ok bool) {
 // — INDEPENDENT of the allowlist. The arch filter does not even have to be
 // enabled for the binary-all trap to bite: a transient upstream 404 on
 // binary-all/Packages is a 4xx_index_target skip that would otherwise
-// publish a degraded snapshot. Other arches are required only when an
+// publish a degraded snapshot. Sources are also required with no filter:
+// the default includes deb-src clients, so a transient Sources 404 must
+// not publish a snapshot that breaks their updates (issue #29). An explicit
+// allowlist may exclude source. Other arches are required only when an
 // allowlist scopes the cache to them; without a filter, an upstream's
 // declared-but-unserved foreign-arch IndexTargets (e.g. Ubuntu's
 // binary-armhf, which 404s on the main archive) are legitimately tolerated
@@ -429,7 +432,7 @@ func missingRequestableIndexGroups(suitePath string, declared, fetched []Release
 		if !ok {
 			continue
 		}
-		if arch == "all" {
+		if arch == "all" || (arch == "source" && allowlist == nil) {
 			required[group] = struct{}{}
 			continue
 		}

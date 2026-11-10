@@ -943,15 +943,31 @@ architecture-independent `all` indexes automatically. Unrecognized member paths
 and architecture-independent translations/icons are not filtered.
 
 The daemon always requires a fetched variant for each declared `binary-all`
-Packages group and for declared Packages/Sources groups selected by a nonempty
-`architectures` list. This applies even when `required_architectures = []`.
+Packages group (root `Packages` for flat repositories). With an empty
+`architectures` list, declared Sources groups are required too. With a nonempty
+list, declared Packages/Sources groups selected by that list are required.
+This applies even when `required_architectures = []`.
 The explicit required list is useful, for example, when adopting all
 architectures but requiring availability for only `amd64`.
+
+Clients using `deb-src` need source indexes: either leave `architectures = []`
+to include all, or include `"source"` in the list, for example
+`architectures = ["amd64", "source"]`. A binary-only list such as `["amd64"]`
+deliberately excludes them. If a client asks for an excluded Sources index,
+`snapshot_index_target_404` includes `reason="arch_not_in_allowlist"` and a
+configuration hint. Add `"source"`, restart the daemon to load the configuration,
+and let automatic reconciliation restore the missing declared indexes, or use
+[`POST /reconcile`](../README.md#recovering-a-degraded-repository) to request it
+immediately. Reconciliation uses the stored Release's hashes; it does not fetch
+files that the snapshot's Release never declared.
 
 `404`/`410` member responses are generally skips, independently of optional-member
 tolerance, but the index-group guards can block the resulting adoption. Other
 availability or integrity failures on required indexes abort adoption. A failed
-adoption leaves the previous snapshot serving. Automatic repair does not retry
+adoption leaves the previous snapshot serving. With
+`repair_skipped_members = true` (the default), an unchanged successful freshness
+check also reconciles missing required index groups in existing snapshots,
+including Sources with the default empty architecture list. It does not retry
 every optional `404`/`410` artifact; manual reconciliation is available through
 [`POST /reconcile`](../README.md#recovering-a-degraded-repository).
 

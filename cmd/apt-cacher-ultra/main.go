@@ -1291,20 +1291,21 @@ func handlerConfig(
 		adoptions = freshChecker
 	}
 	return handler.Config{
-		Parser:              parser,
-		Cache:               c,
-		Fetch:               fetchClient,
-		HostLimiter:         hostLimiter,
-		Logger:              logger,
-		Freshness:           freshChecker,
-		Serve:               cfg.Serve,
-		RefuseUnvouchedDebs: cfg.Integrity.RefuseUnvouchedDebs,
-		AdoptionEnabled:     cfg.Adoption.Enabled,
-		FlipGate:            adopter.FlipGate(),
-		KeepDisplaced:       cfg.GC.KeepDisplaced,
-		MaxSuites:           cfg.Freshness.MaxSuites,
-		SuiteGuard:          guard,
-		Adoptions:           adoptions,
+		Parser:                parser,
+		Cache:                 c,
+		Fetch:                 fetchClient,
+		HostLimiter:           hostLimiter,
+		Logger:                logger,
+		Freshness:             freshChecker,
+		Serve:                 cfg.Serve,
+		RefuseUnvouchedDebs:   cfg.Integrity.RefuseUnvouchedDebs,
+		AdoptionEnabled:       cfg.Adoption.Enabled,
+		AdoptionArchitectures: cfg.Adoption.Architectures,
+		FlipGate:              adopter.FlipGate(),
+		KeepDisplaced:         cfg.GC.KeepDisplaced,
+		MaxSuites:             cfg.Freshness.MaxSuites,
+		SuiteGuard:            guard,
+		Adoptions:             adoptions,
 	}
 }
 

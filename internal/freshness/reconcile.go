@@ -318,9 +318,9 @@ func inReleaseMessage(blob []byte) (text []byte, err error) {
 // missingRequestableMembers returns the declared ReleaseMembers belonging
 // to a requestable IndexTarget GROUP that the snapshot does not currently
 // serve. It reuses missingRequestableIndexGroups (the Layer-2 serve-contract
-// predicate) for the group decision — "all" always required, allowlisted
-// arches when filtered — then returns every declared variant of each missing
-// group so apt can fetch whichever it asks for.
+// predicate) for the group decision — "all" always required, "source" with
+// no filter, allowlisted arches when filtered — then returns every declared
+// variant of each missing group so apt can fetch whichever it asks for.
 //
 // AIDEV-NOTE: The conversion from []cache.SnapshotMember to []ReleaseMember
 // is needed because missingRequestableIndexGroups only inspects m.Path, so

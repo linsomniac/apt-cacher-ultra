@@ -15,6 +15,7 @@ import (
 	"os"
 	"regexp"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -124,6 +125,11 @@ type Config struct {
 	// §6.1 / Q17).
 	AdoptionEnabled bool
 
+	// AdoptionArchitectures is the adoption allowlist. It is used only to
+	// explain source-index misses to clients of a binary-only configuration.
+	// Empty includes source; no request is filtered by the handler itself.
+	AdoptionArchitectures []string
+
 	// FlipGate is the spec C8 flip barrier, shared with the adopter
 	// (freshness.Adopter.FlipGate). nil, or a gate with a zero quiet
 	// period, never holds or tracks anything (the pre-C8 behaviour).
@@ -186,6 +192,7 @@ type Handler struct {
 	// rows.
 	refuseUnvouchedDebs bool
 	adoptionEnabled     bool
+	sourceExcluded      bool
 
 	// flipGate is the spec C8 barrier (see anchorStart); nil or disabled
 	// when off.
@@ -290,6 +297,7 @@ func New(cfg Config) (*Handler, error) {
 		logger:                  logger,
 		refuseUnvouchedDebs:     cfg.RefuseUnvouchedDebs,
 		adoptionEnabled:         cfg.AdoptionEnabled,
+		sourceExcluded:          cfg.AdoptionEnabled && len(cfg.AdoptionArchitectures) > 0 && !slices.Contains(cfg.AdoptionArchitectures, "source"),
 		usage:                   cfg.Usage,
 		flipGate:                cfg.FlipGate,
 		keepDisplaced:           cfg.KeepDisplaced,
@@ -706,13 +714,20 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 		// broken update.
 		if isIndexTargetPath(req.SuitePath, memberPath) {
 			arch := indexTargetArch(req.SuitePath, memberPath)
-			h.logger.Warn("snapshot_index_target_404",
+			attrs := []any{
 				"canonical_host", req.CanonicalHost,
 				"suite_path", req.SuitePath,
 				"path", req.Path,
 				"architecture", arch,
 				"snapshot_id", snapshotID,
-			)
+			}
+			if arch == "source" && h.sourceExcluded {
+				attrs = append(attrs,
+					"reason", "arch_not_in_allowlist",
+					"hint", `include "source" in adoption.architectures for deb-src clients`,
+				)
+			}
+			h.logger.Warn("snapshot_index_target_404", attrs...)
 			serveSnapshotIndexTarget404Total.Inc(boundedArchLabel(arch))
 		}
 		http.Error(w, "not in snapshot", http.StatusNotFound)

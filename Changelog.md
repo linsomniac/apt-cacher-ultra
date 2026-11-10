@@ -113,6 +113,13 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Fixed
 
+- Require declared source indexes when `adoption.architectures` is empty,
+  and reconcile missing source indexes in older snapshots. A transient upstream
+  `404`/`410` can no longer publish a snapshot missing every full Sources variant
+  under the default configuration. Explicit binary-only lists remain supported;
+  source-index requests they exclude now log a configuration hint. Added regression
+  coverage for interrupted same-size metadata replacements and retry after restart.
+  Thanks to @charlescurley for issue #29.
 - Adopt gzip repository indexes with trailing NUL padding, as served by
   ClickHouse, while retaining concatenated-member support, CRC/size checks,
   the cumulative decompression cap and verification of the complete stored
