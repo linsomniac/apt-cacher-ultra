@@ -312,15 +312,31 @@ type readerAnswers struct {
 
 // Issue #14 follow-up Tier 2, the first anti-goal: no reader that serves,
 // vouches, reconciles, ranks, warms or reports gives a different answer
-// after sub-job D strips displaced snapshots' package_hash rows. Two signed
-// dists suites and a signed flat suite on one host, each with a current
-// snapshot and two displaced ones, all adopted through CommitAdoption. The
-// displaced snapshots declare other hashes for paths the current ones list
-// (and in another architecture, and source rows), plus paths only they
-// list; one .deb path is in both dists suites; one flat row is in a
-// displaced snapshot only. url_path rows give a hot set and both retention
-// answers. Every reader's answer is recorded, D strips to completion, and
-// the answers must be deep-equal.
+// after sub-job D strips displaced snapshots' package_hash rows. Three signed
+// dists suites (one at the host root) and two signed flat suites (one nested
+// in the other) on one host, each with a current snapshot and two displaced
+// ones, all adopted through CommitAdoption. The displaced snapshots declare
+// other hashes for paths the current ones list (and in another
+// architecture, and source rows), plus paths only they list; one .deb path
+// is in both /r dists suites; one flat row is in a displaced snapshot only.
+// Fix round 1 of the Task 4 review added the shapes that make two readers
+// discriminate:
+//   - the newest-N ranking (topNVersionSetTx): suite a's displaced
+//     snapshots list a withdrawn alpha 5, so a cold current alpha 2, kept
+//     in the current newest 2 {3, 2}, would be reaped if displaced rows
+//     were ranked ({5, 3});
+//   - the flat fallback (Review Focus 4): the host-root dists suite's
+//     displaced snapshots declare /flat/tool_2_amd64.deb as an exact path
+//     (which, read, would suppress the fallback the flat suite's current
+//     row answers it by), and the nested flat suite's displaced snapshots
+//     carry tool_2_amd64.deb (a tie at base /flat) and tool_3_amd64.deb
+//     under the deeper base /flat/deeper (which, read, would win the
+//     longest-base choice for /flat/deeper/tool_3_amd64.deb over /flat's
+//     current deeper/tool_3_amd64.deb).
+//
+// url_path rows give a hot set and both retention answers. Every reader's
+// answer is recorded, D strips to completion, and the answers must be
+// deep-equal.
 //
 // Readers (spec "Audit: who reads package_hash"): DeclaredHashesForPath
 // (declaredExactSQL and, for the flat paths, declaredBySuffixSQL),
@@ -337,6 +353,9 @@ func TestPackageHashReaders_AnswerTheSameAfterTheStrip(t *testing.T) {
 	b := newBlobs(t, c)
 	const now = int64(1_800_000_000)
 	a, bb, flat := sk("h", "/r/dists/a"), sk("h", "/r/dists/b"), sk("h", "/flat")
+	root, deeper := sk("h", "/dists/c"), sk("h", "/flat/deeper") // a host-root dists suite; a flat suite nested in /flat
+	suites := []SuiteKey{a, bb, root, flat, deeper}
+	isFlat := map[SuiteKey]bool{flat: true, deeper: true}
 	row := func(path, content, name, arch, version, flatName string) PackageHash {
 		return PackageHash{CanonicalScheme: "http", CanonicalHost: "h", Path: path, DeclaredSHA256: b.of(content),
 			PackageName: name, Architecture: arch, Version: version, FlatFilename: flatName}
@@ -365,6 +384,7 @@ func TestPackageHashReaders_AnswerTheSameAfterTheStrip(t *testing.T) {
 			}
 			return append(rs,
 				row(pool+"a/alpha_0_amd64.deb", "alpha 0"+tag, "alpha", "amd64", "0", ""), // displaced only
+				row(pool+"a/alpha_5_amd64.deb", "alpha 5"+tag, "alpha", "amd64", "5", ""), // withdrawn: displaced only, the newest
 				row(pool+"a/alpha_2_i386.deb", "alpha 2 i386"+tag, "alpha", "i386", "2", ""))
 		case bb:
 			rs := []PackageHash{
@@ -377,21 +397,38 @@ func TestPackageHashReaders_AnswerTheSameAfterTheStrip(t *testing.T) {
 			return append(rs,
 				row(pool+"b/beta_0_amd64.deb", "beta 0"+tag, "beta", "amd64", "0", ""),
 				row(pool+"b/beta_1.dsc", "beta 1 dsc"+tag, "beta", "source", "", ""))
-		default: // flat
+		case root: // archive root "/": Filename "flat/tool_2_amd64.deb" is the path /flat/tool_2_amd64.deb
+			rs := []PackageHash{row("/pool/main/g/gamma_1_amd64.deb", "gamma 1"+tag, "gamma", "amd64", "1", "")}
+			if cur {
+				return rs
+			}
+			return append(rs, row("/flat/tool_2_amd64.deb", "tool 2 at the root"+tag, "tool", "amd64", "2", ""))
+		case flat:
 			rs := []PackageHash{row("/flat/./tool_2_amd64.deb", "tool 2"+tag, "tool", "amd64", "2", "tool_2_amd64.deb")}
+			if cur {
+				rs = append(rs, row("/flat/./deeper/tool_3_amd64.deb", "tool 3", "tool", "amd64", "3", "deeper/tool_3_amd64.deb"))
+			}
 			if g == 0 {
 				rs = append(rs, row("/flat/./tool_1_amd64.deb", "tool 1"+tag, "tool", "amd64", "1", "tool_1_amd64.deb"))
 			}
 			return rs
+		default: // deeper
+			rs := []PackageHash{row("/flat/deeper/./gadget_1_amd64.deb", "gadget 1"+tag, "gadget", "amd64", "1", "gadget_1_amd64.deb")}
+			if cur {
+				return rs
+			}
+			return append(rs,
+				row("/flat/deeper/./tool_2_amd64.deb", "tool 2 deeper"+tag, "tool", "amd64", "2", "tool_2_amd64.deb"),
+				row("/flat/deeper/./tool_3_amd64.deb", "tool 3 deeper"+tag, "tool", "amd64", "3", "tool_3_amd64.deb"))
 		}
 	}
 	type suiteIDs struct{ displaced, current []int64 }
 	ids := map[SuiteKey]*suiteIDs{}
-	for _, key := range []SuiteKey{a, bb, flat} {
+	for _, key := range suites {
 		seedRow(t, c, key, 1)
 		ids[key] = &suiteIDs{}
 		index := "main/binary-amd64/Packages"
-		if key == flat {
+		if isFlat[key] {
 			index = "Packages"
 		}
 		for g := range 3 {
@@ -399,7 +436,7 @@ func TestPackageHashReaders_AnswerTheSameAfterTheStrip(t *testing.T) {
 				"InRelease": fmt.Sprintf("InRelease %s gen %d", key.SuitePath, g),
 				index:       fmt.Sprintf("Packages %s gen %d", key.SuitePath, g),
 			}
-			if key != flat {
+			if !isFlat[key] {
 				members["main/binary-amd64/Packages.diff/Index"] = fmt.Sprintf("pdiff Index %s gen %d", key.SuitePath, g)
 			}
 			id := adoptGeneration(t, c, b, key, members, []string{"Contents-amd64.gz"}, rowsOf(key, g))
@@ -424,8 +461,9 @@ func TestPackageHashReaders_AnswerTheSameAfterTheStrip(t *testing.T) {
 		{pool + "s/shared_1_amd64.deb", "shared 1", hot},
 		{"/flat/./tool_2_amd64.deb", "tool 2", hot},
 		{pool + "a/alpha_0_amd64.deb", "alpha 0 /r/dists/a gen 0", hot},
-		{pool + "a/alpha_1_amd64.deb", "alpha 1", cold},                  // current hash, not in the newest 2
-		{pool + "a/alpha_2_amd64.deb", "alpha 2 /r/dists/a gen 1", cold}, // a displaced hash
+		{pool + "a/alpha_1_amd64.deb", "alpha 1", cold},                                         // current hash, not in the newest 2
+		{pool + "a/alpha_2_amd64.deb", "alpha 2", cold},                                         // current hash, in the current newest 2 (not with alpha 5)
+		{"/r/dists/a/main/binary-amd64/Packages.diff/T-1.gz", "pdiff a /r/dists/a gen 1", cold}, // a displaced hash
 		{pool + "a/alpha_2_i386.deb", "alpha 2 i386 /r/dists/a gen 0", cold},
 		{pool + "a/alpha_3.dsc", "alpha 3 dsc", cold}, // version-less: the fallback keeps it
 		{pool + "b/beta_0_amd64.deb", "beta 0 /r/dists/b gen 1", cold},
@@ -441,7 +479,7 @@ func TestPackageHashReaders_AnswerTheSameAfterTheStrip(t *testing.T) {
 	// ones with a newer alpha.
 	cands := map[SuiteKey]int64{}
 	candRows := map[SuiteKey][]PackageHash{}
-	for _, key := range []SuiteKey{a, bb, flat} {
+	for _, key := range suites {
 		anchor := b.of("InRelease candidate " + key.SuitePath)
 		id, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{CanonicalScheme: "http", CanonicalHost: "h",
 			SuitePath: key.SuitePath, InReleaseHash: &anchor})
@@ -459,7 +497,7 @@ func TestPackageHashReaders_AnswerTheSameAfterTheStrip(t *testing.T) {
 		candRows[key] = rs
 	}
 
-	paths := []string{"/flat/tool_2_amd64.deb", "/flat/tool_1_amd64.deb"} // the suffix fallback's
+	paths := []string{"/flat/tool_2_amd64.deb", "/flat/tool_1_amd64.deb", "/flat/deeper/tool_3_amd64.deb"} // the suffix fallback's
 	paths = append(paths, tableDump(t, c, `SELECT DISTINCT path FROM package_hash ORDER BY path`)...)
 
 	answers := func() readerAnswers {
@@ -488,7 +526,7 @@ func TestPackageHashReaders_AnswerTheSameAfterTheStrip(t *testing.T) {
 			t.Fatal(err)
 		}
 		r.HotSets = map[string][]HotSetEntry{}
-		for _, key := range []SuiteKey{a, bb, flat} {
+		for _, key := range suites {
 			hs, err := c.ComputeHotSet(ctx, "http", "h", ids[key].current[0], cands[key], slices.Clone(candRows[key]), 86400, now, 2)
 			if err != nil {
 				t.Fatal(err)
@@ -544,6 +582,22 @@ func TestPackageHashReaders_AnswerTheSameAfterTheStrip(t *testing.T) {
 	if len(before.Declared[pool+"s/shared_1_amd64.deb"]) != 2 || len(before.Declared["/flat/tool_2_amd64.deb"]) != 1 ||
 		len(before.Declared["/flat/tool_1_amd64.deb"]) != 0 || len(before.Declared[pool+"a/alpha_0_amd64.deb"]) != 0 {
 		t.Fatalf("premise: DeclaredHashesForPath answers %+v", before.Declared)
+	}
+	// Review Focus 4: each flat request path answers with only the /flat
+	// current snapshot's row, by the suffix fallback — not the host-root
+	// suite's displaced exact row, nor /flat/deeper's displaced rows (a tie
+	// at base /flat for tool_2, the longer base for tool_3).
+	for p, content := range map[string]string{"/flat/tool_2_amd64.deb": "tool 2", "/flat/deeper/tool_3_amd64.deb": "tool 3"} {
+		want := []DeclaredHash{{DeclaredSHA256: b.of(content), SnapshotID: ids[flat].current[0], PackageName: "tool", SuitePath: flat.SuitePath}}
+		if got := before.Declared[p]; !reflect.DeepEqual(got, want) {
+			t.Fatalf("premise: DeclaredHashesForPath(%s) = %+v, want only the /flat current row %+v", p, got, want)
+		}
+	}
+	// The newest-N ranking reads only the current snapshot: alpha 2 (cold,
+	// current hash) is in the current newest 2 {3, 2}, alpha 1 is not.
+	if !before.URLRetains[pool+"a/alpha_2_amd64.deb"] || before.URLRetains[pool+"a/alpha_1_amd64.deb"] {
+		t.Fatalf("premise: retention of alpha 2 %v (want kept), alpha 1 %v (want reaped)",
+			before.URLRetains[pool+"a/alpha_2_amd64.deb"], before.URLRetains[pool+"a/alpha_1_amd64.deb"])
 	}
 	if len(before.Integrity) == 0 || before.Coverage.PackageHashRowsTotal == 0 || len(before.Summary["h"]) == 0 ||
 		len(before.HotSets[a.SuitePath]) == 0 || len(before.HotSets[flat.SuitePath]) == 0 {
