@@ -1106,7 +1106,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   stripped steady state): insert of 70,000 rows 1.488 s against 1.289 s,
   chunked delete of 70,000 rows 1.138 s against 839 ms (a 10,000-row chunk
   163 ms against 120 ms), database file 1172 MiB against 320 MiB as seeded
-  (the real file keeps its size). The long run (70,000 rows a snapshot, a
+  (the real file keeps its size); the time gaps are likely real, all in
+  the same direction, but inside the run-to-run noise, so their size is
+  unmeasured. The long run (70,000 rows a snapshot, a
   3 s budget, four suites, three "days" of 16 concurrent adoptions, then
   eight restarts): blobs reaped on day 1 51 (was 0); ticks and startups
   end at their budget, at most 3.02 s (was 5.13 s on day 1 and 24.66 s and

@@ -119,13 +119,16 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 - A reconcile decision that fails on a snapshot (a stored anchor apt's
   text layer refuses, say) warns once, not at every check;
   `acu_adoption_reconcile_failed_total{stage}` counts every failure.
-- GC deletes a displaced snapshot's package list (its `package_hash` rows)
-  early, 10,000 rows a transaction, so the table shrinks to roughly the
-  current snapshots' size; `gc.keep_displaced` now keeps displaced
-  snapshots' headers and index files, not their package lists. The database
-  file keeps its size (SQLite reuses the pages); an offline `VACUUM` is
-  optional. A failing GC sub-job no longer stops the ones after it
-  (issue #14).
+- GC deletes displaced snapshots' package lists (their `package_hash`
+  rows), 10,000 rows a transaction, at its next run that reaches them (a
+  start, the periodic run every `gc.interval`, or the hourly run while a
+  backlog lasts), instead of keeping `gc.keep_displaced` snapshots' worth
+  per suite; between runs a suite that adopts several times a day still
+  holds those it displaced since the last. `gc.keep_displaced` now keeps
+  displaced snapshots' headers and index files, not their package lists.
+  The database file keeps its size (SQLite reuses the pages); an offline
+  `VACUUM` is optional. A failing GC sub-job no longer stops the ones after
+  it (issue #14).
 - Built with Go 1.27; `golang.org/x/net`, `x/text`, `x/crypto`, `x/sys`,
   `github.com/cloudflare/circl` and `github.com/ProtonMail/go-crypto`
   updated (`govulncheck`: no known vulnerability the code reaches).
@@ -178,7 +181,7 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   longer DEGRADED.
 - A GC pass gives up a database write it cannot start before its deadline,
   so a busy writer no longer pushes GC past `gc.max_tick_duration`
-  (issue #14).
+  beyond the one write already under way at the deadline (issue #14).
 - The startup GC pass retires the displaced snapshots beyond
   `gc.keep_displaced` and deletes them 10,000 rows a transaction, like a
   periodic run, instead of deleting them in one transaction; a start's

@@ -408,9 +408,10 @@ const phaseRetired = "retired"
 // goroutine (never beside a tick). Its blobs are reclaimed by the next
 // blob pass: the next start's or the next periodic tick's. C also deletes
 // the displaced snapshots a periodic tick's sub-job B retired (DN-7 of the
-// GC and upstream hardening plan): normally that tick's own C does, and
-// this run takes those still retired when a tick's pass stopped before its
-// C had deleted them (its deadline, a shutdown, a C chunk that failed, or a
+// GC and upstream hardening plan), or, since 2026-11-09 (issue #14
+// follow-up, Tier 1b), the startup pass's B: normally that pass's own C
+// does, and this run takes those still retired when a start's or a tick's
+// snapshot pass stopped before its C had deleted them (its deadline, a shutdown, a C chunk that failed, or a
 // batch or chunk that panicked; a failed batch no longer stops it before C
 // since 2026-11-09), which the startup pass's B no longer selects (its C
 // does, within its budget). Since issue #14 the startup pass also runs C,

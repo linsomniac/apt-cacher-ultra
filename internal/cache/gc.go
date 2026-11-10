@@ -270,7 +270,8 @@ func (c *Cache) RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGrac
 	// when two displacements share the same unix-second adopted_at.
 	// Retired snapshots — those of a suite reaped, evicted at a cap or
 	// forgotten, those the legacy trust audit quarantined, and the displaced
-	// snapshots a periodic tick's sub-job B retired (ruling HD-4) — are
+	// snapshots a startup or periodic sub-job B retired (ruling HD-4; the
+	// startup B too since 2026-11-09, issue #14 follow-up Tier 1b) — are
 	// ranked out the same way, before the window function (spec C9): they
 	// never take one of a suite's keep_displaced slots, B never selects one
 	// again (so a batch never selects what an earlier one retired), and
