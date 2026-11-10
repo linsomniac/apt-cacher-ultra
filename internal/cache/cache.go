@@ -325,12 +325,18 @@ func (req *writeReq) abandon() bool {
 // received from c.writes at most once; nobody need read it after the
 // submitter has gone.
 // A ctx cancelled while waiting (shutdown) returns ctx.Err() as before,
-// never ErrWriteNotStarted, so a shutdown still reads as a shutdown; for
-// a request with a start deadline it also abandons a still-pending
-// request, so the writer skips an op whose submitter has gone instead of
-// starting it on a cancelled ctx. That can only stop an op that has not
-// started, so the "never interrupt a started op" rule holds, and a
-// running op still sees the cancel through its own ctx, as before. A
+// never ErrWriteNotStarted, so a shutdown still reads as a shutdown,
+// even when the start deadline is due at the same time: Go's select picks
+// at random among ready cases, so the entry check and both deadline cases
+// check ctx.Err() first (notStartedErr; the final review's M-1,
+// 2026-11-09: a GC pass must never log a shutdown as its deadline). The
+// op still never runs there: those paths return only for a request never
+// enqueued or one whose abandon won the CAS. For a request with a start
+// deadline the cancel also abandons a still-pending request, so the
+// writer skips an op whose submitter has gone instead of starting it on a
+// cancelled ctx. That can only stop an op that has not started, so the
+// "never interrupt a started op" rule holds, and a running op still sees
+// the cancel through its own ctx, as before. A
 // request with no start deadline is untouched: nil state, no timer (a nil
 // channel in the selects), and the writer still calls its op after a
 // cancel, exactly as before issue #14.
@@ -343,7 +349,8 @@ func (c *Cache) submitWrite(ctx context.Context, op writeOp) error {
 	if deadline, ok := writeStartDeadline(ctx); ok {
 		wait := time.Until(deadline)
 		if wait <= 0 {
-			return ErrWriteNotStarted
+			// Not enqueued. A shutdown reads as a shutdown (ctx.Err()).
+			return notStartedErr(ctx)
 		}
 		timer := time.NewTimer(wait)
 		defer timer.Stop()
@@ -357,8 +364,9 @@ func (c *Cache) submitWrite(ctx context.Context, op writeOp) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-deadlineC:
-		// Not enqueued, so the writer can never see it.
-		return ErrWriteNotStarted
+		// Not enqueued, so the writer can never see it. A ctx cancelled
+		// too (both ready, the select chose the deadline) is ctx.Err().
+		return notStartedErr(ctx)
 	}
 	for {
 		select {
@@ -374,13 +382,26 @@ func (c *Cache) submitWrite(ctx context.Context, op writeOp) error {
 			return ctx.Err()
 		case <-deadlineC:
 			if req.abandon() {
-				return ErrWriteNotStarted
+				// Never runs. A ctx cancelled too (both ready, the
+				// select chose the deadline) is ctx.Err().
+				return notStartedErr(ctx)
 			}
 			// The writer started the op first: it runs to completion.
 			// Stop selecting on the spent timer and wait for its result.
 			deadlineC = nil
 		}
 	}
+}
+
+// notStartedErr is submitWrite's answer for a request it gave up before the
+// writer started it: ctx.Err() if ctx has ended (a shutdown reads as a
+// shutdown, even when the start deadline was due at the same time), else
+// ErrWriteNotStarted. Either way the op never runs.
+func notStartedErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return ErrWriteNotStarted
 }
 
 // writer is the singleton goroutine that owns the write connection. All

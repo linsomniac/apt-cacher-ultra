@@ -43,15 +43,27 @@ func startDeadlineGC(t *testing.T, c *cache.Cache, logger *slog.Logger, budget t
 // out), so a failing test never leaves Close waiting on it.
 func holdGCWriter(t *testing.T, c *cache.Cache, at time.Time) {
 	t.Helper()
+	holdGCWriterNow(t, c)(at)
+}
+
+// holdGCWriterNow occupies c's writer goroutine now and returns releaseAt,
+// which arms its release at at (once); the test's end releases it in any
+// case, as holdGCWriter's does. A test that times its release against a
+// start taken after the hold (HoldWriterForTest takes a moment) uses it.
+func holdGCWriterNow(t *testing.T, c *cache.Cache) (releaseAt func(at time.Time)) {
+	t.Helper()
 	release, err := c.HoldWriterForTest(context.Background())
 	if err != nil {
 		t.Fatalf("HoldWriterForTest: %v", err)
 	}
-	timer := time.AfterFunc(time.Until(at), release)
+	var timer *time.Timer
 	t.Cleanup(func() {
-		timer.Stop()
+		if timer != nil {
+			timer.Stop()
+		}
 		release()
 	})
+	return func(at time.Time) { timer = time.AfterFunc(time.Until(at), release) }
 }
 
 // noTickFailed fails the test if buf logged a gc_tick_failed line.
@@ -74,20 +86,27 @@ func deadlineLine(t *testing.T, buf *bytes.Buffer, which string) map[string]any 
 }
 
 // A snapshot batch queued behind the writer is abandoned at the snapshot
-// deadline (start + 800 ms of a 1 s budget): the pass ends there, never
-// having run the batch, and the blob pass, once the writer frees up 50 ms
-// later, reaps the dead blob within the tick's budget. Before the fix the
-// batch waited for the writer and then ran past the snapshot deadline.
+// deadline (start + 1.6 s of a 2 s budget): the pass ends there, never
+// having run the batch, and the blob pass, once the writer frees up 200 ms
+// later, reaps the dead blob in the 200 ms left of the tick's budget.
+// Before the fix the batch waited for the writer and then ran past the
+// snapshot deadline. The hold is taken first and start just before runTick
+// takes its own, so runTick's snapshot deadline is at most a hair after
+// the one the release is timed from, and the 200 ms margin is all
+// scheduling slack (the final review: 50 ms, less the hold's set-up, was
+// too thin under -race).
 func TestRunTick_ASnapshotBatchStuckBehindTheWriterEndsAtItsDeadline(t *testing.T) {
+	const releaseMargin = 200 * time.Millisecond
 	c := openTestCache(t)
 	logger, buf := captureLogger()
 	dead := seedReapableBlob(t, c, "a dead blob behind a busy writer")
-	g := startDeadlineGC(t, c, logger, time.Second)
+	g := startDeadlineGC(t, c, logger, 2*time.Second)
 	g.nextPass = snapshotPass // no url-path pass: the held writer stalls only the snapshot pass
 
+	releaseAt := holdGCWriterNow(t, c)
 	start := time.Now()
 	deadlines := passDeadlines(start, g.cfg.MaxTickDuration)
-	holdGCWriter(t, c, deadlines.snapshot.Add(50*time.Millisecond))
+	releaseAt(deadlines.snapshot.Add(releaseMargin))
 	res, err := g.runTick(context.Background(), "periodic")
 	elapsed := time.Since(start)
 	if err != nil {

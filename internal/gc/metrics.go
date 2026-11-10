@@ -121,12 +121,7 @@ var (
 	// ruling on Task 5's review, 2026-11-09); a pass that only a shutdown
 	// stopped logged nothing, did not fail, and is not counted, nor is a
 	// write the writer never started before its deadline (notStarted).
-	gcPassFailuresTotal = metrics.NewCounterWithCap(
-		"acu_gc_pass_failures_total",
-		"Total GC passes that failed, logged as WARN gc_tick_failed (one per pass per run, however many of its sub-jobs failed) or, for pool_scan, returned by the startup pool scan; by pass: url_path, snapshot, blob, retired, pool_scan.",
-		metrics.DefaultMaxSeries,
-		"pass",
-	)
+	gcPassFailuresTotal = newPassFailuresCounter(metrics.Default)
 
 	gcRepresentationRowsPrunedTotal = metrics.NewCounterWithCap(
 		"acu_gc_representation_rows_pruned_total",
@@ -160,6 +155,35 @@ var (
 		"phase",
 	)
 )
+
+// passFailureLabels are acu_gc_pass_failures_total's pass labels: every
+// one newPassFailuresCounter primes.
+var passFailureLabels = []string{"url_path", "snapshot", "blob", "retired", "pool_scan"}
+
+// newPassFailuresCounter declares acu_gc_pass_failures_total{pass} on r,
+// with every pass label's series primed at 0.
+//
+// AIDEV-NOTE: primed, not created lazily (the issue #14 follow-up's final
+// review, I-2, 2026-11-09). The documented alert is
+// increase(acu_gc_pass_failures_total[1d]) > 0, and Prometheus sees no
+// increase in a series whose first sample is already 1: a series created
+// at its label's first failure would hide that failure after every
+// restart. Priming once per process, here at package init, makes each
+// series' first sample 0 (as refreshFailures and the process cpu counter
+// in internal/admin do). A new pass label must be added to
+// passFailureLabels.
+func newPassFailuresCounter(r *metrics.Registry) *metrics.Counter {
+	c := metrics.NewCounterWithCapIn(r,
+		"acu_gc_pass_failures_total",
+		"Total GC passes that failed, logged as WARN gc_tick_failed (one per pass per run, however many of its sub-jobs failed) or, for pool_scan, returned by the startup pool scan; by pass: url_path, snapshot, blob, retired, pool_scan.",
+		metrics.DefaultMaxSeries,
+		"pass",
+	)
+	for _, p := range passFailureLabels {
+		c.Add(0, p)
+	}
+	return c
+}
 
 func emitGCPassMetrics(phase string, tick tickResult) {
 	for _, p := range []struct {

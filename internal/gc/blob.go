@@ -93,12 +93,18 @@ func (g *GC) runBlobPass(ctx context.Context, deadline time.Time, phase string) 
 	// Its count and duration (its wait for the writer included) go to
 	// res.pruned and res.pruneDuration (issue #14 follow-up, Tier 1c):
 	// gc_run_complete's representation_rows_pruned and
-	// representation_prune_ms.
+	// representation_prune_ms. Updated 2026-11-09 (the final review's M-2):
+	// a prune the writer never started (notStarted) records no duration,
+	// so its wait behind the writer, the whole of what it spent, is
+	// neither a representation_prune_ms nor a pass="representation_prune"
+	// sample of 0 rows; it stays in the blob pass's own duration.
 	wctx := cache.WithWriteStartDeadline(ctx, deadline)
 	if ctx.Err() == nil && time.Now().Before(deadline) {
 		pruneStart := time.Now()
 		pruned, err := g.store.PruneRepresentationMetadata(wctx, representationPruneRows)
-		res.pruneDuration = time.Since(pruneStart)
+		if !notStarted(err) {
+			res.pruneDuration = time.Since(pruneStart)
+		}
 		res.pruned = pruned
 		if err != nil && !notStarted(err) {
 			pruneErr = fmt.Errorf("representation metadata prune: %w", err)

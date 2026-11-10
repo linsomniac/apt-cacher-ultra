@@ -184,11 +184,14 @@ func TestIssue14LongRun(t *testing.T) {
 		return g
 	}
 
+	// report logs one run: its counts (displaced_package_rows_deleted is
+	// sub-job D's, as gc_run_complete and LastRunSummary carry it, so the
+	// evidence shows D's work per day), then the cache's totals.
 	report := func(label string, res tickResult, d time.Duration) {
 		rows, bytes, snaps, ph := poolStats(t, c)
-		t.Logf("%-28s dur=%-7s deadline=%-5v retired=%-3d displaced_reaped=%-3d blobs_reaped=%-3d bytes_reclaimed=%-6dKiB | blobs=%d (%d MiB) snapshots=%d package_hash=%d",
-			label, d.Round(10*time.Millisecond), res.deadlineReached, res.retiredReaped, res.displacedReaped, res.blobsReaped,
-			res.bytesReclaimed>>10, rows, bytes>>20, snaps, ph)
+		t.Logf("%-28s dur=%-7s deadline=%-5v retired=%-3d displaced_reaped=%-3d displaced_package_rows_deleted=%-7d blobs_reaped=%-3d bytes_reclaimed=%-6dKiB | blobs=%d (%d MiB) snapshots=%d package_hash=%d",
+			label, d.Round(10*time.Millisecond), res.deadlineReached, res.retiredReaped, res.displacedReaped,
+			res.displacedPackageRowsDeleted, res.blobsReaped, res.bytesReclaimed>>10, rows, bytes>>20, snaps, ph)
 	}
 
 	// Periodic ticks with contending writer traffic: the freshness
@@ -234,6 +237,7 @@ func TestIssue14LongRun(t *testing.T) {
 		report(fmt.Sprintf("restart %d startup", r), tickResult{
 			deadlineReached: s.DeadlineReached, displacedReaped: s.DisplacedReaped, retiredReaped: s.RetiredReaped,
 			blobsReaped: s.BlobsReaped, bytesReclaimed: s.BytesReclaimed,
+			displacedPackageRowsDeleted: s.DisplacedPackageRowsDeleted,
 		}, time.Since(t0))
 		if !s.DeadlineReached {
 			break

@@ -1,15 +1,19 @@
 package gc
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
+	"github.com/linsomniac/apt-cacher-ultra/internal/metrics"
 )
 
 // Issue #14 follow-up, Tier 1c: GC's failures and work are visible. A pass
@@ -239,6 +243,35 @@ func TestRunTick_ANotStartedWriteIsNotAFailure(t *testing.T) {
 	checkFailureCounts(t, before, nil)
 }
 
+// A representation prune the writer never started before the blob pass's
+// deadline reports no duration (the final review's M-2): it never ran, so
+// its wait behind the writer is neither its representation_prune_ms, its
+// last-run summary seconds, nor a pass="representation_prune" sample of
+// acu_gc_pass_duration_seconds. The blob pass's own sample still holds the
+// wait (it is the pass's wall-clock time).
+func TestRunBlobPass_APruneNeverStartedReportsNoDuration(t *testing.T) {
+	c := openTestCache(t)
+	logger, buf := captureLogger()
+	g := startDeadlineGC(t, c, logger, 300*time.Millisecond)
+	g.nextPass = blobPass
+	holdGCWriter(t, c, time.Now().Add(g.cfg.MaxTickDuration+500*time.Millisecond))
+	durations := `acu_gc_pass_duration_seconds_count{phase="periodic",pass="representation_prune"}`
+	before := gcMetricValue(t, durations)
+	g.periodicTick(context.Background())
+
+	noTickFailed(t, buf)
+	runs := gcEvents(t, buf, "gc_run_complete")
+	if len(runs) != 1 || runs[0]["representation_prune_ms"] != float64(0) || runs[0]["representation_rows_pruned"] != float64(0) {
+		t.Fatalf("gc_run_complete lines %v, want one with representation_prune_ms 0 and representation_rows_pruned 0", runs)
+	}
+	if s, ok := g.LastRunSummary(); !ok || s.RepresentationPruneSeconds != 0 || !s.DeadlineReached {
+		t.Fatalf("summary %+v (%v), want RepresentationPruneSeconds 0 and deadline_reached", s, ok)
+	}
+	if got := gcMetricValue(t, durations) - before; got != 0 {
+		t.Fatalf("%s rose by %v, want 0: the prune never ran", durations, got)
+	}
+}
+
 // seedPrunableDates is seedPruneFixture's cache plus n-1 more unowned,
 // day-old dates: n prunable dates in all, and no reapable blob.
 func seedPrunableDates(t *testing.T, c *cache.Cache, n int) {
@@ -295,5 +328,43 @@ func TestRunBlobPass_ReportsThePrunesCountAndDuration(t *testing.T) {
 				t.Fatalf("%s rose by %v, want 1: one prune a run", durations, got)
 			}
 		})
+	}
+}
+
+// The failure counter's five series exist from the process's start, each
+// at 0 (issue #14 follow-up, the final review's I-2): the documented alert
+// increase(acu_gc_pass_failures_total[1d]) > 0 sees no increase in a series
+// whose first sample is already 1, so a series created lazily at its first
+// failure would hide every label's first failure after a restart.
+// The process's own counter (package init) is checked for each series; a
+// fresh one, which no test has failed a pass into, for each series at 0.
+func TestPassFailuresTotal_EverySeriesIsPrimed(t *testing.T) {
+	var buf bytes.Buffer
+	metrics.Default.Render(&buf)
+	for _, p := range failurePasses {
+		series := fmt.Sprintf(`acu_gc_pass_failures_total{pass=%q} `, p)
+		if !strings.Contains(buf.String(), series) {
+			t.Errorf("no %s series before any failure: it is created lazily", strings.TrimSpace(series))
+		}
+	}
+
+	r := metrics.NewRegistry()
+	newPassFailuresCounter(r)
+	buf.Reset()
+	r.Render(&buf)
+	var lines []string
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.HasPrefix(line, "acu_gc_pass_failures_total{") {
+			lines = append(lines, line)
+		}
+	}
+	var want []string
+	for _, p := range failurePasses {
+		want = append(want, fmt.Sprintf(`acu_gc_pass_failures_total{pass=%q} 0`, p))
+	}
+	slices.Sort(lines)
+	slices.Sort(want)
+	if !slices.Equal(lines, want) {
+		t.Fatalf("a fresh counter renders %q, want each pass label's series at 0: %q", lines, want)
 	}
 }
