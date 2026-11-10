@@ -32,12 +32,14 @@ import (
 // are never started, dChunkNotStarted: cache.ErrWriteNotStarted). calls
 // records the snapshot pass's store calls in order: "batch", "C", "D". Its
 // url-path batches are the real cache's (storeGC gives it the cache:
-// useCache), each taking urlSleep once its real batch has run.
+// useCache), each taking urlSleep once its real batch has run, unless told
+// to fail (urlErrs).
 type fakeStore struct {
 	mu          sync.Mutex
 	cache       *cache.Cache  // the url-path batches' (useCache)
 	urlSleep    time.Duration // each url-path batch takes this long once its real batch has run (virtual time in a bubble)
 	urlBatches  int           // RunURLPathGCBatch calls
+	urlErrs     bool          // RunURLPathGCBatch fails (its real batch never runs)
 	prunes      int           // PruneRepresentationMetadata calls (delegated to cache)
 	pruneErrs   bool          // PruneRepresentationMetadata fails
 	batchPanics int           // RunSnapshotGCBatch panics on this many first calls
@@ -74,7 +76,11 @@ func (f *fakeStore) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSec
 ) (cache.URLPathGCBatchResult, error) {
 	f.mu.Lock()
 	f.urlBatches++
+	fail := f.urlErrs
 	f.mu.Unlock()
+	if fail {
+		return cache.URLPathGCBatchResult{}, errors.New("url-path fault")
+	}
 	// The batch runs, then takes urlSleep: a started batch that runs long.
 	// A sleep before the call would model a wait in the writer's queue,
 	// which the pass's start deadline now cuts short (issue #14 Tier 1a).

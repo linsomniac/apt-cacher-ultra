@@ -30,6 +30,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"sync"
 	"time"
 
@@ -203,6 +204,18 @@ type LastRunSummary struct {
 	PoolOrphanBytesRepaired     int64
 	PoolUnlinkErrors            int
 	DeadlineReached             bool
+	// FailedPasses names the run's passes whose failure was logged (WARN
+	// gc_tick_failed), in tick order, each once: "url_path", "snapshot",
+	// "blob"; nil when none failed (issue #14 follow-up, Tier 1c). A
+	// retired run's failure never reaches it (that run writes no summary),
+	// nor a failed pool scan's (the startup pass then writes none).
+	FailedPasses []string
+	// RepresentationRowsPruned and RepresentationPruneSeconds are the blob
+	// pass's representation prune: the stored upstream dates it released
+	// and how long it took, its wait for the writer included (issue #14
+	// follow-up, Tier 1c).
+	RepresentationRowsPruned   int
+	RepresentationPruneSeconds float64
 }
 
 // Interval returns the configured periodic-tick cadence. Pure accessor
@@ -228,7 +241,9 @@ func (g *GC) LastRunSummary() (LastRunSummary, bool) {
 	if g.lastRun == nil {
 		return LastRunSummary{}, false
 	}
-	return *g.lastRun, true
+	s := *g.lastRun
+	s.FailedPasses = slices.Clone(s.FailedPasses) // the caller's own copy (nil stays nil)
+	return s, true
 }
 
 // recordLastRun captures one completed tick's payload. Called at the
@@ -327,6 +342,10 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 	// Step 5: pool/ orphan scan.
 	scan, err := g.runPoolScan(ctx)
 	if err != nil {
+		// Counted here, as main logs it (issue #14 follow-up Tier 1c); a
+		// shutdown never fails the scan (runPoolScan returns only its
+		// pool/ read's error), and no summary is written.
+		gcPassFailuresTotal.Inc("pool_scan")
 		return fmt.Errorf("gc startup: pool scan: %w", err)
 	}
 
@@ -355,6 +374,8 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 		"url_path_duration_ms", tick.urlPathDuration.Milliseconds(),
 		"snapshot_duration_ms", tick.snapshotDuration.Milliseconds(),
 		"blob_duration_ms", tick.blobDuration.Milliseconds(),
+		"representation_rows_pruned", tick.representationRowsPruned,
+		"representation_prune_ms", tick.representationPruneDuration.Milliseconds(),
 		"pool_orphans_repaired", scan.orphansRepaired,
 		"pool_orphan_bytes_repaired", scan.orphanBytesRepaired,
 		"pool_unlink_errors", tick.poolUnlinkErrors+scan.unlinkErrors,
@@ -399,6 +420,9 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 		PoolOrphanBytesRepaired:     scan.orphanBytesRepaired,
 		PoolUnlinkErrors:            tick.poolUnlinkErrors + scan.unlinkErrors,
 		DeadlineReached:             tick.deadlineReached,
+		FailedPasses:                tick.failedPasses,
+		RepresentationRowsPruned:    tick.representationRowsPruned,
+		RepresentationPruneSeconds:  tick.representationPruneDuration.Seconds(),
 	})
 	if tickErr != nil {
 		return fmt.Errorf("gc startup: tick: %w", tickErr)
@@ -532,6 +556,8 @@ func (g *GC) periodicTick(ctx context.Context) (snapshotBacklog bool) {
 		"url_path_duration_ms", tick.urlPathDuration.Milliseconds(),
 		"snapshot_duration_ms", tick.snapshotDuration.Milliseconds(),
 		"blob_duration_ms", tick.blobDuration.Milliseconds(),
+		"representation_rows_pruned", tick.representationRowsPruned,
+		"representation_prune_ms", tick.representationPruneDuration.Milliseconds(),
 		"pool_orphans_repaired", 0,
 		"pool_orphan_bytes_repaired", int64(0),
 		"pool_unlink_errors", tick.poolUnlinkErrors,
@@ -576,6 +602,9 @@ func (g *GC) periodicTick(ctx context.Context) (snapshotBacklog bool) {
 		PoolOrphanBytesRepaired:     0,
 		PoolUnlinkErrors:            tick.poolUnlinkErrors,
 		DeadlineReached:             tick.deadlineReached,
+		FailedPasses:                tick.failedPasses,
+		RepresentationRowsPruned:    tick.representationRowsPruned,
+		RepresentationPruneSeconds:  tick.representationPruneDuration.Seconds(),
 	})
 	return snapshotBacklog
 }
@@ -742,6 +771,13 @@ type tickResult struct {
 	urlPathDuration         time.Duration
 	snapshotDuration        time.Duration
 	blobDuration            time.Duration
+	// representationRowsPruned and representationPruneDuration are the
+	// blob pass's representation prune's (blobResult; issue #14 follow-up,
+	// Tier 1c).
+	representationRowsPruned    int
+	representationPruneDuration time.Duration
+	// failedPasses: LastRunSummary.FailedPasses (runTick's failedPass).
+	failedPasses []string
 }
 
 // tickDeadlines are one tick's three pass deadlines (passDeadlines).
@@ -841,7 +877,9 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 	// earlier pass of this tick failed first. It reports whether the tick
 	// goes on: not once ctx has ended, which never comes undone, so a tick
 	// whose rotation passFailed left as it was always ends there. It logs
-	// nothing: failed does, for the passes that do not log their own.
+	// and counts nothing: failed does, for the passes that do not log their
+	// own (the snapshot pass logs and counts its own: subJobRun), since a
+	// failure is counted where it is logged and ctx may end in between.
 	recordFailure := func(err error) bool {
 		e := g.passFailed(ctx, err)
 		if firstErr == nil {
@@ -849,8 +887,16 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 		}
 		return ctx.Err() == nil
 	}
+	// failedPass names a pass whose failure was logged in the run's
+	// FailedPasses, once (issue #14 follow-up, Tier 1c).
+	failedPass := func(name string) {
+		if !slices.Contains(res.failedPasses, name) {
+			res.failedPasses = append(res.failedPasses, name)
+		}
+	}
 	// failed is recordFailure, and, while ctx lives, the pass's WARN
-	// gc_tick_failed: the url-path and blob passes'.
+	// gc_tick_failed and its count under name (acu_gc_pass_failures_total,
+	// FailedPasses): the url-path and blob passes'.
 	//
 	// AIDEV-NOTE: passFailed's test: a pass stopped by the end of ctx (a
 	// shutdown) did not fail, whatever its error's shape, and logs nothing.
@@ -867,11 +913,24 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 	// already logged, and runTick takes it with recordFailure alone: still
 	// one line per failure. Every failed pass, logged here or by itself,
 	// goes through recordFailure.
-	failed := func(err error) bool {
+	//
+	// AIDEV-NOTE: issue #14 follow-up Tier 1c, 2026-11-09. A failure is
+	// counted (acu_gc_pass_failures_total{pass}, FailedPasses) exactly when
+	// its gc_tick_failed line is logged, so the counter and the lines always
+	// agree: here for the url-path and blob passes; for the snapshot pass,
+	// subJobRun.next counts at its first logged line, and runTick names the
+	// pass from snap.failureLogged before recordFailure, so a logged failure
+	// stays counted and named even when a shutdown lands in a later sub-job
+	// and recordFailure finds ctx ended (the controller's ruling on Task 5's
+	// review). A pass that only a shutdown stopped logged nothing and counts
+	// nothing; a write never started (notStarted) never reaches here.
+	failed := func(name string, err error) bool {
 		if !recordFailure(err) {
 			return false
 		}
 		g.cfg.Logger.Warn("gc_tick_failed", "err", err)
+		gcPassFailuresTotal.Inc(name)
+		failedPass(name)
 		return true
 	}
 
@@ -901,7 +960,7 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 			}
 			switch {
 			case err != nil: // passFailed moves the rotation to the snapshot pass
-				if !failed(err) {
+				if !failed("url_path", err) {
 					return res, firstErr
 				}
 			default: // drained, or its deadline saved the cursor: the tick goes on (issue #14)
@@ -925,6 +984,9 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 			res.deadlineReached = true
 			res.snapshotDeadlineReached = true
 		}
+		if snap.failureLogged { // counted by subJobRun.next as it logged it; named here whatever ctx says now
+			failedPass("snapshot")
+		}
 		switch {
 		case err != nil: // passFailed moves the rotation to the blob pass; the pass logged its failures
 			if !recordFailure(err) {
@@ -943,13 +1005,15 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 	res.blobDuration = time.Since(start)
 	res.blobsReaped += blob.count
 	res.bytesReclaimed += blob.bytes
+	res.representationRowsPruned += blob.pruned
+	res.representationPruneDuration += blob.pruneDuration
 	res.poolUnlinkErrors += blobUnlinkErrs
 	if blobDeadline {
 		res.deadlineReached = true
 	}
 	switch {
 	case err != nil: // the last pass: the tick ends either way
-		failed(err)
+		failed("blob", err)
 	case !blobDeadline:
 		g.nextPass = urlPathPass
 	}
@@ -957,10 +1021,17 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 	return res, firstErr
 }
 
-// blobResult bundles the blob pass's reap counts.
+// blobResult bundles the blob pass's reap counts and its representation
+// prune's outcome.
 type blobResult struct {
 	count int
 	bytes int64
+	// pruned and pruneDuration are the representation prune's: the dates
+	// it released and how long its call took, its wait for the writer
+	// included; both 0 when the pass ran no prune (issue #14 follow-up,
+	// Tier 1c).
+	pruned        int
+	pruneDuration time.Duration
 }
 
 // poolDir returns pool/<hash[:2]>/<hash> the way Cache.BlobPath does,

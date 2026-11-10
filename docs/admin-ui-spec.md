@@ -455,11 +455,15 @@ is `stale` (§9.1). The JSON keeps every field as stored.
 
 ### 4.6 GC and Recent Adoptions fields (phase H1)
 
-Two more fields, additive to the locked JSON contract as §4.5's are:
+More fields, additive to the locked JSON contract as §4.5's are (the
+last three since issue #14's follow-up, 1.1.0):
 
 | Field | Type | Meaning |
 |---|---|---|
 | `gc.retired_reaped` | int | Retired snapshots the last GC run deleted — those of reaped, forgotten and evicted suites, those the upgrade's trust audit quarantined, and the displaced snapshots beyond `gc.keep_displaced` a startup or periodic run retired (spec C9, sub-job C) — beside `displaced_reaped`; the GC panel shows it as *Retired reaped*. A displaced snapshot a startup or periodic run retires counts twice: in `displaced_reaped` when it is retired, and here when it is deleted, normally by the same run (the startup run retired and deleted them in one go until issue #14's follow-up: it no longer deletes them itself). The startup run deletes the retired ones within its snapshot pass's share of `gc.max_tick_duration` (counted here, since 1.1.0's fix of issue #14), and leaves the rest to the retired runs (an hour after the start and hourly while some are left, when `gc.interval` is longer than an hour) and to the periodic runs; a retired run's count (INFO `gc_retired_run_complete`) is not a last-run figure and does not reach this field. |
+| `gc.last_run_failed_passes` | list of strings | The last GC run's passes that failed, in run order, each once: `url_path`, `snapshot`, `blob`; `[]` when none failed (never `null` in the full block; the pre-first-run block is still `last_run_unixtime` alone). A pass is listed when its failure was logged (WARN `gc_tick_failed`; a snapshot pass whose sub-jobs failed twice is listed once), even when a shutdown followed; a pass that only a shutdown stopped, or that reached its deadline (a write the database never started in time included), did not fail. The GC panel shows it as *Failed passes*, a `.b--crit` badge per pass (`.b--ok` "none" when empty), and the GC vital is `crit` while it is not empty (§9.1). A retired run's failure and a failed startup pool scan never reach it (neither writes a last-run summary); `acu_gc_pass_failures_total{pass}` counts them all (`retired`, `pool_scan` too). |
+| `gc.last_run_displaced_package_rows_deleted` | int | The `package_hash` rows of displaced snapshots the last GC run's sub-job D deleted (the snapshots' headers and index files stay); the GC panel shows it as *Package rows stripped*. A retired run's count (`gc_retired_run_complete`) does not reach it. |
+| `gc.last_run_representation_rows_pruned` | int | The stored upstream dates (`representation_metadata` rows) no URL or snapshot owns any more that the last GC run's blob pass released, at most 10,000 a run; the GC panel shows it as *Representation rows pruned*. |
 | `recent_adoptions[].scheme` | string | The adopted suite's canonical scheme, `http` or `https`; the Recent Adoptions table's Host cell shows `scheme://host`, as the Suites table does. Empty for an event recorded without one. |
 
 A Recent Adoptions row's duration is the attempt's wall-clock time,
@@ -1163,7 +1167,7 @@ rules; both reference this section.
 | CACHE     | `.GC.PoolUnlinkErrors > 0`                                   | `.Cache.ZeroRefcountBacklog > 1000`                              | `.Cache.BytesUsed == 0`                |
 | SUITES    | any suite's lag exceeds 24h                                  | any suite's lag exceeds 1h, an adoption is failing, or a refusal is older than 24h | `len .Suites == 0`, or adoption disabled |
 | ADOPTIONS | non-success rate ≥ 50%                                       | non-success rate ≥ 10%                                           | ring buffer empty (uptime <5m)         |
-| GC        | (none since issue #14; see below)                            | `.GC.LastRunDeadlineReached` true on the last run, or last run older than `2 × .GCIntervalSeconds` (wrapper) | `.GC.LastRunUnixTime == nil`           |
+| GC        | `.GC.LastRunFailedPasses` not empty (since issue #14's follow-up; see below) | `.GC.LastRunDeadlineReached` true on the last run, or last run older than `2 × .GCIntervalSeconds` (wrapper) | `.GC.LastRunUnixTime == nil`           |
 | ACTIVE    | (no crit threshold defined; reserved)                        | (no warn threshold; reserved)                                    | no active hosts and uptime <5m         |
 
 **GC (issue #14, 1.1.0).** A reached deadline was this cell's crit. Since
@@ -1172,10 +1176,20 @@ ends the run: the passes after it run, the blob pass included, so a busy
 cache reports a reached deadline in steady state while it frees disk. It is
 warn (the verdict reads WATCHING), and the GC panel's *Deadline reached*
 badge is `.b--warn`, with a tooltip naming the failure sign to watch
-instead: *Blobs reaped* staying 0 run after run. No GC state is crit: a
-failed pass has no status field (WARN `gc_tick_failed` is its sign), a GC
-that never ran is stale and one that stopped running warns; pool unlink
-errors are the CACHE cell's crit.
+instead: *Blobs reaped* staying 0 run after run. A failed pass is crit
+(DEGRADED): since issue #14's follow-up (the maintainer's decision of
+2026-11-09, which reverses this section's earlier "no GC state is crit")
+the last run's failed passes are in `gc.last_run_failed_passes` (§4.6),
+and the cell is crit while that list is not empty, with or without a
+reached deadline; the GC panel's *Failed passes* row shows a `.b--crit`
+badge per pass. The accepted cost: a transient failure reads crit until
+the next periodic run or start replaces the last-run summary (up to
+`gc.interval`); a retired run's failure never reaches it (WARN
+`gc_tick_failed` and `acu_gc_pass_failures_total{pass="retired"}` are its
+signs). A GC that never ran is stale and one that stopped running warns;
+pool unlink errors are the CACHE cell's crit. The client-side verdict (§8.1)
+needs no change: it reads the cells' `data-state`, which `vitalState()`
+sets.
 
 **SUITES (phase B; replaces the two-stamp comparison this row originally
 described).** Lag runs from the first time the cache saw upstream's new

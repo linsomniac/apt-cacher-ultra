@@ -20,6 +20,11 @@ type snapshotPassResult struct {
 	// packageRowsStripped counts the package_hash rows of displaced
 	// snapshots sub-job D deleted (issue #14 follow-up, Tier 2).
 	packageRowsStripped int
+	// failureLogged: a sub-job's failure was logged (WARN gc_tick_failed)
+	// and counted (subJobRun.next), so runTick names the pass in
+	// FailedPasses, even when a shutdown followed (issue #14 follow-up,
+	// Tier 1c).
+	failureLogged bool
 }
 
 // runSnapshotPass implements SPEC4 §9.6.3: a per-tick batched reap
@@ -149,22 +154,25 @@ func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase stri
 	// Every write of the pass, A ∪ B's batches and C's and D's chunks, must
 	// start by the deadline (issue #14 Tier 1a: notStarted's AIDEV-NOTE).
 	wctx := cache.WithWriteStartDeadline(ctx, deadline)
-	sj := subJobRun{g: g, ctx: ctx}
+	sj := subJobRun{g: g, ctx: ctx, pass: "snapshot"}
 
 	hit, err := g.runSubJobsAB(wctx, dl, &acc.batch, &batchesRun)
 	if !sj.next(hit, err) {
+		acc.failureLogged = sj.failureLogged
 		return acc, hit, sj.firstErr
 	}
 	// Sub-job C, at a start too (ruling PF-15 re-ruled, issue #14).
 	retired, hit, err := g.runSubJobC(wctx, dl, &batchesRun)
 	acc.retired += retired
 	if !sj.next(hit, err) {
+		acc.failureLogged = sj.failureLogged
 		return acc, hit, sj.firstErr
 	}
 	// Sub-job D, last: C frees disk (its snapshots' blobs), D only rows.
 	stripped, hit, err := g.runSubJobD(wctx, dl, &batchesRun)
 	acc.packageRowsStripped += stripped
 	sj.next(hit, err)
+	acc.failureLogged = sj.failureLogged
 	return acc, hit, sj.firstErr
 }
 
@@ -220,17 +228,28 @@ func (g *GC) runSubJobsAB(ctx context.Context, dl snapshotPassDeadline, acc *cac
 // fail), stops the sub-jobs after it. The pass still returns its first
 // failure, so runTick counts the pass as failed (passFailed moves the
 // rotation) without logging it again (runTick's recordFailure, which every
-// failed pass goes through, logged or not: the place for a per-pass failure
-// count).
+// failed pass goes through, logged or not). Updated 2026-11-09 (issue #14
+// follow-up Tier 1c): the per-pass failure count is here, not in
+// recordFailure, at the first line next logs (failureLogged), so it counts
+// one per failed pass or run however many sub-jobs failed, and exactly the
+// failures that were logged: one logged before a shutdown still counts, and
+// one a shutdown caused (no line) never does.
 type subJobRun struct {
-	g        *GC
-	ctx      context.Context // the pass's ctx, not its wctx
+	g   *GC
+	ctx context.Context // the pass's ctx, not its wctx
+	// pass is the acu_gc_pass_failures_total label: "snapshot" or
+	// "retired".
+	pass     string
 	firstErr error
+	// failureLogged: next logged a gc_tick_failed line, and counted the
+	// pass's failure once.
+	failureLogged bool
 }
 
 // next takes a sub-job that returned (deadlineHit, err) and reports whether
-// the next sub-job runs: after a failure, logged here while ctx lives, yes;
-// at the deadline or once ctx has ended (a shutdown), no.
+// the next sub-job runs: after a failure, logged (and, the first, counted)
+// here while ctx lives, yes; at the deadline or once ctx has ended (a
+// shutdown), no.
 func (s *subJobRun) next(deadlineHit bool, err error) bool {
 	if err != nil && s.firstErr == nil {
 		s.firstErr = err
@@ -240,6 +259,10 @@ func (s *subJobRun) next(deadlineHit bool, err error) bool {
 	}
 	if err != nil {
 		s.g.cfg.Logger.Warn("gc_tick_failed", "err", err)
+		if !s.failureLogged {
+			s.failureLogged = true
+			gcPassFailuresTotal.Inc(s.pass)
+		}
 		return true
 	}
 	return !deadlineHit
@@ -421,7 +444,9 @@ func (g *GC) retiredRun(ctx context.Context) (backlog bool) {
 	// logs no gc_tick_failed then, and runs no D). Since 2026-11-09 (issue
 	// #14 follow-up Tier 2) a failed C no longer ends the run: D runs after
 	// it (subJobRun's AIDEV-NOTE), and each logs its own line.
-	sj := subJobRun{g: g, ctx: ctx}
+	// A failed run counts once, pass="retired", as next logs its first
+	// failure; it reaches no last-run summary (issue #14 follow-up Tier 1c).
+	sj := subJobRun{g: g, ctx: ctx, pass: phaseRetired}
 	retired, deadlineHit, err := g.runSubJobC(wctx, dl, &batchesRun)
 	var stripped int
 	if sj.next(deadlineHit, err) {

@@ -109,6 +109,31 @@ var (
 		0,
 	)
 
+	// gcPassFailuresTotal counts the failed passes, one per pass per run
+	// however many of its sub-jobs failed, where their WARN gc_tick_failed
+	// is logged (issue #14 follow-up, Tier 1c): pass is url_path, snapshot
+	// or blob (runTick, at a start and in a periodic tick), retired
+	// (retiredRun) or pool_scan (StartupPass's pool scan, which logs no
+	// gc_tick_failed: main logs its error as the startup pass's failure).
+	//
+	// AIDEV-NOTE: a failure that was logged is counted, even when a
+	// shutdown lands later in the same pass or run (the controller's
+	// ruling on Task 5's review, 2026-11-09); a pass that only a shutdown
+	// stopped logged nothing, did not fail, and is not counted, nor is a
+	// write the writer never started before its deadline (notStarted).
+	gcPassFailuresTotal = metrics.NewCounterWithCap(
+		"acu_gc_pass_failures_total",
+		"Total GC passes that failed, logged as WARN gc_tick_failed (one per pass per run, however many of its sub-jobs failed) or, for pool_scan, returned by the startup pool scan; by pass: url_path, snapshot, blob, retired, pool_scan.",
+		metrics.DefaultMaxSeries,
+		"pass",
+	)
+
+	gcRepresentationRowsPrunedTotal = metrics.NewCounterWithCap(
+		"acu_gc_representation_rows_pruned_total",
+		"Total stored upstream dates (representation_metadata rows) no URL or snapshot owns any more, released by the blob pass's once-a-run representation prune.",
+		0,
+	)
+
 	gcDeadlineReachedTotal = metrics.NewCounterWithCap(
 		"acu_gc_deadline_reached_total",
 		"Per-phase counter incremented when a tick exits early due to gc.max_tick_duration (SPEC5 §10.4.5).",
@@ -144,6 +169,9 @@ func emitGCPassMetrics(phase string, tick tickResult) {
 		{"url_path", tick.urlPathDuration},
 		{"snapshot", tick.snapshotDuration},
 		{"blob", tick.blobDuration},
+		// The blob pass's representation prune, inside its blob sample
+		// (issue #14 follow-up, Tier 1c); 0 when the pass ran no prune.
+		{"representation_prune", tick.representationPruneDuration},
 	} {
 		if p.duration > 0 {
 			gcPassDurationSeconds.Observe(p.duration.Seconds(), phase, p.name)
@@ -152,6 +180,9 @@ func emitGCPassMetrics(phase string, tick tickResult) {
 	gcURLPathRowsScannedTotal.Add(float64(tick.urlPath.scanned))
 	gcURLPathRowsStampedTotal.Add(float64(tick.urlPath.stamped))
 	gcURLPathRowsClearedTotal.Add(float64(tick.urlPath.cleared))
+	if tick.representationRowsPruned > 0 {
+		gcRepresentationRowsPrunedTotal.Add(float64(tick.representationRowsPruned))
+	}
 }
 
 // emitGCMetrics records all GC metrics for one gc_run_complete log

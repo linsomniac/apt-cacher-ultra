@@ -35,7 +35,8 @@ const representationPruneRows = 10_000
 // Returns:
 //   - the cumulative reap count (rows DELETEd this pass) and bytes
 //     reclaimed (from the DELETE's RETURNING clause; equals the sum
-//     of `blob.size` for the rows actually removed),
+//     of `blob.size` for the rows actually removed), and the
+//     representation prune's count and duration,
 //   - whether the deadline tripped (true means the pass exited
 //     between batches with backlog remaining, or at a batch the writer
 //     never started before the deadline, its start deadline (issue #14
@@ -88,9 +89,18 @@ func (g *GC) runBlobPass(ctx context.Context, deadline time.Time, phase string) 
 	// past it. A prune the writer never started before the deadline is no
 	// failure (never pruneErr): it never ran, and the batches' deadline
 	// check then ends the pass at its deadline.
+	//
+	// Its count and duration (its wait for the writer included) go to
+	// res.pruned and res.pruneDuration (issue #14 follow-up, Tier 1c):
+	// gc_run_complete's representation_rows_pruned and
+	// representation_prune_ms.
 	wctx := cache.WithWriteStartDeadline(ctx, deadline)
 	if ctx.Err() == nil && time.Now().Before(deadline) {
-		if _, err := g.store.PruneRepresentationMetadata(wctx, representationPruneRows); err != nil && !notStarted(err) {
+		pruneStart := time.Now()
+		pruned, err := g.store.PruneRepresentationMetadata(wctx, representationPruneRows)
+		res.pruneDuration = time.Since(pruneStart)
+		res.pruned = pruned
+		if err != nil && !notStarted(err) {
 			pruneErr = fmt.Errorf("representation metadata prune: %w", err)
 		}
 	}

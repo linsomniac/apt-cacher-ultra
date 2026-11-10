@@ -1218,7 +1218,18 @@ with `deadline_reached=true` (its `gc_run_complete` line,
 healthy steady state for a busy cache while a backlog drains; look further only
 when `acu_gc_blobs_reaped_total` also stays flat run after run, or the
 `gc_retired_run_complete` lines' `retired_reaped` stop adding up to what the
-periodic runs' `displaced_reaped` retire. `max_tick_duration` is checked
+periodic runs' `displaced_reaped` retire. A pass that fails is not a steady
+state: it logs WARN `gc_tick_failed`, counts in
+`acu_gc_pass_failures_total{pass}` (`url_path`, `snapshot`, `blob`, the
+hourly `retired` run, or the startup `pool_scan`), and a startup or periodic
+run lists it in the status page's *Failed passes*, which turns the GC vital
+crit (DEGRADED) until a run in which no pass fails; alert on
+`increase(acu_gc_pass_failures_total[1d]) > 0`. The blob pass's
+representation prune reports its rows in `representation_rows_pruned`
+(`acu_gc_representation_rows_pruned_total`, the status page's
+*Representation rows pruned*) and its time in `representation_prune_ms`
+(`acu_gc_pass_duration_seconds{pass="representation_prune"}`).
+`max_tick_duration` is checked
 between batches and does not interrupt a running batch or bound the startup
 orphan-file scan: a batch that waits long for the database (behind adoptions,
 say) can use up the later passes' shares. A blob pass left no time does no

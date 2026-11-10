@@ -162,6 +162,42 @@ func TestGoldenGCDeadlineReachedIsNotAFailure(t *testing.T) {
 	mustContain(t, renderHTMLForGolden(t, newHealthyModel()), `<span class="b b--ok">false</span>`)
 }
 
+// Issue #14 follow-up Tier 1c: the GC panel shows the last run's failed
+// passes, a crit badge each ("none", ok, when none failed), the package
+// rows sub-job D stripped and the representation rows the prune released;
+// a failed pass makes the GC vital crit (the maintainer, 2026-11-09),
+// where a reached deadline alone warns.
+func TestGoldenGCShowsFailedPassesAndPrune(t *testing.T) {
+	m := newHealthyModel()
+	gc := *m.GC
+	gc.LastRunFailedPasses = []string{"url_path", "blob"}
+	gc.LastRunDisplacedPackageRowsDeleted = 70123
+	gc.LastRunRepresentationRowsPruned = 456
+	m.GC = &gc
+	html := renderHTMLForGolden(t, m)
+	mustContain(t, html,
+		`data-vital="gc" data-state="crit"`,
+		`<div class="k">Failed passes</div>`,
+		`<span class="b b--crit" title="This pass failed on the last run: see WARN gc_tick_failed in the log.`,
+		`>url_path</span>`,
+		`>blob</span>`,
+		`<div class="k">Package rows stripped</div>`,
+		`<code>70123</code>`,
+		`<div class="k">Representation rows pruned</div>`,
+		`<code>456</code>`,
+	)
+
+	healthy := renderHTMLForGolden(t, newHealthyModel())
+	mustContain(t, healthy,
+		`data-vital="gc" data-state="ok"`,
+		`<div class="k">Failed passes</div>`,
+		`<span class="b b--ok">none</span>`,
+	)
+	if strings.Contains(healthy, `title="This pass failed on the last run`) {
+		t.Error("a run with no failed pass renders a failed-pass badge")
+	}
+}
+
 // TestGoldenMemberFetchFailedShowsMember verifies the redesigned
 // adoptions row surfaces the failing member path + detail for a
 // member_fetch_failed outcome — the operator-facing "why did adoption

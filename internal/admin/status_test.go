@@ -420,6 +420,47 @@ func TestVitalState(t *testing.T) {
 			},
 			"gc", "warn",
 		},
+		// Issue #14 follow-up Tier 1c (the maintainer, 2026-11-09): a
+		// failed pass on the last run is crit, with or without a reached
+		// deadline (which alone stays warn, above); a GC that never ran is
+		// still stale.
+		{
+			"gc_crit_failed_pass",
+			func(m *htmlRenderModel) {
+				m.GC = &gcInfo{
+					LastRunUnixTime:     ptrI64(1_000_003_500),
+					LastRunFailedPasses: []string{"blob"},
+				}
+			},
+			"gc", "crit",
+		},
+		{
+			"gc_crit_failed_pass_beside_a_reached_deadline",
+			func(m *htmlRenderModel) {
+				m.GC = &gcInfo{
+					LastRunUnixTime:        ptrI64(1_000_003_500),
+					LastRunDeadlineReached: true,
+					LastRunFailedPasses:    []string{"url_path", "snapshot"},
+				}
+			},
+			"gc", "crit",
+		},
+		{
+			"gc_warn_deadline_reached_no_failure",
+			func(m *htmlRenderModel) {
+				m.GC = &gcInfo{
+					LastRunUnixTime:        ptrI64(1_000_003_500),
+					LastRunDeadlineReached: true,
+					LastRunFailedPasses:    []string{},
+				}
+			},
+			"gc", "warn",
+		},
+		{
+			"gc_stale_no_run_despite_failed_passes",
+			func(m *htmlRenderModel) { m.GC = &gcInfo{LastRunFailedPasses: []string{"blob"}} },
+			"gc", "stale",
+		},
 		{
 			"gc_stale_no_run_despite_deadline_flag",
 			func(m *htmlRenderModel) { m.GC = &gcInfo{LastRunDeadlineReached: true} },

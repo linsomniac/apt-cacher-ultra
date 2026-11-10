@@ -2,10 +2,12 @@ package admin
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -73,6 +75,54 @@ func TestJSONContractPreserved(t *testing.T) {
 			if strings.Contains(body, leaked) {
 				t.Errorf("HTML-only field %q leaked into JSON wire shape", leaked)
 			}
+		}
+	})
+
+	// Issue #14 follow-up Tier 1c (additive): the full gc block carries
+	// last_run_failed_passes (a list, [] when none failed, never null),
+	// last_run_displaced_package_rows_deleted and
+	// last_run_representation_rows_pruned; the abbreviated pre-first-run
+	// form still carries last_run_unixtime alone (SPEC5 §10.5 / §11).
+	t.Run("gc_failed_passes_and_prune_fields", func(t *testing.T) {
+		gcBlock := func(t *testing.T, m statusModel) map[string]any {
+			t.Helper()
+			var buf bytes.Buffer
+			if err := writeStatusJSON(&buf, m); err != nil {
+				t.Fatalf("writeStatusJSON: %v", err)
+			}
+			var doc struct {
+				GC map[string]any `json:"gc"`
+			}
+			if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			return doc.GC
+		}
+		full := gcBlock(t, populatedJSONContractFixture())
+		for key, want := range map[string]any{
+			"last_run_failed_passes":                  []any{"snapshot"},
+			"last_run_displaced_package_rows_deleted": float64(70_000),
+			"last_run_representation_rows_pruned":     float64(5),
+		} {
+			if got, ok := full[key]; !ok || !reflect.DeepEqual(got, want) {
+				t.Errorf("gc.%s = %#v (present %v), want %#v", key, got, ok, want)
+			}
+		}
+
+		none := populatedJSONContractFixture()
+		gci := *none.GC
+		gci.LastRunFailedPasses = nil
+		none.GC = &gci
+		if got := gcBlock(t, none)["last_run_failed_passes"]; !reflect.DeepEqual(got, []any{}) {
+			t.Errorf("gc.last_run_failed_passes with no failed pass = %#v, want []", got)
+		}
+
+		short := gcBlock(t, minimalJSONContractFixture())
+		if len(short) != 1 {
+			t.Errorf("abbreviated gc block %v, want last_run_unixtime alone", short)
+		}
+		if v, ok := short["last_run_unixtime"]; !ok || v != nil {
+			t.Errorf("abbreviated gc.last_run_unixtime = %v (present %v), want null", v, ok)
 		}
 	})
 
@@ -279,6 +329,10 @@ func populatedJSONContractFixture() statusModel {
 			PoolOrphansRepaired:     0,
 			PoolOrphanBytesRepaired: 0,
 			PoolUnlinkErrors:        0,
+			// Issue #14 follow-up Tier 1c (additive).
+			LastRunFailedPasses:                []string{"snapshot"},
+			LastRunDisplacedPackageRowsDeleted: 70_000,
+			LastRunRepresentationRowsPruned:    5,
 		},
 		HotURLPaths: []hotURLEntry{
 			{

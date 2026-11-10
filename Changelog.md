@@ -69,6 +69,14 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   `displaced_package_rows_deleted` field of `gc_run_complete` and
   `gc_retired_run_complete`: displaced snapshots' package-list rows GC
   deleted (issue #14).
+- GC failures and work are visible (issue #14): the counters
+  `acu_gc_pass_failures_total{pass}` and
+  `acu_gc_representation_rows_pruned_total`, `gc_run_complete`'s
+  `representation_rows_pruned` and `representation_prune_ms`, and the status
+  JSON's `gc.last_run_failed_passes`, `gc.last_run_displaced_package_rows_deleted`
+  and `gc.last_run_representation_rows_pruned` (GC panel rows); a failed pass
+  turns the GC vital crit (DEGRADED). Alert:
+  `increase(acu_gc_pass_failures_total[1d]) > 0`.
 - Tests: `make e2e-flat` (real apt clients on six Debian and Ubuntu images,
   in CI) and `make e2e-live` (a manual smoke against live vendors).
 - `make e2e-apt-oracle` and `make e2e-apt-oracle-old`: check that the real
