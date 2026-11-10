@@ -663,13 +663,19 @@ table.usage-table tbody th{display:block;padding:3px 0 6px;border-bottom:0}
           <div class="v"><code>{{.GC.DisplacedReaped}}</code></div>
           <div class="k">Retired reaped</div>
           <div class="v"><code>{{.GC.RetiredReaped}}</code></div>
+          <div class="k">Package rows stripped</div>
+          <div class="v"><code>{{.GC.LastRunDisplacedPackageRowsDeleted}}</code></div>
+          <div class="k">Representation rows pruned</div>
+          <div class="v"><code>{{.GC.LastRunRepresentationRowsPruned}}</code></div>
           <div class="k">Pool orphans repaired</div>
           <div class="v"><code>{{.GC.PoolOrphansRepaired}}</code> <span class="muted">({{formatBytes .GC.PoolOrphanBytesRepaired}})</span></div>
           <div class="k">Pool unlink errors</div>
           <div class="v"><code>{{.GC.PoolUnlinkErrors}}</code></div>
           <div class="k">Deadline reached</div>
-          {{/* AIDEV-NOTE: issue #14 (the hardening plan's Task 8). Since a pass that reaches its deadline no longer ends the run, a reached deadline is a busy cache's steady state while it drains a backlog, not a failure: warn, with the tooltip; Blobs reaped staying 0 is the failure sign. The GC vital warns on it too (vitalState, the controller's ruling of 2026-11-05). */}}
+          {{/* AIDEV-NOTE: issue #14 (the hardening plan's Task 8). Since a pass that reaches its deadline no longer ends the run, a reached deadline is a busy cache's steady state while it drains a backlog, not a failure: warn, with the tooltip; Blobs reaped staying 0 is the failure sign. The GC vital warns on it too (vitalState, the controller's ruling of 2026-11-05). Updated 2026-11-09 (issue #14 follow-up Tier 1c, the maintainer's decision): a failed pass now has its own row, Failed passes below, a b--crit badge per pass, and makes the GC vital crit (vitalState), with or without a reached deadline, which alone stays warn. */}}
           <div class="v">{{if .GC.LastRunDeadlineReached}}<span class="b b--warn" title="The last run stopped a pass at its share of gc.max_tick_duration. The passes after it still ran, and the rest resumes at the next run (retired snapshots hourly): normal while a busy cache drains a backlog. Look further only if Blobs reaped stays 0 run after run.">true</span>{{else}}<span class="b b--ok">false</span>{{end}}</div>
+          <div class="k">Failed passes</div>
+          <div class="v">{{range .GC.LastRunFailedPasses}}<span class="b b--crit" title="This pass failed on the last run: see WARN gc_tick_failed in the log. The passes after it still ran; GC retries it at the next run, and this stays until a run in which it does not fail.">{{.}}</span> {{else}}<span class="b b--ok">none</span>{{end}}</div>
         </div>
         {{else}}<div class="empty"><div class="empty__head">NO GC RUN YET</div><div class="empty__body">GC has not completed since process start.</div></div>{{end}}
       </section>

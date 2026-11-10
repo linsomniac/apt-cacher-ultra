@@ -43,7 +43,7 @@ func TestRunSnapshotGCBatch_KeepsAuditDeferredSignedHistory(t *testing.T) {
 			if err := c.CheckUnsignedDowngrade(ctx, "h", "/r/dists/x"); !errors.Is(err, ErrUnsignedDowngradeRefused) {
 				t.Fatalf("premise: CheckUnsignedDowngrade = %v, want refused by the displaced snapshot", err)
 			}
-			res, err := c.RunSnapshotGCBatch(ctx, 100, 0, 0, false)
+			res, err := c.RunSnapshotGCBatch(ctx, 100, 0, 0)
 			if err != nil || res.DisplacedReaped != 0 || res.OrphanReaped != 0 {
 				t.Fatalf("RunSnapshotGCBatch(keep_displaced 0) = %+v, %v; want nothing reaped", res, err)
 			}
@@ -77,7 +77,7 @@ func TestRunSnapshotGCBatch_KeepsTheAuditsVerdict(t *testing.T) {
 		if _, err := c.ApplyLegacyAuditDecisions(ctx, []LegacyAuditDecision{{SnapshotID: id, Outcome: LegacyAuditKeep}}); err != nil {
 			t.Fatal(err)
 		}
-		if res, err := c.RunSnapshotGCBatch(ctx, 100, 0, 0, true); err != nil || res.DisplacedReaped != 1 {
+		if res, err := c.RunSnapshotGCBatch(ctx, 100, 0, 0); err != nil || res.DisplacedReaped != 1 {
 			t.Fatalf("after Keep: RunSnapshotGCBatch = %+v, %v; want it retired", res, err)
 		}
 		assertRetired(t, c, []int64{id}, nil)
@@ -100,7 +100,7 @@ func TestRunSnapshotGCBatch_KeepsTheAuditsVerdict(t *testing.T) {
 		if _, err := c.ApplyLegacyAuditDecisions(ctx, []LegacyAuditDecision{{SnapshotID: id, Outcome: LegacyAuditQuarantine}}); err != nil {
 			t.Fatal(err)
 		}
-		if res, err := c.RunSnapshotGCBatch(ctx, 100, 0, 0, false); err != nil || res.DisplacedReaped != 0 {
+		if res, err := c.RunSnapshotGCBatch(ctx, 100, 0, 0); err != nil || res.DisplacedReaped != 0 {
 			t.Fatalf("a retired snapshot: RunSnapshotGCBatch = %+v, %v; want nothing (sub-job C's)", res, err)
 		}
 		if n, more, err := c.RunRetiredSnapshotGCChunk(ctx, 0); err != nil || n != 1 || !more || snapshotExists(t, c, id) {
@@ -152,7 +152,7 @@ func TestRunSnapshotGCBatch_AQueuedSnapshotTakesNoKeepSlot(t *testing.T) {
 	oldest := seedDisplacedAt(t, c, key, evictNow-3000, false)
 	older := seedDisplacedAt(t, c, key, evictNow-2000, false)
 	queued := seedDisplacedAt(t, c, key, evictNow-1000, true)
-	if res, err := c.RunSnapshotGCBatch(ctx, 100, 0, 1, true); err != nil || res.DisplacedReaped != 1 {
+	if res, err := c.RunSnapshotGCBatch(ctx, 100, 0, 1); err != nil || res.DisplacedReaped != 1 {
 		t.Fatalf("RunSnapshotGCBatch(keep_displaced 1) = %+v, %v; want one retired", res, err)
 	}
 	assertRetired(t, c, []int64{oldest}, []int64{older, queued})
@@ -161,7 +161,7 @@ func TestRunSnapshotGCBatch_AQueuedSnapshotTakesNoKeepSlot(t *testing.T) {
 		t.Fatalf("kept: oldest %v, older %v, queued %v; want older and queued (the queued one takes no slot)",
 			snapshotExists(t, c, oldest), snapshotExists(t, c, older), snapshotExists(t, c, queued))
 	}
-	if res, err := c.RunSnapshotGCBatch(ctx, 100, 0, 0, true); err != nil || res.DisplacedReaped != 1 {
+	if res, err := c.RunSnapshotGCBatch(ctx, 100, 0, 0); err != nil || res.DisplacedReaped != 1 {
 		t.Fatalf("RunSnapshotGCBatch(keep_displaced 0) = %+v, %v; want the unqueued one retired", res, err)
 	}
 	assertRetired(t, c, []int64{older}, []int64{queued})

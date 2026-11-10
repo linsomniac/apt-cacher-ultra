@@ -7,6 +7,8 @@ import (
 	"io/fs"
 	"os"
 	"time"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
 
 // representationPruneRows is the most stored upstream dates one tick's
@@ -33,10 +35,12 @@ const representationPruneRows = 10_000
 // Returns:
 //   - the cumulative reap count (rows DELETEd this pass) and bytes
 //     reclaimed (from the DELETE's RETURNING clause; equals the sum
-//     of `blob.size` for the rows actually removed),
+//     of `blob.size` for the rows actually removed), and the
+//     representation prune's count and duration,
 //   - whether the deadline tripped (true means the pass exited
-//     between batches with backlog remaining; the next tick picks
-//     up the rest),
+//     between batches with backlog remaining, or at a batch the writer
+//     never started before the deadline, its start deadline (issue #14
+//     Tier 1a: notStarted); the next tick picks up the rest),
 //   - the count of os.Remove errors (other than ErrNotExist) — fed
 //     into gc_run_complete.pool_unlink_errors,
 //   - error iff a DB-level failure occurred (ctx cancellation alone
@@ -78,12 +82,46 @@ func (g *GC) runBlobPass(ctx context.Context, deadline time.Time, phase string) 
 	// ruling HD-15), unless a batch fails too, whose error it then is. So a
 	// failed prune moves the rotation as a failed blob pass does, even when
 	// the batches stopped at their deadline.
+	//
+	// Since 2026-11-09 (issue #14 Tier 1a, G2-RR1-M1) the prune and the
+	// batches must also start by the pass's deadline (notStarted's
+	// AIDEV-NOTE), so a prune queued behind a busy writer no longer runs
+	// past it. A prune the writer never started before the deadline is no
+	// failure (never pruneErr): it never ran, and the batches' deadline
+	// check then ends the pass at its deadline.
+	//
+	// Its count and duration (its wait for the writer included) go to
+	// res.pruned and res.pruneDuration (issue #14 follow-up, Tier 1c):
+	// gc_run_complete's representation_rows_pruned and
+	// representation_prune_ms. Updated 2026-11-09 (the final review's M-2):
+	// a prune the writer never started (notStarted) records no duration,
+	// so its wait behind the writer, the whole of what it spent, is
+	// neither a representation_prune_ms nor a pass="representation_prune"
+	// sample of 0 rows; it stays in the blob pass's own duration.
+	wctx := cache.WithWriteStartDeadline(ctx, deadline)
 	if ctx.Err() == nil && time.Now().Before(deadline) {
-		if _, err := g.store.PruneRepresentationMetadata(ctx, representationPruneRows); err != nil {
+		pruneStart := time.Now()
+		pruned, err := g.store.PruneRepresentationMetadata(wctx, representationPruneRows)
+		if !notStarted(err) {
+			res.pruneDuration = time.Since(pruneStart)
+		}
+		res.pruned = pruned
+		if err != nil && !notStarted(err) {
 			pruneErr = fmt.Errorf("representation metadata prune: %w", err)
 		}
 	}
 
+	// reached is the pass's deadline branch: between batches, and for a
+	// batch the writer never started before the deadline (notStarted).
+	reached := func() (blobResult, bool, int, error) {
+		g.cfg.Logger.Info("gc_tick_deadline_reached",
+			"phase", phase,
+			"which", "blob",
+			"batches_completed", batchesRun,
+			"bytes_reclaimed_this_tick", bytesThisTick,
+		)
+		return res, true, unlinkErrors, pruneErr
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			// Cooperative cancel — return what we have; not an error
@@ -92,16 +130,13 @@ func (g *GC) runBlobPass(ctx context.Context, deadline time.Time, phase string) 
 			return res, false, unlinkErrors, nil
 		}
 		if !time.Now().Before(deadline) {
-			g.cfg.Logger.Info("gc_tick_deadline_reached",
-				"phase", phase,
-				"which", "blob",
-				"batches_completed", batchesRun,
-				"bytes_reclaimed_this_tick", bytesThisTick,
-			)
-			return res, true, unlinkErrors, pruneErr
+			return reached()
 		}
 
-		reaped, err := g.cfg.Cache.RunBlobGCBatch(ctx, g.cfg.BatchSize, graceSeconds)
+		reaped, err := g.cfg.Cache.RunBlobGCBatch(wctx, g.cfg.BatchSize, graceSeconds)
+		if notStarted(err) {
+			return reached() // the batch never ran: nothing to unlink
+		}
 		if err != nil {
 			// A DB error on one batch surfaces and the pass exits.
 			// Subsequent ticks will retry. Don't try to keep going

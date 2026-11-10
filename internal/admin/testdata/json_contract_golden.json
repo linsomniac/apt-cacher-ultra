@@ -151,7 +151,12 @@
     "url_path_rows_reaped": 0,
     "pool_orphans_repaired": 0,
     "pool_orphan_bytes_repaired": 0,
-    "pool_unlink_errors": 0
+    "pool_unlink_errors": 0,
+    "last_run_failed_passes": [
+      "snapshot"
+    ],
+    "last_run_displaced_package_rows_deleted": 70000,
+    "last_run_representation_rows_pruned": 5
   },
   "hot_url_paths": [
     {

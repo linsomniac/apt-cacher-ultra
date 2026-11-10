@@ -27,13 +27,19 @@ import (
 // none (or panic, chunkPanics, or fail, chunkErrs), and whose HashKnown
 // knows no hash and panics for hashPanic. A batch or chunk call checks
 // for its panic first, then calls its hook (batchHook, chunkHook), then
-// fails or answers. Its url-path batches are the real cache's (storeGC
-// gives it the cache: useCache), each taking urlSleep first.
+// fails or answers. Its sub-job D chunks strip fakeDChunkRows rows and
+// report more for dChunksMore calls and then none (or fail, dChunkErrs, or
+// are never started, dChunkNotStarted: cache.ErrWriteNotStarted). calls
+// records the snapshot pass's store calls in order: "batch", "C", "D". Its
+// url-path batches are the real cache's (storeGC gives it the cache:
+// useCache), each taking urlSleep once its real batch has run, unless told
+// to fail (urlErrs).
 type fakeStore struct {
 	mu          sync.Mutex
 	cache       *cache.Cache  // the url-path batches' (useCache)
-	urlSleep    time.Duration // each url-path batch takes this long first (virtual time in a bubble)
+	urlSleep    time.Duration // each url-path batch takes this long once its real batch has run (virtual time in a bubble)
 	urlBatches  int           // RunURLPathGCBatch calls
+	urlErrs     bool          // RunURLPathGCBatch fails (its real batch never runs)
 	prunes      int           // PruneRepresentationMetadata calls (delegated to cache)
 	pruneErrs   bool          // PruneRepresentationMetadata fails
 	batchPanics int           // RunSnapshotGCBatch panics on this many first calls
@@ -47,7 +53,20 @@ type fakeStore struct {
 	chunkErrs   bool   // RunRetiredSnapshotGCChunk fails
 	chunkHook   func() // called on every RunRetiredSnapshotGCChunk call that does not panic, before it fails or answers; runs under f.mu: it must not call the fake
 	hashPanic   string
+
+	dChunks          int           // RunDisplacedPackageHashChunk calls
+	dChunkRows       []int         // maxRows of each RunDisplacedPackageHashChunk call
+	dChunksMore      int           // the first dChunksMore D calls strip fakeDChunkRows rows each and report more
+	dChunkErrs       bool          // RunDisplacedPackageHashChunk fails
+	dChunkNotStarted bool          // RunDisplacedPackageHashChunk returns cache.ErrWriteNotStarted (its start deadline)
+	dChunkSleep      time.Duration // each D chunk takes this long (virtual time in a bubble)
+
+	calls []string // "batch", "C", "D": the snapshot pass's store calls, in order
 }
+
+// fakeDChunkRows is the package_hash rows each of fakeStore's D chunks that
+// reports more strips: not 1, so a count of rows is not a count of calls.
+const fakeDChunkRows = 7
 
 // useCache is storeGC's: the url-path batches go to c.
 func (f *fakeStore) useCache(c *cache.Cache) { f.cache = c }
@@ -55,11 +74,19 @@ func (f *fakeStore) useCache(c *cache.Cache) { f.cache = c }
 func (f *fakeStore) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds, holdSeconds int64, maxVersions int,
 	afterScheme, afterHost, afterPath string,
 ) (cache.URLPathGCBatchResult, error) {
-	time.Sleep(f.urlSleep)
 	f.mu.Lock()
 	f.urlBatches++
+	fail := f.urlErrs
 	f.mu.Unlock()
-	return f.cache.RunURLPathGCBatch(ctx, batchSize, ttlSeconds, holdSeconds, maxVersions, afterScheme, afterHost, afterPath)
+	if fail {
+		return cache.URLPathGCBatchResult{}, errors.New("url-path fault")
+	}
+	// The batch runs, then takes urlSleep: a started batch that runs long.
+	// A sleep before the call would model a wait in the writer's queue,
+	// which the pass's start deadline now cuts short (issue #14 Tier 1a).
+	res, err := f.cache.RunURLPathGCBatch(ctx, batchSize, ttlSeconds, holdSeconds, maxVersions, afterScheme, afterHost, afterPath)
+	time.Sleep(f.urlSleep)
+	return res, err
 }
 
 func (f *fakeStore) PruneRepresentationMetadata(ctx context.Context, limit int) (int, error) {
@@ -73,9 +100,10 @@ func (f *fakeStore) PruneRepresentationMetadata(ctx context.Context, limit int) 
 	return f.cache.PruneRepresentationMetadata(ctx, limit)
 }
 
-func (f *fakeStore) RunSnapshotGCBatch(context.Context, int, int64, int, bool) (cache.SnapshotGCBatchResult, error) {
+func (f *fakeStore) RunSnapshotGCBatch(context.Context, int, int64, int) (cache.SnapshotGCBatchResult, error) {
 	f.mu.Lock()
 	f.batches++
+	f.calls = append(f.calls, "batch")
 	n := f.batches
 	f.mu.Unlock()
 	if n <= f.batchPanics {
@@ -94,6 +122,7 @@ func (f *fakeStore) RunRetiredSnapshotGCChunk(_ context.Context, maxRows int) (i
 	time.Sleep(f.chunkSleep)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.calls = append(f.calls, "C")
 	if f.chunkPanics {
 		panic("retired chunk bug")
 	}
@@ -109,6 +138,27 @@ func (f *fakeStore) RunRetiredSnapshotGCChunk(_ context.Context, maxRows int) (i
 	}
 	if len(f.chunkRows) <= f.chunksMore {
 		return 1, true, nil
+	}
+	return 0, false, nil
+}
+
+func (f *fakeStore) RunDisplacedPackageHashChunk(_ context.Context, maxRows int) (int, bool, error) {
+	time.Sleep(f.dChunkSleep)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "D")
+	f.dChunks++
+	if f.dChunks > 1000 {
+		panic("runaway sub-job D loop")
+	}
+	f.dChunkRows = append(f.dChunkRows, maxRows)
+	switch {
+	case f.dChunkNotStarted:
+		return 0, false, cache.ErrWriteNotStarted
+	case f.dChunkErrs:
+		return 0, false, errors.New("displaced chunk fault")
+	case f.dChunks <= f.dChunksMore:
+		return fakeDChunkRows, true, nil
 	}
 	return 0, false, nil
 }
@@ -443,9 +493,9 @@ type slowBatchStore struct {
 	batchSleep time.Duration
 }
 
-func (s slowBatchStore) RunSnapshotGCBatch(ctx context.Context, n int, g int64, k int, retire bool) (cache.SnapshotGCBatchResult, error) {
+func (s slowBatchStore) RunSnapshotGCBatch(ctx context.Context, n int, g int64, k int) (cache.SnapshotGCBatchResult, error) {
 	time.Sleep(s.batchSleep)
-	return s.fakeStore.RunSnapshotGCBatch(ctx, n, g, k, retire)
+	return s.fakeStore.RunSnapshotGCBatch(ctx, n, g, k)
 }
 
 // Deferred minor F-1 (execution review G-8): sub-job C checks the tick's
@@ -795,10 +845,11 @@ func TestStartupPass_AFailingURLPathPassLeavesTheSnapshotPassToRun(t *testing.T)
 
 // Ruling HD-15 (the hardening plan's final review, G-I1), the snapshot
 // pass: with snapshot_skipped_member unreadable each start's snapshot pass
-// fails (its sub-job B deletes the displaced snapshots beyond
-// keep_displaced, skipped members included), and its blob pass still reaps
-// a dead blob, at the first start; StartupPass returns the snapshot pass's
-// failure.
+// fails (its sub-job B retires the displaced snapshots beyond
+// keep_displaced, and sub-job C's chunk fails deleting their skipped
+// members; B deleted them itself until 2026-11-09, issue #14 follow-up Tier
+// 1b), and its blob pass still reaps a dead blob, at the first start;
+// StartupPass returns the snapshot pass's failure.
 func TestStartupPass_AFailingSnapshotPassLeavesTheBlobPassToRun(t *testing.T) {
 	c := openTestCache(t)
 	db := dbOf(t, c)
@@ -814,8 +865,8 @@ func TestStartupPass_AFailingSnapshotPassLeavesTheBlobPassToRun(t *testing.T) {
 	for start := 1; start <= 2; start++ {
 		logger, _ := captureLogger()
 		err := freshStartGC(t, c, logger, 0).StartupPass(context.Background())
-		if err == nil || !strings.Contains(err.Error(), "snapshot gc batch") {
-			t.Fatalf("start %d: StartupPass = %v, want the snapshot pass's failure", start, err)
+		if err == nil || !strings.Contains(err.Error(), "retired snapshot gc chunk") {
+			t.Fatalf("start %d: StartupPass = %v, want the snapshot pass's failure (sub-job C's chunk)", start, err)
 		}
 		if row, file := blobRowExists(t, db, dead), fileExists(t, c.BlobPath(dead)); row || file {
 			t.Fatalf("after start %d the dead blob is still there (row %v, file %v): want it reaped at the first start", start, row, file)
@@ -852,8 +903,9 @@ func gcMetricValue(t *testing.T, series string) float64 {
 // unreadable the url-path pass fails, the snapshot pass deletes the two
 // displaced snapshots beyond keep_displaced, and the blob pass, whose
 // reachability predicate reads url_path too, fails, so the dead blob stays;
-// with snapshot_skipped_member unreadable the snapshot pass fails and the
-// blob pass reaps the dead blob.
+// with snapshot_skipped_member unreadable the snapshot pass fails (B has
+// retired the two displaced snapshots, C's chunk fails deleting them) and
+// the blob pass reaps the dead blob.
 func TestStartupPass_AFailedPassStillReportsItsWork(t *testing.T) {
 	for _, tc := range []struct {
 		table      string        // renamed away
@@ -863,7 +915,7 @@ func TestStartupPass_AFailedPassStillReportsItsWork(t *testing.T) {
 		blobs      int           // blobs_reaped: the blob pass's work
 	}{
 		{"url_path", time.Hour, []string{"url_path gc batch", "blob gc batch"}, 2, 0},
-		{"snapshot_skipped_member", 0, []string{"snapshot gc batch"}, 0, 1},
+		{"snapshot_skipped_member", 0, []string{"retired snapshot gc chunk"}, 2, 1},
 	} {
 		t.Run(tc.table+" unreadable", func(t *testing.T) {
 			c := openTestCache(t)

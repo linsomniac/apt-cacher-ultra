@@ -65,6 +65,18 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   `adoption.flip_quiet_period`, `adoption.max_duration`,
   `freshness.max_suites` (with a per-host cap) and `gc.suite_idle_ttl`.
 - New status-page and JSON fields, log events and metrics.
+- The counter `acu_gc_displaced_package_rows_deleted_total` and the
+  `displaced_package_rows_deleted` field of `gc_run_complete` and
+  `gc_retired_run_complete`: displaced snapshots' package-list rows GC
+  deleted (issue #14).
+- GC failures and work are visible (issue #14): the counters
+  `acu_gc_pass_failures_total{pass}` and
+  `acu_gc_representation_rows_pruned_total`, `gc_run_complete`'s
+  `representation_rows_pruned` and `representation_prune_ms`, and the status
+  JSON's `gc.last_run_failed_passes`, `gc.last_run_displaced_package_rows_deleted`
+  and `gc.last_run_representation_rows_pruned` (GC panel rows); a failed pass
+  turns the GC vital crit (DEGRADED). Alert:
+  `increase(acu_gc_pass_failures_total[1d]) > 0`.
 - Tests: `make e2e-flat` (real apt clients on six Debian and Ubuntu images,
   in CI) and `make e2e-live` (a manual smoke against live vendors).
 - `make e2e-apt-oracle` and `make e2e-apt-oracle-old`: check that the real
@@ -107,6 +119,24 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 - A reconcile decision that fails on a snapshot (a stored anchor apt's
   text layer refuses, say) warns once, not at every check;
   `acu_adoption_reconcile_failed_total{stage}` counts every failure.
+- GC deletes displaced snapshots' package lists (their `package_hash`
+  rows), 10,000 rows a transaction, at its next run that reaches them (a
+  start, the periodic run every `gc.interval`, or the hourly retired run),
+  instead of keeping `gc.keep_displaced` snapshots' worth per suite;
+  within the hour a suite that adopts several times an hour still holds
+  those it displaced since the last run. `gc.keep_displaced` now keeps
+  displaced snapshots' headers and index files, not their package lists.
+  The database file keeps its size (SQLite reuses the pages); an offline
+  `VACUUM` is optional. A failing GC sub-job no longer stops the ones after
+  it (issue #14).
+- When `gc.interval` is longer than an hour, the retired run (which
+  deletes retired snapshots and strips displaced snapshots' package lists)
+  now runs every hour, not only while it has a backlog, so a cache whose
+  upstreams update several times a day sheds those rows within the hour
+  instead of at the next daily run. On a quiet cache a run finds nothing
+  and costs two small queries; a GC sub-job that fails at every call now
+  logs `gc_tick_failed` (and counts in `acu_gc_pass_failures_total`) once
+  an hour, not once a day (issue #14).
 - Built with Go 1.27; `golang.org/x/net`, `x/text`, `x/crypto`, `x/sys`,
   `github.com/cloudflare/circl` and `github.com/ProtonMail/go-crypto`
   updated (`govulncheck`: no known vulnerability the code reaches).
@@ -160,10 +190,18 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   reported by Skibbi (@skibbipl)): a pass that runs out of
   `gc.max_tick_duration` no longer ends the run, so the pass that deletes
   unused files is no longer skipped behind the others; retired snapshots
-  left over are deleted hourly until none is left, and at every start. A
+  left over are deleted hourly, and at every start. A
   run that ends with `deadline_reached=true` is now normal while a
   backlog drains: the status page shows it as a warning (WATCHING), no
   longer DEGRADED.
+- A GC pass gives up a database write it cannot start before its deadline,
+  so a busy writer no longer pushes GC past `gc.max_tick_duration`
+  beyond the one write already under way at the deadline (issue #14).
+- The startup GC pass retires the displaced snapshots beyond
+  `gc.keep_displaced` and deletes them 10,000 rows a transaction, like a
+  periodic run, instead of deleting them in one transaction; a start's
+  displaced snapshots now count in `displaced_reaped` and again in
+  `retired_reaped` (issue #14).
 - Upstream downloads are no longer decompressed in transit (a gzip-encoded
   body skipped the size check, and a resumed one could be corrupted), and
   adoption stops a member's download at the size its `Release` declares.

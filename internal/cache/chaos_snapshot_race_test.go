@@ -39,9 +39,10 @@ import (
 // keep_displaced=0) and CommitAdoption(S2) which would displace S1.
 // The §9.6.3 SELECT's `NOT IN current_snapshot_id` clause guarantees
 // that whichever op runs first determines whether S1 is retired. The
-// batch is a periodic tick's (retireDisplaced): the startup pass, whose
-// batches delete, runs before the freshness scheduler, so no adoption
-// races it.
+// batch retires the displaced snapshot (since 2026-11-09, issue #14
+// follow-up Tier 1b, the startup pass's batches retire too; they used to
+// delete, which ran before the freshness scheduler, so no adoption raced
+// them).
 func TestChaos_SnapshotGC_DisplacementDuringTick_VariantOne(t *testing.T) {
 	for run := 0; run < chaosRuns; run++ {
 		t.Run(fmt.Sprintf("run-%02d", run), func(t *testing.T) {
@@ -87,7 +88,7 @@ func TestChaos_SnapshotGC_DisplacementDuringTick_VariantOne(t *testing.T) {
 			wg.Add(2)
 			go func() {
 				defer wg.Done()
-				gcResult, gcErr = c.RunSnapshotGCBatch(ctx, 100, 30*60, 0, true)
+				gcResult, gcErr = c.RunSnapshotGCBatch(ctx, 100, 30*60, 0)
 			}()
 			go func() {
 				defer wg.Done()
@@ -191,7 +192,7 @@ func TestChaos_SnapshotGC_HeartbeatLivenessRace_VariantTwo(t *testing.T) {
 			}()
 			go func() {
 				defer wg.Done()
-				gcResult, gcErr = c.RunSnapshotGCBatch(ctx, 100, heartbeatStaleGrace, 0, false)
+				gcResult, gcErr = c.RunSnapshotGCBatch(ctx, 100, heartbeatStaleGrace, 0)
 			}()
 			wg.Wait()
 

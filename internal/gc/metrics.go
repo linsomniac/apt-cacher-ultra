@@ -71,13 +71,18 @@ var (
 
 	gcDisplacedReapedTotal = metrics.NewCounterWithCap(
 		"acu_gc_displaced_reaped_total",
-		"Total displaced suite_snapshot rows beyond keep_displaced reaped (startup) or retired (periodic; deleted later and counted in acu_gc_retired_reaped_total).",
+		"Total displaced suite_snapshot rows beyond keep_displaced retired by snapshot-GC sub-job B, at startup and in periodic ticks alike (sub-job C deletes them later and counts them in acu_gc_retired_reaped_total).",
 		0,
 	)
 
 	gcRetiredReapedTotal = metrics.NewCounterWithCap(
 		"acu_gc_retired_reaped_total",
-		"Total retired suite_snapshot rows reaped by snapshot-GC sub-job C: snapshots of reaped, evicted or forgotten suites, snapshots the legacy trust audit quarantined (spec C9), and displaced snapshots beyond keep_displaced a periodic run retired (counted in acu_gc_displaced_reaped_total when retired).",
+		"Total retired suite_snapshot rows reaped by snapshot-GC sub-job C: snapshots of reaped, evicted or forgotten suites, snapshots the legacy trust audit quarantined (spec C9), and displaced snapshots beyond keep_displaced a startup or periodic run retired (counted in acu_gc_displaced_reaped_total when retired).",
+		0,
+	)
+	gcDisplacedPackageRowsDeletedTotal = metrics.NewCounterWithCap(
+		"acu_gc_displaced_package_rows_deleted_total",
+		"Total package_hash rows of displaced snapshots deleted by snapshot-GC sub-job D, in the startup pass, the periodic ticks and the retired runs; the snapshots' headers and index files stay (gc.keep_displaced).",
 		0,
 	)
 	gcURLPathRowsReapedTotal = metrics.NewCounterWithCap(
@@ -101,6 +106,26 @@ var (
 	gcPoolUnlinkErrorsTotal = metrics.NewCounterWithCap(
 		"acu_gc_pool_unlink_errors_total",
 		"Total pool/ unlink errors during GC (SPEC5 §10.4.5).",
+		0,
+	)
+
+	// gcPassFailuresTotal counts the failed passes, one per pass per run
+	// however many of its sub-jobs failed, where their WARN gc_tick_failed
+	// is logged (issue #14 follow-up, Tier 1c): pass is url_path, snapshot
+	// or blob (runTick, at a start and in a periodic tick), retired
+	// (retiredRun) or pool_scan (StartupPass's pool scan, which logs no
+	// gc_tick_failed: main logs its error as the startup pass's failure).
+	//
+	// AIDEV-NOTE: a failure that was logged is counted, even when a
+	// shutdown lands later in the same pass or run (the controller's
+	// ruling on Task 5's review, 2026-11-09); a pass that only a shutdown
+	// stopped logged nothing, did not fail, and is not counted, nor is a
+	// write the writer never started before its deadline (notStarted).
+	gcPassFailuresTotal = newPassFailuresCounter(metrics.Default)
+
+	gcRepresentationRowsPrunedTotal = metrics.NewCounterWithCap(
+		"acu_gc_representation_rows_pruned_total",
+		"Total stored upstream dates (representation_metadata rows) no URL or snapshot owns any more, released by the blob pass's once-a-run representation prune.",
 		0,
 	)
 
@@ -131,6 +156,35 @@ var (
 	)
 )
 
+// passFailureLabels are acu_gc_pass_failures_total's pass labels: every
+// one newPassFailuresCounter primes.
+var passFailureLabels = []string{"url_path", "snapshot", "blob", "retired", "pool_scan"}
+
+// newPassFailuresCounter declares acu_gc_pass_failures_total{pass} on r,
+// with every pass label's series primed at 0.
+//
+// AIDEV-NOTE: primed, not created lazily (the issue #14 follow-up's final
+// review, I-2, 2026-11-09). The documented alert is
+// increase(acu_gc_pass_failures_total[1d]) > 0, and Prometheus sees no
+// increase in a series whose first sample is already 1: a series created
+// at its label's first failure would hide that failure after every
+// restart. Priming once per process, here at package init, makes each
+// series' first sample 0 (as refreshFailures and the process cpu counter
+// in internal/admin do). A new pass label must be added to
+// passFailureLabels.
+func newPassFailuresCounter(r *metrics.Registry) *metrics.Counter {
+	c := metrics.NewCounterWithCapIn(r,
+		"acu_gc_pass_failures_total",
+		"Total GC passes that failed, logged as WARN gc_tick_failed (one per pass per run, however many of its sub-jobs failed) or, for pool_scan, returned by the startup pool scan; by pass: url_path, snapshot, blob, retired, pool_scan.",
+		metrics.DefaultMaxSeries,
+		"pass",
+	)
+	for _, p := range passFailureLabels {
+		c.Add(0, p)
+	}
+	return c
+}
+
 func emitGCPassMetrics(phase string, tick tickResult) {
 	for _, p := range []struct {
 		name     string
@@ -139,6 +193,9 @@ func emitGCPassMetrics(phase string, tick tickResult) {
 		{"url_path", tick.urlPathDuration},
 		{"snapshot", tick.snapshotDuration},
 		{"blob", tick.blobDuration},
+		// The blob pass's representation prune, inside its blob sample
+		// (issue #14 follow-up, Tier 1c); 0 when the pass ran no prune.
+		{"representation_prune", tick.representationPruneDuration},
 	} {
 		if p.duration > 0 {
 			gcPassDurationSeconds.Observe(p.duration.Seconds(), phase, p.name)
@@ -147,6 +204,9 @@ func emitGCPassMetrics(phase string, tick tickResult) {
 	gcURLPathRowsScannedTotal.Add(float64(tick.urlPath.scanned))
 	gcURLPathRowsStampedTotal.Add(float64(tick.urlPath.stamped))
 	gcURLPathRowsClearedTotal.Add(float64(tick.urlPath.cleared))
+	if tick.representationRowsPruned > 0 {
+		gcRepresentationRowsPrunedTotal.Add(float64(tick.representationRowsPruned))
+	}
 }
 
 // emitGCMetrics records all GC metrics for one gc_run_complete log
@@ -166,6 +226,7 @@ func emitGCMetrics(
 	orphanCandidatesReaped int,
 	displacedReaped int,
 	retiredReaped int,
+	displacedPackageRowsDeleted int,
 	urlPathRowsReaped int,
 	poolOrphansRepaired int,
 	poolOrphanBytesRepaired int64,
@@ -189,6 +250,9 @@ func emitGCMetrics(
 	}
 	if retiredReaped > 0 {
 		gcRetiredReapedTotal.Add(float64(retiredReaped))
+	}
+	if displacedPackageRowsDeleted > 0 {
+		gcDisplacedPackageRowsDeletedTotal.Add(float64(displacedPackageRowsDeleted))
 	}
 	if urlPathRowsReaped > 0 {
 		gcURLPathRowsReapedTotal.Add(float64(urlPathRowsReaped))

@@ -159,7 +159,7 @@ func TestRunTick_AURLPathDeadlineDoesNotDeferTheLaterPasses(t *testing.T) {
 // chunk takes chunkSleep and deletes one retired snapshot while any is left
 // (1, more), and reports none left once it is empty (0, no more), as the
 // cache's chunk does for small snapshots; and each periodic snapshot pass's
-// sub-job B (its batch with retireDisplaced) retires retiresPerPass more,
+// sub-job B (its batch; at a start too since 2026-11-09) retires retiresPerPass more,
 // as a periodic B retires the displaced snapshots of the day's adoptions.
 type backlogStore struct {
 	*fakeStore
@@ -169,14 +169,12 @@ type backlogStore struct {
 	retiresPerPass int
 }
 
-func (s *backlogStore) RunSnapshotGCBatch(ctx context.Context, n int, grace int64, keep int, retire bool) (cache.SnapshotGCBatchResult, error) {
-	if retire {
-		s.mu.Lock()
-		s.backlog += s.retiresPerPass
-		s.maxBacklog = max(s.maxBacklog, s.backlog)
-		s.mu.Unlock()
-	}
-	return s.fakeStore.RunSnapshotGCBatch(ctx, n, grace, keep, retire)
+func (s *backlogStore) RunSnapshotGCBatch(ctx context.Context, n int, grace int64, keep int) (cache.SnapshotGCBatchResult, error) {
+	s.mu.Lock()
+	s.backlog += s.retiresPerPass
+	s.maxBacklog = max(s.maxBacklog, s.backlog)
+	s.mu.Unlock()
+	return s.fakeStore.RunSnapshotGCBatch(ctx, n, grace, keep)
 }
 
 func (s *backlogStore) RunRetiredSnapshotGCChunk(context.Context, int) (int, bool, error) {
@@ -206,12 +204,15 @@ func runFor(g *GC, d time.Duration) {
 	<-done
 }
 
-// Issue #14 (G2-I2, the cadence): while retiredRun's run ends at its
-// deadline with retired snapshots left, Run repeats it an hour later, until
-// one drains them. With five left and two 30 s chunks a 1 min run: runs an
-// hour, two and three hours in (2, 2, then 1 and none left), and no fourth.
-// Before the fix the run came once a process.
-func TestRun_RepeatsTheRetiredRunHourlyWhileABacklogRemains(t *testing.T) {
+// Issue #14 (G2-I2, the cadence; made unconditional by the maintainer,
+// 2026-11-10): Run repeats the retired run every hour, an hour after the
+// previous one ended, whether or not it left a backlog. With five retired
+// left and two 30 s chunks a 1 min run: runs an hour, two and three hours
+// in delete 2, 2, then 1 (the third run's C finds none left exactly at its
+// deadline, so D starts there, its deadline reached before it could look),
+// and the runs four and five hours in find nothing and still come. Before
+// 2026-11-10 the run stopped re-arming after the fourth, which drained it.
+func TestRun_RepeatsTheRetiredRunHourly(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		logger, buf := captureLogger()
 		g, _ := storeGC(t, &fakeStore{chunksMore: 5, chunkSleep: 30 * time.Second}, 2, logger)
@@ -221,48 +222,73 @@ func TestRun_RepeatsTheRetiredRunHourlyWhileABacklogRemains(t *testing.T) {
 		for _, r := range gcEvents(t, buf, "gc_retired_run_complete") {
 			got = append(got, fmt.Sprintf("%v/%v", r["retired_reaped"], r["deadline_reached"]))
 		}
-		if fmt.Sprint(got) != "[2/true 2/true 1/false]" {
-			t.Fatalf("retired runs (retired_reaped/deadline_reached) %v, want [2/true 2/true 1/false]: hourly until drained", got)
+		if fmt.Sprint(got) != "[2/true 2/true 1/true 0/false 0/false]" {
+			t.Fatalf("retired runs (retired_reaped/deadline_reached) %v, want [2/true 2/true 1/true 0/false 0/false]: hourly, drained or not", got)
 		}
 	})
 }
 
-// Issue #14 (G2-I2): a periodic tick whose snapshot pass hits its deadline
-// (here sub-job C, behind the 10 its sub-job B retired: five 10 s chunks by
-// its 48 s) arms the retired run an hour later, which deletes the other
-// five, when gc.interval (2 h here) is longer than an hour; the run an hour
-// after the start found nothing and did not re-arm.
-func TestPeriodicTick_ASnapshotDeadlineArmsTheRetiredRun(t *testing.T) {
+// Issue #14 (G2-I2; unconditional since 2026-11-10): a periodic tick whose
+// snapshot pass hits its deadline (here sub-job C, behind the 10 its
+// sub-job B retired: five 10 s chunks by its 48 s) leaves five retired, and
+// the next hourly retired run deletes them, when gc.interval (2 h here) is
+// longer than an hour. The run an hour after the start found nothing, and
+// the run after the five found nothing; both came anyway.
+func TestPeriodicTick_ItsBacklogIsDeletedByTheNextHourlyRetiredRun(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		logger, buf := captureLogger()
 		s := &backlogStore{fakeStore: &fakeStore{chunkSleep: 10 * time.Second}, retiresPerPass: 10}
 		g, _ := storeGC(t, s, 2, logger)
 		g.cfg.Interval = 2 * time.Hour
 		runFor(g, 3*time.Hour+30*time.Minute)
-		runs := gcEvents(t, buf, "gc_retired_run_complete")
-		if len(runs) != 2 || runs[0]["retired_reaped"] != float64(0) || runs[1]["retired_reaped"] != float64(5) {
-			t.Fatalf("retired runs %v, want two: an hour after the start (none left), and an hour after the tick (5)", runs)
+		var got []string
+		for _, r := range gcEvents(t, buf, "gc_retired_run_complete") {
+			got = append(got, fmt.Sprint(r["retired_reaped"]))
+		}
+		if fmt.Sprint(got) != "[0 5 0]" {
+			t.Fatalf("retired runs' retired_reaped %v, want [0 5 0]: an hour after the start (none left), after the tick (5), then hourly (none left)", got)
 		}
 		if ticks := gcEvents(t, buf, "gc_run_complete"); len(ticks) != 1 || ticks[0]["deadline_reached"] != true {
 			t.Fatalf("periodic ticks %v, want one, which reached its snapshot deadline", ticks)
 		}
+		if s.left() != 0 {
+			t.Fatalf("%d retired left, want none", s.left())
+		}
 	})
 }
 
-// Issue #14 (G2-I2), no retry storm: a retired run that fails is not
-// repeated hourly (the next periodic tick retries C, as before): one run,
-// one gc_tick_failed, in five hours.
-func TestRun_AFailedRetiredRunIsNotRepeatedHourly(t *testing.T) {
+// Issue #14 (unconditional since 2026-11-10; the accepted cost): a retired
+// run that fails is still repeated hourly, one WARN gc_tick_failed an hour,
+// in four and a half hours four runs and four lines. Before 2026-11-10 a
+// failed run was not repeated (the next periodic tick retried C).
+func TestRun_AFailedRetiredRunIsRepeatedHourly(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		logger, buf := captureLogger()
 		g, _ := storeGC(t, &fakeStore{chunkErrs: true}, 2, logger)
 		g.cfg.Interval = 24 * time.Hour
-		runFor(g, 5*time.Hour)
-		if runs := gcEvents(t, buf, "gc_retired_run_complete"); len(runs) != 1 {
-			t.Fatalf("retired runs %v, want one: a failed run is not repeated", runs)
+		runFor(g, 4*time.Hour+30*time.Minute)
+		if runs := gcEvents(t, buf, "gc_retired_run_complete"); len(runs) != 4 {
+			t.Fatalf("retired runs %v, want four: hourly, failed or not", runs)
 		}
-		if failed := gcEvents(t, buf, "gc_tick_failed"); len(failed) != 1 {
-			t.Fatalf("gc_tick_failed lines %v, want one", failed)
+		if failed := gcEvents(t, buf, "gc_tick_failed"); len(failed) != 4 {
+			t.Fatalf("gc_tick_failed lines %v, want four, one a run", failed)
+		}
+	})
+}
+
+// gc.interval of an hour or less: no separate retired run; the periodic
+// ticks, within the hour, run sub-jobs C and D themselves.
+func TestRun_NoRetiredRunWhenTheIntervalIsAnHourOrLess(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logger, buf := captureLogger()
+		g, _ := storeGC(t, &fakeStore{}, 2, logger)
+		g.cfg.Interval = time.Hour
+		runFor(g, 3*time.Hour+30*time.Minute)
+		if runs := gcEvents(t, buf, "gc_retired_run_complete"); len(runs) != 0 {
+			t.Fatalf("retired runs %v, want none: gc.interval is an hour", runs)
+		}
+		if ticks := gcEvents(t, buf, "gc_run_complete"); len(ticks) != 3 {
+			t.Fatalf("periodic ticks %v, want three", ticks)
 		}
 	})
 }

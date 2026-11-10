@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 	_ "modernc.org/sqlite"
@@ -19,6 +20,30 @@ import (
 
 // ErrClosed is returned by Cache methods when the cache has been Closed.
 var ErrClosed = errors.New("cache: closed")
+
+// ErrWriteNotStarted is returned by a write whose start deadline
+// (WithWriteStartDeadline) passed before the writer goroutine started it.
+// The op never ran and never will: nothing it would have written was
+// written. It means "deadline reached", not a failure.
+var ErrWriteNotStarted = errors.New("cache: write not started before its start deadline")
+
+// writeStartDeadlineKey is the context key of a write's start deadline.
+type writeStartDeadlineKey struct{}
+
+// WithWriteStartDeadline returns a ctx whose writes must start by t: a
+// write still queued behind the writer goroutine at t gives up with
+// ErrWriteNotStarted, and the writer then skips it. It gates only
+// starting. A write the writer has started runs to completion under its
+// ctx exactly as without a start deadline; t never cancels it.
+func WithWriteStartDeadline(ctx context.Context, t time.Time) context.Context {
+	return context.WithValue(ctx, writeStartDeadlineKey{}, t)
+}
+
+// writeStartDeadline returns ctx's start deadline, if it has one.
+func writeStartDeadline(ctx context.Context) (time.Time, bool) {
+	t, ok := ctx.Value(writeStartDeadlineKey{}).(time.Time)
+	return t, ok
+}
 
 // writeBufferSize bounds how many pending writes can queue before the
 // caller blocks (or hits ctx.Done). Apt traffic is bursty but each write
@@ -238,14 +263,42 @@ func openDB(path string) (*sql.DB, error) {
 // and a *sql.Conn that is dedicated to the writer for the call.
 type writeOp func(ctx context.Context, conn *sql.Conn) error
 
+// writeReq states, for a request with a start deadline. The writer moves
+// pending to running just before it calls the op; the submitter moves
+// pending to abandoned when it gives up. Exactly one of the two CASes
+// wins, so the op runs at most once and never after its submitter gave up.
+const (
+	writePending int32 = iota
+	writeRunning
+	writeAbandoned
+)
+
 type writeReq struct {
 	ctx context.Context
 	op  writeOp
 	res chan error
+	// state is nil for a request with no start deadline (no allocation,
+	// and the writer runs it unconditionally, as before issue #14). It is
+	// a pointer because writeReq travels through c.writes by value and
+	// both sides must CAS the same word.
+	state *atomic.Int32
+}
+
+// start claims req for running: true unless its submitter abandoned it.
+func (req *writeReq) start() bool {
+	return req.state == nil || req.state.CompareAndSwap(writePending, writeRunning)
+}
+
+// abandon marks req abandoned if the writer has not started it: true
+// means the op will never run.
+func (req *writeReq) abandon() bool {
+	return req.state != nil && req.state.CompareAndSwap(writePending, writeAbandoned)
 }
 
 // submitWrite enqueues op on the writer goroutine and waits for its
-// result. Returns ErrClosed if the cache is closing.
+// result. Returns ErrClosed if the cache is closing, and
+// ErrWriteNotStarted if ctx carries a start deadline
+// (WithWriteStartDeadline) that passes before the writer starts op.
 //
 // AIDEV-NOTE: Both selects must watch closeCh. The race is: a sender that
 // passes the closed.Load() check can still race the writer's exit. If the
@@ -253,28 +306,102 @@ type writeReq struct {
 // land in a now-orphaned buffer after the writer's drain has completed.
 // Watching closeCh in the result-wait select guarantees the caller
 // unblocks (ErrClosed) instead of hanging forever on req.res.
+//
+// AIDEV-NOTE: the start deadline (issue #14 Tier 1a, G2-RR1-M1, added
+// 2026-11-09) gates only *starting* an op; it never cancels or
+// interrupts one the writer has started: op keeps the submitter's ctx,
+// and the deadline is not on that ctx. Why: a GC batch queued behind
+// adoption commits must give up at its pass deadline instead of running
+// late, but a GC transaction interrupted midway is wasted work, and a
+// large one would never complete. Invariant: the op runs at most once,
+// and the submitter's answer is the truth. The timer and the writer's
+// dequeue race, so both sides CAS req.state from pending: the writer to
+// running (start), the submitter to abandoned (abandon). If abandon wins,
+// the op never runs and ErrWriteNotStarted is truthful; if it loses, the
+// op is running and the submitter keeps waiting for its real result.
+// The writer answers a skipped request with ErrWriteNotStarted on res,
+// which never blocks it: res is buffered (cap 1) and only the writer (or
+// drainWrites, never both) sends on it, at most once, since a request is
+// received from c.writes at most once; nobody need read it after the
+// submitter has gone.
+// A ctx cancelled while waiting (shutdown) returns ctx.Err() as before,
+// never ErrWriteNotStarted, so a shutdown still reads as a shutdown,
+// even when the start deadline is due at the same time: Go's select picks
+// at random among ready cases, so the entry check and both deadline cases
+// check ctx.Err() first (notStartedErr; the final review's M-1,
+// 2026-11-09: a GC pass must never log a shutdown as its deadline). The
+// op still never runs there: those paths return only for a request never
+// enqueued or one whose abandon won the CAS. For a request with a start
+// deadline the cancel also abandons a still-pending request, so the
+// writer skips an op whose submitter has gone instead of starting it on a
+// cancelled ctx. That can only stop an op that has not started, so the
+// "never interrupt a started op" rule holds, and a running op still sees
+// the cancel through its own ctx, as before. A
+// request with no start deadline is untouched: nil state, no timer (a nil
+// channel in the selects), and the writer still calls its op after a
+// cancel, exactly as before issue #14.
 func (c *Cache) submitWrite(ctx context.Context, op writeOp) error {
 	if c.closed.Load() {
 		return ErrClosed
 	}
 	req := writeReq{ctx: ctx, op: op, res: make(chan error, 1)}
+	var deadlineC <-chan time.Time // nil (never ready) without a start deadline
+	if deadline, ok := writeStartDeadline(ctx); ok {
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			// Not enqueued. A shutdown reads as a shutdown (ctx.Err()).
+			return notStartedErr(ctx)
+		}
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		deadlineC = timer.C
+		req.state = new(atomic.Int32) // writePending
+	}
 	select {
 	case c.writes <- req:
 	case <-c.closeCh:
 		return ErrClosed
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-deadlineC:
+		// Not enqueued, so the writer can never see it. A ctx cancelled
+		// too (both ready, the select chose the deadline) is ctx.Err().
+		return notStartedErr(ctx)
 	}
-	select {
-	case err := <-req.res:
+	for {
+		select {
+		case err := <-req.res:
+			return err
+		case <-c.closeCh:
+			return ErrClosed
+		case <-ctx.Done():
+			// The writer will still dequeue the request and write to
+			// req.res; res is buffered (cap 1) so no goroutine blocks.
+			// With a start deadline, a still-pending op is skipped.
+			req.abandon()
+			return ctx.Err()
+		case <-deadlineC:
+			if req.abandon() {
+				// Never runs. A ctx cancelled too (both ready, the
+				// select chose the deadline) is ctx.Err().
+				return notStartedErr(ctx)
+			}
+			// The writer started the op first: it runs to completion.
+			// Stop selecting on the spent timer and wait for its result.
+			deadlineC = nil
+		}
+	}
+}
+
+// notStartedErr is submitWrite's answer for a request it gave up before the
+// writer started it: ctx.Err() if ctx has ended (a shutdown reads as a
+// shutdown, even when the start deadline was due at the same time), else
+// ErrWriteNotStarted. Either way the op never runs.
+func notStartedErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
 		return err
-	case <-c.closeCh:
-		return ErrClosed
-	case <-ctx.Done():
-		// The writer will still run the op and write to req.res; res is
-		// buffered (cap 1) so no goroutine blocks.
-		return ctx.Err()
 	}
+	return ErrWriteNotStarted
 }
 
 // writer is the singleton goroutine that owns the write connection. All
@@ -306,7 +433,14 @@ func (c *Cache) writer() {
 	for {
 		select {
 		case req := <-c.writes:
-			req.res <- req.op(req.ctx, conn)
+			// A request whose submitter gave up at its start deadline
+			// (or was cancelled while it was still pending) is skipped,
+			// never started. See submitWrite's AIDEV-NOTE.
+			if req.start() {
+				req.res <- req.op(req.ctx, conn)
+			} else {
+				req.res <- ErrWriteNotStarted
+			}
 		case <-c.closeCh:
 			// Drain anything queued before close.
 			c.drainWrites(ErrClosed)

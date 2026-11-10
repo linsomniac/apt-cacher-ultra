@@ -439,7 +439,11 @@ type GCConfig struct {
 
 	// KeepDisplaced is the per-suite forensic retention count for
 	// displaced snapshots. Default 3. 0 is permitted (no retention,
-	// every displaced snapshot is reapable on the next tick).
+	// every displaced snapshot is reapable on the next tick). It keeps
+	// their headers and index files (suite_snapshot, snapshot_member,
+	// snapshot_skipped_member), not their package lists: since 2026-11-09
+	// (issue #14 follow-up Tier 2, approved by the maintainer) GC sub-job D
+	// deletes every displaced snapshot's package_hash rows, kept or not.
 	KeepDisplaced int `toml:"keep_displaced"`
 
 	// PoolScanWorkers is the worker pool size for the startup

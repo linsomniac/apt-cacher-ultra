@@ -345,6 +345,14 @@ type gcInfo struct {
 	PoolOrphansRepaired     int     `json:"pool_orphans_repaired"`
 	PoolOrphanBytesRepaired int64   `json:"pool_orphan_bytes_repaired"`
 	PoolUnlinkErrors        int     `json:"pool_unlink_errors"`
+	// Issue #14 follow-up Tier 1c (additive): the last run's passes whose
+	// failure was logged (gc_tick_failed), in tick order — url_path,
+	// snapshot, blob; [] when none failed (MarshalJSON), and the GC vital
+	// is crit when any did (vitalState); sub-job D's package rows; the
+	// representation prune's rows.
+	LastRunFailedPasses                []string `json:"last_run_failed_passes"`
+	LastRunDisplacedPackageRowsDeleted int      `json:"last_run_displaced_package_rows_deleted"`
+	LastRunRepresentationRowsPruned    int      `json:"last_run_representation_rows_pruned"`
 }
 
 // MarshalJSON renders the abbreviated form when no GC run has
@@ -356,7 +364,11 @@ func (g *gcInfo) MarshalJSON() ([]byte, error) {
 		return []byte(`{"last_run_unixtime":null}`), nil
 	}
 	type alias gcInfo
-	return json.Marshal((*alias)(g))
+	full := alias(*g)
+	if full.LastRunFailedPasses == nil {
+		full.LastRunFailedPasses = []string{} // [], never null: none failed
+	}
+	return json.Marshal(&full)
 }
 
 type hotURLEntry struct {
@@ -529,6 +541,10 @@ func gcInfoFromSummary(summary gc.LastRunSummary) *gcInfo {
 		PoolOrphansRepaired:     summary.PoolOrphansRepaired,
 		PoolOrphanBytesRepaired: summary.PoolOrphanBytesRepaired,
 		PoolUnlinkErrors:        summary.PoolUnlinkErrors,
+		// Issue #14 follow-up Tier 1c; a copy, never nil (JSON []).
+		LastRunFailedPasses:                append([]string{}, summary.FailedPasses...),
+		LastRunDisplacedPackageRowsDeleted: summary.DisplacedPackageRowsDeleted,
+		LastRunRepresentationRowsPruned:    summary.RepresentationRowsPruned,
 	}
 }
 
@@ -1541,11 +1557,21 @@ func vitalState(kind string, m htmlRenderModel) string {
 		// not crit: a pass that reaches its share of gc.max_tick_duration
 		// no longer ends the run, so a busy cache reports it in steady
 		// state while it frees disk (the page then reads WATCHING, not
-		// DEGRADED). No GC failure reads crit here, before or after this
-		// change: a failed pass has no status field (WARN gc_tick_failed
-		// is its sign), a GC that never ran is stale and one that stopped
-		// running is warn (the age rule below); pool unlink errors are the
-		// CACHE cell's crit.
+		// DEGRADED). Until 2026-11-09 no GC failure read crit here: a
+		// failed pass had no status field (WARN gc_tick_failed was its
+		// sign). Changed 2026-11-09 (issue #14 follow-up Tier 1c; the
+		// maintainer's decision, reversing §9.1's "no GC state is crit"):
+		// a failed pass on the last run (gc.last_run_failed_passes not
+		// empty) is crit, DEGRADED, beside a reached deadline too, which
+		// alone stays warn. The cost the maintainer accepted: a transient
+		// failure reads crit until the next periodic tick or start writes
+		// a new summary (up to gc.interval); a retired run's failure never
+		// reaches it (it writes no summary). A GC that never ran is still
+		// stale and one that stopped running warns (the age rule below);
+		// pool unlink errors are the CACHE cell's crit.
+		if len(m.GC.LastRunFailedPasses) > 0 {
+			return "crit"
+		}
 		if m.GC.LastRunDeadlineReached {
 			return "warn"
 		}

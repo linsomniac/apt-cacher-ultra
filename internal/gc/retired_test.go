@@ -19,9 +19,11 @@ import (
 // first deleted header (the Task 4 review's minor 1). The startup pass
 // runs sub-jobs A and B — a candidate whose heartbeat went stale, and
 // another suite's fourth displaced snapshot beyond keep_displaced = 3, are
-// deleted (the final fix wave's re-review, gc-sims minor 2) — and its blob
-// pass, which reclaims an unreferenced orphan blob; with nothing retired
-// yet its sub-job C deletes nothing (TestStartupPass_DeletesRetiredSnapshotsAndReapsTheirBlobs
+// deleted (the final fix wave's re-review, gc-sims minor 2), the displaced
+// one retired and then deleted by its sub-job C (since 2026-11-09, issue
+// #14 follow-up Tier 1b; B used to delete it) — and its blob pass, which
+// reclaims an unreferenced orphan blob; with nothing else retired yet its
+// sub-job C deletes only that one (TestStartupPass_DeletesRetiredSnapshotsAndReapsTheirBlobs
 // pins what it deletes since issue #14). The suite is forgotten after the
 // start; the first periodic tick's snapshot pass deletes its retired
 // snapshots (retired_reaped in its gc_run_complete and LastRunSummary) and
@@ -72,10 +74,10 @@ func TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs(t *testing.T) {
 		if blobRowExists(t, db, orphan) || fileExists(t, c.BlobPath(orphan)) {
 			t.Fatal("the startup pass kept an orphan blob: its blob pass did not run")
 		}
-		if s, ok := g.LastRunSummary(); !ok || s.Phase != "startup" || s.RetiredReaped != 0 ||
+		if s, ok := g.LastRunSummary(); !ok || s.Phase != "startup" || s.RetiredReaped != 1 ||
 			s.OrphanCandidatesReaped != 1 || s.DisplacedReaped != 1 {
-			t.Fatalf("startup LastRunSummary = %+v, %v; want retired_reaped 0, and sub-jobs A and B run "+
-				"(orphan_candidates_reaped 1, displaced_reaped 1)", s, ok)
+			t.Fatalf("startup LastRunSummary = %+v, %v; want sub-jobs A and B run (orphan_candidates_reaped 1, "+
+				"displaced_reaped 1) and C delete the one B retired (retired_reaped 1)", s, ok)
 		}
 		if snapshotRowExists(t, db, stale) || snapshotRowExists(t, db, displaced) {
 			t.Fatalf("after the startup pass: stale candidate kept %v, displaced snapshot beyond keep_displaced kept %v; "+
@@ -116,8 +118,8 @@ func TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs(t *testing.T) {
 				got[line["phase"]] = line["retired_reaped"]
 			}
 		}
-		if got["startup"] != float64(0) || got["periodic"] != float64(2) {
-			t.Fatalf("gc_run_complete retired_reaped by phase = %v; want startup 0, periodic 2", got)
+		if got["startup"] != float64(1) || got["periodic"] != float64(2) {
+			t.Fatalf("gc_run_complete retired_reaped by phase = %v; want startup 1 (the displaced one B retired), periodic 2", got)
 		}
 	})
 }
@@ -135,9 +137,10 @@ func TestRunTick_SubJobCReapsRetiredSnapshotsAndTheirBlobs(t *testing.T) {
 // pass is deleted an hour into that start, which logs
 // gc_retired_run_complete; no periodic tick ran (no periodic
 // gc_run_complete). Another suite's displaced snapshot beyond
-// keep_displaced is deleted by the first start's startup pass, which
-// deletes it rather than retiring it (DN-7 of the GC and upstream
-// hardening plan).
+// keep_displaced is retired by the first start's startup pass, and deleted
+// by its sub-job C in the same pass (since 2026-11-09, issue #14 follow-up
+// Tier 1b; ruling HD-7 had that pass delete it in B), so that pass's
+// retired_reaped is 1 too.
 func TestRun_DeletesRetiredSnapshotsAnHourAfterTheStart(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		c := openTestCache(t)
@@ -193,7 +196,7 @@ func TestRun_DeletesRetiredSnapshotsAnHourAfterTheStart(t *testing.T) {
 			t.Fatal("the retired snapshot was deleted before an hour had passed")
 		}
 		if snapshotRowExists(t, db, displaced) {
-			t.Fatal("the displaced snapshot beyond keep_displaced survived the startup pass, which deletes it")
+			t.Fatal("the displaced snapshot beyond keep_displaced survived the startup pass, which retires and deletes it")
 		}
 		start(time.Hour+time.Second, func() {
 			if snapshotRowExists(t, db, id) {
@@ -221,8 +224,8 @@ func TestRun_DeletesRetiredSnapshotsAnHourAfterTheStart(t *testing.T) {
 				startupRetired = append(startupRetired, line["retired_reaped"])
 			}
 		}
-		if fmt.Sprint(startupRetired) != "[0 1]" {
-			t.Fatalf("the startup passes' retired_reaped %v, want [0 1]: the second start deletes the first's retired snapshot", startupRetired)
+		if fmt.Sprint(startupRetired) != "[1 1]" {
+			t.Fatalf("the startup passes' retired_reaped %v, want [1 1]: the first deletes the displaced snapshot its B retired, the second the forgotten suite's", startupRetired)
 		}
 		if len(retiredRuns) != 1 || retiredRuns[0]["level"] != "INFO" || retiredRuns[0]["retired_reaped"] != float64(1) ||
 			retiredRuns[0]["deadline_reached"] != false {
@@ -272,7 +275,7 @@ func TestStartupPass_DeletesRetiredSnapshotsAndReapsTheirBlobs(t *testing.T) {
 				members = append(members, m...)
 			}
 		}
-		if res, err := c.RunSnapshotGCBatch(ctx, 10, 1800, 3, true); err != nil || res.DisplacedReaped != 1 {
+		if res, err := c.RunSnapshotGCBatch(ctx, 10, 1800, 3); err != nil || res.DisplacedReaped != 1 {
 			t.Fatalf("a periodic B: %+v, %v; want one displaced snapshot retired", res, err)
 		}
 		// Suite w: its displaced snapshot quarantined by the startup audit.
@@ -330,6 +333,57 @@ func TestStartupPass_DeletesRetiredSnapshotsAndReapsTheirBlobs(t *testing.T) {
 		runFor(g, time.Hour+time.Minute)
 		if runs := gcEvents(t, buf, "gc_retired_run_complete"); len(runs) != 1 || runs[0]["retired_reaped"] != float64(0) {
 			t.Fatalf("gc_retired_run_complete lines %v, want one an hour after the start, with nothing left to delete", runs)
+		}
+	})
+}
+
+// Issue #14 follow-up, Tier 1b (2026-11-09; supersedes ruling HD-7's
+// one-transaction delete at a start): the startup pass's sub-job B retires
+// the displaced snapshots beyond keep_displaced like a periodic tick's, and
+// its sub-job C deletes them in the same pass, so each counts twice (in
+// displaced_reaped when retired, in retired_reaped when deleted) and the
+// same start's blob pass reaps the blobs they pinned.
+func TestStartupPass_RetiresTheDisplacedAndCDeletesThem(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := openTestCache(t)
+		logger, buf := captureLogger()
+		db := dbOf(t, c)
+		ctx := context.Background()
+		// A current snapshot and 5 displaced ones in all: six adopted, the
+		// two oldest beyond keep_displaced = 3, each pinning a blob of its own.
+		var ids []int64
+		var members []string
+		for i := range 6 {
+			m := putPoolBlob(t, c, fmt.Sprintf("z member %d", i))
+			ids = append(ids, adoptSnapshot(t, c, "http", "h", "/r/dists/z", putPoolBlob(t, c, fmt.Sprintf("z anchor %d", i)), []string{m}))
+			members = append(members, m)
+		}
+		for _, h := range members {
+			fastForwardZeroedAt(t, db, h)
+		}
+		g, err := New(Config{Cache: c, Logger: logger, Enabled: true, Interval: 24 * time.Hour, BatchSize: 100,
+			SnapshotBatchSize: 10, MaxTickDuration: time.Minute, BlobGrace: time.Minute, KeepDisplaced: 3,
+			PoolScanWorkers: 2, HeartbeatStaleGrace: 30 * time.Minute})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := g.StartupPass(ctx); err != nil {
+			t.Fatal(err)
+		}
+		for i, id := range ids {
+			beyond := i < 2
+			if snapshotRowExists(t, db, id) == beyond {
+				t.Fatalf("snapshot %d (beyond keep_displaced: %v) exists %v after the startup pass", id, beyond, !beyond)
+			}
+			if h := members[i]; beyond == (blobRowExists(t, db, h) || fileExists(t, c.BlobPath(h))) {
+				t.Fatalf("blob %s of snapshot %d (beyond keep_displaced: %v) survived %v", h, id, beyond, !beyond)
+			}
+		}
+		if s, ok := g.LastRunSummary(); !ok || s.Phase != "startup" || s.DisplacedReaped != 2 || s.RetiredReaped != 2 {
+			t.Fatalf("startup LastRunSummary = %+v, %v; want displaced_reaped 2 and retired_reaped 2", s, ok)
+		}
+		if ev := gcEvents(t, buf, "gc_run_complete"); len(ev) != 1 || ev[0]["displaced_reaped"] != float64(2) || ev[0]["retired_reaped"] != float64(2) {
+			t.Fatalf("gc_run_complete lines %v, want one with displaced_reaped 2 and retired_reaped 2", ev)
 		}
 	})
 }

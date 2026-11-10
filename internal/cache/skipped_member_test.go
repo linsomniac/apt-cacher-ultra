@@ -402,7 +402,7 @@ func TestSnapshotGC_ReapsSkippedMemberRows(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := c.RunSnapshotGCBatch(ctx, 10, 3600, 0, true)
+	res, err := c.RunSnapshotGCBatch(ctx, 10, 3600, 0)
 	if err != nil {
 		t.Fatalf("RunSnapshotGCBatch: %v", err)
 	}
