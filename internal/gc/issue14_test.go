@@ -159,7 +159,7 @@ func TestRunTick_AURLPathDeadlineDoesNotDeferTheLaterPasses(t *testing.T) {
 // chunk takes chunkSleep and deletes one retired snapshot while any is left
 // (1, more), and reports none left once it is empty (0, no more), as the
 // cache's chunk does for small snapshots; and each periodic snapshot pass's
-// sub-job B (its batch with retireDisplaced) retires retiresPerPass more,
+// sub-job B (its batch; at a start too since 2026-11-09) retires retiresPerPass more,
 // as a periodic B retires the displaced snapshots of the day's adoptions.
 type backlogStore struct {
 	*fakeStore
@@ -169,14 +169,12 @@ type backlogStore struct {
 	retiresPerPass int
 }
 
-func (s *backlogStore) RunSnapshotGCBatch(ctx context.Context, n int, grace int64, keep int, retire bool) (cache.SnapshotGCBatchResult, error) {
-	if retire {
-		s.mu.Lock()
-		s.backlog += s.retiresPerPass
-		s.maxBacklog = max(s.maxBacklog, s.backlog)
-		s.mu.Unlock()
-	}
-	return s.fakeStore.RunSnapshotGCBatch(ctx, n, grace, keep, retire)
+func (s *backlogStore) RunSnapshotGCBatch(ctx context.Context, n int, grace int64, keep int) (cache.SnapshotGCBatchResult, error) {
+	s.mu.Lock()
+	s.backlog += s.retiresPerPass
+	s.maxBacklog = max(s.maxBacklog, s.backlog)
+	s.mu.Unlock()
+	return s.fakeStore.RunSnapshotGCBatch(ctx, n, grace, keep)
 }
 
 func (s *backlogStore) RunRetiredSnapshotGCChunk(context.Context, int) (int, bool, error) {

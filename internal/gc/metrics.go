@@ -71,13 +71,13 @@ var (
 
 	gcDisplacedReapedTotal = metrics.NewCounterWithCap(
 		"acu_gc_displaced_reaped_total",
-		"Total displaced suite_snapshot rows beyond keep_displaced reaped (startup) or retired (periodic; deleted later and counted in acu_gc_retired_reaped_total).",
+		"Total displaced suite_snapshot rows beyond keep_displaced retired by snapshot-GC sub-job B, at startup and in periodic ticks alike (sub-job C deletes them later and counts them in acu_gc_retired_reaped_total).",
 		0,
 	)
 
 	gcRetiredReapedTotal = metrics.NewCounterWithCap(
 		"acu_gc_retired_reaped_total",
-		"Total retired suite_snapshot rows reaped by snapshot-GC sub-job C: snapshots of reaped, evicted or forgotten suites, snapshots the legacy trust audit quarantined (spec C9), and displaced snapshots beyond keep_displaced a periodic run retired (counted in acu_gc_displaced_reaped_total when retired).",
+		"Total retired suite_snapshot rows reaped by snapshot-GC sub-job C: snapshots of reaped, evicted or forgotten suites, snapshots the legacy trust audit quarantined (spec C9), and displaced snapshots beyond keep_displaced a startup or periodic run retired (counted in acu_gc_displaced_reaped_total when retired).",
 		0,
 	)
 	gcURLPathRowsReapedTotal = metrics.NewCounterWithCap(

@@ -165,11 +165,14 @@ const (
 )
 
 // phaseStartup is runTick's phase for StartupPass's one-shot pass, the
-// pass main runs before any listener serves. Its snapshot pass's sub-job
-// B deletes the displaced snapshots beyond keep_displaced; the periodic
-// ticks' ("periodic") B only retires those snapshots, for C to delete (DN-7
-// of the GC and upstream hardening plan). Both run sub-job C (ruling PF-15,
-// re-ruled for issue #14: runSnapshotPass).
+// pass main runs before any listener serves. Its snapshot pass and the
+// periodic ticks' ("periodic") alike run sub-job B, which only retires the
+// displaced snapshots beyond keep_displaced, and sub-job C, which deletes
+// them (DN-7 of the GC and upstream hardening plan; ruling PF-15, re-ruled
+// for issue #14: runSnapshotPass). Until 2026-11-09 (issue #14 follow-up
+// Tier 1b) the startup B deleted them itself (ruling HD-7); C now runs at
+// a start, and the start deadline bounds every startup write, so it
+// retires too.
 const phaseStartup = "startup"
 
 // LastRunSummary is the SPEC5 §9.6 / §9.7.8 in-memory captured copy
@@ -289,8 +292,9 @@ func New(cfg Config) (*GC, error) {
 // are real). The one-shot pass runs snapshot-GC sub-job C (spec C9's
 // retired snapshots) within its snapshot deadline, so a start with a
 // retired backlog may wait up to max_tick_duration before the listeners
-// open, the bound ruling HD-7 accepts (ruling PF-15, re-ruled for issue
-// #14: runSnapshotPass); what its budget leaves, Run's retired run (an hour
+// open, the bound ruling HD-7 accepted for B's one-transaction deletes, which
+// bounds C's chunks now that B only retires (2026-11-09, issue #14 follow-up
+// Tier 1b; ruling PF-15, re-ruled for issue #14: runSnapshotPass); what its budget leaves, Run's retired run (an hour
 // after the start when gc.interval is longer, hourly while a backlog lasts)
 // and the periodic ticks delete.
 //
@@ -568,7 +572,7 @@ func (g *GC) periodicTick(ctx context.Context) (snapshotBacklog bool) {
 // keep Config.Cache.
 type gcStore interface {
 	RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds, holdSeconds int64, maxVersions int, afterScheme, afterHost, afterPath string) (cache.URLPathGCBatchResult, error)
-	RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGraceSeconds int64, keepDisplaced int, retireDisplaced bool) (cache.SnapshotGCBatchResult, error)
+	RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGraceSeconds int64, keepDisplaced int) (cache.SnapshotGCBatchResult, error)
 	RunRetiredSnapshotGCChunk(ctx context.Context, maxRows int) (reaped int, more bool, err error)
 	HashKnown(ctx context.Context, hash string) (bool, error)
 	PruneRepresentationMetadata(ctx context.Context, limit int) (int, error)
@@ -794,10 +798,11 @@ func passDeadlines(start time.Time, budget time.Duration) tickDeadlines {
 //
 // `phase` is phaseStartup ("startup", StartupPass) or "periodic" (Run).
 // It labels the gc_tick_deadline_reached events, so an operator can
-// correlate, and it selects behaviour: in phaseStartup the snapshot pass's
-// sub-job B deletes the displaced snapshots; in any other phase its B
-// retires them for C to delete (DN-7 of the GC and upstream hardening
-// plan). Both run sub-job C (runSnapshotPass; ruling PF-15, re-ruled for
+// correlate; it changes no behaviour of the snapshot pass. Until 2026-11-09
+// (issue #14 follow-up Tier 1b) it selected whether B deleted the displaced
+// snapshots (phaseStartup) or retired them for C to delete (DN-7 of the GC
+// and upstream hardening plan, ruling HD-7); B now always retires them, and
+// both phases run sub-job C (runSnapshotPass; ruling PF-15, re-ruled for
 // issue #14).
 func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 	deadlines := passDeadlines(time.Now(), g.cfg.MaxTickDuration)

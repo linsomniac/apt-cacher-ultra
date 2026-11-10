@@ -155,7 +155,7 @@ func TestIssue14LongRun(t *testing.T) {
 	// Measure one snapshot batch alone (no contention), to calibrate.
 	{
 		b0 := time.Now()
-		r, err := c.RunSnapshotGCBatch(context.Background(), 1, 3600, 3, true)
+		r, err := c.RunSnapshotGCBatch(context.Background(), 1, 3600, 3)
 		if err != nil {
 			t.Fatal(err)
 		}

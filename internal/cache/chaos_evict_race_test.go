@@ -150,7 +150,7 @@ func TestChaos_BlobGC_EvictRace_OneZeroNegOne(t *testing.T) {
 			// snapshot_member row kept, and sub-job C deletes it, as the
 			// tick's snapshot pass does before its blob pass (DN-7 of the
 			// GC and upstream hardening plan).
-			snapRes, err := c.RunSnapshotGCBatch(ctx, 100, 30*60, 0, true)
+			snapRes, err := c.RunSnapshotGCBatch(ctx, 100, 30*60, 0)
 			if err != nil {
 				t.Fatalf("RunSnapshotGCBatch: %v", err)
 			}

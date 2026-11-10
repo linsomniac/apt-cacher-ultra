@@ -77,7 +77,7 @@ func (f *fakeStore) PruneRepresentationMetadata(ctx context.Context, limit int) 
 	return f.cache.PruneRepresentationMetadata(ctx, limit)
 }
 
-func (f *fakeStore) RunSnapshotGCBatch(context.Context, int, int64, int, bool) (cache.SnapshotGCBatchResult, error) {
+func (f *fakeStore) RunSnapshotGCBatch(context.Context, int, int64, int) (cache.SnapshotGCBatchResult, error) {
 	f.mu.Lock()
 	f.batches++
 	n := f.batches
@@ -447,9 +447,9 @@ type slowBatchStore struct {
 	batchSleep time.Duration
 }
 
-func (s slowBatchStore) RunSnapshotGCBatch(ctx context.Context, n int, g int64, k int, retire bool) (cache.SnapshotGCBatchResult, error) {
+func (s slowBatchStore) RunSnapshotGCBatch(ctx context.Context, n int, g int64, k int) (cache.SnapshotGCBatchResult, error) {
 	time.Sleep(s.batchSleep)
-	return s.fakeStore.RunSnapshotGCBatch(ctx, n, g, k, retire)
+	return s.fakeStore.RunSnapshotGCBatch(ctx, n, g, k)
 }
 
 // Deferred minor F-1 (execution review G-8): sub-job C checks the tick's
@@ -799,10 +799,11 @@ func TestStartupPass_AFailingURLPathPassLeavesTheSnapshotPassToRun(t *testing.T)
 
 // Ruling HD-15 (the hardening plan's final review, G-I1), the snapshot
 // pass: with snapshot_skipped_member unreadable each start's snapshot pass
-// fails (its sub-job B deletes the displaced snapshots beyond
-// keep_displaced, skipped members included), and its blob pass still reaps
-// a dead blob, at the first start; StartupPass returns the snapshot pass's
-// failure.
+// fails (its sub-job B retires the displaced snapshots beyond
+// keep_displaced, and sub-job C's chunk fails deleting their skipped
+// members; B deleted them itself until 2026-11-09, issue #14 follow-up Tier
+// 1b), and its blob pass still reaps a dead blob, at the first start;
+// StartupPass returns the snapshot pass's failure.
 func TestStartupPass_AFailingSnapshotPassLeavesTheBlobPassToRun(t *testing.T) {
 	c := openTestCache(t)
 	db := dbOf(t, c)
@@ -818,8 +819,8 @@ func TestStartupPass_AFailingSnapshotPassLeavesTheBlobPassToRun(t *testing.T) {
 	for start := 1; start <= 2; start++ {
 		logger, _ := captureLogger()
 		err := freshStartGC(t, c, logger, 0).StartupPass(context.Background())
-		if err == nil || !strings.Contains(err.Error(), "snapshot gc batch") {
-			t.Fatalf("start %d: StartupPass = %v, want the snapshot pass's failure", start, err)
+		if err == nil || !strings.Contains(err.Error(), "retired snapshot gc chunk") {
+			t.Fatalf("start %d: StartupPass = %v, want the snapshot pass's failure (sub-job C's chunk)", start, err)
 		}
 		if row, file := blobRowExists(t, db, dead), fileExists(t, c.BlobPath(dead)); row || file {
 			t.Fatalf("after start %d the dead blob is still there (row %v, file %v): want it reaped at the first start", start, row, file)
@@ -856,8 +857,9 @@ func gcMetricValue(t *testing.T, series string) float64 {
 // unreadable the url-path pass fails, the snapshot pass deletes the two
 // displaced snapshots beyond keep_displaced, and the blob pass, whose
 // reachability predicate reads url_path too, fails, so the dead blob stays;
-// with snapshot_skipped_member unreadable the snapshot pass fails and the
-// blob pass reaps the dead blob.
+// with snapshot_skipped_member unreadable the snapshot pass fails (B has
+// retired the two displaced snapshots, C's chunk fails deleting them) and
+// the blob pass reaps the dead blob.
 func TestStartupPass_AFailedPassStillReportsItsWork(t *testing.T) {
 	for _, tc := range []struct {
 		table      string        // renamed away
@@ -867,7 +869,7 @@ func TestStartupPass_AFailedPassStillReportsItsWork(t *testing.T) {
 		blobs      int           // blobs_reaped: the blob pass's work
 	}{
 		{"url_path", time.Hour, []string{"url_path gc batch", "blob gc batch"}, 2, 0},
-		{"snapshot_skipped_member", 0, []string{"snapshot gc batch"}, 0, 1},
+		{"snapshot_skipped_member", 0, []string{"retired snapshot gc chunk"}, 2, 1},
 	} {
 		t.Run(tc.table+" unreadable", func(t *testing.T) {
 			c := openTestCache(t)

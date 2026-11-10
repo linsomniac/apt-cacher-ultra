@@ -160,6 +160,11 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 - A GC pass gives up a database write it cannot start before its deadline,
   so a busy writer no longer pushes GC past `gc.max_tick_duration`
   (issue #14).
+- The startup GC pass retires the displaced snapshots beyond
+  `gc.keep_displaced` and deletes them 10,000 rows a transaction, like a
+  periodic run, instead of deleting them in one transaction; a start's
+  displaced snapshots now count in `displaced_reaped` and again in
+  `retired_reaped` (issue #14).
 - Upstream downloads are no longer decompressed in transit (a gzip-encoded
   body skipped the size check, and a resumed one could be corrupted), and
   adoption stops a member's download at the size its `Release` declares.

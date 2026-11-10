@@ -22,18 +22,17 @@ type snapshotPassResult struct {
 // runSnapshotPass implements SPEC4 §9.6.3: a per-tick batched reap
 // loop over orphan candidate snapshots (sub-job A) ∪ displaced
 // snapshots beyond keep-N (sub-job B). Each batch is a single writer-
-// tx that runs SELECT-inside-tx + cascade DELETE of the orphans, and of
-// the displaced snapshots in the startup pass (phase phaseStartup); a
-// periodic tick's batch retires the displaced snapshots instead
-// (retireDisplaced: one UPDATE), for sub-job C to delete (DN-7 of the GC
-// and upstream hardening plan). The SELECT-DELETE (or -UPDATE)
+// tx that runs SELECT-inside-tx + cascade DELETE of the orphans, and
+// retires the displaced snapshots (one UPDATE; at a start too since
+// 2026-11-09, issue #14 follow-up Tier 1b), for sub-job C to delete (DN-7
+// of the GC and upstream hardening plan). The SELECT-DELETE (or -UPDATE)
 // liveness race is closed by single-writer ordering (heartbeat /
 // CommitAdoption / InsertCandidateSnapshot writes serialize through
 // the same writer goroutine — they cannot interleave between SELECT
 // and DELETE inside this tx). Once A ∪ B is drained, sub-job C (spec C9)
 // deletes the retired snapshots — those of reaped, evicted and forgotten
 // suites, those the legacy trust audit quarantined, and the displaced
-// snapshots a periodic tick's B retired — in chunks of at most 10,000
+// snapshots B retired — in chunks of at most 10,000
 // rows per writer transaction, in the startup pass and the periodic ticks
 // alike (ruling PF-15, re-ruled for issue #14), as does retiredRun, an
 // hour after the start and hourly while a backlog lasts.
@@ -75,16 +74,21 @@ type snapshotPassResult struct {
 // backlog lasts (Run). Retired rows never serve meanwhile.
 //
 // AIDEV-NOTE: rulings HD-4, HD-7 (DN-7 of the GC and upstream hardening
-// plan; the H3 final review R3 #4). A periodic tick's B only retires the
-// displaced snapshots beyond keep_displaced (retireDisplaced = phase !=
-// phaseStartup), and C deletes them in this same pass, 10,000 rows a
+// plan; the H3 final review R3 #4), HD-7 superseded in part 2026-11-09
+// (issue #14 follow-up Tier 1b). B only retires the displaced snapshots
+// beyond keep_displaced, and C deletes them in this same pass, 10,000 rows a
 // transaction: B's cascade DELETE held the writer — every miss's store,
 // every flip's commit — for seconds on a large suite while the listeners
-// served. The startup pass's B still deletes them: it runs before the
-// freshness scheduler and the listeners (main), so its long transactions
-// hold up no other writer and no request, and a daemon that never lives
-// until C runs (min(1 h, gc.interval)) still deletes them, their blobs in
-// this start's blob pass. When a periodic tick's pass stops before its C
+// served. HD-7 had the startup pass's B still delete them (phase ==
+// phaseStartup chose that): it runs before the freshness scheduler and the
+// listeners (main), so its long transactions held up no other writer and
+// no request, and a daemon that never lived until C ran (min(1 h,
+// gc.interval)) still deleted them, their blobs in that start's blob pass.
+// Since PF-15's re-ruling (issue #14) the startup pass runs C after B, and
+// the start deadline (Tier 1a) bounds every startup write, so the startup B
+// retires too (one code path) and that start's C deletes them, their
+// blobs in the same start's blob pass; they count twice at a start as in a
+// periodic tick. When a periodic tick's pass stops before its C
 // has deleted what its B retired — at its deadline, at a shutdown (ctx),
 // or on a batch or chunk that failed or panicked — those snapshots are no
 // longer B-selectable (retired_at); C deletes them: retiredRun an hour
@@ -129,7 +133,6 @@ func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase stri
 			g.cfg.SnapshotBatchSize,
 			staleGraceSeconds,
 			g.cfg.KeepDisplaced,
-			phase != phaseStartup,
 		)
 		if notStarted(err) {
 			// The batch never ran: the deadline, not a batch that found
