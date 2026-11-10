@@ -207,8 +207,12 @@ func runFor(g *GC, d time.Duration) {
 // Issue #14 (G2-I2, the cadence): while retiredRun's run ends at its
 // deadline with retired snapshots left, Run repeats it an hour later, until
 // one drains them. With five left and two 30 s chunks a 1 min run: runs an
-// hour, two and three hours in (2, 2, then 1 and none left), and no fourth.
-// Before the fix the run came once a process.
+// hour, two and three hours in (2, 2, then 1 and none left). Before the fix
+// the run came once a process. Since 2026-11-09 (issue #14 follow-up Tier 2)
+// the run goes on to sub-job D after C; the third run's C finds none left
+// exactly at its deadline, so D starts there, its deadline reached before it
+// could look (rows may be left), and the run re-arms once more: a fourth,
+// four hours in, finds nothing for either and ends it.
 func TestRun_RepeatsTheRetiredRunHourlyWhileABacklogRemains(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		logger, buf := captureLogger()
@@ -219,8 +223,8 @@ func TestRun_RepeatsTheRetiredRunHourlyWhileABacklogRemains(t *testing.T) {
 		for _, r := range gcEvents(t, buf, "gc_retired_run_complete") {
 			got = append(got, fmt.Sprintf("%v/%v", r["retired_reaped"], r["deadline_reached"]))
 		}
-		if fmt.Sprint(got) != "[2/true 2/true 1/false]" {
-			t.Fatalf("retired runs (retired_reaped/deadline_reached) %v, want [2/true 2/true 1/false]: hourly until drained", got)
+		if fmt.Sprint(got) != "[2/true 2/true 1/true 0/false]" {
+			t.Fatalf("retired runs (retired_reaped/deadline_reached) %v, want [2/true 2/true 1/true 0/false]: hourly until drained", got)
 		}
 	})
 }

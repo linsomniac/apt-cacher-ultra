@@ -27,8 +27,12 @@ import (
 // none (or panic, chunkPanics, or fail, chunkErrs), and whose HashKnown
 // knows no hash and panics for hashPanic. A batch or chunk call checks
 // for its panic first, then calls its hook (batchHook, chunkHook), then
-// fails or answers. Its url-path batches are the real cache's (storeGC
-// gives it the cache: useCache), each taking urlSleep first.
+// fails or answers. Its sub-job D chunks strip fakeDChunkRows rows and
+// report more for dChunksMore calls and then none (or fail, dChunkErrs, or
+// are never started, dChunkNotStarted: cache.ErrWriteNotStarted). calls
+// records the snapshot pass's store calls in order: "batch", "C", "D". Its
+// url-path batches are the real cache's (storeGC gives it the cache:
+// useCache), each taking urlSleep once its real batch has run.
 type fakeStore struct {
 	mu          sync.Mutex
 	cache       *cache.Cache  // the url-path batches' (useCache)
@@ -47,7 +51,20 @@ type fakeStore struct {
 	chunkErrs   bool   // RunRetiredSnapshotGCChunk fails
 	chunkHook   func() // called on every RunRetiredSnapshotGCChunk call that does not panic, before it fails or answers; runs under f.mu: it must not call the fake
 	hashPanic   string
+
+	dChunks          int           // RunDisplacedPackageHashChunk calls
+	dChunkRows       []int         // maxRows of each RunDisplacedPackageHashChunk call
+	dChunksMore      int           // the first dChunksMore D calls strip fakeDChunkRows rows each and report more
+	dChunkErrs       bool          // RunDisplacedPackageHashChunk fails
+	dChunkNotStarted bool          // RunDisplacedPackageHashChunk returns cache.ErrWriteNotStarted (its start deadline)
+	dChunkSleep      time.Duration // each D chunk takes this long (virtual time in a bubble)
+
+	calls []string // "batch", "C", "D": the snapshot pass's store calls, in order
 }
+
+// fakeDChunkRows is the package_hash rows each of fakeStore's D chunks that
+// reports more strips: not 1, so a count of rows is not a count of calls.
+const fakeDChunkRows = 7
 
 // useCache is storeGC's: the url-path batches go to c.
 func (f *fakeStore) useCache(c *cache.Cache) { f.cache = c }
@@ -80,6 +97,7 @@ func (f *fakeStore) PruneRepresentationMetadata(ctx context.Context, limit int) 
 func (f *fakeStore) RunSnapshotGCBatch(context.Context, int, int64, int) (cache.SnapshotGCBatchResult, error) {
 	f.mu.Lock()
 	f.batches++
+	f.calls = append(f.calls, "batch")
 	n := f.batches
 	f.mu.Unlock()
 	if n <= f.batchPanics {
@@ -98,6 +116,7 @@ func (f *fakeStore) RunRetiredSnapshotGCChunk(_ context.Context, maxRows int) (i
 	time.Sleep(f.chunkSleep)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.calls = append(f.calls, "C")
 	if f.chunkPanics {
 		panic("retired chunk bug")
 	}
@@ -113,6 +132,27 @@ func (f *fakeStore) RunRetiredSnapshotGCChunk(_ context.Context, maxRows int) (i
 	}
 	if len(f.chunkRows) <= f.chunksMore {
 		return 1, true, nil
+	}
+	return 0, false, nil
+}
+
+func (f *fakeStore) RunDisplacedPackageHashChunk(_ context.Context, maxRows int) (int, bool, error) {
+	time.Sleep(f.dChunkSleep)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "D")
+	f.dChunks++
+	if f.dChunks > 1000 {
+		panic("runaway sub-job D loop")
+	}
+	f.dChunkRows = append(f.dChunkRows, maxRows)
+	switch {
+	case f.dChunkNotStarted:
+		return 0, false, cache.ErrWriteNotStarted
+	case f.dChunkErrs:
+		return 0, false, errors.New("displaced chunk fault")
+	case f.dChunks <= f.dChunksMore:
+		return fakeDChunkRows, true, nil
 	}
 	return 0, false, nil
 }

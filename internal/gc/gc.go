@@ -180,25 +180,29 @@ const phaseStartup = "startup"
 // status-page handler renders this; the §9.7.6 refresher mirrors
 // fields into Phase 5 GC counters/gauges.
 type LastRunSummary struct {
-	Phase                   string // "startup" | "periodic"
-	AtUnixTime              int64
-	DurationSeconds         float64
-	BlobsReaped             int
-	BytesReclaimed          int64
-	OrphanCandidatesReaped  int
-	DisplacedReaped         int
-	RetiredReaped           int // snapshot-GC sub-job C (spec C9)
-	URLPathRowsReaped       int
-	URLPathRowsScanned      int
-	URLPathRowsStamped      int
-	URLPathRowsCleared      int
-	URLPathDurationSeconds  float64
-	SnapshotDurationSeconds float64
-	BlobDurationSeconds     float64
-	PoolOrphansRepaired     int
-	PoolOrphanBytesRepaired int64
-	PoolUnlinkErrors        int
-	DeadlineReached         bool
+	Phase                  string // "startup" | "periodic"
+	AtUnixTime             int64
+	DurationSeconds        float64
+	BlobsReaped            int
+	BytesReclaimed         int64
+	OrphanCandidatesReaped int
+	DisplacedReaped        int
+	RetiredReaped          int // snapshot-GC sub-job C (spec C9)
+	// DisplacedPackageRowsDeleted is snapshot-GC sub-job D's count: the
+	// package_hash rows of displaced snapshots it stripped (issue #14
+	// follow-up, Tier 2).
+	DisplacedPackageRowsDeleted int
+	URLPathRowsReaped           int
+	URLPathRowsScanned          int
+	URLPathRowsStamped          int
+	URLPathRowsCleared          int
+	URLPathDurationSeconds      float64
+	SnapshotDurationSeconds     float64
+	BlobDurationSeconds         float64
+	PoolOrphansRepaired         int
+	PoolOrphanBytesRepaired     int64
+	PoolUnlinkErrors            int
+	DeadlineReached             bool
 }
 
 // Interval returns the configured periodic-tick cadence. Pure accessor
@@ -343,6 +347,7 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 		"orphan_candidates_reaped", tick.orphanCandidatesReaped,
 		"displaced_reaped", tick.displacedReaped,
 		"retired_reaped", tick.retiredReaped,
+		"displaced_package_rows_deleted", tick.displacedPackageRowsDeleted,
 		"url_path_rows_reaped", tick.urlPathRowsReaped,
 		"url_path_rows_scanned", tick.urlPath.scanned,
 		"url_path_rows_stamped", tick.urlPath.stamped,
@@ -365,6 +370,7 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 		tick.orphanCandidatesReaped,
 		tick.displacedReaped,
 		tick.retiredReaped,
+		tick.displacedPackageRowsDeleted,
 		tick.urlPathRowsReaped,
 		scan.orphansRepaired,
 		scan.orphanBytesRepaired,
@@ -373,25 +379,26 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 	)
 	emitGCPassMetrics("startup", tick)
 	g.recordLastRun(LastRunSummary{
-		Phase:                   "startup",
-		AtUnixTime:              endUnix,
-		DurationSeconds:         duration.Seconds(),
-		BlobsReaped:             tick.blobsReaped,
-		BytesReclaimed:          tick.bytesReclaimed,
-		OrphanCandidatesReaped:  tick.orphanCandidatesReaped,
-		DisplacedReaped:         tick.displacedReaped,
-		RetiredReaped:           tick.retiredReaped,
-		URLPathRowsReaped:       tick.urlPathRowsReaped,
-		URLPathRowsScanned:      tick.urlPath.scanned,
-		URLPathRowsStamped:      tick.urlPath.stamped,
-		URLPathRowsCleared:      tick.urlPath.cleared,
-		URLPathDurationSeconds:  tick.urlPathDuration.Seconds(),
-		SnapshotDurationSeconds: tick.snapshotDuration.Seconds(),
-		BlobDurationSeconds:     tick.blobDuration.Seconds(),
-		PoolOrphansRepaired:     scan.orphansRepaired,
-		PoolOrphanBytesRepaired: scan.orphanBytesRepaired,
-		PoolUnlinkErrors:        tick.poolUnlinkErrors + scan.unlinkErrors,
-		DeadlineReached:         tick.deadlineReached,
+		Phase:                       "startup",
+		AtUnixTime:                  endUnix,
+		DurationSeconds:             duration.Seconds(),
+		BlobsReaped:                 tick.blobsReaped,
+		BytesReclaimed:              tick.bytesReclaimed,
+		OrphanCandidatesReaped:      tick.orphanCandidatesReaped,
+		DisplacedReaped:             tick.displacedReaped,
+		RetiredReaped:               tick.retiredReaped,
+		DisplacedPackageRowsDeleted: tick.displacedPackageRowsDeleted,
+		URLPathRowsReaped:           tick.urlPathRowsReaped,
+		URLPathRowsScanned:          tick.urlPath.scanned,
+		URLPathRowsStamped:          tick.urlPath.stamped,
+		URLPathRowsCleared:          tick.urlPath.cleared,
+		URLPathDurationSeconds:      tick.urlPathDuration.Seconds(),
+		SnapshotDurationSeconds:     tick.snapshotDuration.Seconds(),
+		BlobDurationSeconds:         tick.blobDuration.Seconds(),
+		PoolOrphansRepaired:         scan.orphansRepaired,
+		PoolOrphanBytesRepaired:     scan.orphanBytesRepaired,
+		PoolUnlinkErrors:            tick.poolUnlinkErrors + scan.unlinkErrors,
+		DeadlineReached:             tick.deadlineReached,
 	})
 	if tickErr != nil {
 		return fmt.Errorf("gc startup: tick: %w", tickErr)
@@ -405,9 +412,10 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 // immediately, even when an individual batch exceeds the tick budget.
 // When `gc.interval` is longer than an hour, Run also deletes the retired
 // snapshots an hour after the start (retiredRun; the final review's R3 #2),
-// and again an hour after any retired run or periodic tick whose sub-job C
-// stopped at its deadline with retired snapshots left (issue #14), until
-// one drains them.
+// and strips the displaced snapshots' package rows (sub-job D, issue #14
+// follow-up Tier 2), and again an hour after any retired run or periodic
+// tick whose sub-job C or D stopped at its deadline with work left (issue
+// #14), until one drains them.
 //
 // AIDEV-NOTE: issue #14 (the hardening plan's final review 2, G2-I2; the
 // maintainer's decision of 2026-11-05). Since DN-7 a periodic tick's
@@ -423,7 +431,14 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 // A ∪ B had work left; that run then finds nothing retired and costs one
 // SELECT. Never re-armed after a failure or a panic (no hourly retry
 // storm: the next periodic tick retries C, as before), nor when gc.interval
-// is an hour or less, whose ticks already come hourly.
+// is an hour or less, whose ticks already come hourly. Updated 2026-11-09
+// (issue #14 follow-up Tier 2): the retired run and a tick's snapshot pass
+// run sub-job D after C, which strips the displaced snapshots'
+// package_hash rows, and D's deadline re-arms the run too, so the first
+// 1.1.0 start's backlog of package rows (every displaced snapshot's) drains
+// hourly, not daily. A run whose C failed goes on to D (HD-15 within the
+// run); it re-arms only on D's deadline, so a failing C is retried hourly
+// only while D has rows left.
 //
 // When Enabled = false, returns immediately — the goroutine is not
 // started.
@@ -509,6 +524,7 @@ func (g *GC) periodicTick(ctx context.Context) (snapshotBacklog bool) {
 		"orphan_candidates_reaped", tick.orphanCandidatesReaped,
 		"displaced_reaped", tick.displacedReaped,
 		"retired_reaped", tick.retiredReaped,
+		"displaced_package_rows_deleted", tick.displacedPackageRowsDeleted,
 		"url_path_rows_reaped", tick.urlPathRowsReaped,
 		"url_path_rows_scanned", tick.urlPath.scanned,
 		"url_path_rows_stamped", tick.urlPath.stamped,
@@ -531,6 +547,7 @@ func (g *GC) periodicTick(ctx context.Context) (snapshotBacklog bool) {
 		tick.orphanCandidatesReaped,
 		tick.displacedReaped,
 		tick.retiredReaped,
+		tick.displacedPackageRowsDeleted,
 		tick.urlPathRowsReaped,
 		0,
 		0,
@@ -539,25 +556,26 @@ func (g *GC) periodicTick(ctx context.Context) (snapshotBacklog bool) {
 	)
 	emitGCPassMetrics("periodic", tick)
 	g.recordLastRun(LastRunSummary{
-		Phase:                   "periodic",
-		AtUnixTime:              endUnix,
-		DurationSeconds:         duration.Seconds(),
-		BlobsReaped:             tick.blobsReaped,
-		BytesReclaimed:          tick.bytesReclaimed,
-		OrphanCandidatesReaped:  tick.orphanCandidatesReaped,
-		DisplacedReaped:         tick.displacedReaped,
-		RetiredReaped:           tick.retiredReaped,
-		URLPathRowsReaped:       tick.urlPathRowsReaped,
-		URLPathRowsScanned:      tick.urlPath.scanned,
-		URLPathRowsStamped:      tick.urlPath.stamped,
-		URLPathRowsCleared:      tick.urlPath.cleared,
-		URLPathDurationSeconds:  tick.urlPathDuration.Seconds(),
-		SnapshotDurationSeconds: tick.snapshotDuration.Seconds(),
-		BlobDurationSeconds:     tick.blobDuration.Seconds(),
-		PoolOrphansRepaired:     0,
-		PoolOrphanBytesRepaired: 0,
-		PoolUnlinkErrors:        tick.poolUnlinkErrors,
-		DeadlineReached:         tick.deadlineReached,
+		Phase:                       "periodic",
+		AtUnixTime:                  endUnix,
+		DurationSeconds:             duration.Seconds(),
+		BlobsReaped:                 tick.blobsReaped,
+		BytesReclaimed:              tick.bytesReclaimed,
+		OrphanCandidatesReaped:      tick.orphanCandidatesReaped,
+		DisplacedReaped:             tick.displacedReaped,
+		RetiredReaped:               tick.retiredReaped,
+		DisplacedPackageRowsDeleted: tick.displacedPackageRowsDeleted,
+		URLPathRowsReaped:           tick.urlPathRowsReaped,
+		URLPathRowsScanned:          tick.urlPath.scanned,
+		URLPathRowsStamped:          tick.urlPath.stamped,
+		URLPathRowsCleared:          tick.urlPath.cleared,
+		URLPathDurationSeconds:      tick.urlPathDuration.Seconds(),
+		SnapshotDurationSeconds:     tick.snapshotDuration.Seconds(),
+		BlobDurationSeconds:         tick.blobDuration.Seconds(),
+		PoolOrphansRepaired:         0,
+		PoolOrphanBytesRepaired:     0,
+		PoolUnlinkErrors:            tick.poolUnlinkErrors,
+		DeadlineReached:             tick.deadlineReached,
 	})
 	return snapshotBacklog
 }
@@ -574,6 +592,7 @@ type gcStore interface {
 	RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds, holdSeconds int64, maxVersions int, afterScheme, afterHost, afterPath string) (cache.URLPathGCBatchResult, error)
 	RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGraceSeconds int64, keepDisplaced int) (cache.SnapshotGCBatchResult, error)
 	RunRetiredSnapshotGCChunk(ctx context.Context, maxRows int) (reaped int, more bool, err error)
+	RunDisplacedPackageHashChunk(ctx context.Context, maxRows int) (rows int, more bool, err error)
 	HashKnown(ctx context.Context, hash string) (bool, error)
 	PruneRepresentationMetadata(ctx context.Context, limit int) (int, error)
 }
@@ -709,11 +728,15 @@ type tickResult struct {
 	orphanCandidatesReaped int
 	displacedReaped        int
 	retiredReaped          int
-	urlPathRowsReaped      int
-	poolUnlinkErrors       int
-	deadlineReached        bool
+	// displacedPackageRowsDeleted: sub-job D's package_hash rows (issue #14
+	// follow-up, Tier 2).
+	displacedPackageRowsDeleted int
+	urlPathRowsReaped           int
+	poolUnlinkErrors            int
+	deadlineReached             bool
 	// snapshotDeadlineReached: the snapshot pass stopped at its deadline
-	// with work left (A ∪ B, or sub-job C); Run re-arms its retired run.
+	// with work left (A ∪ B, sub-job C or sub-job D); Run re-arms its
+	// retired run.
 	snapshotDeadlineReached bool
 	urlPath                 urlPathResult
 	urlPathDuration         time.Duration
@@ -764,7 +787,8 @@ func passDeadlines(start time.Time, budget time.Duration) tickDeadlines {
 // its writes (cache.WithWriteStartDeadline): a write still queued behind the
 // writer goroutine at the deadline never runs, and the pass ends there as at
 // its deadline, never as a failure (notStarted). A pass that fails while ctx
-// lives does not end the tick (ruling HD-15): it logs WARN gc_tick_failed,
+// lives does not end the tick (ruling HD-15): it logs WARN gc_tick_failed
+// (the snapshot pass, one per failed sub-job, itself: subJobRun),
 // passFailed moves the rotation past it, as if it had completed, and the
 // passes after it run; runTick returns the tick's first failure. A pass that
 // fails once ctx has ended (a shutdown) ends the tick at once, the rotation
@@ -812,12 +836,21 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 		// firstErr is the tick's first failure, what runTick returns.
 		firstErr error
 	)
-	// failed takes a pass that failed with err: passFailed moves the
-	// rotation past it unless ctx has ended, err is kept unless an earlier
-	// pass of this tick failed first, and, while ctx lives, the pass logs
-	// WARN gc_tick_failed. It reports whether the tick goes on: not once ctx
-	// has ended, which never comes undone, so a tick whose rotation
-	// passFailed left as it was always ends there.
+	// recordFailure takes a pass that failed with err: passFailed moves the
+	// rotation past it unless ctx has ended, and err is kept unless an
+	// earlier pass of this tick failed first. It reports whether the tick
+	// goes on: not once ctx has ended, which never comes undone, so a tick
+	// whose rotation passFailed left as it was always ends there. It logs
+	// nothing: failed does, for the passes that do not log their own.
+	recordFailure := func(err error) bool {
+		e := g.passFailed(ctx, err)
+		if firstErr == nil {
+			firstErr = e
+		}
+		return ctx.Err() == nil
+	}
+	// failed is recordFailure, and, while ctx lives, the pass's WARN
+	// gc_tick_failed: the url-path and blob passes'.
 	//
 	// AIDEV-NOTE: passFailed's test: a pass stopped by the end of ctx (a
 	// shutdown) did not fail, whatever its error's shape, and logs nothing.
@@ -827,16 +860,18 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 	// the first, nor a failure behind a shutdown later in the tick (ruling
 	// HD-15's follow-up in the hardening plan's final fix wave). runTick
 	// returns the first for StartupPass's caller, which logs it once more,
-	// as the startup pass's failure.
+	// as the startup pass's failure. Updated 2026-11-09 (issue #14
+	// follow-up Tier 2): the snapshot pass is the exception. Its sub-jobs
+	// (A ∪ B, C, D) go on past a failed one, each logging its own line as it
+	// fails (subJobRun's AIDEV-NOTE), so the pass returns its first failure
+	// already logged, and runTick takes it with recordFailure alone: still
+	// one line per failure. Every failed pass, logged here or by itself,
+	// goes through recordFailure.
 	failed := func(err error) bool {
-		e := g.passFailed(ctx, err)
-		if firstErr == nil {
-			firstErr = e
-		}
-		if ctx.Err() != nil {
+		if !recordFailure(err) {
 			return false
 		}
-		g.cfg.Logger.Warn("gc_tick_failed", "err", e)
+		g.cfg.Logger.Warn("gc_tick_failed", "err", err)
 		return true
 	}
 
@@ -885,13 +920,14 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 		res.orphanCandidatesReaped += snap.batch.OrphanReaped
 		res.displacedReaped += snap.batch.DisplacedReaped
 		res.retiredReaped += snap.retired
+		res.displacedPackageRowsDeleted += snap.packageRowsStripped
 		if snapDeadline {
 			res.deadlineReached = true
 			res.snapshotDeadlineReached = true
 		}
 		switch {
-		case err != nil: // passFailed moves the rotation to the blob pass
-			if !failed(err) {
+		case err != nil: // passFailed moves the rotation to the blob pass; the pass logged its failures
+			if !recordFailure(err) {
 				return res, firstErr
 			}
 		default: // drained, or its deadline left work for the next tick: the tick goes on (issue #14)

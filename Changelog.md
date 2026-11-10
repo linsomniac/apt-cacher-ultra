@@ -65,6 +65,10 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   `adoption.flip_quiet_period`, `adoption.max_duration`,
   `freshness.max_suites` (with a per-host cap) and `gc.suite_idle_ttl`.
 - New status-page and JSON fields, log events and metrics.
+- The counter `acu_gc_displaced_package_rows_deleted_total` and the
+  `displaced_package_rows_deleted` field of `gc_run_complete` and
+  `gc_retired_run_complete`: displaced snapshots' package-list rows GC
+  deleted (issue #14).
 - Tests: `make e2e-flat` (real apt clients on six Debian and Ubuntu images,
   in CI) and `make e2e-live` (a manual smoke against live vendors).
 - `make e2e-apt-oracle` and `make e2e-apt-oracle-old`: check that the real
@@ -107,6 +111,13 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 - A reconcile decision that fails on a snapshot (a stored anchor apt's
   text layer refuses, say) warns once, not at every check;
   `acu_adoption_reconcile_failed_total{stage}` counts every failure.
+- GC deletes a displaced snapshot's package list (its `package_hash` rows)
+  early, 10,000 rows a transaction, so the table shrinks to roughly the
+  current snapshots' size; `gc.keep_displaced` now keeps displaced
+  snapshots' headers and index files, not their package lists. The database
+  file keeps its size (SQLite reuses the pages); an offline `VACUUM` is
+  optional. A failing GC sub-job no longer stops the ones after it
+  (issue #14).
 - Built with Go 1.27; `golang.org/x/net`, `x/text`, `x/crypto`, `x/sys`,
   `github.com/cloudflare/circl` and `github.com/ProtonMail/go-crypto`
   updated (`govulncheck`: no known vulnerability the code reaches).

@@ -17,6 +17,9 @@ type snapshotPassResult struct {
 	batch cache.SnapshotGCBatchResult
 	// retired counts the retired snapshots sub-job C deleted (spec C9).
 	retired int
+	// packageRowsStripped counts the package_hash rows of displaced
+	// snapshots sub-job D deleted (issue #14 follow-up, Tier 2).
+	packageRowsStripped int
 }
 
 // runSnapshotPass implements SPEC4 §9.6.3: a per-tick batched reap
@@ -35,7 +38,25 @@ type snapshotPassResult struct {
 // snapshots B retired — in chunks of at most 10,000
 // rows per writer transaction, in the startup pass and the periodic ticks
 // alike (ruling PF-15, re-ruled for issue #14), as does retiredRun, an
-// hour after the start and hourly while a backlog lasts.
+// hour after the start and hourly while a backlog lasts. Then sub-job D
+// (issue #14 follow-up Tier 2) strips the displaced snapshots'
+// package_hash rows, 10,000 rows a writer transaction, keeping their
+// headers, members and skipped members, as does retiredRun after its C.
+//
+// AIDEV-NOTE: sub-job D and ruling HD-15 within the pass (issue #14
+// follow-up Tier 2, 2026-11-09; the maintainer approved keep_displaced's
+// meaning change the same day). The pass runs A ∪ B, then C, then D, all
+// under the snapshot deadline and its start deadline; D comes last because
+// C frees disk (its snapshots' blobs) and D frees only rows. A sub-job that
+// fails logs its own WARN gc_tick_failed and the sub-jobs after it still
+// run (subJobRun): HD-15, which already kept a failed pass from ending its
+// tick, now applies within the pass, because C fails on the oldest retired
+// snapshot at every call when that snapshot is the fault, and a C stuck so
+// would otherwise stop D forever, defeating the strip (G1). The pass then
+// returns its first failure, so it counts as failed (a failed D too), and
+// runTick records it without logging it again (recordFailure). A deadline
+// or a shutdown still stops the sub-jobs after it: a shutdown is not a
+// failure, and logs nothing.
 //
 // AIDEV-NOTE: ruling PF-15 (final review concurrency m1), re-ruled by the
 // maintainer, 2026-11-05 (issue #14; the final review 2's G2-I2). PF-15
@@ -94,7 +115,9 @@ type snapshotPassResult struct {
 // blobs in the same start's blob pass; they count twice at a start as in a
 // periodic tick. When a periodic tick's pass stops before its C
 // has deleted what its B retired — at its deadline, at a shutdown (ctx),
-// or on a batch or chunk that failed or panicked — those snapshots are no
+// on a C chunk that failed, or on a batch or chunk that panicked (a batch
+// that fails no longer stops the pass before its C since 2026-11-09: HD-15
+// within the pass, subJobRun) — those snapshots are no
 // longer B-selectable (retired_at); C deletes them: retiredRun an hour
 // later when the pass stopped at its deadline (issue #14), the next start's
 // startup pass (PF-15 re-ruled), or a later periodic tick's snapshot pass
@@ -104,36 +127,62 @@ type snapshotPassResult struct {
 // displaced_reaped when B retires it, in retired_reaped when C deletes it.
 //
 // Returns:
-//   - the cumulative counts (orphan, displaced, retired),
+//   - the cumulative counts (orphan, displaced, retired, package rows
+//     stripped),
 //   - whether the deadline tripped (true means the pass exited
 //     between batches with backlog remaining, or at a batch or chunk
 //     the writer never started before the deadline, its start deadline
 //     (issue #14 Tier 1a: notStarted); runTick then moves the
 //     rotation to the blob pass, which runs in the same tick, under its
 //     own share of the budget, and the next tick that reaches this pass
-//     re-selects — A ∪ B, then C: issue #14),
-//   - error iff a DB-level failure occurred (runTick then runs the blob
-//     pass all the same: ruling HD-15).
+//     re-selects — A ∪ B, then C, then D: issue #14),
+//   - the first sub-job's DB-level failure, nil if none failed; each failed
+//     sub-job has logged its own gc_tick_failed line, and the sub-jobs after
+//     it ran (subJobRun); runTick then runs the blob pass all the same
+//     (ruling HD-15).
 func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase string) (snapshotPassResult, bool, error) {
-	staleGraceSeconds := int64(g.cfg.HeartbeatStaleGrace.Seconds())
-
 	var (
 		acc        snapshotPassResult
 		batchesRun int
 	)
 	dl := g.snapshotDeadline(deadline, phase, &batchesRun)
-	// Every write of the pass, A ∪ B's batches and C's chunks, must start by
-	// the deadline (issue #14 Tier 1a: notStarted's AIDEV-NOTE).
+	// Every write of the pass, A ∪ B's batches and C's and D's chunks, must
+	// start by the deadline (issue #14 Tier 1a: notStarted's AIDEV-NOTE).
 	wctx := cache.WithWriteStartDeadline(ctx, deadline)
+	sj := subJobRun{g: g, ctx: ctx}
+
+	hit, err := g.runSubJobsAB(wctx, dl, &acc.batch, &batchesRun)
+	if !sj.next(hit, err) {
+		return acc, hit, sj.firstErr
+	}
+	// Sub-job C, at a start too (ruling PF-15 re-ruled, issue #14).
+	retired, hit, err := g.runSubJobC(wctx, dl, &batchesRun)
+	acc.retired += retired
+	if !sj.next(hit, err) {
+		return acc, hit, sj.firstErr
+	}
+	// Sub-job D, last: C frees disk (its snapshots' blobs), D only rows.
+	stripped, hit, err := g.runSubJobD(wctx, dl, &batchesRun)
+	acc.packageRowsStripped += stripped
+	sj.next(hit, err)
+	return acc, hit, sj.firstErr
+}
+
+// runSubJobsAB runs snapshot-GC sub-jobs A ∪ B (SPEC4 §9.6.3): batches until
+// one finds nothing (drained), ctx ends, or dl's deadline comes
+// (deadlineHit): dl expired between batches, or a batch the writer never
+// started before it (notStarted). ctx is the pass's wctx. It adds each
+// batch's counts to acc.
+func (g *GC) runSubJobsAB(ctx context.Context, dl snapshotPassDeadline, acc *cache.SnapshotGCBatchResult, batchesRun *int) (deadlineHit bool, err error) {
+	staleGraceSeconds := int64(g.cfg.HeartbeatStaleGrace.Seconds())
 	for {
 		if err := ctx.Err(); err != nil {
-			return acc, false, nil
+			return false, nil
 		}
 		if dl.expired() {
-			return acc, true, nil
+			return true, nil
 		}
-
-		batch, err := g.store.RunSnapshotGCBatch(wctx,
+		batch, err := g.store.RunSnapshotGCBatch(ctx,
 			g.cfg.SnapshotBatchSize,
 			staleGraceSeconds,
 			g.cfg.KeepDisplaced,
@@ -141,23 +190,59 @@ func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase stri
 		if notStarted(err) {
 			// The batch never ran: the deadline, not a batch that found
 			// nothing (A ∪ B drained), so neither counted nor followed by C.
-			return acc, dl.reached(), nil
+			return dl.reached(), nil
 		}
 		if err != nil {
-			return acc, false, fmt.Errorf("snapshot gc batch: %w", err)
+			return false, fmt.Errorf("snapshot gc batch: %w", err)
 		}
-		batchesRun++
-		acc.batch.OrphanReaped += batch.OrphanReaped
-		acc.batch.DisplacedReaped += batch.DisplacedReaped
-
+		*batchesRun++
+		acc.OrphanReaped += batch.OrphanReaped
+		acc.DisplacedReaped += batch.DisplacedReaped
 		if batch.Total() == 0 {
-			break // A ∪ B drained
+			return false, nil // A ∪ B drained
 		}
 	}
-	// Sub-job C, at a start too (ruling PF-15 re-ruled, issue #14).
-	retired, deadlineHit, err := g.runSubJobC(wctx, dl, &batchesRun)
-	acc.retired += retired
-	return acc, deadlineHit, err
+}
+
+// subJobRun carries one snapshot pass's (or retired run's) sub-jobs from one
+// to the next: next takes a sub-job's outcome and reports whether the
+// sub-job after it runs, and firstErr is the first sub-job failure, which
+// the pass returns.
+//
+// AIDEV-NOTE: ruling HD-15 within the pass (issue #14 follow-up Tier 2,
+// 2026-11-09). Until then a sub-job that failed ended its pass; kept so, a C
+// that failed on the same retired snapshot at every call (its chunks take
+// the oldest first) would keep D from ever running, and the displaced
+// snapshots' package_hash rows — the strip's whole point (G1) — would never
+// be deleted. Now a failed sub-job logs its own WARN gc_tick_failed here, as it fails,
+// and the sub-jobs after it run under the same deadline; a sub-job that
+// reached the deadline, or a shutdown (ctx ended: no line, it did not
+// fail), stops the sub-jobs after it. The pass still returns its first
+// failure, so runTick counts the pass as failed (passFailed moves the
+// rotation) without logging it again (runTick's recordFailure, which every
+// failed pass goes through, logged or not: the place for a per-pass failure
+// count).
+type subJobRun struct {
+	g        *GC
+	ctx      context.Context // the pass's ctx, not its wctx
+	firstErr error
+}
+
+// next takes a sub-job that returned (deadlineHit, err) and reports whether
+// the next sub-job runs: after a failure, logged here while ctx lives, yes;
+// at the deadline or once ctx has ended (a shutdown), no.
+func (s *subJobRun) next(deadlineHit bool, err error) bool {
+	if err != nil && s.firstErr == nil {
+		s.firstErr = err
+	}
+	if s.ctx.Err() != nil {
+		return false
+	}
+	if err != nil {
+		s.g.cfg.Logger.Warn("gc_tick_failed", "err", err)
+		return true
+	}
+	return !deadlineHit
 }
 
 // snapshotPassDeadline is the snapshot pass's deadline (and retiredRun's),
@@ -234,6 +319,40 @@ func (g *GC) runSubJobC(ctx context.Context, dl snapshotPassDeadline, batchesRun
 	}
 }
 
+// runSubJobD is snapshot GC sub-job D (issue #14 follow-up, Tier 2): it
+// strips the displaced snapshots' package_hash rows
+// (cache.RunDisplacedPackageHashChunk), oldest snapshot first, in bounded
+// chunks, until none is left, ctx ends, or dl's deadline comes (deadlineHit:
+// rows left): dl expired between chunks, or a chunk the writer never
+// started before it (notStarted). ctx is the caller's wctx (runSubJobC's
+// note). The snapshot pass runs it after C, and so does retiredRun. Their
+// headers, members and skipped members stay: gc.keep_displaced now keeps a
+// displaced snapshot's headers and index files, not its package list.
+func (g *GC) runSubJobD(ctx context.Context, dl snapshotPassDeadline, batchesRun *int) (stripped int, deadlineHit bool, err error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return stripped, false, nil
+		}
+		if dl.expired() {
+			return stripped, true, nil
+		}
+		// 0: the cache's own chunk (retiredChunkRows, 10,000 rows a
+		// transaction), as C's.
+		rows, more, err := g.store.RunDisplacedPackageHashChunk(ctx, 0)
+		if notStarted(err) {
+			return stripped, dl.reached(), nil // the chunk never ran: rows may be left
+		}
+		if err != nil {
+			return stripped, false, fmt.Errorf("displaced package_hash gc chunk: %w", err)
+		}
+		*batchesRun++
+		stripped += rows
+		if !more {
+			return stripped, false, nil
+		}
+	}
+}
+
 // retiredRunAfterStart is when, after the start, Run deletes the retired
 // snapshots (retiredRun), if gc.interval is longer, and how long after a
 // run or a periodic tick that left a backlog it runs again (issue #14).
@@ -242,12 +361,13 @@ const retiredRunAfterStart = time.Hour
 // phaseRetired labels retiredRun's gc_tick_deadline_reached line.
 const phaseRetired = "retired"
 
-// retiredRun runs sub-job C alone, retiredRunAfterStart after the start
-// (Run), within max_tick_duration, and logs INFO gc_retired_run_complete.
-// It reports backlog: C stopped at its deadline with retired snapshots
+// retiredRun runs sub-job C, then sub-job D (issue #14 follow-up Tier 2),
+// retiredRunAfterStart after the start (Run), within max_tick_duration, and
+// logs INFO gc_retired_run_complete. It reports backlog: C stopped at its
+// deadline with retired snapshots left, or D with displaced package rows
 // left, so Run runs it again an hour later (issue #14: hourly while a
-// backlog lasts); false when it drained them, failed, panicked or was
-// stopped by ctx. A panic is recovered (gc_panicked, where=retired); the
+// backlog lasts); false when it drained them, D failed, it panicked or was
+// stopped by ctx (a failed C goes on to D, whose outcome decides). A panic is recovered (gc_panicked, where=retired); the
 // periodic ticks are not affected.
 //
 // AIDEV-NOTE: the final review's R3 #2. Sub-job C ran only in the periodic
@@ -267,14 +387,25 @@ const phaseRetired = "retired"
 // the displaced snapshots a periodic tick's sub-job B retired (DN-7 of the
 // GC and upstream hardening plan): normally that tick's own C does, and
 // this run takes those still retired when a tick's pass stopped before its
-// C had deleted them (its deadline, a shutdown, or a batch or chunk that
-// failed or panicked), which the startup pass's B no longer selects (its C
+// C had deleted them (its deadline, a shutdown, a C chunk that failed, or a
+// batch or chunk that panicked; a failed batch no longer stops it before C
+// since 2026-11-09), which the startup pass's B no longer selects (its C
 // does, within its budget). Since issue #14 the startup pass also runs C,
 // within its snapshot deadline, so this run takes what that start's budget
 // left and what was retired since.
 // Since issue #14 it also repeats hourly while a backlog lasts (Run's
 // AIDEV-NOTE): once a process could not keep up with a sustained
 // displacement rate.
+//
+// AIDEV-NOTE: issue #14 follow-up Tier 2, 2026-11-09. The run is no longer
+// C alone: D runs after C, so the hourly runs strip the displaced
+// snapshots' package_hash rows too (an upgrade's backlog, or one a periodic
+// tick's budget left), and the run re-arms when either stops at its
+// deadline. A failed C no longer ends the run (subJobRun: HD-15 within the
+// run, so a C stuck on one snapshot never stops D); each failure logs its
+// own gc_tick_failed. The cost, accepted: while D still has a backlog a C
+// that fails at every call is retried with it hourly, one WARN an hour,
+// until D drains; a run whose last sub-job failed still does not re-arm.
 func (g *GC) retiredRun(ctx context.Context) (backlog bool) {
 	defer g.recoverPanic("retired")
 	start := time.Now()
@@ -284,25 +415,36 @@ func (g *GC) retiredRun(ctx context.Context) (backlog bool) {
 	// queued behind the writer then never runs; the run ends there and
 	// reports a backlog, so Run re-arms it).
 	wctx := cache.WithWriteStartDeadline(ctx, deadline)
-	retired, deadlineHit, err := g.runSubJobC(wctx,
-		g.snapshotDeadline(deadline, phaseRetired, &batchesRun), &batchesRun)
+	dl := g.snapshotDeadline(deadline, phaseRetired, &batchesRun)
 	// AIDEV-NOTE: passFailed's test: a run stopped by the end of ctx (a
-	// shutdown) did not fail, whatever its error's shape.
-	if err != nil && ctx.Err() == nil {
-		g.cfg.Logger.Warn("gc_tick_failed", "err", err)
+	// shutdown) did not fail, whatever its error's shape (subJobRun.next
+	// logs no gc_tick_failed then, and runs no D). Since 2026-11-09 (issue
+	// #14 follow-up Tier 2) a failed C no longer ends the run: D runs after
+	// it (subJobRun's AIDEV-NOTE), and each logs its own line.
+	sj := subJobRun{g: g, ctx: ctx}
+	retired, deadlineHit, err := g.runSubJobC(wctx, dl, &batchesRun)
+	var stripped int
+	if sj.next(deadlineHit, err) {
+		stripped, deadlineHit, err = g.runSubJobD(wctx, dl, &batchesRun)
+		sj.next(deadlineHit, err)
 	}
 	if retired > 0 {
 		gcRetiredReapedTotal.Add(float64(retired))
 	}
+	if stripped > 0 {
+		gcDisplacedPackageRowsDeletedTotal.Add(float64(stripped))
+	}
 	g.cfg.Logger.Info("gc_retired_run_complete",
 		"retired_reaped", retired,
+		"displaced_package_rows_deleted", stripped,
 		"deadline_reached", deadlineHit,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
-	// deadlineHit is false after a failed chunk or a shutdown
-	// (runSubJobC): no hourly retry storm. It is true after a chunk the
-	// writer never started before the deadline (notStarted): whether a
-	// backlog is left is unknown, and a re-armed run that finds none costs
-	// one SELECT.
+	// deadlineHit is the last sub-job's that ran: C's when it stopped at the
+	// deadline (D never ran), else D's. It is false after a failed chunk or
+	// a shutdown (runSubJobC, runSubJobD): no hourly retry storm. It is true
+	// after a chunk the writer never started before the deadline
+	// (notStarted): whether a backlog is left is unknown, and a re-armed run
+	// that finds none costs one SELECT per sub-job.
 	return deadlineHit
 }
