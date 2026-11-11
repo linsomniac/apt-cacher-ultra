@@ -141,6 +141,13 @@ re-enumerated here. The values are listed at the SPEC anchor.
 
 ## Stability guarantees
 
+The additional WARN event `snapshot_release_compat_failed` carries
+`canonical_host`, `path`, `snapshot_id`, and `err`. It means the selected
+snapshot's InRelease could not safely produce a compatibility Release or
+Release.gpg (a database error or unreadable, oversized, corrupt, or malformed
+anchor). The response is 502 with Retry-After; upstream sidecars are never
+substituted.
+
 - The `path_class` enum is closed. Adding a value requires a spec
   amendment (SPEC6_5 §2.3).
 - Field names never change without a spec amendment. Field-presence

@@ -451,6 +451,13 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 	mem, err := h.cache.GetSnapshotMember(r.Context(), snapshotID, memberPath)
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
+		if ok, st, n := h.tryInlineRelease(w, r, req, snapshotID, memberPath, start); ok {
+			if st >= 200 && st < 300 || st == http.StatusNotModified {
+				go h.touchAsync(req)
+				h.maybeFireFreshness(req)
+			}
+			return true, st, n, true
+		}
 		// SPEC2 §6.1: snapshot is the contract. Path not in the snapshot
 		// → 404. No Phase 1 fallback would be allowed to satisfy this
 		// request, regardless of whether url_path has a row for it.
