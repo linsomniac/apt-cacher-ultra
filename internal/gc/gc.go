@@ -45,8 +45,8 @@ type Config struct {
 	Logger *slog.Logger
 
 	// Enabled mirrors gc.enabled. False short-circuits Run (no
-	// goroutine work) and StartupPass (no startup pool scan / no
-	// startup GC pass). Main emits gc_disabled Warn before
+	// goroutine work, no startup GC pass) and StartupScan and
+	// StartupPass (no startup pool scan). Main emits gc_disabled Warn before
 	// constructing the GC at all when Enabled = false; the field is
 	// here so this package's tests can exercise the short-circuit
 	// without going through main.
@@ -107,9 +107,10 @@ type Config struct {
 	MaxVersionsPerPackage int
 }
 
-// GC is the orchestrator. Run() owns the periodic tick loop;
-// StartupPass() runs the §4.2 step 5 + step 6 startup sequence (pool
-// scan + one-shot GC pass) blocking before listeners come up.
+// GC is the orchestrator. StartupScan() runs the §4.2 step 5 pool scan,
+// which main blocks on before the listeners come up; Run() runs the step 6
+// one-shot GC pass first, after them (2026-11-11), then owns the periodic
+// tick loop. StartupPass() runs both in one call, for the tests.
 type GC struct {
 	cfg Config
 
@@ -126,8 +127,15 @@ type GC struct {
 	// moves it too, past that pass, for the next tick (skipPanickedPass); one
 	// that failed moves it past that pass in its own tick, whose passes after
 	// it then run (passFailed, ruling HD-15). Only the GC goroutine touches
-	// this, after the sequential startup pass.
+	// this: the startup pass runs on it too, first (Run).
 	nextPass pass
+
+	// startup is the pending startup pass's pool scan: set by StartupScan,
+	// which main runs before any listener, and taken by runStartupPass,
+	// the first thing Run does, on the GC goroutine (the go statement that
+	// starts Run orders the write before the read). nil when no scan ran,
+	// the scan failed, or the pass has run.
+	startup *startupScan
 
 	// lastRunMu guards lastRun. Writes happen at the end of each
 	// completed tick (Run goroutine and StartupPass — sequential, but
@@ -144,7 +152,7 @@ type GC struct {
 	// longer ends the tick (issue #14): the snapshot and blob passes run
 	// after it. It lives in memory, so every start begins a fresh scan.
 	// Reset to empty once a pass drains. Touched
-	// only by the tick goroutine (StartupPass runs before Run starts), so
+	// only by the tick goroutine (the startup pass runs on it, first), so
 	// no lock is needed.
 	urlPathCursor struct{ scheme, host, path string }
 
@@ -165,8 +173,9 @@ const (
 	blobPass
 )
 
-// phaseStartup is runTick's phase for StartupPass's one-shot pass, the
-// pass main runs before any listener serves. Its snapshot pass and the
+// phaseStartup is runTick's phase for the one-shot startup pass, which
+// Run runs first, after the listeners opened (2026-11-11; until then main
+// ran it before any listener served). Its snapshot pass and the
 // periodic ticks' ("periodic") alike run sub-job B, which only retires the
 // displaced snapshots beyond keep_displaced, and sub-job C, which deletes
 // them (DN-7 of the GC and upstream hardening plan; ruling PF-15, re-ruled
@@ -296,50 +305,42 @@ func New(cfg Config) (*GC, error) {
 	return &GC{cfg: cfg, store: cfg.Cache}, nil
 }
 
-// StartupPass runs the SPEC4 §4.2 step 5 (pool/ orphan scan) and step
-// 6 (one-shot GC pass) sequence. Blocks until both complete or ctx is
-// cancelled. Returns the first error encountered: a failed pool scan's,
-// which ends it before the one-shot pass, or the first failed pass's, once
-// the passes after it have run too (runTick, ruling HD-15: a failed pass
-// no longer ends the one-shot pass, so a daemon restarted more often than
-// gc.interval, which never runs a periodic tick, still runs every pass at
-// every start) and the pass has written its gc_run_complete line, metrics
-// and last-run summary, as a periodic tick does: each failed pass logged
-// its own gc_tick_failed line (runTick), and main logs the returned first
-// failure as the startup pass's (the fix wave's follow-up of HD-15).
-// Partial progress is preserved (DB rows / pool files reaped before cancel
-// are real). The one-shot pass runs snapshot-GC sub-job C (spec C9's
-// retired snapshots) within its snapshot deadline, so a start with a
-// retired backlog may wait up to max_tick_duration before the listeners
-// open, the bound ruling HD-7 accepted for B's one-transaction deletes, which
-// bounds C's chunks now that B only retires (2026-11-09, issue #14 follow-up
-// Tier 1b; ruling PF-15, re-ruled for issue #14: runSnapshotPass); what its budget leaves, Run's retired run (an hour
-// after the start when gc.interval is longer, then hourly) and the
-// periodic ticks delete.
+// startupScan is a completed startup pool scan, waiting for its startup
+// pass (GC.startup).
+type startupScan struct {
+	scan scanResult
+	took time.Duration
+}
+
+// StartupScan runs the SPEC4 §4.2 step 5 pool/ orphan scan, which main
+// runs before any listener opens, and leaves step 6, the one-shot GC pass,
+// to Run, which runs it first, after the listeners opened. Blocks until
+// the scan completes or ctx is cancelled. A scan that fails (its pool/
+// read) counts pass="pool_scan" and returns its error, which main logs;
+// no startup pass runs at that start. A panic is recovered and returned
+// as an error (gc_panicked, where=startup). When Enabled = false, returns
+// nil at once.
 //
-// Order matters: pool scan runs first so its
-// `gc_pool_orphans_repaired` count reflects only pre-existing orphan
-// files (not files just created by the same-tick blob GC pass).
-//
-// When Enabled = false, returns nil immediately.
-//
-// A panic is recovered and returned as an error (gc_panicked,
-// where=startup), which main logs before it serves: this pass runs on
-// main's goroutine before any listener, and a panic that persisted data
-// triggers would otherwise recur at every start (review I-1 of the H1
-// plan). A panic in its passes moves the rotation past the pass in
-// progress, as a periodic tick's does, so the first periodic tick does not
-// begin with the pass that panicked (re-review m-4).
-func (g *GC) StartupPass(ctx context.Context) (err error) {
-	passesDone := true // a panic before runTick leaves the rotation as it is
-	defer g.skipPanickedPass(&passesDone)
+// AIDEV-NOTE: the maintainer's decision, 2026-11-11 (a restart on
+// adm1.dev waited 102 s before serving, 99 s of it sub-job D stripping the
+// upgrade's backlog of displaced package rows; the first 1.1.0 start
+// waited 4 min). The scan stays before the listeners: it unlinks a pool
+// file with no blob row, and a fetch writes its pool file before its
+// PutBlob row, so a scan beside live traffic could unlink a file a request
+// just fetched. The passes run beside live traffic at every periodic tick
+// already, and the startup phase changes nothing in them but log labels
+// (phaseStartup), so they move to Run's goroutine: never beside a periodic
+// tick or a retired run, and before Run's schedule starts. This supersedes
+// the listener bound that rulings HD-7 and PF-15 (re-ruled for issue #14)
+// accepted: a start no longer waits up to max_tick_duration before it
+// serves; the start's GC takes as long as before, beside the traffic.
+func (g *GC) StartupScan(ctx context.Context) (err error) {
 	defer g.recoverPanicInto("startup", &err)
+	g.startup = nil
 	if !g.cfg.Enabled {
 		return nil
 	}
 	start := time.Now()
-
-	// Step 5: pool/ orphan scan.
 	scan, err := g.runPoolScan(ctx)
 	if err != nil {
 		// Counted here, as main logs it (issue #14 follow-up Tier 1c); a
@@ -348,6 +349,70 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 		gcPassFailuresTotal.Inc("pool_scan")
 		return fmt.Errorf("gc startup: pool scan: %w", err)
 	}
+	if ctx.Err() != nil {
+		// A shutdown stopped the scan part way (it returns no error then):
+		// leave no startup pass pending; the next start scans again.
+		return nil
+	}
+	g.startup = &startupScan{scan: scan, took: time.Since(start)}
+	return nil
+}
+
+// StartupPass runs StartupScan and then the startup pass in one call, on
+// the caller's goroutine: the tests that drive a whole start use it; main
+// runs StartupScan before the listeners and leaves the pass to Run
+// (2026-11-11). Returns the first error: a failed pool scan's, which ends
+// it before the pass, or the pass's (runStartupPass). When Enabled = false,
+// returns nil immediately.
+func (g *GC) StartupPass(ctx context.Context) error {
+	if err := g.StartupScan(ctx); err != nil {
+		return err
+	}
+	return g.runStartupPass(ctx)
+}
+
+// runStartupPass runs the SPEC4 §4.2 step 6 one-shot GC pass after a
+// successful StartupScan, and nothing when none is pending (no scan ran,
+// it failed, or the pass already ran): Run calls it first, on the GC
+// goroutine, after main opened the listeners. Returns the first failed
+// pass's error, once the passes after it have run too (runTick, ruling
+// HD-15: a failed pass no longer ends the one-shot pass, so a daemon
+// restarted more often than gc.interval, which never runs a periodic tick,
+// still runs every pass at every start) and the pass has written its
+// gc_run_complete line, metrics and last-run summary, as a periodic tick
+// does: each failed pass logged its own gc_tick_failed line (runTick), and
+// Run logs the returned first failure as WARN "gc startup pass failed"
+// (the fix wave's follow-up of HD-15; main logged it until 2026-11-11).
+// Partial progress is preserved (DB rows / pool files reaped before cancel
+// are real). The pass runs snapshot-GC sub-job C (spec C9's retired
+// snapshots) and D within its snapshot deadline, so it may take up to
+// max_tick_duration, beside the traffic since 2026-11-11 (StartupScan's
+// AIDEV-NOTE); what its budget leaves, Run's retired run (an hour after
+// the pass when gc.interval is longer, then hourly) and the periodic ticks
+// delete. Its gc_run_complete line and summary carry the scan's counts,
+// and its duration_ms is the scan's plus the pass's, not the time between.
+//
+// Order matters: the pool scan runs first so its
+// `gc_pool_orphans_repaired` count reflects only pre-existing orphan
+// files (not files just created by the same-tick blob GC pass).
+//
+// A panic is recovered and returned as an error (gc_panicked,
+// where=startup), which Run logs: a panic that persisted data triggers
+// would otherwise recur at every start (review I-1 of the H1 plan). A
+// panic in its passes moves the rotation past the pass in progress, as a
+// periodic tick's does, so the first periodic tick does not begin with
+// the pass that panicked (re-review m-4).
+func (g *GC) runStartupPass(ctx context.Context) (err error) {
+	s := g.startup
+	if s == nil {
+		return nil
+	}
+	g.startup = nil
+	scan := s.scan
+	passesDone := true // a panic before runTick leaves the rotation as it is
+	defer g.skipPanickedPass(&passesDone)
+	defer g.recoverPanicInto("startup", &err)
+	start := time.Now()
 
 	// Step 6: one-shot GC pass, sub-job C included (ruling PF-15, re-ruled
 	// for issue #14: runSnapshotPass). A failed pass is returned after the
@@ -357,7 +422,7 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 	tick, tickErr := g.runTick(ctx, phaseStartup)
 	passesDone = true
 
-	duration := time.Since(start)
+	duration := s.took + time.Since(start)
 	endUnix := wallclock.Unix()
 	g.cfg.Logger.Info("gc_run_complete",
 		"phase", "startup",
@@ -431,11 +496,15 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 }
 
 // Run owns the periodic tick goroutine. Returns when ctx is cancelled.
-// Each tick fires `gc.interval` after the previous tick completed. A
+// It first runs the startup pass a StartupScan left (runStartupPass;
+// since 2026-11-11, after main opened the listeners), then its schedule:
+// the first tick fires `gc.interval` after that pass ended, and
+// each tick fires `gc.interval` after the previous tick completed. A
 // long tick cannot leave a pending timer firing that starts work again
 // immediately, even when an individual batch exceeds the tick budget.
 // When `gc.interval` is longer than an hour, Run also deletes the retired
-// snapshots an hour after the start (retiredRun; the final review's R3 #2),
+// snapshots an hour after the start — after the startup pass ended, since
+// 2026-11-11 — (retiredRun; the final review's R3 #2),
 // and strips the displaced snapshots' package rows (sub-job D, issue #14
 // follow-up Tier 2), and again every hour after that, an hour after the
 // previous run ended (issue #14; unconditional since 2026-11-10).
@@ -480,6 +549,16 @@ func (g *GC) StartupPass(ctx context.Context) (err error) {
 // started.
 func (g *GC) Run(ctx context.Context) {
 	if !g.cfg.Enabled {
+		return
+	}
+	// The startup pass first, when StartupScan left one (2026-11-11: main
+	// runs the scan before the listeners and this pass after them). Its
+	// failure is logged here, as main logged StartupPass's; a shutdown
+	// during it is not one. The schedule below starts when it ends.
+	if err := g.runStartupPass(ctx); err != nil && ctx.Err() == nil {
+		g.cfg.Logger.Warn("gc startup pass failed", "err", err)
+	}
+	if ctx.Err() != nil {
 		return
 	}
 	t := time.NewTimer(g.cfg.Interval)
@@ -534,7 +613,8 @@ func (g *GC) periodicTick(ctx context.Context) {
 	start := time.Now()
 	// Each failed pass logged its own WARN gc_tick_failed as it failed
 	// (runTick's failed); the first failure, which runTick returns, is for
-	// StartupPass's caller, so a tick logs none of its own for it.
+	// runStartupPass's caller (Run, or a test's StartupPass), so a tick
+	// logs none of its own for it.
 	tick, _ := g.runTick(ctx, "periodic")
 	passesDone = true
 	duration := time.Since(start)
@@ -624,7 +704,7 @@ type gcStore interface {
 }
 
 // skipPanickedPass is deferred by periodicTick before its recoverPanic,
-// and by StartupPass before its recoverPanicInto, so it runs after the
+// and by runStartupPass before its recoverPanicInto, so it runs after the
 // recover: when the passes did not finish (a recovered panic), it moves
 // the rotation past the pass in progress — g.nextPass, which runTick
 // advances only when a pass completes or fails (passFailed), never when
@@ -723,7 +803,7 @@ func (g *GC) recoverPanic(where string) {
 }
 
 // recoverPanicInto is recoverPanic for a function that returns an error
-// (StartupPass): it also sets *err, so the caller sees the panic as a
+// (StartupScan, runStartupPass): it also sets *err, so the caller sees the panic as a
 // failure. Like recoverPanic it works only as the deferred function itself
 // (defer g.recoverPanicInto(where, &err)).
 func (g *GC) recoverPanicInto(where string, err *error) {
@@ -849,7 +929,8 @@ func passDeadlines(start time.Time, budget time.Duration) tickDeadlines {
 // deadline_reached, the rotation moved as at any deadline), never a
 // failure: no gc_tick_failed and no passFailed.
 //
-// `phase` is phaseStartup ("startup", StartupPass) or "periodic" (Run).
+// `phase` is phaseStartup ("startup", runStartupPass) or "periodic"
+// (periodicTick); both run on Run's goroutine.
 // It labels the gc_tick_deadline_reached events, so an operator can
 // correlate; it changes no behaviour of the snapshot pass. Until 2026-11-09
 // (issue #14 follow-up Tier 1b) it selected whether B deleted the displaced
@@ -898,8 +979,8 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 	// failure is logged once — so a second failed pass is not hidden behind
 	// the first, nor a failure behind a shutdown later in the tick (ruling
 	// HD-15's follow-up in the hardening plan's final fix wave). runTick
-	// returns the first for StartupPass's caller, which logs it once more,
-	// as the startup pass's failure. Updated 2026-11-09 (issue #14
+	// returns the first for runStartupPass's caller (Run), which logs it
+	// once more, as the startup pass's failure, unless a shutdown followed. Updated 2026-11-09 (issue #14
 	// follow-up Tier 2): the snapshot pass is the exception. Its sub-jobs
 	// (A ∪ B, C, D) go on past a failed one, each logging its own line as it
 	// fails (subJobRun's AIDEV-NOTE), so the pass returns its first failure

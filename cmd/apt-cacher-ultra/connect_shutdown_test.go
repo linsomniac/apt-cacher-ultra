@@ -120,7 +120,7 @@ func TestServe_GracefulShutdown_DrainsInflightCONNECT(t *testing.T) {
 	// Wait for the daemon's serve loop to be accepting+handling — the
 	// listener is bound before serveListeners runs, so a Dial succeeds
 	// from the moment we returned from net.Listen, but the http.Server
-	// behind it isn't ready until cache.Open + GC startup pass + handler
+	// behind it isn't ready until cache.Open + GC startup pool scan + handler
 	// wiring finish. Probe by sending a no-op HEAD/GET that we expect
 	// to fail (no mirror, no allowlist match → 4xx) and waiting for the
 	// status line.

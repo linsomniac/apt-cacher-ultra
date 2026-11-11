@@ -82,7 +82,10 @@ type snapshotPassResult struct {
 // start. The cost: a start with a retired backlog may wait up to
 // max_tick_duration before the listeners open, the bound ruling HD-7
 // already accepted for B's one-transaction deletes at a start; C only
-// fills the budget B leaves. Since 2026-11-09 (issue #14 follow-up, Tier
+// fills the budget B leaves. Superseded 2026-11-11 (the maintainer;
+// StartupScan's AIDEV-NOTE): the startup pass runs after the listeners
+// opened, on Run's goroutine, so that wait is gone; the budget still
+// bounds the pass. Since 2026-11-09 (issue #14 follow-up, Tier
 // 1b) the startup B only retires too, so the HD-7 bound now covers C's
 // chunks, not B's deletes, and the start deadline bounds every startup
 // write. The startup C deletes the snapshots the

@@ -1029,6 +1029,43 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   `TestRunHotPrefetch_NoContentIsAFailure`,
   `TestFetch_NoContentIsEmptySuccess` and `TestFetch_NoContentOnlyForA204`.
 
+- **The startup GC pass runs after the listeners open** (the maintainer,
+  2026-11-11). `main` runs only the pool orphan scan (`gc.StartupScan`)
+  before the listeners; `gc.Run` runs the one-shot startup pass first, on
+  the GC goroutine, then its schedule (the first periodic tick
+  `gc.interval` after the pass ends, the first retired run an hour after
+  it). Why: on adm1.dev a restart waited 102 s before serving, 99 s of it
+  sub-job D stripping 330,333 displaced `package_hash` rows (the upgrade's
+  backlog), and the first 1.1.0 start waited 4 minutes; a cache that
+  refuses connections for minutes is an outage for its clients, and every
+  1.1.0 upgrade pays it once. The passes already run beside live traffic
+  at every periodic tick, and the startup phase changes only their log
+  labels, so moving them is safe; on Run's goroutine they never run beside
+  a tick or a retired run. The pool scan stays before the listeners: it
+  unlinks a pool file with no blob row, and a fetch writes its file before
+  its `PutBlob` row. Supersedes the listener bound of rulings HD-7 and
+  PF-15 (re-ruled for issue #14), "a start may wait up to
+  `max_tick_duration` before the listeners open". Costs, accepted: the
+  start's GC competes with the first requests for the database writer, as
+  a periodic tick does (on adm1.dev's disk a sub-job D chunk held the
+  writer about 3 s); the status page shows no last run until the startup
+  pass ends (its GC vital stale, its verdict "awaiting first GC run"), and
+  the pool scan's counts reach the status page and metrics only with the
+  pass's line; a failed startup pass is logged by the GC goroutine,
+  same message (`gc startup pass failed`). Not changed: the pass's work,
+  budget, log line and summary (its `duration_ms` is the scan's plus the
+  pass's); `StartupPass` stays, scan and pass in one call, for the tests.
+  Pinned by `TestStartupScan_RunsOnlyThePoolScan`,
+  `TestRun_RunsTheStartupPassFirstAfterAStartupScan`,
+  `TestRun_NoStartupPassWithoutAStartupScan`,
+  `TestRun_NoStartupPassAfterAFailedStartupScan`,
+  `TestRun_LogsAFailedStartupPass`, `TestRun_RecoversAStartupPassPanic`,
+  `TestRun_ItsScheduleStartsAfterTheStartupPass`,
+  `TestRun_AShutdownDuringTheStartupPassReturnsPromptly`,
+  `TestStartupScan_ACancelledScanLeavesNoStartupPass`, and in `main`
+  `TestServeListeners_LegacyAuditRunsBeforeGCAndServing`'s check that the
+  startup `gc_run_complete` follows `startup_preparation_complete`.
+
 - **Issue #14 follow-up: the retired run comes every hour** (the
   maintainer, 2026-11-10, the follow-up's final review I-1). When
   `gc.interval` is longer than an hour, `Run` re-runs `retiredRun` (sub-jobs
@@ -1186,7 +1223,9 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   the run left, failures included, see the entry above); (3) ruling PF-15 is re-ruled: the startup pass runs C
   after A ∪ B within its snapshot deadline and its blob pass reclaims their
   blobs, so a start with a retired backlog may wait up to
-  `max_tick_duration` before the listeners open, the bound HD-7 accepts
+  `max_tick_duration` before the listeners open (superseded 2026-11-11:
+  the startup pass now runs after the listeners open, see *Decided*, the
+  startup GC pass runs after the listeners), the bound HD-7 accepts
   for B; C deletes every retired snapshot, the trust audit's quarantined
   ones included (spec C9), and none that is not retired, such as a
   displaced one the audit still holds queued (R-H1) (commit 13a999e).

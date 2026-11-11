@@ -504,18 +504,17 @@ func serveListeners(
 	// suite evicts an idle one, so a full table logs nothing.
 	warnSuiteCaps(ctx, c, cfg.Freshness.MaxSuites, logger)
 
-	// SPEC4 §4.2 steps 5 + 6: pool/ orphan scan + one-shot GC pass.
-	// Both are blocking — the cache does not begin answering requests
-	// until they complete (we have not yet called Serve on any
-	// listener). When gc.enabled = false, gcsvc.StartupPass returns
-	// immediately and the periodic goroutine below is never started.
-	// The one-shot pass runs snapshot-GC sub-job C too, within its
-	// snapshot deadline (ruling PF-15, re-ruled by the maintainer on
-	// 2026-11-05 for issue #14), so a restart deletes the retired
-	// snapshots again; a start with a retired backlog may keep the
-	// listeners closed up to gc.max_tick_duration, the bound ruling HD-7
-	// already accepts for its sub-job B. What its budget leaves, the
-	// retired run (hourly) and the periodic ticks delete.
+	// SPEC4 §4.2 step 5: the pool/ orphan scan blocks — the cache does
+	// not begin answering requests until it completes (we have not yet
+	// called Serve on any listener): it unlinks pool files with no blob
+	// row, which a fetch in progress has. Step 6, the one-shot GC pass,
+	// no longer blocks (the maintainer, 2026-11-11): gcsvc.Run runs it
+	// first, after the listeners opened, on the GC goroutine below
+	// (gc.StartupScan's AIDEV-NOTE), so a start with a GC backlog — the
+	// first 1.1.0 start strips every displaced snapshot's package rows —
+	// serves within seconds instead of up to gc.max_tick_duration. When
+	// gc.enabled = false, gcsvc.StartupScan and gcsvc.Run return
+	// immediately.
 	gcsvc, err := gc.New(gc.Config{
 		Cache:                 c,
 		Logger:                logger,
@@ -535,16 +534,13 @@ func serveListeners(
 	if err != nil {
 		return fmt.Errorf("build gc: %w", err)
 	}
-	if err := gcsvc.StartupPass(ctx); err != nil {
-		// A startup-pass failure (DB error, fs error reading pool/)
-		// is loud but not fatal — the daemon can still serve. Log
-		// and continue. A failed pool scan ends the startup pass
-		// before its GC passes, and the next process restart re-runs
-		// it. A failed GC pass did not keep the passes after it from
-		// running (ruling HD-15): each failed pass logged its own
-		// gc_tick_failed, the startup pass its gc_run_complete, and
-		// err is the first failure. The periodic ticks run every
-		// pass again, the failed one included.
+	if err := gcsvc.StartupScan(ctx); err != nil {
+		// A failed pool scan (an fs error reading pool/) is loud but
+		// not fatal — the daemon can still serve. Log and continue.
+		// It ends the start's GC before its passes (gcsvc.Run runs no
+		// startup pass), and the next process restart re-runs it. A
+		// failed startup GC pass is logged by gcsvc.Run, with the same
+		// message.
 		logger.Warn("gc startup pass failed", "err", err)
 	}
 
@@ -732,7 +728,8 @@ func serveListeners(
 
 	logger.Info("startup_preparation_complete")
 
-	// All constructors, migrations, audits and startup GC have completed.
+	// All constructors, migrations, audits and the startup pool scan have
+	// completed; the startup GC pass runs in gcsvc.Run, below.
 	adminAddr := ""
 	if cfg.Admin.Enabled {
 		adminAddr = cfg.Admin.Listen
@@ -773,7 +770,8 @@ func serveListeners(
 		scanner.Run(freshCtx)
 	}()
 
-	// SPEC4 §9.6 periodic GC goroutine. Shares freshCtx so the
+	// SPEC4 §9.6 periodic GC goroutine; it runs the startup GC pass
+	// first (StartupScan left it pending). Shares freshCtx so the
 	// shutdown sequence below cancels and drains it the same way as
 	// the freshness scheduler and integrity scanner. When
 	// gc.enabled = false, gcsvc.Run returns immediately.
