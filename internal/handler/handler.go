@@ -692,6 +692,13 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 	mem, err := h.cache.GetSnapshotMember(r.Context(), snapshotID, memberPath)
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
+		if ok, st, n := h.tryInlineRelease(w, r, req, snapshotID, memberPath, start); ok {
+			if st >= 200 && st < 300 || st == http.StatusNotModified {
+				go h.touchAsync(req, true, servedSuite(sr, st))
+				h.maybeFireFreshness(req)
+			}
+			return true, st, n, true, false
+		}
 		// Spec C8 retained by-hash: a by-hash member the current snapshot
 		// lacks may be one a displaced snapshot declared — a client that
 		// fetched an earlier anchor asks for exactly those bytes.

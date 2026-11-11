@@ -143,6 +143,11 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Fixed
 
+- Serve snapshot-consistent `Release` and `Release.gpg` files for repositories
+  adopted from `InRelease`. Debian installer mirror checks now work with existing
+  inline snapshots, including offline, without clearing the cache or re-adopting.
+  The original signatures and metadata are extracted together; newer upstream
+  sidecars cannot be mixed with cached indexes. Thanks to @charlescurley for #30.
 - Require declared source indexes when `adoption.architectures` is empty,
   and reconcile missing source indexes in older snapshots. A transient upstream
   `404`/`410` can no longer publish a snapshot missing every full Sources variant
