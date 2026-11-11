@@ -352,7 +352,8 @@ configured listeners are serving, and local readiness checks pass. It returns
 `admin.enabled = false`; the existing admin `/healthz` keeps its authentication.
 
 Application ports stay closed during startup preparation, including migrations,
-startup GC and certificate setup. ACME HTTP-01 uses its separate challenge port
+the startup GC's pool orphan scan and certificate setup; the startup GC pass runs
+in the background once they open. ACME HTTP-01 uses its separate challenge port
 during issuance. See [readiness and HAProxy setup](docs/configuration.md#readiness-and-load-balancers)
 for probe semantics, startup tradeoffs, and an example configuration.
 

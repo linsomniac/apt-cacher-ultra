@@ -129,7 +129,14 @@ func TestServeListeners_LegacyAuditRunsBeforeGCAndServing(t *testing.T) {
 	if err := waitForDaemonReady(t, cacheLn.Addr().String(), 10*time.Second); err != nil {
 		t.Fatalf("daemon never became ready: %v", err)
 	}
-	out := logs.String()
+	// Since 2026-11-11 the GC startup pass runs after the listeners
+	// opened (gc.StartupScan's AIDEV-NOTE): wait for its line.
+	var out string
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if out = logs.String(); strings.Contains(out, `"msg":"gc_run_complete"`) {
+			break
+		}
+	}
 	audit := strings.Index(out, `"msg":"legacy_trust_audit_completed"`)
 	gcRun := strings.Index(out, `"msg":"gc_run_complete"`)
 	switch {
@@ -141,6 +148,13 @@ func TestServeListeners_LegacyAuditRunsBeforeGCAndServing(t *testing.T) {
 		t.Fatalf("no gc_run_complete line from the GC startup pass:\n%s", out)
 	case gcRun < audit:
 		t.Fatalf("the GC startup pass ran before the legacy trust audit")
+	case !strings.Contains(out, `"msg":"startup_preparation_complete"`):
+		t.Fatalf("no startup_preparation_complete line:\n%s", out)
+	case gcRun < strings.Index(out, `"msg":"startup_preparation_complete"`):
+		// Since 2026-11-11 the startup pass runs after the listeners open
+		// (gc.StartupScan's AIDEV-NOTE): a main that ran it before them
+		// logs its line before startup_preparation_complete.
+		t.Fatalf("the GC startup pass ran before startup preparation completed: it must run after the listeners open")
 	}
 	stop()
 	c2, err := cache.Open(ctx, cacheDir, silentBuildLogger())

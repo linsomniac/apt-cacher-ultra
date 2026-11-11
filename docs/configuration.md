@@ -987,7 +987,12 @@ On its first start after an upgrade, the daemon audits every metadata snapshot
 adopted by earlier versions before it serves anything (a large cache can take
 a little while; progress is logged per 100 snapshots). Application ports remain
 closed during this work; clients connecting directly may see connection refusal
-until startup finishes. A snapshot whose stored `InRelease` is not a signed, clean
+until startup finishes. The first start's garbage collection then runs in the
+background once the ports are open: it deletes the package lists that earlier
+versions kept for every displaced snapshot, which on a large, old cache can take
+several minutes (up to `gc.max_tick_duration`, then hourly runs). Requests are
+served meanwhile, some more slowly, since GC and the cache share one database
+writer. A snapshot whose stored `InRelease` is not a signed, clean
 clearsigned message — a plain-text file adopted with `require_signature =
 false`, or one carrying declarations outside its signature — or whose pool
 file is missing or corrupt, is quarantined: it stops serving and vouching,
@@ -1207,7 +1212,7 @@ unvouched package.
 | `interval` | duration | `"24h"` | Delay after a GC tick completes before the next periodic tick. Must be positive; disable through `enabled`. |
 | `batch_size` | integer | `100` | Maximum URL-path/blob rows processed per GC batch. At least `1`. |
 | `snapshot_batch_size` | integer | `10` | Maximum snapshots one GC batch handles: abandoned adoption candidates are deleted; displaced snapshots beyond `keep_displaced` are retired, at a start and in the periodic runs alike (since 1.1.0 the startup pass no longer deletes them in one transaction), and their rows are then deleted 10,000 rows a transaction, so a large suite never holds the database for long while the cache serves. At least `1`. |
-| `max_tick_duration` | duration | `"5m"` | Budget for one startup or periodic GC run, checked between batches; remaining work resumes later. The run splits it so every pass gets a turn: the URL-path pass stops by three fifths of it, the snapshot pass by four fifths, the blob pass at its end, and a pass that runs out of its share leaves its rest to a later run while the passes after it still run (1 m each, at least, at the default). The startup pass, which runs before the listeners serve, deletes the retired snapshots too (of a reaped, evicted or forgotten suite, one the upgrade's trust audit quarantined, and the displaced snapshots beyond `keep_displaced`, which the startup pass retires first, like a periodic run), within its snapshot pass's share, so a start with many of them may keep the listeners closed for up to this budget; what it leaves, a run of that work (which also strips the displaced snapshots' package rows) deletes an hour after the start, and again every hour while a run ends with some left, when `interval` is longer than an hour (INFO `gc_retired_run_complete`, within this budget too), as do the periodic passes (see *Suite reaping*). Must be positive. |
+| `max_tick_duration` | duration | `"5m"` | Budget for one startup or periodic GC run, checked between batches; remaining work resumes later. The run splits it so every pass gets a turn: the URL-path pass stops by three fifths of it, the snapshot pass by four fifths, the blob pass at its end, and a pass that runs out of its share leaves its rest to a later run while the passes after it still run (1 m each, at least, at the default). The startup pass deletes the retired snapshots too (of a reaped, evicted or forgotten suite, one the upgrade's trust audit quarantined, and the displaced snapshots beyond `keep_displaced`, which the startup pass retires first, like a periodic run), within its snapshot pass's share. Since 1.1.0 it runs as soon as the listeners open, beside the traffic, as a periodic run does (only its pool orphan scan still runs before them), so a start with a large backlog serves at once and spends up to this budget on GC in the background; until then such a start kept the listeners closed for up to this budget. What it leaves, a run of that work (which also strips the displaced snapshots' package rows) deletes an hour after the startup pass and then every hour, when `interval` is longer than an hour (INFO `gc_retired_run_complete`, within this budget too), as do the periodic passes (see *Suite reaping*). Must be positive. |
 | `blob_grace` | duration | `"5m"` | Grace after a blob's reference count reaches zero before deletion. At least `"1s"`, and greater than twice `heartbeat_interval`. |
 | `keep_displaced` | integer | `3` | Recent displaced snapshots kept per suite for inspection: their headers and index files. Since 1.1.0 their package lists (the `package_hash` rows, a large suite's 70,000 to 100,000 a snapshot) are not kept: GC deletes them, 10,000 rows a transaction, at its next run that reaches them: a start's GC pass, the periodic run (every `interval`, daily by default), or the retired run, an hour after a start and then hourly (when `interval` is longer than an hour). Between those runs a suite that adopts several times an hour still holds the package lists of the snapshots it displaced since the last one. `0` retains none; must be nonnegative. A displaced snapshot the upgrade's trust audit has not judged yet (one whose pool file it could not read: see *Upgrading an existing cache*) is kept, and takes none of the `keep_displaced` places, until the audit decides it: it may be the suite's only evidence of a signature. Does not by itself retain superseded package binaries. Also bounds retained by-hash: a by-hash request the current snapshot lacks is served from the newest `keep_displaced` + 1 displaced snapshots of its suite, and `0` turns that off (see *Flip consistency*). |
 | `pool_scan_workers` | integer | `4` | Workers for the startup orphan-file scan. At least `1`. |
@@ -1514,8 +1519,9 @@ SNI for the backend name; check the same encrypted service used by clients.
 
 Application ports now bind only after startup preparation: admin credential
 loading, MITM CA setup, server certificate loading or ACME issuance, cache open
-and schema migration, the legacy trust audit, startup GC, and construction of
-the proxy and admin handlers. Background maintenance starts afterwards. Once
+and schema migration, the legacy trust audit, the startup GC's pool orphan
+scan, and construction of the proxy and admin handlers. Background maintenance
+starts afterwards, the startup GC pass first among it. Once
 the sockets open there can be a brief 503 while the HTTP servers enter their
 accept loops, including the admin server's initial metrics refresh. HTTP checks
 cover this transition; a TCP-only check cannot detect runtime degradation.

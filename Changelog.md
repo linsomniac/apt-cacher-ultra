@@ -129,6 +129,13 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   The database file keeps its size (SQLite reuses the pages); an offline
   `VACUUM` is optional. A failing GC sub-job no longer stops the ones after
   it (issue #14).
+- The startup GC pass no longer holds the listeners closed: the daemon
+  serves as soon as the pool orphan scan (and, at the first 1.1.0 start,
+  the migration and trust audit) is done, and runs the GC pass in the
+  background. A start with a GC backlog, such as the first 1.1.0 start,
+  which deletes the package lists earlier versions kept for displaced
+  snapshots, no longer waits up to `gc.max_tick_duration` before serving
+  (a 102-second wait on a test cache).
 - When `gc.interval` is longer than an hour, the retired run (which
   deletes retired snapshots and strips displaced snapshots' package lists)
   now runs every hour, not only while it has a backlog, so a cache whose
