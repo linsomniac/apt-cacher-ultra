@@ -94,6 +94,8 @@ allow_short_keyid      = true
 keyring_dirs          = []
 # [] adopts all architectures; e.g. ["amd64", "arm64", "source"].
 # "all" content is always included. At most 32 entries, each [a-z][a-z0-9]*.
+# NOTE: If this does not list "source", downloading deb-src will fail.
+#architectures         = ["amd64", "arm64", "source"]
 architectures         = []
 # Require a fetched variant in every declared Packages/Sources group for
 # these architectures; [] adds no explicit requirements. Same entry rules;
