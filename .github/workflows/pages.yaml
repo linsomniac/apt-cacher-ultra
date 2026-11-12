@@ -4,8 +4,8 @@ name: Publish apt repo
 # design does NOT emit a release:published event (anti-recursion). So we
 # chain off the Release workflow's completion via workflow_run, and also
 # expose a manual button for rebuilds and day-one population. An RC tag
-# also triggers Release (and therefore this) but the rebuild only ever
-# republishes the current stable set, so it is an idempotent no-op.
+# also triggers Release, but must not rebuild or deploy the stable apt
+# repository. The job gate below skips prerelease tags entirely.
 on:
   workflow_run:
     workflows: ["Release"]
@@ -25,11 +25,15 @@ concurrency:
 
 jobs:
   publish:
-    # Skip when the triggering Release run did not succeed. Manual
-    # dispatch always proceeds.
+    # Release validates MAJOR.MINOR.PATCH[-prerelease] tags. Its
+    # workflow_run.head_branch is the tag name, so '-' identifies an RC
+    # or other prerelease. Skip it before importing keys or deploying.
+    # Manual dispatch still rebuilds the stable releases only.
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch != '' &&
+       !contains(github.event.workflow_run.head_branch, '-'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment:

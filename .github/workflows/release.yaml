@@ -23,6 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
+      # Match CI's compiler bound for Lego's large DNS provider catalogue.
+      GOFLAGS: -p=2
       # Pin nfpm + its SHA256 so a goreleaser release does not silently
       # change the output .deb layout under us and so we can detect tarball
       # tampering before extracting as root. Bump both deliberately.
@@ -150,6 +152,16 @@ jobs:
           (cd dist && sha256sum -- * > SHA256SUMS)
           ls -lh dist/
 
+      - name: Select release notes
+        id: notes
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          notes="docs/release-notes/${VERSION}.md"
+          if [[ -f "$notes" ]]; then
+            echo "path=$notes" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
@@ -157,6 +169,8 @@ jobs:
           tag_name: ${{ github.ref_name }}
           draft: false
           prerelease: ${{ contains(steps.vars.outputs.version, '-') }}
+          make_latest: ${{ contains(steps.vars.outputs.version, '-') && 'false' || 'legacy' }}
+          body_path: ${{ steps.notes.outputs.path }}
           generate_release_notes: true
           files: |
             dist/apt-cacher-ultra-${{ steps.vars.outputs.version }}-linux-amd64

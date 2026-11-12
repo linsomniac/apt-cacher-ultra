@@ -34,25 +34,25 @@ until its README's procedure says what to do.
    go-crypto upgrade or a verifier change, as that plan did.
 6. **The release notes** (`docs/release-notes/<version>.md`), brought up to
    date with [Changelog.md](../Changelog.md) and committed before the tag.
-   In the tree their links name the release's own tag (`/blob/1.1.0/`),
-   whichever candidate comes first: never `main`, which moves, and never
+   Their links name the tag being released (`/blob/1.1.0-rc1/` for that
+   candidate): never `main`, which moves, and never
    links relative to the file (`../configuration.md`), which do not
-   resolve in a GitHub release.
+   resolve in a GitHub release. A candidate may have concise notes in
+   `docs/release-notes/1.1.0-rc1.md` linking to the full cycle's
+   `docs/release-notes/1.1.0.md`; update that file's tag links too.
 7. **Tag** the commit (`MAJOR.MINOR.PATCH`, or `-rcN`; no `v` prefix) and
    check the release workflow's `Verify no e2e test seam` step on the tag.
-   The workflow creates the GitHub release, with generated notes.
-8. **Paste the notes** into that release (edit it), once the tag exists,
-   with their links rewritten to the tag just made. For a release
-   candidate:
-   `sed 's|/blob/1\.1\.0/|/blob/1.1.0-rc1/|g' docs/release-notes/1.1.0.md`
-   (for another version or candidate, its own numbers); for the release
-   itself, the file as it is. The file is wrapped at about 72 columns:
-   check the release editor's *Preview*, and if GitHub breaks the lines
-   where the file does, paste the paragraphs unwrapped instead (lists,
-   tables and headings kept):
-   `sed 's|/blob/1\.1\.0/|/blob/1.1.0-rc1/|g' docs/release-notes/1.1.0.md | perl -0777 -pe 's/([^\n|])\n *+(?![-|#\n]|\z)/$1 /g'`
-   (for the release itself, drop the `sed` and pass the file name to
-   `perl`: `perl -0777 -pe '…' docs/release-notes/1.1.0.md`).
+   The workflow creates the GitHub release with the matching version's
+   notes file, when present, followed by generated notes. A prerelease
+   tag is marked as a prerelease and explicitly kept off GitHub's latest
+   release. Its `.deb` uses `~rcN`, so the final version sorts newer.
+8. **Verify the published release:** the intended notes, binary, `.deb`,
+   source archive and checksums are present; the binary reports the tag;
+   and the package has the expected version. For a candidate, confirm
+   the previous stable release remains latest and `Publish apt repo`'s
+   publish job is skipped. RCs must not rebuild or deploy the apt
+   repository. Docker's `latest` and stable minor tags are also left
+   unchanged; the candidate gets its own version tag.
 
 Why each check exists: `docs/open-decisions.md`, *Decided*: "The apt
 oracle runs before every release, both sets of images" and "`make

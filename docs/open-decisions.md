@@ -44,98 +44,6 @@ hardening plan's (CI, packaging, tests and logs, from `govulncheck` to the
 packaging loose ends) are all class none, operational: none touches what
 the cache trusts or serves.
 
-## Before the 1.1.0 release candidate
-
-Steps only the maintainer can take, since they need a push or a tag (delete
-this section once 1.1.0-rc1 is tagged). More changes go into 1.1.0 before
-the candidate; each adds its entry to [Changelog.md](../Changelog.md).
-
-1. **The first CI run of the merged branch must be green in full**
-   (raised 2026-10-26, the H2 plan's For H3 item 7). The branch was
-   merged into `main` without a pull request (the maintainer,
-   2026-10-28), so that run is the one for the first push of `main`
-   (CI runs on pull requests and on pushes to `main`: `ci.yaml`'s `on:`).
-   It is the first run
-   on GitHub's runners of the `e2e-flat` matrix (its `unsigned` boolean,
-   the derived timeouts, the `timeout -s INT` wrapper), of the `test`
-   job's `e2ehooks seam` step and its binary guard, of e2e/deb's
-   eager-adoption fix and its upgrade phase, of Go 1.27 with
-   golangci-lint v2.14.0, and of the `lint` job's two later steps (the
-   `e2ehooks` lint and `make shellcheck`, which runs the pinned
-   `koalaman/shellcheck:v0.11.0` image). Re-run its `e2e-flat` matrix a few times: every
-   time so far comes from a 12-core machine, and public runners have 4
-   vCPUs. Watch the `debian:11` row's build time (`archive.debian.org` is
-   its slowest input); `REACH`, the bound that depends most on runner
-   speed (the `${POLL_TOOK}s after the publish` lines of `pr8-table`,
-   `frozen-date`, `anchorless`, `two-suites` and `mirror-mode`: 4–8 s
-   locally, against 22 s); and the `test` job's `internal/freshness` time
-   against its `-timeout 10m` (307 s on 4 local CPUs under `-race`).
-2. **The first CI run's job times against the timeouts** (the H2 plan's
-   For H3 item 8). A short job over 10 minutes, or a long-wait job over
-   25: raise its `timeout-minutes` with the measured reason, and its
-   `E2E_STEP_MINUTES` with it (3 minutes under the timeout). Expected:
-   short jobs 5–8 minutes; long-wait jobs 8–12, and 16–21 when an
-   unsigned record waits for its third retry (about one CI run in four).
-3. **`make e2e-live`** on the tree you tag (`e2e/live/README.md`; add its
-   row to that file's *Results*): the H3 plan ran it during planning and
-   again on its final tree.
-4. **`make e2e-apt-oracle`** and **`make e2e-apt-oracle-old`** on the
-   tree you tag (`e2e/apt-oracle/README.md`; add their row to that file's
-   *Results*), after `docker pull` of the eleven images (the README's
-   *Running it*: a cached tag is never refreshed, so a run without the
-   pull measures the images of 2026-10-29 and 2026-11-05 again and passes
-   by construction): the real apt of the six client images, and of the
-   five older ones (debian:10, ubuntu:20.04, 18.04, 16.04 and 14.04),
-   must still give the verdicts and error classes recorded for the
-   verifier's 904 signature-shape fixtures; about 90 and 100 seconds with
-   the images cached (87 to 92 s and 98 to 101 s, 2026-11-05). A difference blocks the tag
-   until it is recorded and the table test agrees (the README's *When apt
-   changes*). The GC
-   and upstream hardening plan recorded them (2026-10-29; the older
-   images 2026-11-05, its Task 9e). This item outlives the section: the
-   oracle runs before every release (*Decided*, below).
-5. **Run the release candidate once on a copy of a production 1.0.x
-   cache** (raised 2026-10-27, the H3 final review R5 #5): every test
-   builds its 1.0.x database by hand, so only a real `cache.db` and
-   `pool/` show what the trust audit makes of real vendors' `InRelease`
-   files, and its quarantines cannot be undone. Copy `cache.db` (with
-   its `-wal`) with 1.0.x stopped, and `pool/`; point the candidate at
-   the copy with the production configuration, never at the production
-   pool (the audit and GC delete pool files). Read `schema migrated` and
-   its time; `legacy_trust_audit_completed`, expecting `quarantined=0`
-   and `deferred=0` on a healthy cache (explain any quarantine's reason
-   before tagging); the startup `gc_run_complete`'s `duration_ms` (the
-   listeners wait for it); and, an hour later,
-   `suite_reaper_run_complete`, the `suite_reaped` reasons and
-   `gc_retired_run_complete`. The copy also runs the new verifier against
-   the operator's real repositories, beyond the 81 vendors surveyed: read
-   every `adoption_gpg_failed` of the first hour whose reason is
-   `malformed_clearsign`, `malformed_signature`, `bad_signature` or
-   `crypto_verify_failed`, every `adoption_signer_downgrade`, and the
-   start's `keyring_file_skipped`, `keyring_file_truncated` and
-   `keyring: parse failed; skipping file` lines, and compare each with
-   what the clients' apt does on that repository (the hardening plan's
-   final review, D-M10). A snapshot 1.0.x adopted keeps serving whatever
-   the new rules make of its anchor (the trust audit does not run the
-   verifier); it is the suite's next adoption that the rules decide.
-6. **Tag `1.1.0-rc1`** on `main`. The release workflow's
-   `Verify no e2e test seam` step runs first on the tag: check it there.
-7. **The release notes** (`docs/release-notes/1.1.0.md`): bring them up
-   to date with what `Changelog.md` collected since this branch and
-   commit them before the tag (item 6), then paste them into the GitHub
-   release the tag created, as [docs/releasing.md](releasing.md)'s steps 6
-   and 8 say (step 8 gives the commands that rewrite the links to the tag
-   just made and unwrap the paragraphs for GitHub's editor; the
-   per-release steps that outlive this section are there). The GC and upstream hardening plan's Task 8 rebuilt
-   them from the Changelog on 2026-11-05, main's changes included: the
-   verifier and its reasons, the signer downgrade guard and its recourse,
-   the six vendors with no strong signer, the SHA-1 refusal, the key
-   reader's changes, the HTTP 204 rule, issue #14's GC fix, the
-   older-client oracle, the new events and metrics (29 metrics since
-   1.0.3), the GC counters' double count and the refusal count, eight. A
-   later change to `Changelog.md` before the tag needs its line there
-   too.
-
 ## Open
 
 - **`govulncheck` and dependabot in CI, and `go 1.26` for the last
@@ -983,6 +891,30 @@ the candidate; each adds its entry to [Changelog.md](../Changelog.md).
   duration to the blob pass's tick line.
 
 ## Decided
+
+- **1.1.0-rc1 release preparation** (2026-11-11 local / 2026-11-12 UTC).
+  The candidate is opt-in testing; 1.0.4 remains the recommended stable
+  release. Its release notes are `docs/release-notes/1.1.0-rc1.md`, with
+  the full cycle's notes linked from there. GitHub marks it prerelease
+  and not latest; the apt publishing job skips prerelease tags entirely.
+  Docker's existing prerelease rules retain stable tags.
+  Validation of application code `e15e019` (the release preparation changes
+  only documentation and workflows): all eleven apt client images freshly
+  pulled, both 904-shape oracles passed (113 s current, 101 s older), and
+  the live vendor smoke passed (238 s: all eight suites, six installs,
+  five expected strict refusals). The harness READMEs record the runs.
+  Actionlint and stable-tag selection passed; Debian ordering was checked
+  as `1.0.4 < 1.1.0~rc1 < 1.1.0`.
+  Sean reports the real 1.0.x upgrade trial went fine, about 3.5 hours of
+  operation and a system reinstall through the cache; this is
+  operator-reported evidence, not independent inspection of every audit
+  or cleanup counter. The preceding main CI run, `43130562546`, passed
+  in full: short e2e-flat jobs took about 4.5–5.3 minutes, and the two
+  unsigned jobs about 9.6–10.4 minutes, within their 15/30-minute limits.
+  CI must also pass on the final preparation commit before tagging,
+  as [releasing.md](releasing.md) requires. The known issues and deferred
+  cases under *Open* remain documented; issue #14's fixes await field
+  feedback, and #19's CONNECT pass-through is deferred beyond 1.1.0.
 
 - **An upstream HTTP 204 is an empty file for indexes and metadata only**
   (the maintainer, 2026-11-05; raised by the hardening plan's final review

@@ -21,6 +21,12 @@ available from the cache at all times.
 Stable 1.0 release.  I run it in my 4 environments with 200 machines, serving thousands
 of "apt update/upgrade" and "apt installs".
 
+The [1.1.0-rc1 release candidate](https://github.com/linsomniac/apt-cacher-ultra/releases/tag/1.1.0-rc1)
+is for users who want to test the upcoming 1.1 release and report problems.
+Stable users should stay on 1.0.4 for now; the apt repository continues to
+serve stable releases only. Read the [candidate's upgrade notes](docs/release-notes/1.1.0-rc1.md)
+before installing its downloaded `.deb` or standalone binary.
+
 ## Features
 
 - Drop-in apt-cacher-ng replacement — same :3142 port, proxy mode, and http://HTTPS/// URL convention, so existing
