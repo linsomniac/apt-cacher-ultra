@@ -136,10 +136,12 @@ jobs:
           # is self-identifying after download.
           cp build/apt-cacher-ultra "dist/apt-cacher-ultra-${VERSION}-linux-amd64"
 
-          # The .deb keeps nfpm's Debian-conventional naming
-          # (apt-cacher-ultra_<deb_version>_amd64.deb) so apt tooling
-          # downstream can recognise it without renaming.
-          cp "build/apt-cacher-ultra_${DEB_VERSION}_amd64.deb" dist/
+          # GitHub rewrites '~' in asset names to '.', which would make
+          # the uploaded filename disagree with SHA256SUMS. Use the tag
+          # in the download name; the package's internal Debian version
+          # still uses '~' so an RC sorts before the final release.
+          cp "build/apt-cacher-ultra_${DEB_VERSION}_amd64.deb" \
+            "dist/apt-cacher-ultra_${VERSION}_amd64.deb"
 
           # Source archive from the tag, prefixed so it expands into a
           # versioned directory.
@@ -174,6 +176,6 @@ jobs:
           generate_release_notes: true
           files: |
             dist/apt-cacher-ultra-${{ steps.vars.outputs.version }}-linux-amd64
-            dist/apt-cacher-ultra_${{ steps.vars.outputs.deb_version }}_amd64.deb
+            dist/apt-cacher-ultra_${{ steps.vars.outputs.version }}_amd64.deb
             dist/apt-cacher-ultra-${{ steps.vars.outputs.version }}-source.tar.gz
             dist/SHA256SUMS

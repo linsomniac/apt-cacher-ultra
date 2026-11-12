@@ -45,7 +45,9 @@ until its README's procedure says what to do.
    The workflow creates the GitHub release with the matching version's
    notes file, when present, followed by generated notes. A prerelease
    tag is marked as a prerelease and explicitly kept off GitHub's latest
-   release. Its `.deb` uses `~rcN`, so the final version sorts newer.
+   release. Its `.deb` uses `~rcN` internally, so the final version sorts
+   newer; the download filename uses `-rcN` because GitHub rewrites `~`
+   in asset names. `SHA256SUMS` must name the files as downloaded.
 8. **Verify the published release:** the intended notes, binary, `.deb`,
    source archive and checksums are present; the binary reports the tag;
    and the package has the expected version. For a candidate, confirm
