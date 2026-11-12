@@ -449,9 +449,10 @@ about a day after the row starts warning.
 
 **Adoption disabled.** With adoption disabled (the shipped default) a
 stored record marks no warn and is not counted as FAILING or REFUSED 24H+,
-and a lag keeps its "(lagging …)" text but does not warn: Phase 1 never
-refreshes metadata, so the lag is truthful but expected. The SUITES vital
-is `stale` (§9.1). The JSON keeps every field as stored.
+and a lag keeps its "(lagging …)" text but does not warn. Changed anchors
+invalidate mutable metadata for subsequent requests; previously adopted
+suites are automatically forgotten at startup when adoption is disabled.
+The SUITES vital is `stale` (§9.1). The JSON keeps every field as stored.
 
 ### 4.6 GC and Recent Adoptions fields (phase H1)
 
@@ -1206,10 +1207,10 @@ about the content's age, so a long refusal must not freeze a suite silently.
 Adoption is disabled by default. The freshness checker still refreshes a
 suite that has no adopted snapshot (#18): a changed tracked `InRelease` or
 `Release` invalidates its mutable metadata, and later requests fetch current
-files. A suite with an adopted snapshot keeps serving that snapshot until
-adoption is enabled, so it lags by more than a day — truthfully, but by
-design. Following the keyring panel's `ADOPTION DISABLED` precedent, the
-SUITES vital is then `stale` (not `warn`/`crit` from lag) and its sub-line
+files. Previously adopted suites are automatically forgotten before serving
+at startup with adoption disabled, so they return as unadopted suites on
+their next requests. Following the keyring panel's `ADOPTION DISABLED`
+precedent, the SUITES vital is then `stale` (not `warn`/`crit` from lag) and its sub-line
 reads `ADOPTION DISABLED`; rows keep their "(lagging …)" text but do not warn,
 and a stored failure or refusal record is inert, its text gaining
 " (adoption disabled)" (`suitesForHTML`; §4.5). The page therefore stays

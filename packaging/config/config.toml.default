@@ -79,6 +79,8 @@ max_suites               = 5000  # tracked suites; a tenth per host; at least 10
 [adoption]
 # Adopt verified, coherent metadata snapshots atomically; failure retains
 # the previous snapshot. Enable after loading keys for your repositories.
+# Restarting with false automatically forgets adopted suites before serving:
+# metadata is fetched afresh and old snapshots are retired for normal GC.
 enabled               = false
 require_signature     = true    # false only allows an empty keyring; see reference
 require_pinned_signer = false   # true requires a matching trusted_signer rule

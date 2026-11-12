@@ -605,8 +605,7 @@ func serveListeners(
 
 	// SPEC2 §7.6 Phase 2 adoption wiring. When adoption.enabled = true,
 	// build the keyring + verifier + adopter here; nil adopter means
-	// freshness continues Phase 1 behavior (record divergence, do not
-	// flip).
+	// freshness invalidates changed metadata for the next client fetch.
 	var adopter *freshness.Adopter
 	var keyring *gpg.Keyring
 	if cfg.Adoption.Enabled {
@@ -632,6 +631,19 @@ func serveListeners(
 	reaper, err := freshness.NewReaper(reaperConfig(cfg, c, freshChecker, logger))
 	if err != nil {
 		return fmt.Errorf("build suite reaper: %w", err)
+	}
+	// Changing to adoption-disabled mode also applies to snapshots left by
+	// earlier runs. Complete the forgets before serving or starting freshness
+	// and GC workers, even with GC/reaping disabled. GC later deletes the retired rows
+	// and unreferenced blobs through its normal bounded passes.
+	if !cfg.Adoption.Enabled {
+		n, err := reaper.ForgetAdoptedAtStartup(ctx)
+		if err != nil {
+			return fmt.Errorf("forget adopted suites with adoption disabled: %w", err)
+		}
+		if n > 0 {
+			logger.Info("adoption_disabled_suites_forgotten", "suites", n)
+		}
 	}
 
 	hcfg := handlerConfig(cfg, parser, c, fetchClient, hostLimiter, logger, freshChecker, adopter)

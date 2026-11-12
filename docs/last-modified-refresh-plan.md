@@ -77,3 +77,12 @@ Run the full Go suite and race checks for affected packages.
 - Race detector: `go test -race -p 1 -timeout 10m ./internal/cache ./internal/freshness ./internal/handler` passed.
 - Production lint: `golangci-lint run --timeout 5m ./cmd/... ./internal/...` passed.
 - E2E hooks lint: `golangci-lint run --timeout 5m --build-tags e2ehooks ./cmd/...` passed.
+
+## Adoption-disabled startup follow-up (2026-11-11)
+
+Disabling adoption now automatically forgets existing adopted suites at
+startup before serving, using the ordinary forget path and leaving retired
+snapshots for GC. This supersedes the original decision to keep serving those
+snapshots with a warning. Never-adopted suites retain the invalidation behavior
+above. Daemon restart tests cover this transition and subsequent refreshes;
+cleanup tests cover retirement, GC and failure retry.

@@ -11,6 +11,37 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
 
+// ForgetAdoptedAtStartup applies adoption.enabled=false to persisted snapshots.
+// Call before starting the scheduler, reaper or request listeners. The ordinary
+// forget path deletes cached metadata and retires all snapshots of each adopted
+// suite, releasing their pins for GC. Never-adopted suites keep their cache.
+// A failure must stop startup; completed forgets remain committed and an
+// interrupted suite is selected again on the next start.
+func (r *Reaper) ForgetAdoptedAtStartup(ctx context.Context) (int, error) {
+	if r.checker.adopter != nil {
+		return 0, errors.New("cannot forget adopted suites while adoption is enabled")
+	}
+	suites, err := r.cache.ListSuites(ctx)
+	if err != nil {
+		return 0, err
+	}
+	forgotten := 0
+	for _, s := range suites {
+		if s.CurrentSnapshotID == nil {
+			continue
+		}
+		res, err := r.Forget(ctx, s.CanonicalScheme, s.CanonicalHost, s.SuitePath)
+		if err != nil {
+			return forgotten, fmt.Errorf("%s://%s%s: %w", s.CanonicalScheme, s.CanonicalHost, s.SuitePath, err)
+		}
+		if !res.Deleted {
+			return forgotten, fmt.Errorf("%s://%s%s: adopted suite was not forgotten", s.CanonicalScheme, s.CanonicalHost, s.SuitePath)
+		}
+		forgotten++
+	}
+	return forgotten, nil
+}
+
 // Forget is POST /forget (spec C9, D9; admin.Forgetter): the reaper's
 // steps for one suite, run to completion regardless of idleness within
 // suiteHoldTimeout — under the suite's mutex every metadata batch, then

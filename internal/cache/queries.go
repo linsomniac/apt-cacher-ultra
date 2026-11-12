@@ -748,9 +748,8 @@ SELECT canonical_host, path, is_metadata, request_count, last_requested_at
 }
 
 // ListSuites returns every suite_freshness row, in no guaranteed order.
-// It has no production caller since phase E: the periodic freshness
-// scheduler (SPEC §7.4) reads ListSuitesWithAdoption at every tick. Kept
-// for tests and diagnostics.
+// Startup uses it to forget adopted suites when adoption is disabled. The
+// periodic freshness scheduler reads ListSuitesWithAdoption at every tick.
 //
 // AIDEV-NOTE: a full-table scan with no LIMIT. The scaling caveat for the
 // scheduler's per-tick scan now lives on ListSuitesWithAdoption, the query

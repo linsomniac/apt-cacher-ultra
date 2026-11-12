@@ -170,7 +170,10 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   ETags for conditional responses to prevent stale date-only responses (#17).
 - Refresh mutable repository metadata when snapshot adoption is disabled,
   including Release-only repositories; fence downloads racing a refresh and
-  warn when an existing adopted snapshot cannot refresh in this mode (#18).
+  automatically forget previously adopted suites at startup before serving
+  in this mode (#18). Their metadata is fetched afresh and their snapshots
+  are retired for normal GC. Added daemon restart coverage for the transition,
+  previously excluded indexes, subsequent refreshes and cleanup failures.
   Schema 8 migrates stored dates automatically and is forward-only.
 - Empty repository indexes served as HTTP 204 now adopt successfully, and
   a client's request for an index file that upstream answers 204 is

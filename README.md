@@ -273,13 +273,20 @@ connection. To access HTTPS repositories directly, explicitly set
 
 Snapshot adoption (`[adoption] enabled = true`, after loading the
 repositories' signing keys on the cache host, in `/etc/apt/keyrings` or
-`adoption.keyring_dirs`; restart after adding one) is what keeps metadata
-fresh: the cache checks each repository its clients use and serves every
-change as one coherent snapshot, adopted at the repository's first
+`adoption.keyring_dirs`; restart after adding one) keeps each repository's
+metadata coherent: the cache checks each repository its clients use and
+serves every change as one coherent snapshot, adopted at the repository's first
 `apt update` through the cache when an adoption slot is free. It is off
-in the packaged configuration:
-until you enable it, each metadata file is served as the cache first
-stored it, and suites are only checked for changes.
+in the packaged configuration. With adoption disabled, a change to a tracked
+`InRelease` or `Release` invalidates the suite's mutable cached metadata;
+subsequent requests fetch current upstream files.
+
+Restarting with adoption disabled automatically forgets previously adopted
+suites before serving requests. Their metadata is fetched afresh, including
+indexes excluded by the old `adoption.architectures` setting. Never-adopted
+suites keep their cache. Old snapshots are retired for garbage collection;
+cached packages remain subject to normal GC. See
+[disabling adoption](docs/configuration.md#disabling-adoption).
 
 - **`dists/` repositories** (Debian, Ubuntu, most vendors), signed with an
   `InRelease` or with `Release` and `Release.gpg`; a suite moves between

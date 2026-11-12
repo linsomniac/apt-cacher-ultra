@@ -340,7 +340,8 @@ A refetched anchor counts as a successful check. A changed anchor invalidates
 its suite's mutable metadata, so subsequent requests fetch current files.
 A plain-text "InRelease" without the clearsign line does not track a suite;
 APT rejects it too. Release-only repositories remain tracked and refreshable.
-Existing adopted snapshots still require adoption to publish an update.
+On startup with adoption disabled, previously adopted suites are automatically
+forgotten before serving requests (see *Disabling adoption*).
 
 At most `max_suites` suites are tracked and at most `max_suites / 10` per
 host. At the total cap, a new suite makes room by evicting the least
@@ -439,10 +440,12 @@ it — plus once for each client check while it waits (at most one per
 `cooldown`) and once for each slot offered to it that another admission
 takes first.
 
-With adoption disabled nothing changes: suites are checked for changes
-only, and a miss that creates a suite starts no check (a cache hit on a
-suite's anchor still triggers its usual check, under the `cooldown`, also
-the hit that creates the suite's row).
+With adoption disabled, checks invalidate a changed suite's mutable metadata
+so later requests fetch current files. A miss that creates a suite starts no
+check: it has just fetched the anchor. A cache hit on a suite's anchor triggers
+its usual check under the `cooldown`, including the hit that creates the suite's
+row. The request that triggers a background check can still receive the cached
+version; subsequent requests see the refresh once the check completes.
 
 ### Flat repositories
 
@@ -603,7 +606,7 @@ declares.
 
 | Key | Type | Default | Behavior and constraints |
 | --- | --- | --- | --- |
-| `enabled` | boolean | `false` | Enable adoption of verified snapshots. When false, changes to an unadopted suite’s `InRelease` or `Release` invalidate its mutable cached metadata; subsequent requests fetch current upstream files. Existing adopted snapshots still require adoption to refresh and a changed snapshot emits `legacy_metadata_refresh_failed` at WARN. Failure records from earlier adoption runs remain inert. The suite reaper still runs. |
+| `enabled` | boolean | `false` | Enable adoption of verified snapshots. When false, startup automatically forgets previously adopted suites before serving; changes to a tracked suite's `InRelease` or `Release` invalidate its mutable cached metadata so subsequent requests fetch current files. Never-adopted suites keep their cache and any earlier adoption failure records remain inert. See *Disabling adoption*. The suite reaper still runs. |
 | `require_signature` | boolean | `true` | Allows starting with an empty keyring. It no longer relaxes verification: only a decodable clearsigned `InRelease` is adopted as inline metadata in every mode (plain-text bodies are `missing_signature`, undecodable ones `malformed_clearsign`). Unsigned repositories are adopted in the unsigned form instead (`adopt_unsigned`). |
 | `adopt_unsigned` | boolean | `true` | Adopt a repository that publishes a `Release` with no signature (neither `InRelease` nor `Release.gpg`) as an unsigned snapshot: served coherently, but never trusted — it vouches no `.deb` and never counts for `integrity.refuse_unvouched_debs`. A suite the cache has seen signed is never adopted unsigned. `false` refuses every unsigned `Release` ("refused: unsigned_disabled", a state, not a failed check), so the cache no longer keeps unsigned repositories fresh: an unsigned suite already adopted keeps serving its last snapshot, coherent but frozen — never updated — until the knob is turned back on (it then updates at its next retry, at most 75 minutes later: a restart keeps a refusal's retry time), the suite is forgotten (`POST /forget`), or it is reaped after `gc.suite_idle_ttl` without a client. Forgotten or reaped with the knob still off, it is then a repository not yet adopted, which is worse: the forget or reap deletes its cached index files first, so its next requests fetch upstream's current files, but it stays unadopted and each file then stays as the cache first stored it, never refreshed, so an upstream publish can leave its clients with Hash Sum mismatches. Off also stops the refresh of a flat repository that publishes no `Release` at all (see *Flat repositories* under `[freshness]`): it is served as the cache first stored its files, and the status page shows "refused: unsigned_disabled"; turning the knob on resumes its refresh. Set it to `false` only if you do not serve unsigned repositories through the cache. Either way the suite is asked upstream again only at its retry times (2 minutes, doubling to an hour; for a suite not yet adopted, also once `periodic_refresh` has passed), never at the checks clients trigger in between. See *Anchor forms and unsigned repositories* for the safeguards and the threat notes. |
 | `require_pinned_signer` | boolean | `false` | Reject adoption when no `[[trusted_signer]]` matches the canonical host. Evaluated before `accept_any_signer`. |
@@ -619,6 +622,34 @@ declares.
 | `hot_prefetch_budget` | duration | `"5m"` | Wall-clock budget for fetching hot package versions before publishing a new snapshot. `"0s"` removes this overall guard; each fetch still has upstream limits. Nonnegative. |
 | `max_duration` | duration | `"30m"` | Longest an adoption, repair or reconcile may run. An abandoned adoption is retried on the normal schedule; a repair or reconcile runs again on the next unchanged check. The deadline never cuts the final commit short: the commit runs under its own 5-minute bound. Nor does it cut the flip barrier short (at most 140 s, see *Flip consistency*), which only a shutdown ends early. On shutdown an adoption that has not reached its commit is abandoned at once, but a commit already running is waited for, up to those 5 minutes; the packaged systemd unit's `TimeoutStopSec=35` may kill the process first, in which case SQLite rolls the commit back and nothing is lost. At least `"1m"`. |
 | `flip_quiet_period` | duration | `"10s"` | How long a suite's `InRelease`/`Release` serves must have been quiet before a new snapshot replaces the current one, so a client that just received the old one fetches matching indexes (see *Flip consistency*). `"0s"` disables the barrier: adoptions commit at once, as before. Otherwise between `"1s"` and `"15s"`: a shorter period protects almost no one, and a longer one leaves less of a hold's first 15 s for the responses already being sent when it starts, so more holds commit before the suite is quiet (`acu_flip_quiet_cut_short_total`). |
+
+### Disabling adoption
+
+Set `[adoption] enabled = false` and restart. Before serving requests, the
+daemon automatically forgets every suite with an adopted snapshot, using the
+same cleanup as `POST /forget`: cached metadata is removed, all of the suite's
+snapshots are retired, and the suite's tracking and adoption failure state is
+cleared. This includes inline, detached and unsigned snapshots, under both
+HTTP and HTTPS. Signing history is cleared under the same rules as an explicit
+forget (see *Forgetting a suite* under `[admin]`). Never-adopted suites keep
+their cached files; subsequent disabled restarts do not flush them.
+
+The next requests fetch current upstream metadata, including indexes that the
+old `adoption.architectures` setting excluded. They need upstream access:
+previously adopted metadata is no longer available for offline serving. The
+suite is tracked again without a snapshot, and normal freshness checks
+invalidate its mutable metadata when its `InRelease` or `Release` changes.
+If adoption is enabled again later, it adopts afresh.
+
+The startup cleanup runs even with `gc.enabled = false` or
+`gc.suite_idle_ttl = "0s"`. Cached package files are kept, but lose the version
+retention supplied by the forgotten snapshots. With GC enabled, its normal
+bounded passes delete retired snapshot rows and reclaim unreferenced blobs
+after `gc.blob_grace`; package files follow the usual retention rules. With GC
+disabled, retired data stays on disk until GC is enabled. A cleanup failure
+stops startup before requests are served, and the next start resumes the
+remaining work. A successful cleanup logs `adoption_disabled_suites_forgotten`
+with the number of suites, plus the usual `suite_forgotten` line for each.
 
 ### How failed adoptions are retried
 
