@@ -640,6 +640,10 @@ type Adopter struct {
 	// (MemberFetchWorkers; tests may lower it).
 	memberWorkers int
 
+	// progressInterval is how often a running attempt logs
+	// adoption_in_progress (adoptionProgressInterval; tests shorten it).
+	progressInterval time.Duration
+
 	// signers is verifier as a SignerVerifier, nil when it is not one: the
 	// signer downgrade guard (signer_guard.go) then stands down.
 	signers SignerVerifier
@@ -841,6 +845,7 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		hostSem:                 cfg.HostLimiter,
 		blobLocks:               hostsem.New(1),
 		memberWorkers:           MemberFetchWorkers,
+		progressInterval:        adoptionProgressInterval,
 		maxConcurrent:           cfg.MaxConcurrent,
 		maxDuration:             maxDur,
 		flipGate:                cfg.FlipGate,
@@ -1010,12 +1015,20 @@ func (a *Adopter) heartbeat(ctx context.Context, host string, snapshotID int64, 
 // gaps, the gap from runHotPrefetch returning to CommitAdoption
 // running). Sites 1–5 are latency-fresh event-driven heartbeats; the
 // ticker is the floor under them, not a replacement.
-func (a *Adopter) runHeartbeatTicker(ctx context.Context, host string, snapshotID int64, tracker *blobHeartbeatTracker) {
+//
+// The ticker also reports an attempt that is still running: progress,
+// when non-nil, is called at the first tick after every progressInterval
+// (adoption_in_progress).
+func (a *Adopter) runHeartbeatTicker(ctx context.Context, host string, snapshotID int64, tracker *blobHeartbeatTracker, progress func()) {
 	if a.heartbeatInterval <= 0 {
 		return
 	}
 	t := time.NewTicker(a.heartbeatInterval)
 	defer t.Stop()
+	lastProgress := time.Now()
+	if attempt := adoptionLogFromContext(ctx); attempt != nil {
+		lastProgress = attempt.started
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -1025,6 +1038,10 @@ func (a *Adopter) runHeartbeatTicker(ctx context.Context, host string, snapshotI
 				a.heartbeatHook()
 			}
 			a.heartbeat(ctx, host, snapshotID, tracker)
+			if progress != nil && a.progressInterval > 0 && time.Since(lastProgress) >= a.progressInterval {
+				lastProgress = time.Now()
+				progress()
+			}
 		}
 	}
 }
@@ -1155,10 +1172,10 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		if r := recover(); r != nil {
 			// Preserve the existing panic boundary and failure bookkeeping, even
 			// if a log handler itself panics while writing the terminal record.
-			unloggedPanic(func() { attempt.finish(a.logger, ctx, suite, p, runErr, true) })
+			unloggedPanic(func() { attempt.finish(a.logger, ctx, suite, p, runErr, true, a.now()) })
 			panic(r)
 		}
-		attempt.finish(a.logger, ctx, suite, p, runErr, false)
+		attempt.finish(a.logger, ctx, suite, p, runErr, false, a.now())
 	}()
 	a.logger.Info("adoption_started", attempt.attrs(suite, p.form)...)
 
@@ -1327,6 +1344,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// A missing or unparseable Date is 0 (apt). Snapshots adopted before
 	// v7 have no stored date (NULL): no rule applies to their successor.
 	relDate := releaseDate(releaseText)
+	attempt.releaseDate = relDate
 	if now := a.now(); relDate > now.Add(maxReleaseDateSkew).Unix() {
 		return fmt.Errorf("%w: Date is %ds ahead of the cache's clock",
 			ErrAdoptionReleaseDateInFuture, relDate-now.Unix())
@@ -1485,7 +1503,9 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 					unloggedPanic(func() { logPanic(a.adoptionLogger(ctx), "adoption_panicked", "heartbeat", suite, r) })
 				}
 			}()
-			a.runHeartbeatTicker(tickerCtx, suite.CanonicalHost, snapshotID, tracker)
+			a.runHeartbeatTicker(tickerCtx, suite.CanonicalHost, snapshotID, tracker, func() {
+				attempt.logProgress(a.adoptionLogger(ctx), suite)
+			})
 		}()
 	}
 	defer func() {

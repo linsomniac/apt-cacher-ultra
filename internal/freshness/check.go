@@ -136,6 +136,12 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 			out.req.trigger.previousFailureReason = *failureReason
 		}
 		out.req.trigger.retry = failures > 0 && failureHash != nil && *failureHash == out.req.key
+		// The first sighting of this change (setChangeSeen keeps it across
+		// the checks that found no slot or deferred), for the attempt's
+		// first_seen_seconds.
+		if cur.InReleaseChangeSeenAt != nil {
+			out.req.trigger.changeSeenAt = *cur.InReleaseChangeSeenAt
+		}
 	}()
 
 	// Cooldown gate. Spec C4 clock-step rule: a past-event stamp found in

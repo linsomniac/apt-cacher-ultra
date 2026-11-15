@@ -28,7 +28,6 @@ var mainEventsWithoutARow = []string{
 	"adoption_hot_prefetch_started",
 	"adoption_member_repair_failed",
 	"adoption_member_repaired",
-	"adoption_member_retry",
 	"adoption_parse_failed",
 	"adoption_reconcile_member_failed",
 	"adoption_reconcile_snapshot_displaced",

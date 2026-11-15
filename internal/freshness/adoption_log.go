@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
@@ -17,6 +18,21 @@ type adoptionTrigger struct {
 	previousFailureReason  string
 	previousSnapshot       int64
 	previousKnown          bool
+	// changeSeenAt is when the cache first saw the upstream change this
+	// attempt adopts (suite_freshness.inrelease_change_seen_at, unix
+	// seconds; 0: unknown, as for a direct adopter call).
+	changeSeenAt int64
+}
+
+// adoptionProgressInterval is how often an attempt that is still running
+// logs adoption_in_progress: after its first minute, and every minute
+// after (a constant, not a knob).
+const adoptionProgressInterval = time.Minute
+
+// phaseMark is the phase an attempt is in and since when (monotonic).
+type phaseMark struct {
+	name  string
+	since time.Time
 }
 
 // Only the adoption goroutine updates lifecycle fields. Transfer accounting is
@@ -36,6 +52,13 @@ type adoptionLog struct {
 	membersSkipped                 int
 	hot                            hotPrefetchStats
 	pipelineDone                   bool
+	// releaseDate is the Release's Date field (unix seconds; 0: none, or
+	// not parsed yet).
+	releaseDate int64
+	// mark mirrors phase and phaseStarted for the heartbeat goroutine,
+	// which logs adoption_in_progress: the only lifecycle state another
+	// goroutine reads.
+	mark atomic.Pointer[phaseMark]
 }
 
 type adoptionLogKey struct{}
@@ -63,17 +86,42 @@ func newAdoptionLog(trigger adoptionTrigger, start time.Time) *adoptionLog {
 	if trigger.reason == "" {
 		trigger.reason = "explicit_run"
 	}
-	return &adoptionLog{
+	l := &adoptionLog{
 		trace: observability.NewAdoptionTrace(), trigger: trigger, started: start,
 		phaseStarted: start, phase: "prepare", phases: make(map[string]float64),
 		previous: trigger.previousSnapshot, previousKnown: trigger.previousKnown,
 	}
+	l.mark.Store(&phaseMark{name: l.phase, since: start})
+	return l
 }
 
 func (l *adoptionLog) nextPhase(phase string) {
 	now := time.Now()
 	l.phases[l.phase] += now.Sub(l.phaseStarted).Seconds()
 	l.phase, l.phaseStarted = phase, now
+	l.mark.Store(&phaseMark{name: phase, since: now})
+}
+
+// logProgress logs adoption_in_progress: the attempt is still running, and
+// where. Called from the heartbeat goroutine, so it reads only what that
+// goroutine may read: the attempt's identity, its start, and mark.
+//
+// AIDEV-NOTE: adoption_finished tells an attempt's whole story, but only
+// once it has ended; an attempt that is stuck, or merely slow, was
+// invisible until then (the 2026-11-14 publication-delay review: "the
+// update is upstream and the cache does not have it" could not be told
+// from "an adoption has been in its flip barrier for two minutes").
+func (l *adoptionLog) logProgress(logger *slog.Logger, suite SuiteRef) {
+	mark := l.mark.Load()
+	logger.Info("adoption_in_progress",
+		"adoption_id", l.trace.ID,
+		"canonical_scheme", suite.CanonicalScheme,
+		"canonical_host", suite.CanonicalHost,
+		"suite_path", suite.SuitePath,
+		"phase", mark.name,
+		"phase_seconds", time.Since(mark.since).Seconds(),
+		"elapsed_seconds", time.Since(l.started).Seconds(),
+	)
 }
 
 func (l *adoptionLog) attrs(suite SuiteRef, form adoptionForm) []any {
@@ -88,7 +136,9 @@ func (l *adoptionLog) attrs(suite SuiteRef, form adoptionForm) []any {
 	}
 }
 
-func (l *adoptionLog) finish(logger *slog.Logger, ctx context.Context, suite SuiteRef, p *adoptionPayload, err error, panicked bool) {
+// finish logs adoption_finished. now is the wall clock (the adopter's),
+// for the two ages measured against persisted or signed stamps.
+func (l *adoptionLog) finish(logger *slog.Logger, ctx context.Context, suite SuiteRef, p *adoptionPayload, err error, panicked bool, now time.Time) {
 	lastPhase := l.phase
 	l.nextPhase("finished")
 	outcome := classifyAdoptionOutcome(err)
@@ -120,6 +170,18 @@ func (l *adoptionLog) finish(logger *slog.Logger, ctx context.Context, suite Sui
 		"hot_count", l.hot.hotCount, "hot_fetched", l.hot.fetched, "hot_reused", l.hot.reused,
 		"hot_failed", l.hot.failed, "hot_mismatched", l.hot.mismatched, "hot_unattempted", l.hot.unattempted,
 	)
+	// How late: how long the cache had known of this upstream change when
+	// the attempt ended, and how old the release itself — by its signed
+	// Date — was then. For a success the second is the publication's lag
+	// behind upstream, whatever the cache's own logs cover. Each only when
+	// known (a direct adopter call has no first sighting; a Release may
+	// carry no Date).
+	if l.trigger.changeSeenAt > 0 {
+		attrs = append(attrs, "first_seen_seconds", max(now.Unix()-l.trigger.changeSeenAt, 0))
+	}
+	if l.releaseDate > 0 {
+		attrs = append(attrs, "release_date", l.releaseDate, "release_age_seconds", now.Unix()-l.releaseDate)
+	}
 	if err != nil {
 		path, detail := memberErrorFields(err)
 		attrs = append(attrs, "err", err, "member_path", path, "detail", detail)
