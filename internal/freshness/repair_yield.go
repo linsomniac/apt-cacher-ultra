@@ -14,9 +14,9 @@ package freshness
 // Now the repair runs under a context that can be cancelled on request:
 //   - an adoption that finds only repairs between it and a slot asks them
 //     to give way and takes the slot (Checker.admitPastRepairs);
-//   - a check of the repair's own suite that would ask upstream — the
-//     repair has run for the cooldown — asks it to give way and then runs
-//     (Checker.repairGivesWay).
+//   - a due check probes beside maintenance first; unchanged content lets
+//     maintenance finish, while a change or inconclusive answer asks it to
+//     give way to the ordinary check (Checker.repairGivesWay).
 //
 // A repair that gave way logs repair_yielded at INFO, counts in
 // acu_repair_yielded_total{to}, and records nothing about the members it
@@ -49,8 +49,10 @@ func yielded(ctx context.Context) bool {
 
 // repairRun is one repair or reconcile goroutine in flight.
 type repairRun struct {
-	started time.Time // monotonic
-	cancel  context.CancelCauseFunc
+	probeMu    sync.Mutex
+	snapshotID int64
+	started    time.Time // monotonic
+	cancel     context.CancelCauseFunc
 	// done is closed once the goroutine has released the suite's mutex.
 	done chan struct{}
 
@@ -78,30 +80,17 @@ func (r *repairRun) yieldedTo() string {
 	return r.to
 }
 
-// repairGivesWay asks the repair of the suite key, if one is running and
-// has run for at least the cooldown, to give way to a check, and waits —
-// at most repairYieldWait — until it has released the suite's mutex. It
-// reports whether the caller should try the suite's mutex again.
-//
-// AIDEV-NOTE: why the cooldown. A repair starts right after a
-// confirmed-unchanged check, which stamped last_check_at; until the
-// cooldown has passed, a check of the suite is turned away by the cooldown
-// gate without asking upstream, so stopping the repair for it would buy
-// nothing. Once it has passed the check would ask, and a new release may
-// be waiting. The age is monotonic (the stamp is wall clock, but the two
-// start within milliseconds of each other). What this costs: under steady
-// client traffic a single member whose download takes longer than the
-// cooldown is stopped before it completes, each time; it then stays
-// missing until the suite's next adoption fetches it in the member
-// pipeline, which no check interrupts. The members a repair did finish are
-// promoted one by one and stay.
-func (c *Checker) repairGivesWay(key string) bool {
-	v, ok := c.repairs.Load(key)
-	if !ok {
-		return false
+// repairGivesWay cancels maintenance after checkDuringRepair determined that
+// an ordinary locked check is needed. Unchanged probes and cooldown skips leave
+// maintenance running; slow optional/required members can finish across ticks.
+func (c *Checker) repairGivesWay(key string, run *repairRun) bool {
+	select {
+	case <-run.done:
+		return true // it finished naturally; retry the suite mutex immediately
+	default:
 	}
-	run := v.(*repairRun)
-	if time.Since(run.started) < c.cooldown {
+	v, ok := c.repairs.Load(key)
+	if !ok || v != run {
 		return false
 	}
 	run.yield("check")
@@ -111,6 +100,7 @@ func (c *Checker) repairGivesWay(key string) bool {
 	case <-run.done:
 		return true
 	case <-t.C:
+		c.logYieldTimeout(key)
 	case <-c.lifetimeCtx.Done():
 	}
 	return false
@@ -140,10 +130,22 @@ func (c *Checker) admitPastRepairs(host string, signedCurrent bool) (*lease, boo
 		select {
 		case <-b.released:
 		case <-t.C:
+			unloggedPanic(func() {
+				c.logger.Warn("repair_yield_timeout", "canonical_host", host, "to", "adoption", "wait_seconds", repairYieldWait.Seconds())
+			})
 			return nil, false
 		case <-c.lifetimeCtx.Done():
 			return nil, false
 		}
 	}
 	return c.admission.tryAcquire(host, signedCurrent)
+}
+
+func (c *Checker) logYieldTimeout(key string) {
+	if v, ok := c.work.Load(key); ok {
+		w := v.(*backgroundWork)
+		unloggedPanic(func() {
+			c.logger.Warn("repair_yield_timeout", append(w.attrs(), "to", "check", "wait_seconds", repairYieldWait.Seconds())...)
+		})
+	}
 }

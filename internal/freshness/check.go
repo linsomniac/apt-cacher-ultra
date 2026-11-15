@@ -157,6 +157,7 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 			// The scheduler's slot-driven re-check, or its check of a
 			// suite with a pending change (spec C4).
 		case now.Sub(last) < c.cooldown:
+			freshnessSkippedTotal.Inc("cooldown", host)
 			return // out.report stays resultSkipped
 		}
 	}
@@ -284,6 +285,7 @@ type checkEnd struct {
 // reports it to the scheduler, and returns the repair signal of a
 // confirmed-unchanged suite with a current snapshot.
 func (c *Checker) finishCheck(ctx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, e checkEnd) *repairRequest {
+	workPhase(ctx, "record_result")
 	host, suitePath := suite.CanonicalHost, suite.SuitePath
 	if perr := c.cache.UpdateSuiteFreshness(ctx, *cur); perr != nil {
 		c.logger.Warn("freshness: persist success failed",
@@ -349,6 +351,7 @@ func (c *Checker) finishCheck(ctx context.Context, out *checkOutcome, cur *cache
 // Without an adopter (Phase 1) every Conditional error still extends the
 // streak, as before phase E.
 func (c *Checker) failCheck(ctx context.Context, out *checkOutcome, cur *cache.SuiteFreshness, suite SuiteRef, nowUnix int64, form string, err error) {
+	workPhase(ctx, "record_result")
 	host, suitePath := suite.CanonicalHost, suite.SuitePath
 	c.absentAnswered.Delete(suiteKey(suite.CanonicalScheme, host, suitePath)) // ruling PE-10 (b)
 	cur.LastCheckAt = &nowUnix
@@ -640,6 +643,7 @@ func (c *Checker) checkInline(ctx, fetchCtx context.Context, out *checkOutcome, 
 	// an adversarial allowlisted upstream. Sharing the limiter with
 	// the handler's miss path means cache-miss fetches and
 	// freshness checks contend for the same per-host budget.
+	workPhase(fetchCtx, "host_slot")
 	release, err := c.hostSem.Acquire(fetchCtx, host)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -655,6 +659,7 @@ func (c *Checker) checkInline(ctx, fetchCtx context.Context, out *checkOutcome, 
 		return nil, nil, false
 	}
 	defer release()
+	workPhase(fetchCtx, "upstream")
 
 	res, err := c.fetcher.Conditional(fetchCtx, target, etag, lastmod, c.maxBody)
 	if c.adopter != nil && cur.CurrentSnapshotID != nil {
@@ -860,6 +865,7 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 		}
 	}
 
+	workPhase(fetchCtx, "host_slot")
 	releaseSlot, err := c.hostSem.Acquire(fetchCtx, host)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -875,6 +881,7 @@ func (c *Checker) checkDetached(ctx, fetchCtx context.Context, out *checkOutcome
 		return nil, nil
 	}
 	defer releaseSlot()
+	workPhase(fetchCtx, "upstream")
 
 	lateralHeld := false
 	if c.adopter != nil && cur.CurrentSnapshotID != nil {

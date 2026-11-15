@@ -503,7 +503,7 @@ func chaos3SuiteRef(upstream *url.URL) freshness.SuiteRef {
 // freshness.HotPrefetchWorkers at a time, so the test hangs that many: the
 // first debs the hot set visits take every worker and never answer. With
 // budget=200ms, prefetchCtx fires DeadlineExceeded with them in flight,
-// fetchHotDeb logs hot_prefetch_deb_failed for each (the in-flight-cancel-
+// fetchHotDeb logs hot_prefetch_budget_elapsed for each (the in-flight-cancel-
 // as-failed contract per the §12.3 ordering pin), and
 // adoption_hot_prefetch_partial reports `missing` as the remaining
 // (never started) paths — NOT the hung ones. Adoption flips despite the
@@ -586,11 +586,11 @@ func TestPhase3Chaos_HotPrefetchBudget_HungFirst(t *testing.T) {
 		t.Errorf("adoption_hot_prefetch_started for newID=%d: count=%d, want 1", newID, n)
 	}
 
-	// hot_prefetch_deb_failed must fire for every hung deb's canonical
+	// hot_prefetch_budget_elapsed must fire for every hung deb's canonical
 	// path. SPEC3 §12.3 variant 1: in-flight cancellation by budget
 	// elapse maps to deb_failed (NOT cancelled-and-silent).
 	failedPaths := map[string]bool{}
-	for _, r := range stack.logBuf.findAll("hot_prefetch_deb_failed") {
+	for _, r := range stack.logBuf.findAll("hot_prefetch_budget_elapsed") {
 		if extractInt64(r, "snapshot_id") != newID {
 			continue
 		}
@@ -599,7 +599,7 @@ func TestPhase3Chaos_HotPrefetchBudget_HungFirst(t *testing.T) {
 		}
 	}
 	if len(failedPaths) != len(hungPaths) {
-		t.Errorf("hot_prefetch_deb_failed: records for %d of the %d hung paths on snapshot %d",
+		t.Errorf("hot_prefetch_budget_elapsed: records for %d of the %d hung paths on snapshot %d",
 			len(failedPaths), len(hungPaths), newID)
 	}
 
@@ -764,7 +764,7 @@ func TestPhase3Chaos_HotPrefetchBudgetZero_HardCancel(t *testing.T) {
 // TestPhase3Chaos_HotPrefetchBudget_HungLast is SPEC3 §12.3 variant 3:
 // hung deb is LAST in iteration order. The first N-1 debs fetch
 // successfully; the budget elapses while the last deb is in flight;
-// hot_prefetch_deb_failed fires for the hung one;
+// hot_prefetch_budget_elapsed fires for the hung one;
 // adoption_hot_prefetch_partial does NOT fire (the loop exits naturally
 // after the failed bucket — no further iterations to trigger the
 // top-of-iteration partial check); complete reports fetched=N-1,
@@ -823,10 +823,10 @@ func TestPhase3Chaos_HotPrefetchBudget_HungLast(t *testing.T) {
 		t.Errorf("adoption_hot_prefetch_partial for newID=%d: count=%d, want 0", newID, n)
 	}
 
-	// hot_prefetch_deb_failed must fire for the hung deb (in-flight
+	// hot_prefetch_budget_elapsed must fire for the hung deb (in-flight
 	// cancellation by budget — fetchHotDeb's DeadlineExceeded branch).
 	foundHung := false
-	for _, r := range stack.logBuf.findAll("hot_prefetch_deb_failed") {
+	for _, r := range stack.logBuf.findAll("hot_prefetch_budget_elapsed") {
 		if extractInt64(r, "snapshot_id") != newID {
 			continue
 		}
@@ -836,7 +836,7 @@ func TestPhase3Chaos_HotPrefetchBudget_HungLast(t *testing.T) {
 		}
 	}
 	if !foundHung {
-		t.Errorf("hot_prefetch_deb_failed: no record for hung path on snapshot %d", newID)
+		t.Errorf("hot_prefetch_budget_elapsed: no record for hung path on snapshot %d", newID)
 	}
 
 	// adoption_hot_prefetch_complete: fetched=N-1, failed=1, unattempted=0.

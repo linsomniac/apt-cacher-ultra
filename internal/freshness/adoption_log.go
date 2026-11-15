@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"sync/atomic"
 	"time"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
@@ -39,6 +38,7 @@ type phaseMark struct {
 // separately synchronized in trace, since HTTP bodies may close concurrently.
 type adoptionLog struct {
 	trace                          *observability.AdoptionTrace
+	work                           *backgroundWork
 	trigger                        adoptionTrigger
 	started, phaseStarted          time.Time
 	phase                          string
@@ -55,10 +55,6 @@ type adoptionLog struct {
 	// releaseDate is the Release's Date field (unix seconds; 0: none, or
 	// not parsed yet).
 	releaseDate int64
-	// mark mirrors phase and phaseStarted for the heartbeat goroutine,
-	// which logs adoption_in_progress: the only lifecycle state another
-	// goroutine reads.
-	mark atomic.Pointer[phaseMark]
 }
 
 type adoptionLogKey struct{}
@@ -91,7 +87,6 @@ func newAdoptionLog(trigger adoptionTrigger, start time.Time) *adoptionLog {
 		phaseStarted: start, phase: "prepare", phases: make(map[string]float64),
 		previous: trigger.previousSnapshot, previousKnown: trigger.previousKnown,
 	}
-	l.mark.Store(&phaseMark{name: l.phase, since: start})
 	return l
 }
 
@@ -99,29 +94,9 @@ func (l *adoptionLog) nextPhase(phase string) {
 	now := time.Now()
 	l.phases[l.phase] += now.Sub(l.phaseStarted).Seconds()
 	l.phase, l.phaseStarted = phase, now
-	l.mark.Store(&phaseMark{name: phase, since: now})
-}
-
-// logProgress logs adoption_in_progress: the attempt is still running, and
-// where. Called from the heartbeat goroutine, so it reads only what that
-// goroutine may read: the attempt's identity, its start, and mark.
-//
-// AIDEV-NOTE: adoption_finished tells an attempt's whole story, but only
-// once it has ended; an attempt that is stuck, or merely slow, was
-// invisible until then (the 2026-11-14 publication-delay review: "the
-// update is upstream and the cache does not have it" could not be told
-// from "an adoption has been in its flip barrier for two minutes").
-func (l *adoptionLog) logProgress(logger *slog.Logger, suite SuiteRef) {
-	mark := l.mark.Load()
-	logger.Info("adoption_in_progress",
-		"adoption_id", l.trace.ID,
-		"canonical_scheme", suite.CanonicalScheme,
-		"canonical_host", suite.CanonicalHost,
-		"suite_path", suite.SuitePath,
-		"phase", mark.name,
-		"phase_seconds", time.Since(mark.since).Seconds(),
-		"elapsed_seconds", time.Since(l.started).Seconds(),
-	)
+	if l.work != nil {
+		l.work.setPhase(phase)
+	}
 }
 
 func (l *adoptionLog) attrs(suite SuiteRef, form adoptionForm) []any {

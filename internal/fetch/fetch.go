@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/upstreamproxy"
 	"github.com/linsomniac/apt-cacher-ultra/internal/usage"
 )
@@ -356,6 +357,7 @@ func New(opts Options) (*Client, error) {
 //     Caller may serve stale (metadata) or 502 (blob).
 //   - context.Canceled / context.DeadlineExceeded: the ctx fired.
 func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (result *FetchResult, retErr error) {
+	defer observability.TrackWait(ctx, "upstream_fetch")()
 	// SPEC5 §10.4.2: every Fetch terminal return drives one
 	// fetch-counter increment and one duration observation. The
 	// classifier is a total function, so the sum across outcome

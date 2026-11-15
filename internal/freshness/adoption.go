@@ -885,7 +885,7 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		verifier:                cfg.Verifier,
 		signers:                 signers,
 		hostSem:                 cfg.HostLimiter,
-		blobLocks:               hostsem.New(1),
+		blobLocks:               hostsem.NewNamed(1, "content_lock"),
 		memberWorkers:           MemberFetchWorkers,
 		progressInterval:        adoptionProgressInterval,
 		maxConcurrent:           cfg.MaxConcurrent,
@@ -1058,19 +1058,14 @@ func (a *Adopter) heartbeat(ctx context.Context, host string, snapshotID int64, 
 // running). Sites 1–5 are latency-fresh event-driven heartbeats; the
 // ticker is the floor under them, not a replacement.
 //
-// The ticker also reports an attempt that is still running: progress,
-// when non-nil, is called at the first tick after every progressInterval
-// (adoption_in_progress).
-func (a *Adopter) runHeartbeatTicker(ctx context.Context, host string, snapshotID int64, tracker *blobHeartbeatTracker, progress func()) {
+// Progress reporting has its own watchdog (work_log.go), independent of
+// these database writes.
+func (a *Adopter) runHeartbeatTicker(ctx context.Context, host string, snapshotID int64, tracker *blobHeartbeatTracker) {
 	if a.heartbeatInterval <= 0 {
 		return
 	}
 	t := time.NewTicker(a.heartbeatInterval)
 	defer t.Stop()
-	lastProgress := time.Now()
-	if attempt := adoptionLogFromContext(ctx); attempt != nil {
-		lastProgress = attempt.started
-	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -1080,10 +1075,6 @@ func (a *Adopter) runHeartbeatTicker(ctx context.Context, host string, snapshotI
 				a.heartbeatHook()
 			}
 			a.heartbeat(ctx, host, snapshotID, tracker)
-			if progress != nil && a.progressInterval > 0 && time.Since(lastProgress) >= a.progressInterval {
-				lastProgress = time.Now()
-				progress()
-			}
 		}
 	}
 }
@@ -1208,6 +1199,11 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	if attempt == nil {
 		attempt = newAdoptionLog(adoptionTrigger{}, time.Now())
 	}
+	if attempt.work == nil {
+		attempt.work = newBackgroundWork(a.logger, suite, "adoption", attempt.trace.ID, a.progressInterval)
+		defer attempt.work.finish()
+	}
+	ctx = attempt.work.context(ctx)
 	ctx = observability.WithAdoptionTrace(ctx, attempt.trace)
 	ctx = context.WithValue(ctx, adoptionLogKey{}, attempt)
 	defer func() {
@@ -1545,9 +1541,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 					unloggedPanic(func() { logPanic(a.adoptionLogger(ctx), "adoption_panicked", "heartbeat", suite, r) })
 				}
 			}()
-			a.runHeartbeatTicker(tickerCtx, suite.CanonicalHost, snapshotID, tracker, func() {
-				attempt.logProgress(a.adoptionLogger(ctx), suite)
-			})
+			a.runHeartbeatTicker(tickerCtx, suite.CanonicalHost, snapshotID, tracker)
 		}()
 	}
 	defer func() {

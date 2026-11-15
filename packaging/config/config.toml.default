@@ -71,7 +71,7 @@ deny_target_ranges = []
 
 [freshness]
 cooldown                 = "60s" # minimum gap between per-suite checks
-periodic_refresh         = "15m" # background refresh cadence
+periodic_refresh         = "1m" # background refresh cadence
 # Explicit 0s for either duration above restores its default, not off.
 max_concurrent_adoptions = 2     # global adoption cap; 0 = unlimited
 max_suites               = 5000  # tracked suites; a tenth per host; at least 10
@@ -120,8 +120,10 @@ member_retry_delay    = "30s"
 # freshness check finds unchanged metadata at upstream.
 repair_skipped_members = true
 # Hot-package prefetch budget before publishing a snapshot; 0s removes it.
+# Set a larger budget (e.g. "5m") to favor warming before publication.
+# Unfinished packages are fetched on demand; warming is best effort.
 # Each individual fetch remains bounded by upstream.total_timeout.
-hot_prefetch_budget   = "5m"
+hot_prefetch_budget   = "15s"
 # Longest an adoption, repair or reconcile may run. An abandoned adoption
 # is retried on the normal schedule, a repair or reconcile on the next
 # unchanged check. This deadline never cuts the final commit short; the

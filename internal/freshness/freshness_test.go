@@ -130,6 +130,22 @@ func (f *fakeCache) interest(scheme, host, suitePath string, at int64) {
 	f.suites[k] = s
 }
 
+func (f *fakeCache) ConfirmSnapshotUnchanged(ctx context.Context, key cache.SuiteKey, snapshotID, now int64) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := keyOf(key.CanonicalScheme, key.CanonicalHost, key.SuitePath)
+	s, ok := f.suites[k]
+	if !ok || s.InReleaseChangeSeenAt != nil || s.AdoptionFailCount > 0 || s.CurrentSnapshotID == nil || *s.CurrentSnapshotID != snapshotID || (s.LastCheckAt != nil && *s.LastCheckAt >= now) {
+		return false, nil
+	}
+	s.LastCheckAt, s.LastSuccessAt, s.CheckFailCount = &now, &now, 0
+	f.suites[k] = s
+	return true, nil
+}
+
 // UpdateSuiteFreshness mirrors the production writer: UPDATE-only (an
 // unknown suite is left alone) and only the check columns.
 func (f *fakeCache) UpdateSuiteFreshness(ctx context.Context, s cache.SuiteFreshness) error {

@@ -51,6 +51,15 @@ import (
 // internal/flipgate. An adoption ended by shutdown is not an adoption
 // outcome: it logs adoption_abandoned_at_shutdown and counts nowhere.
 var (
+	freshnessRefusedPendingSuites = metrics.NewGauge("acu_freshness_refused_pending_suites", "Suites with unpublished content blocked by a policy refusal.")
+	freshnessPendingSuites        = metrics.NewGauge("acu_freshness_pending_suites", "Suites with observed upstream content not yet published, excluding policy refusals.")
+	freshnessOldestPendingSeconds = metrics.NewGauge("acu_freshness_oldest_pending_seconds", "Age since first observation of the oldest unpublished upstream change, excluding policy refusals; refreshed each scheduler tick.")
+
+	freshnessSkippedTotal = metrics.NewCounterWithCap(
+		"acu_freshness_skipped_total", "Checks skipped by cooldown or a busy suite, by lock owner and host.",
+		metrics.DefaultMaxSeries, "reason", "host",
+	)
+
 	freshnessCheckTotal = metrics.NewCounterWithCap(
 		"acu_freshness_check_total",
 		"Total freshness checks completed, labeled by result and host (SPEC5 §10.4.3).",

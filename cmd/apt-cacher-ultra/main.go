@@ -430,6 +430,12 @@ func serveListeners(
 		logger.Warn("adoption.accept_any_signer = true: signatures are decoded but not cryptographically verified for unpinned suites; apt clients on the fleet remain the authoritative trust anchor (auditable per SPEC2 §5.1)")
 	}
 
+	if cfg.Adoption.Enabled && (cfg.Freshness.PeriodicRefresh.Duration > time.Minute || cfg.Adoption.HotPrefetchBudget.Duration > time.Minute) {
+		logger.Warn("publication_latency_settings", "periodic_refresh", cfg.Freshness.PeriodicRefresh.Duration,
+			"hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,
+			"detail", "explicit settings retain longer refresh or prepublication warming; suggested latency defaults are 1m and 15s")
+	}
+
 	// SPEC3 §5.2 loud configurations. Both fire once at startup so an
 	// operator scanning the journal sees the configuration's actual
 	// behavior — not just the defaults the spec mentions.

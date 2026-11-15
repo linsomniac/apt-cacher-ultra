@@ -380,7 +380,7 @@ func TestDefaults(t *testing.T) {
 	if cfg.Freshness.Cooldown.Duration != 60*time.Second {
 		t.Errorf("default cooldown = %v", cfg.Freshness.Cooldown.Duration)
 	}
-	if cfg.Freshness.PeriodicRefresh.Duration != 15*time.Minute {
+	if cfg.Freshness.PeriodicRefresh.Duration != time.Minute {
 		t.Errorf("default periodic_refresh = %v", cfg.Freshness.PeriodicRefresh.Duration)
 	}
 	if cfg.Log.Level != "info" {
@@ -838,7 +838,7 @@ window = "0s"
 }
 
 // TestLoad_HotPrefetchBudgetDefaultApplied: omitted
-// adoption.hot_prefetch_budget gets the SPEC3 §5.2 default of 5m.
+// adoption.hot_prefetch_budget gets the publication-latency default of 15s.
 func TestLoad_HotPrefetchBudgetDefaultApplied(t *testing.T) {
 	dir := t.TempDir()
 	path := writeTOML(t, dir, "config.toml", `
@@ -849,8 +849,8 @@ dir = "`+dir+`"
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Adoption.HotPrefetchBudget.Duration != 5*time.Minute {
-		t.Errorf("hot_prefetch_budget default = %s, want 5m", cfg.Adoption.HotPrefetchBudget.Duration)
+	if cfg.Adoption.HotPrefetchBudget.Duration != 15*time.Second {
+		t.Errorf("hot_prefetch_budget default = %s, want 15s", cfg.Adoption.HotPrefetchBudget.Duration)
 	}
 }
 

@@ -19,6 +19,8 @@ import (
 // counts always sum to hotCount by construction — every iteration of
 // the loop lands in exactly one bucket (success, retry-exhausted
 // failure, hash mismatch, or budget-cancelled before attempt).
+var errHotPrefetchBudget = errors.New("hot prefetch budget elapsed")
+
 type hotPrefetchStats struct {
 	hotCount    int
 	fetched     int
@@ -47,6 +49,13 @@ type hotPrefetchStats struct {
 func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 	snapshotID int64, candidatePackageHashes []cache.PackageHash,
 	tracker *blobHeartbeatTracker) ([]cache.PrefetchedURLPath, hotPrefetchStats) {
+	// The budget includes hot-set database reads, not only the downloads.
+	budgetCtx := adoptionCtx
+	if a.hotPrefetchBudget > 0 {
+		var cancel context.CancelFunc
+		budgetCtx, cancel = context.WithTimeoutCause(budgetCtx, a.hotPrefetchBudget, errHotPrefetchBudget)
+		defer cancel()
+	}
 	var stats hotPrefetchStats
 	if attempt := adoptionLogFromContext(adoptionCtx); attempt != nil {
 		defer func() { attempt.hot = stats }()
@@ -59,7 +68,12 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 	// caller-supplied rows belong to this candidate (rejects accidental
 	// cross-snapshot or cross-suite slices via ErrHotSetCandidateMismatch).
 	hotWindowSeconds := int64(a.hotPackagesWindow.Seconds())
-	hotSet, err := a.computeHotSet(adoptionCtx, suite, snapshotID, candidatePackageHashes, hotWindowSeconds)
+	hotSet, err := a.computeHotSet(budgetCtx, suite, snapshotID, candidatePackageHashes, hotWindowSeconds)
+	if err != nil && errors.Is(context.Cause(budgetCtx), errHotPrefetchBudget) {
+		a.adoptionLogger(adoptionCtx).Info("adoption_hot_set_budget_elapsed", "canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "snapshot_id", snapshotID)
+		hotPrefetchTotal.Inc("budget_elapsed", suite.CanonicalHost)
+		return nil, stats
+	}
 	if err != nil {
 		// Hot-set computation failure is non-fatal: log and skip the
 		// loop. The flip still proceeds — operators see a warning,
@@ -98,13 +112,17 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 	// stats is assigned, not returned directly: the deferred update of the
 	// attempt's record above reads it.
 	var rows []cache.PrefetchedURLPath
-	rows, stats = a.prefetchHotSet(adoptionCtx, suite, snapshotID, hotSet, tracker)
+	rows, stats = a.prefetchHotSetContext(adoptionCtx, budgetCtx, suite, snapshotID, hotSet, tracker)
 	return rows, stats
 }
 
 // prefetchHotSet is the SPEC3 §7.5 step 10 loop over a computed hot set.
 func (a *Adopter) prefetchHotSet(adoptionCtx context.Context, suite SuiteRef, snapshotID int64,
 	hotSet []hotSetEntry, tracker *blobHeartbeatTracker) ([]cache.PrefetchedURLPath, hotPrefetchStats) {
+	return a.prefetchHotSetContext(adoptionCtx, adoptionCtx, suite, snapshotID, hotSet, tracker)
+}
+
+func (a *Adopter) prefetchHotSetContext(adoptionCtx, budgetCtx context.Context, suite SuiteRef, snapshotID int64, hotSet []hotSetEntry, tracker *blobHeartbeatTracker) ([]cache.PrefetchedURLPath, hotPrefetchStats) {
 	stats := hotPrefetchStats{hotCount: len(hotSet)}
 
 	// Set up the prefetch context. SPEC3 §7.5 step 10: prefetchCtx is
@@ -119,9 +137,9 @@ func (a *Adopter) prefetchHotSet(adoptionCtx context.Context, suite SuiteRef, sn
 		prefetchCancel context.CancelFunc
 	)
 	if a.hotPrefetchBudget > 0 {
-		prefetchCtx, prefetchCancel = context.WithTimeout(adoptionCtx, a.hotPrefetchBudget)
+		prefetchCtx, prefetchCancel = context.WithTimeoutCause(budgetCtx, a.hotPrefetchBudget, errHotPrefetchBudget)
 	} else {
-		prefetchCtx, prefetchCancel = context.WithCancel(adoptionCtx)
+		prefetchCtx, prefetchCancel = context.WithCancel(budgetCtx)
 	}
 	defer prefetchCancel()
 
@@ -205,25 +223,30 @@ func (a *Adopter) prefetchHotSet(adoptionCtx context.Context, suite SuiteRef, sn
 			} else {
 				stats.fetched++
 			}
-		case hotFetchFailed:
+		case hotFetchFailed, hotFetchBudget:
 			// Includes both retry-exhaustion AND in-flight-at-budget
 			// cancellation per SPEC3 §12.3 variant 1/3 contract: "the
 			// hung fetch was attempted but cancelled when prefetchCtx
 			// hit the budget" maps to failed (deb_failed log already
 			// emitted by fetchHotDeb).
 			stats.failed++
-			hotPrefetchTotal.Inc("deb_failed", suite.CanonicalHost)
+			if r.outcome == hotFetchBudget {
+				hotPrefetchTotal.Inc("budget_elapsed", suite.CanonicalHost)
+			} else {
+				hotPrefetchTotal.Inc("deb_failed", suite.CanonicalHost)
+			}
 		case hotFetchMismatch:
 			stats.mismatched++
 			hotPrefetchTotal.Inc("hash_mismatch", suite.CanonicalHost)
 		}
 	}
 	if len(missing) > 0 && errors.Is(prefetchCtx.Err(), context.DeadlineExceeded) {
-		a.adoptionLogger(adoptionCtx).Warn("adoption_hot_prefetch_partial",
+		a.adoptionLogger(adoptionCtx).Info("adoption_hot_prefetch_partial",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"snapshot_id", snapshotID,
-			"missing", missing,
+			"missing", missing[:min(len(missing), 20)],
+			"missing_count", len(missing),
 		)
 		hotPrefetchTotal.Inc("partial", suite.CanonicalHost)
 	}
@@ -239,6 +262,7 @@ const (
 	hotFetchOK hotFetchOutcome = iota
 	hotFetchReused
 	hotFetchFailed
+	hotFetchBudget
 	hotFetchMismatch
 	hotFetchCancelled
 )
@@ -257,7 +281,12 @@ const (
 //     loop continues to the next entry — one bad deb does not stall
 //     the rest of the warm.
 func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
-	entry hotSetEntry, snapshotID int64) (string, hotFetchOutcome) {
+	entry hotSetEntry, snapshotID int64) (hash string, outcome hotFetchOutcome) {
+	defer func() {
+		if outcome == hotFetchFailed && errors.Is(context.Cause(ctx), errHotPrefetchBudget) {
+			outcome = hotFetchBudget
+		}
+	}()
 	unlock, err := a.blobLocks.Acquire(ctx, entry.declaredSHA256)
 	if err != nil {
 		return "", hotFetchCancelled
@@ -273,7 +302,7 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 		if ctx.Err() != nil {
 			return "", hotFetchCancelled
 		}
-		a.adoptionLogger(ctx).Warn("hot_prefetch_deb_failed", "canonical_host", suite.CanonicalHost,
+		a.logHotFailure(ctx, "canonical_host", suite.CanonicalHost,
 			"path", entry.path, "snapshot_id", snapshotID, "err", err)
 		return "", hotFetchFailed
 	}
@@ -305,7 +334,7 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 	}
 	w, err := a.cache.NewTempBlob()
 	if err != nil {
-		a.adoptionLogger(ctx).Warn("hot_prefetch_deb_failed",
+		a.logHotFailure(ctx,
 			"canonical_host", suite.CanonicalHost,
 			"path", entry.path,
 			"snapshot_id", snapshotID,
@@ -336,7 +365,7 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 		//     prefetchCtx is still alive, so this is bucketed as a
 		//     real per-deb retry-exhaustion failure.
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			a.adoptionLogger(ctx).Warn("hot_prefetch_deb_failed",
+			a.logHotFailure(ctx,
 				"canonical_host", suite.CanonicalHost,
 				"path", entry.path,
 				"snapshot_id", snapshotID,
@@ -347,7 +376,7 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 		if ctx.Err() != nil {
 			return "", hotFetchCancelled
 		}
-		a.adoptionLogger(ctx).Warn("hot_prefetch_deb_failed",
+		a.logHotFailure(ctx,
 			"canonical_host", suite.CanonicalHost,
 			"path", entry.path,
 			"snapshot_id", snapshotID,
@@ -361,7 +390,7 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 	// (TestRunHotPrefetch_NoContentIsAFailure). The deferred Abort drops
 	// the temp; nothing reaches the pool.
 	if res.NoContent {
-		a.adoptionLogger(ctx).Warn("hot_prefetch_deb_failed",
+		a.logHotFailure(ctx,
 			"canonical_host", suite.CanonicalHost,
 			"path", entry.path,
 			"snapshot_id", snapshotID,
@@ -387,7 +416,7 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 			)
 			return "", hotFetchMismatch
 		}
-		a.adoptionLogger(ctx).Warn("hot_prefetch_deb_failed",
+		a.logHotFailure(ctx,
 			"canonical_host", suite.CanonicalHost,
 			"path", entry.path,
 			"snapshot_id", snapshotID,
@@ -396,7 +425,7 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 		return "", hotFetchFailed
 	}
 	if err := a.cache.PutBlob(ctx, hashHex, w.Written()); err != nil {
-		a.adoptionLogger(ctx).Warn("hot_prefetch_deb_failed",
+		a.logHotFailure(ctx,
 			"canonical_host", suite.CanonicalHost,
 			"path", entry.path,
 			"snapshot_id", snapshotID,
@@ -405,7 +434,7 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 		return "", hotFetchFailed
 	}
 	if err := a.cache.PutRepresentation(ctx, suite.CanonicalScheme, suite.CanonicalHost, entry.path, hashHex, res.LastModified); err != nil {
-		a.adoptionLogger(ctx).Warn("hot_prefetch_deb_failed", "canonical_host", suite.CanonicalHost, "path", entry.path, "err", err)
+		a.logHotFailure(ctx, "canonical_host", suite.CanonicalHost, "path", entry.path, "err", err)
 		return "", hotFetchFailed
 	}
 	return hashHex, hotFetchOK
@@ -465,4 +494,12 @@ func (r hotContextReader) Read(p []byte) (int, error) {
 		return 0, err
 	}
 	return r.r.Read(p)
+}
+
+func (a *Adopter) logHotFailure(ctx context.Context, attrs ...any) {
+	if errors.Is(context.Cause(ctx), errHotPrefetchBudget) {
+		a.adoptionLogger(ctx).Info("hot_prefetch_budget_elapsed", attrs...)
+	} else {
+		a.adoptionLogger(ctx).Warn("hot_prefetch_deb_failed", attrs...)
+	}
 }

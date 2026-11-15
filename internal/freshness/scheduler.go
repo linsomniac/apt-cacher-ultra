@@ -14,8 +14,8 @@ import (
 
 // minFastTickInterval is the floor for the periodic scheduler's tick
 // interval. SPEC §7.4 prescribes a "fast tick" of periodic_refresh / 4;
-// this floor keeps a misconfigured periodic_refresh of, say, 1 minute
-// from spinning on the cache every 15s.
+// this floor bounds scheduling overhead for unusually short refresh settings.
+// The default one-minute refresh schedules a tick every 15 seconds.
 const minFastTickInterval = 5 * time.Second
 
 // tickInterval is the scheduler's tick for refresh: SPEC §7.4's fast
@@ -680,6 +680,20 @@ func (c *Checker) tick(ctx context.Context, q *schedQueues) {
 	}
 	q.refreshSigned(signed)
 	nowT := c.now()
+	pending, refused, oldest := 0, 0, int64(0)
+	for _, s := range suites {
+		if s.InReleaseChangeSeenAt != nil {
+			if s.AdoptionFailCount > 0 && s.AdoptionFailReason != nil && cache.IsRefusalReason(*s.AdoptionFailReason) {
+				refused++
+				continue
+			}
+			pending++
+			oldest = max(oldest, nowT.Unix()-*s.InReleaseChangeSeenAt)
+		}
+	}
+	freshnessPendingSuites.Set(float64(pending))
+	freshnessRefusedPendingSuites.Set(float64(refused))
+	freshnessOldestPendingSeconds.Set(float64(oldest))
 	// SPEC §7.4 observability: an adopted suite stale past
 	// staleSuiteFactor*refresh is the freeze signature.
 	staleBefore := nowT.Add(-staleSuiteFactor * c.refresh).Unix()
@@ -697,7 +711,7 @@ func (c *Checker) tick(ctx context.Context, q *schedQueues) {
 	}
 	// paced_stale is the count left out (deferred minor E-30): with
 	// adopted_stale it adds up to the gauge's adopted="true" value.
-	if warnStale := adoptedStale - absentStale; warnStale > 0 {
+	if warnStale := adoptedStale - absentStale; c.shouldWarnStale(warnStale) {
 		c.logger.Warn("freshness: adopted suites stale beyond threshold",
 			"adopted_stale", warnStale,
 			"paced_stale", absentStale,
@@ -803,4 +817,17 @@ func (c *Checker) checkRecovered(ctx context.Context, item schedItem) (rep check
 		source = "queued"
 	}
 	return c.check(ctx, item.ref, checkOpts{source: source, bypassCooldown: item.waiting || item.pendingChange})
+}
+
+// Frequent polling should not turn a persistent outage into four WARNs/minute.
+func (c *Checker) shouldWarnStale(count int) bool {
+	c.staleWarnMu.Lock()
+	defer c.staleWarnMu.Unlock()
+	changed := count != c.staleWarnCount
+	c.staleWarnCount = count
+	if count == 0 || (!changed && time.Since(c.staleWarnAt) < 5*time.Minute) {
+		return false
+	}
+	c.staleWarnAt = time.Now()
+	return true
 }

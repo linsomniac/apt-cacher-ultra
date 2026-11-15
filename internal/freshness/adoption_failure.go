@@ -39,6 +39,10 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(c.lifetimeCtx, failureRecordTimeout)
+	if req.log != nil && req.log.work != nil {
+		req.log.work.setPhase("record_result")
+		ctx = req.log.work.context(ctx)
+	}
 	defer cancel()
 	if c.recordReadHook != nil {
 		c.recordReadHook()

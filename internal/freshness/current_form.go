@@ -454,6 +454,7 @@ func (c *Checker) checkUnsigned(ctx, fetchCtx context.Context, out *checkOutcome
 	gate := c.retryGateFor(cur, now)
 	c.applyClamp(ctx, cur, gate, now)
 
+	workPhase(fetchCtx, "host_slot")
 	release, err := c.hostSem.Acquire(fetchCtx, host)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -465,6 +466,7 @@ func (c *Checker) checkUnsigned(ctx, fetchCtx context.Context, out *checkOutcome
 		return nil, nil
 	}
 	defer release()
+	workPhase(fetchCtx, "upstream")
 
 	if c.adopter != nil {
 		urls := c.anchorURLsFor(suite, map[string]string{"Release": row.UpstreamURL})

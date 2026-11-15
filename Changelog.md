@@ -9,8 +9,22 @@ the detail an operator needs before upgrading.
 Collects changes throughout the release candidates for the final 1.1.0 release.
 The detail, and what to do before upgrading
 from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
+The freshness and publication changes marked "After 1.1.0-rc1" below are
+planned for the anticipated 1.1.0-rc2 and the final 1.1.0 release; they are
+not included in the published 1.1.0-rc1.
 
 ### Added
+
+- After 1.1.0-rc1: independent background-work diagnostics identify busy
+  suite locks, active phases, elapsed time and database/upstream/host/content-lock
+  waits at INFO, including before candidate creation and during failure recording.
+  Progress logs continue when database heartbeats stall. Pending-change age/count
+  and skipped-check counters distinguish "upstream checked" from "new metadata
+  published". Busy-check messages and stale warnings are rate limited.
+- After 1.1.0-rc1: the manual freshness lab measures multi-suite, multi-host
+  bursts and background-only refresh using a signed repository and real APT
+  clients. It remains outside the normal test suite. See the
+  [measurements and limitations](e2e/freshness-lab/README.md#implementation-and-follow-up-measurements-2026-11-15).
 
 - After 1.1.0-rc1: `freshness.revalidate_wait` (default `5s`): a request for
   a suite's `InRelease` or `Release` asks upstream before it is answered, and
@@ -118,6 +132,15 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Changed
 
+- After 1.1.0-rc1: `freshness.periodic_refresh` defaults to `"1m"` instead
+  of `"15m"`, and `adoption.hot_prefetch_budget` to `"15s"` instead of `"5m"`.
+  The warming budget includes hot-set computation. Warming remains best effort
+  before publication; unfinished packages are fetched on demand, and operators
+  can explicitly choose a longer budget. Existing explicit settings retain their
+  values: change them to receive the shorter delays. Startup logs warn about
+  settings that retain long delays. These defaults do not promise five-minute
+  availability; metadata work, queueing, database writes and the client-coherence
+  barrier can add time.
 - After 1.1.0-rc1: adoptions publish sooner. Release members and hot packages
   are fetched four at a time instead of one; a file the `Release` declares but
   upstream never serves is asked for once per adoption instead of twice; and
@@ -194,12 +217,14 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Fixed
 
-- After 1.1.0-rc1: a repair or reconcile of a snapshot's skipped files no
-  longer delays a new release. It held its suite's lock and its host's
-  adoption slot for as long as it ran (up to `adoption.max_duration`): the
-  suite could not notice a new release, and no other suite on that host could
-  adopt one. It now stops when an adoption needs its slots or its suite's
-  check is due (`repair_yielded`), and resumes at the next unchanged check.
+- After 1.1.0-rc1: release checks can run beside automatic repair or manual
+  reconciliation instead of waiting for maintenance to finish. Unchanged
+  metadata lets a slow repair continue across refresh intervals; changed or
+  inconclusive metadata yields maintenance to the ordinary check. Adoptions
+  can also reclaim its admission slots (`repair_yielded`). One additional
+  metadata-probe slot per host prevents bulk downloads from starving detection.
+  This also avoids repeatedly cancelling an unchanged repair at the new
+  one-minute refresh cadence.
 - After 1.1.0-rc1: `upstream.idle_read_timeout` is enforced. It was accepted
   but ignored, so an upstream that went silent mid-response held a fetch — and
   an adoption or repair behind it — until `total_timeout` (5 minutes). A

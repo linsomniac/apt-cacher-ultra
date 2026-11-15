@@ -78,6 +78,7 @@ type Cache interface {
 	// UpdateSuiteFreshness writes a check's result to an existing row
 	// (UPDATE-only, spec C3: a vanished row is left alone).
 	UpdateSuiteFreshness(ctx context.Context, s cache.SuiteFreshness) error
+	ConfirmSnapshotUnchanged(ctx context.Context, key cache.SuiteKey, snapshotID, now int64) (bool, error)
 	ListSuitesWithAdoption(ctx context.Context) ([]cache.SuiteWithAdoption, error)
 	LookupURL(ctx context.Context, scheme, host, path string) (*cache.URLPath, error)
 	GetSuiteSnapshot(ctx context.Context, snapshotID int64) (*cache.SuiteSnapshot, error)
@@ -112,7 +113,8 @@ type Config struct {
 	// HostLimiter bounds concurrent upstream conditional GETs to a
 	// single canonical host. SPEC §9.3. Production wires this to the
 	// same *hostsem.Sem the handler uses for cache-miss fetches so
-	// the per-host budget is honored across both paths.
+	// the per-host bulk budget is honored across both paths. Maintenance
+	// probes have one additional reserved slot per host to preserve detection.
 	//
 	// Required: New rejects a nil HostLimiter. The previous
 	// "optional" treatment let a caller silently bypass the
@@ -191,6 +193,7 @@ type Checker struct {
 	cache               Cache
 	fetcher             Fetcher
 	hostSem             *hostsem.Sem
+	maintenanceProbeSem *hostsem.Sem // one reserved metadata probe per host, beyond the bulk limit
 	cooldown            time.Duration
 	refresh             time.Duration
 	maxSuites           int
@@ -250,6 +253,12 @@ type Checker struct {
 	// suite (the suite's mutex is held while one is in flight), dropped
 	// with the suite's lock-map entry (unlockDropped).
 	active sync.Map
+
+	// work contains only live suite-lock owners, for diagnostics.
+	work           sync.Map
+	staleWarnMu    sync.Mutex
+	staleWarnAt    time.Time
+	staleWarnCount int
 
 	// repairs holds the repair or reconcile goroutine in flight per suite
 	// key (*repairRun), from spawnRepair until the goroutine releases the
@@ -359,6 +368,7 @@ func New(cfg Config) (*Checker, error) {
 		cache:               cfg.Cache,
 		fetcher:             cfg.Fetcher,
 		hostSem:             cfg.HostLimiter,
+		maintenanceProbeSem: hostsem.NewNamed(1, "maintenance_probe_slot"),
 		cooldown:            cfg.Cooldown,
 		refresh:             cfg.Refresh,
 		maxSuites:           cfg.MaxSuites,
@@ -499,10 +509,10 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 }
 
 // check runs the SPEC §7.2 algorithm for one suite, synchronously, and
-// reports its result to the scheduler. It returns at once (resultBusy),
-// without contacting upstream, if another goroutine holds the suite
-// mutex; the cooldown is applied by checkLocked (resultSkipped) unless
-// opts bypass it.
+// reports its result to the scheduler. A busy maintenance owner permits a
+// bounded metadata probe beside it; a change asks that owner to yield. Other
+// busy owners return resultBusy immediately. The cooldown is applied by the
+// probe or checkLocked (resultSkipped) unless opts bypass it.
 //
 // On observed change with an Adopter wired in it takes an admission slot
 // without waiting (spec C4) and spawns a goroutine to run the §7.5
@@ -514,16 +524,32 @@ func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) check
 	scheme, host, suitePath := ref.CanonicalScheme, ref.CanonicalHost, ref.SuitePath
 	key := suiteKey(scheme, host, suitePath)
 	mu, rep, ok := c.acquireSuite(ctx, ref, key)
-	if !ok && rep.result == resultBusy && c.repairGivesWay(key) {
-		// The suite's repair gave way to this check (repair_yield.go).
-		mu, rep, ok = c.acquireSuite(ctx, ref, key)
+	if !ok && rep.result == resultBusy {
+		if v, found := c.repairs.Load(key); found {
+			run := v.(*repairRun)
+			if report, handled := c.checkDuringRepair(ctx, ref, key, opts, run); handled {
+				if report.result == resultBusy {
+					c.logBusy(ref)
+				}
+				return report
+			}
+			if c.repairGivesWay(key, run) {
+				mu, rep, ok = c.acquireSuite(ctx, ref, key)
+			}
+		}
 	}
 	if !ok {
+		if rep.result == resultBusy {
+			c.logBusy(ref)
+		}
 		return rep
 	}
 	// What an anchor request may wait for (revalidate.go). It ends when
 	// this check does, unless the check starts an adoption: then the
 	// adoption goroutine ends it, once the suite's mutex is released.
+	work := c.startWork(ref, "check", "")
+	defer c.finishWork(work)
+	ctx = work.context(ctx)
 	act := c.beginActivity(key)
 	handedOff := false
 	defer func() {
@@ -676,16 +702,20 @@ func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease, 
 		// wall-clock step mid-adoption must not produce a negative duration
 		// in acu_adoption_duration_seconds.
 		start := time.Now()
-		defer c.recoverAdoption(req, start)
 		req.log = newAdoptionLog(req.trigger, start)
+		work := c.startWork(req.suite, "adoption", req.log.trace.ID)
+		defer c.finishWork(work)
+		defer c.recoverAdoption(req, start)
+		req.log.work = work
 		actx, cancel := context.WithTimeout(c.lifetimeCtx, c.maxAdoptionDuration)
 		defer cancel()
 		pipelineDone := false // set by membersDone, which runs on this goroutine (runShared Step 11)
-		err := c.adopter.runRequest(actx, req, runHooks{
+		err := c.adopter.runRequest(work.context(actx), req, runHooks{
 			gpgReasonClassifier: c.gpgReasonClassifier,
 			membersDone:         func() { pipelineDone = true; l.releaseHost() },
 			stop:                c.lifetimeCtx,
 		})
+		work.setPhase("record_result")
 		if err == nil {
 			act.setPublished()
 		}
@@ -855,7 +885,7 @@ func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
 	key := suiteKey(rp.suite.CanonicalScheme, rp.suite.CanonicalHost, rp.suite.SuitePath)
 	dctx, cancelDeadline := context.WithTimeout(c.lifetimeCtx, c.maxAdoptionDuration)
 	rctx, cancel := context.WithCancelCause(dctx)
-	run := &repairRun{started: time.Now(), cancel: cancel, done: make(chan struct{})}
+	run := &repairRun{snapshotID: rp.snapshotID, started: time.Now(), cancel: cancel, done: make(chan struct{})}
 	c.repairs.Store(key, run)
 	l.setYield(run.yield)
 	c.adoptionWg.Add(1)
@@ -871,11 +901,16 @@ func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
 		defer c.recoverGoroutine("repair", rp.suite)
 		defer cancelDeadline()
 		defer cancel(nil)
+		work := c.startWork(rp.suite, "repair", "")
+		defer c.finishWork(work)
+		rctx = work.context(rctx)
+		unloggedPanic(func() { c.logger.Info("background_work_started", work.attrs()...) })
 		// gaveWay is read right after each piece of work returns: a request
 		// to give way that arrives once the work is done changes nothing,
 		// and is not logged or counted as a repair that gave way.
 		gaveWay := false
 		if needRepair {
+			work.setPhase("repair_members")
 			c.adopter.RepairSkippedMembers(rctx, rp.suite, rp.snapshotID)
 			gaveWay = yielded(rctx)
 		}
@@ -884,6 +919,7 @@ func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
 			// on-demand path (Reconcile) so a fail-closed anchor (R-1
 			// decode error) is visible, not a silent non-heal. A reconcile
 			// that gave way is no failure.
+			work.setPhase("reconcile_members")
 			_, err := c.adopter.reconcileSnapshot(rctx, rp.suite, rp.snapshotID, declared, false)
 			gaveWay = yielded(rctx)
 			if err != nil && !gaveWay {
@@ -998,15 +1034,23 @@ func (c *Checker) reportPanic(event, where string, suite SuiteRef, r any) {
 // could not); keep the handler's where=t1 freshness_check_panicked line
 // (internal/handler, maybeFireFreshness) on the same fields.
 func logPanic(logger *slog.Logger, event, where string, suite SuiteRef, r any) {
+	panicValue := r
+	var workerStack []byte
+	if p, ok := r.(workerPanic); ok {
+		panicValue, workerStack = p.value, p.stack
+	}
 	attrs := []any{
 		"where", where,
 		"canonical_scheme", suite.CanonicalScheme,
 		"canonical_host", suite.CanonicalHost,
 		"suite_path", suite.SuitePath,
-		"panic", fmt.Sprint(r),
+		"panic", fmt.Sprint(panicValue),
 	}
 	if _, seen := panicStackLogged.LoadOrStore(where, struct{}{}); !seen {
-		attrs = append(attrs, "stack", string(debug.Stack()))
+		if len(workerStack) == 0 {
+			workerStack = debug.Stack()
+		}
+		attrs = append(attrs, "stack", string(workerStack))
 	}
 	logger.Error(event, attrs...)
 }
@@ -1398,6 +1442,14 @@ func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string)
 	if st != lockOK {
 		return false
 	}
+	work := c.startWork(suite, "reconcile", "")
+	ctx = work.context(ctx)
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			c.finishWork(work)
+		}
+	}()
 	sf, err = c.cache.GetSuiteFreshness(ctx, scheme, host, suitePath)
 	switch {
 	case errors.Is(err, cache.ErrNotFound):
@@ -1441,17 +1493,36 @@ func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string)
 		mu.Unlock()
 		return false // POST /reconcile answers 409 (spec C4)
 	}
-	// AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock, lease
-	// release, recover (first). See recoverGoroutine.
+	// Manual reconciliation uses the same cancellable lease as automatic
+	// repair. Administrative maintenance must not monopolize publication.
+	dctx, cancelDeadline := context.WithTimeout(c.lifetimeCtx, c.maxAdoptionDuration)
+	rctx, cancel := context.WithCancelCause(dctx)
+	run := &repairRun{snapshotID: snapID, started: time.Now(), cancel: cancel, done: make(chan struct{})}
+	c.repairs.Store(key, run)
+	l.setYield(run.yield)
+	handedOff = true
 	c.adoptionWg.Add(1)
 	go func() {
 		defer c.adoptionWg.Done()
+		defer close(run.done) // after Unlock, as in spawnRepair
 		defer mu.Unlock()
+		defer c.repairs.CompareAndDelete(key, run)
 		defer l.release()
 		defer c.recoverGoroutine("reconcile", suite)
-		rctx, cancel := context.WithTimeout(c.lifetimeCtx, c.maxAdoptionDuration)
-		defer cancel()
-		if _, err := c.adopter.ReconcileSnapshot(rctx, suite, snapID, true); err != nil {
+		defer cancelDeadline()
+		defer cancel(nil)
+		defer c.finishWork(work)
+		rctx = work.context(rctx)
+		work.setPhase("reconcile_members")
+		unloggedPanic(func() { c.logger.Info("background_work_started", work.attrs()...) })
+		_, err := c.adopter.ReconcileSnapshot(rctx, suite, snapID, true)
+		if yielded(rctx) {
+			to := run.yieldedTo()
+			repairYieldedTotal.Inc(to)
+			c.logger.Info("repair_yielded", "canonical_scheme", scheme, "canonical_host", host,
+				"suite_path", suitePath, "snapshot_id", snapID, "to", to,
+				"ran_seconds", time.Since(run.started).Seconds())
+		} else if err != nil {
 			c.logReconcileFailure(rctx, "on_demand", suite, snapID, err)
 		}
 	}()

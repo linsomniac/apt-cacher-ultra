@@ -202,7 +202,7 @@ type AdoptionConfig struct {
 	// HotPrefetchBudget caps the wall-clock spent in the SPEC3 §7.5
 	// hot-deb prefetch loop. 0 = no wall-clock guard (loop runs until
 	// every hot deb has terminated; per-deb fetches still respect
-	// upstream.total_timeout × upstream.max_retries). Default 5m.
+	// upstream.total_timeout × upstream.max_retries). Default 15s.
 	// Presence-sensitive: explicit 0 means "operator opted out of the
 	// wall-clock guard" and is preserved through Load.
 	HotPrefetchBudget Duration `toml:"hot_prefetch_budget"`
@@ -778,7 +778,7 @@ func Load(path string) (*Config, error) {
 		cfg.HotPackages.Window.Duration = 24 * time.Hour
 	}
 	if !md.IsDefined("adoption", "hot_prefetch_budget") {
-		cfg.Adoption.HotPrefetchBudget.Duration = 5 * time.Minute
+		cfg.Adoption.HotPrefetchBudget.Duration = 15 * time.Second
 	}
 	if !md.IsDefined("adoption", "max_duration") {
 		cfg.Adoption.MaxDuration.Duration = 30 * time.Minute
@@ -1688,13 +1688,13 @@ func (c *Config) Defaults() {
 		c.Freshness.Cooldown.Duration = 60 * time.Second
 	}
 	if c.Freshness.PeriodicRefresh.Duration == 0 {
-		c.Freshness.PeriodicRefresh.Duration = 15 * time.Minute
+		c.Freshness.PeriodicRefresh.Duration = time.Minute
 	}
 	// SPEC2 §9.3.1: max_concurrent_adoptions defaults 2, 0 = unlimited.
 	// SPEC2 §5.1:   validate_at_rest_interval defaults 24h, 0 = disabled.
 	//               validate_at_rest_workers defaults 4.
 	// SPEC3 §5.2:   hot_packages.window defaults 24h, 0 = hot prefetch off.
-	//               adoption.hot_prefetch_budget defaults 5m, 0 = unbounded.
+	//               adoption.hot_prefetch_budget defaults 15s, 0 = unbounded.
 	// All five are presence-sensitive — explicit 0 has documented
 	// meaning that differs from the default. Defaults are applied in
 	// Load() via TOML's MetaData.IsDefined; this method (called by

@@ -12,12 +12,16 @@
 // fetches) and the freshness checker (conditional GETs). Sharing —
 // rather than giving each path its own semaphore — keeps the SPEC
 // per-host budget honored regardless of which code path is generating
-// the upstream pressure.
+// the upstream pressure. The freshness checker separately reserves one extra
+// metadata-probe slot per host while repair/reconcile runs; bulk transfers
+// cannot starve these probes, and the documented bound is bulk limit plus one.
 package hostsem
 
 import (
 	"context"
 	"sync"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 )
 
 // Sem is a per-host counting semaphore.
@@ -30,9 +34,10 @@ import (
 // caller releases. Memory is then bounded by O(currently-active hosts),
 // not O(hosts ever seen).
 type Sem struct {
-	mu    sync.Mutex
-	limit int
-	slots map[string]*hostSlot
+	mu       sync.Mutex
+	limit    int
+	waitName string
+	slots    map[string]*hostSlot
 }
 
 // hostSlot is the per-host bookkeeping a Sem keeps. ch holds the
@@ -46,13 +51,17 @@ type hostSlot struct {
 
 // New constructs a Sem with the given per-host slot count. A non-positive
 // limit means "no concurrency": Acquire never returns a token.
-func New(limit int) *Sem {
+func New(limit int) *Sem { return NewNamed(limit, "host_slot") }
+
+// NewNamed distinguishes host admission from content deduplication in diagnostics.
+func NewNamed(limit int, waitName string) *Sem {
 	if limit < 0 {
 		limit = 0
 	}
 	return &Sem{
-		limit: limit,
-		slots: make(map[string]*hostSlot),
+		limit:    limit,
+		waitName: waitName,
+		slots:    make(map[string]*hostSlot),
 	}
 }
 
@@ -64,6 +73,7 @@ func New(limit int) *Sem {
 // returned). A no-op release is returned on ctx cancellation so callers
 // can defer it unconditionally.
 func (s *Sem) Acquire(ctx context.Context, host string) (release func(), err error) {
+	defer observability.TrackWait(ctx, s.waitName)()
 	s.mu.Lock()
 	slot, ok := s.slots[host]
 	if !ok {

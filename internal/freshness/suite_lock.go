@@ -107,9 +107,11 @@ func (c *Checker) HoldSuite(key cache.SuiteKey) (func(deleted bool), bool) {
 	if st != lockOK {
 		return nil, false
 	}
+	work := c.startWork(SuiteRef{CanonicalScheme: key.CanonicalScheme, CanonicalHost: key.CanonicalHost, SuitePath: key.SuitePath}, "suite_maintenance", "")
 	var once sync.Once
 	return func(deleted bool) {
 		once.Do(func() {
+			defer c.finishWork(work)
 			if !deleted {
 				mu.Unlock()
 				return

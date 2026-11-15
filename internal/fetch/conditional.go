@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 )
 
 // ErrConditionalBodyTooLarge is returned when a 200 response body exceeds
@@ -58,6 +60,7 @@ func (c *Client) Conditional(
 	etag, lastmod string,
 	maxBody int64,
 ) (result *ConditionalResult, retErr error) {
+	defer observability.TrackWait(ctx, "upstream_probe")()
 	// SPEC5 §10.4.2: every Conditional terminal return drives one
 	// fetch-counter increment and one duration observation, with
 	// outcome derived from the classifier (cond_changed /

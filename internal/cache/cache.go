@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 	_ "modernc.org/sqlite"
 )
@@ -341,6 +342,7 @@ func (req *writeReq) abandon() bool {
 // channel in the selects), and the writer still calls its op after a
 // cancel, exactly as before issue #14.
 func (c *Cache) submitWrite(ctx context.Context, op writeOp) error {
+	defer observability.TrackWait(ctx, "database_write")()
 	if c.closed.Load() {
 		return ErrClosed
 	}

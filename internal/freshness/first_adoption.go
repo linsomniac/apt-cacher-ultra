@@ -309,6 +309,7 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 		return nil
 	}
 
+	workPhase(fetchCtx, "host_slot")
 	release, err := c.hostSem.Acquire(fetchCtx, host)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -320,6 +321,7 @@ func (c *Checker) checkFirst(ctx, fetchCtx context.Context, out *checkOutcome, c
 		return nil
 	}
 	defer release()
+	workPhase(fetchCtx, "upstream")
 
 	urls := c.anchorURLsFor(suite, anchorURLMap(anchors))
 	if urls.model == "" && index != nil {

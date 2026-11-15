@@ -37,7 +37,7 @@ func logResponse(logger *slog.Logger) func(usage.Response) {
 		}
 		// Log the actual redirect destination separately from the cache host.
 		// Do not expose userinfo, query tokens, headers, or raw error strings.
-		observability.AdoptionLogger(ctx, logger).Info("upstream_response", "canonical_host", t.host,
+		observability.AdoptionLogger(ctx, observability.WorkLogger(ctx, logger)).Info("upstream_response", "canonical_host", t.host,
 			"purpose", t.purpose, "scheme", r.Request.URL.Scheme,
 			"host", r.Request.URL.Host, "path", r.Request.URL.EscapedPath(),
 			"method", r.Request.Method, "status", r.Status, "bytes_read", r.Bytes,

@@ -422,6 +422,7 @@ func TestAdopter_IdenticalMembersAreDownloadedOnce(t *testing.T) {
 // carries it there. It is then an adoption panic like any other — logged
 // (with the worker's stack), recorded, and the suite's lock released.
 func TestCheck_MemberWorkerPanicIsRecovered(t *testing.T) {
+	panicStackLogged.Delete("adoption")
 	ctx := context.Background()
 	c := simtest.OpenCache(t)
 	seedStaleAnchorAt(t, c, rigHost, rigSuite)
@@ -451,7 +452,7 @@ func TestCheck_MemberWorkerPanicIsRecovered(t *testing.T) {
 	if !strings.Contains(out, "adoption_panicked") || !strings.Contains(out, "member fetch bug") {
 		t.Fatalf("no adoption_panicked line with the worker's panic; logs:\n%s", out)
 	}
-	if !strings.Contains(out, "worker stack") {
+	if !strings.Contains(out, "stack=") || !strings.Contains(out, "panickingAdoptionFetcher.Fetch") {
 		t.Errorf("the panic line lacks the worker's stack; logs:\n%s", out)
 	}
 	sf, err := c.GetSuiteFreshness(ctx, "http", rigHost, rigSuite)
