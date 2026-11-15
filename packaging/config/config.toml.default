@@ -111,8 +111,9 @@ required_architectures = []
 # Skip failed optional metadata (Contents/dep11/i18n); skipped files may
 # return 404 until repaired. Packages/Sources integrity failures stay fatal.
 tolerate_optional_member_failures = true
-# Extra member attempts after integrity/availability failures; 404/410 skips
-# are not retried here. Nonnegative; 0 attempts or 0s delay are meaningful.
+# Extra rounds of member attempts after integrity/availability failures;
+# members that failed in a round are retried together after one delay.
+# 404/410 skips are not retried. Nonnegative; 0 rounds or 0s are meaningful.
 member_retry_count    = 2
 member_retry_delay    = "30s"
 # Repair integrity-skipped members and missing required indices when a

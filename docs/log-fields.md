@@ -272,7 +272,10 @@ it).
 `acu_adoption_duration_seconds` includes the barrier's wait (at most
 140 s). Eager adoption (spec C4, C10) adds `acu_repair_deferred_total{host}`
 (repairs and reconciles of an unchanged suite deferred because no adoption
-slot was free; they run on a later unchanged check) and
+slot was free; they run on a later unchanged check),
+`acu_repair_yielded_total{to}` (repairs and reconciles that stopped so
+that a new release could be adopted, `to="adoption"`, or noticed,
+`to="check"`; see `repair_yielded`) and
 `acu_strict_adoption_waits_total{host}` (unvouched `.deb` requests that
 waited — at most 15 s, and never past 25 s after the request arrived — for
 a signed adoption running on their host before strict mode decided; the
@@ -523,11 +526,26 @@ The finish record adds:
 - `hot_count`, `hot_fetched`, `hot_reused`, `hot_failed`, `hot_mismatched`,
   `hot_unattempted`: hot-package prefetch progress. Zero if prefetch was not
   reached; use `phase_seconds` to distinguish that from an empty hot set.
+- `first_seen_seconds`: how long the cache had known of this upstream change
+  when the attempt ended — from the first check that saw it, across any
+  checks that found no adoption slot or were deferred by a failure record.
+  Absent for a direct adopter call, which has no first sighting. On a
+  successful attempt it is the time the release spent inside the cache
+  before it was published.
+- `release_date`, `release_age_seconds`: the `Date` the release declares
+  (Unix seconds) and how old that made it when the attempt ended. On a
+  successful attempt `release_age_seconds` is how far behind upstream the
+  publication was by upstream's own stamp, including the time before the
+  cache noticed: the number to look at when a client says an update was
+  upstream and not in the cache. Both absent when the `Release` has no
+  `Date`. A mirror publishes some time after the `Date` it signs, so a
+  healthy cache shows a few minutes here.
 
 Filter by `adoption_id` to reconstruct one attempt, then compare its trigger,
 phase times, member/prefetch counts and upstream transfers. A start without a
 finish indicates an in-flight attempt, an abrupt process termination, or missing
-logs. Logging cannot guarantee a terminal record after SIGKILL or a process
+logs; an attempt in flight for more than a minute also logs
+`adoption_in_progress` each minute, with its phase. Logging cannot guarantee a terminal record after SIGKILL or a process
 crash. Byte totals cover response bodies observed by the fetch transport, using
 the same accounting as usage statistics; they are not a wire-level measurement.
 

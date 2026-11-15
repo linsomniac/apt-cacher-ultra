@@ -12,6 +12,21 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Added
 
+- After 1.1.0-rc1: `freshness.revalidate_wait` (default `5s`): a request for
+  a suite's `InRelease` or `Release` asks upstream before it is answered, and
+  waits up to that long for the answer and for a new release's adoption, so
+  the first `apt update` after an upstream publication can already show it.
+  What is not done in time continues in the background and the current
+  snapshot is served; `0s` restores serve-first. See
+  [checking upstream when a client asks](docs/configuration.md#checking-upstream-when-a-client-asks).
+- After 1.1.0-rc1: logs that answer "the update was upstream but not in the
+  cache". Each `InRelease`/`Release` request line records the snapshot served,
+  how long ago upstream was asked, whether the cache already knew of newer
+  content (`behind_s`), and what the request-time check did (`reval`).
+  `adoption_finished` records how long the cache had known of the release
+  (`first_seen_seconds`) and how old the release was when published
+  (`release_age_seconds`). An adoption still running after a minute logs
+  `adoption_in_progress` with its phase, every minute.
 - Correlated adoption start/finish logs show trigger and retry reasons,
   per-phase and total duration, snapshots, member/package reuse and downloads,
   and actual upstream byte totals, including failed and abandoned attempts.
@@ -103,6 +118,16 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Changed
 
+- After 1.1.0-rc1: adoptions publish sooner. Release members and hot packages
+  are fetched four at a time instead of one; a file the `Release` declares but
+  upstream never serves is asked for once per adoption instead of twice; and
+  members caught mid-mirror-sync are retried together, so they cost one
+  `member_retry_delay` per round rather than one each.
+- After 1.1.0-rc1: a failed adoption whose cause is a member that did not
+  arrive or did not match (`member_fetch_failed`, `member_mismatch`: a mirror
+  mid-sync) is retried after 1 minute doubling to 10, not 2 minutes doubling
+  to an hour, and new upstream content starts that schedule again. Other
+  failures and all refusals keep their schedule.
 - Snapshot adoption reuses transaction-scoped prepared INSERT statements for
   members, skipped members and package hashes, reducing commit time for large
   repositories without changing validation or transaction boundaries. Thanks
@@ -166,6 +191,15 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Fixed
 
+- After 1.1.0-rc1: a repair or reconcile of a snapshot's skipped files no
+  longer delays a new release. It held its suite's lock and its host's
+  adoption slot for as long as it ran (up to `adoption.max_duration`): the
+  suite could not notice a new release, and no other suite on that host could
+  adopt one. It now stops when an adoption needs its slots or its suite's
+  check is due (`repair_yielded`), and resumes at the next unchanged check.
+- After 1.1.0-rc1: `upstream.idle_read_timeout` is enforced. It was accepted
+  but ignored, so an upstream that went silent mid-response held a fetch — and
+  an adoption or repair behind it — until `total_timeout` (5 minutes).
 - Hot prefetch verifies and reuses cached package content instead of downloading
   unchanged packages on every snapshot update. Missing or corrupt content is
   fetched and verified; concurrent prefetches of one hash avoid duplicate downloads.
