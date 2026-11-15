@@ -7,7 +7,8 @@ import (
 )
 
 // Spec C7/C4 retry schedule (C11: constants, not knobs). One schedule
-// serves adoption failures and the scheduler's unknown-check backoff.
+// serves adoption failures and the scheduler's unknown-check backoff;
+// failures of the mirror-sync class have a shorter one (adoptionRetryDelay).
 const (
 	retryBaseDelay  = 2 * time.Minute
 	retryMaxDelay   = time.Hour
@@ -18,6 +19,54 @@ const (
 	// ahead comes from a backward clock step and is clamped to now + 1 h.
 	retryHorizon = retryMaxDelay + retryMaxDelay/4
 )
+
+// The schedule of a failure of the mirror-sync class (syncFailure): the
+// same doubling, from a shorter base to a much lower cap.
+//
+// AIDEV-NOTE: the 2026-11-14 publication-delay review. A member that did
+// not come, or came with other bytes, is almost always a mirror caught
+// between two publications: it heals by itself within minutes. On the
+// general schedule (2 min doubling to 1 h) the cache then sat out a timer
+// far longer than the fault: a suite whose mirror was inconsistent for
+// 20 minutes published after 30, and one that had failed five times
+// waited an hour for its sixth try. A production log of 1,470
+// publications had 227 more than 15 minutes behind upstream and 57 more
+// than an hour, every one behind a run of such failures. An attempt costs
+// little — members already verified are reused from the pool — so the
+// short schedule's price is a few requests every ten minutes against a
+// repository that stays broken.
+const (
+	syncRetryBaseDelay = time.Minute
+	syncRetryMaxDelay  = 10 * time.Minute
+)
+
+// syncFailure reports a failure reason of the mirror-sync class:
+// member_fetch_failed (a member's fetch failed, its size differed, or a
+// pre-commit guard found a required index absent) and member_mismatch
+// (its bytes did not hash to the declaration). Everything else — a
+// signature that does not verify, a parse error, a local fault, a
+// deadline, a panic, every refusal — keeps the general schedule: none of
+// those heals when a mirror finishes its sync.
+func syncFailure(reason string) bool {
+	return reason == "member_fetch_failed" || reason == "member_mismatch"
+}
+
+// adoptionRetryDelay is the wait before the count-th consecutive failed
+// attempt's content is tried again, before jitter: the mirror-sync
+// schedule for a syncFailure reason, the general one (backoffDelay)
+// otherwise.
+func adoptionRetryDelay(reason string, count int64) time.Duration {
+	if !syncFailure(reason) {
+		return backoffDelay(count)
+	}
+	if count < 1 {
+		return 0
+	}
+	if count > 5 { // 1 min << 4 already exceeds the cap; avoid shift overflow
+		return syncRetryMaxDelay
+	}
+	return min(syncRetryBaseDelay<<(count-1), syncRetryMaxDelay)
+}
 
 // contentKey identifies the content an adoption attempted (spec C7).
 // Any byte change is new content, attempted at once. Inline:

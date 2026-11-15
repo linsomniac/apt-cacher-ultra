@@ -81,7 +81,21 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 			count = 1 // a new state: its retry schedule starts over too
 		}
 	}
-	delay := jitterDelay(backoffDelay(count), c.rand())
+	// AIDEV-NOTE: a mirror-sync failure of NEW content starts its schedule
+	// again (the 2026-11-14 publication-delay review). The count used to
+	// carry across publications until one adopted, so a release whose
+	// first attempt met a mirror mid-sync inherited the wait its
+	// predecessor had earned — up to an hour — although it is another
+	// publication and its fault usually heals in minutes. Only the count
+	// restarts: first, the streak's start, stays, so the suite still
+	// reads "failing since" its first failure. Other reasons keep their
+	// count across content (a missing key is not fixed by the next
+	// release), and the confirmation records above keep FW-3 (a)'s rule.
+	if syncFailure(reason) && cur.AdoptionFailCount > 0 &&
+		(cur.AdoptionFailHash == nil || *cur.AdoptionFailHash != req.key) {
+		count = 1
+	}
+	delay := jitterDelay(adoptionRetryDelay(reason, count), c.rand())
 	next := now.Add(delay).Unix()
 	f := cache.AdoptionFailure{
 		Hash: req.key, Reason: reason, Count: count, FirstAt: first, LastAt: now.Unix(),
