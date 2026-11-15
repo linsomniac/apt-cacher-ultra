@@ -159,7 +159,20 @@ type FreshnessConfig struct {
 	// per canonical host, and at most this many suites in the scheduler's
 	// queues. Default 5000; at least 10.
 	MaxSuites int `toml:"max_suites"`
+
+	// RevalidateWait is freshness.revalidate_wait: how long a request for
+	// a suite's InRelease or Release may wait for the cache to ask
+	// upstream, and to publish a new release upstream then has, before it
+	// is answered from the current snapshot. Default 5s; 0s serves at once
+	// and checks after the response (the behaviour before 1.1.0); at most
+	// MaxRevalidateWait.
+	RevalidateWait Duration `toml:"revalidate_wait"`
 }
+
+// MaxRevalidateWait bounds freshness.revalidate_wait. An anchor request
+// may also wait in a flip hold (at most 20 s, spec C8) after it; together
+// they stay below apt's 30 s Acquire::http::Timeout.
+const MaxRevalidateWait = 8 * time.Second
 
 // AdoptionConfig holds the SPEC2 §5.1 [adoption] block. The defaults
 // match the SPEC2 §1.1 / §7.6 secure posture: signatures required,
@@ -737,6 +750,11 @@ func Load(path string) (*Config, error) {
 	if !md.IsDefined("freshness", "max_suites") {
 		cfg.Freshness.MaxSuites = 5000
 	}
+	// freshness.revalidate_wait: 0s is meaningful (off), so the default
+	// applies only when the key is absent.
+	if !md.IsDefined("freshness", "revalidate_wait") {
+		cfg.Freshness.RevalidateWait.Duration = 5 * time.Second
+	}
 	if !md.IsDefined("integrity", "validate_at_rest_interval") {
 		cfg.Integrity.ValidateAtRestInterval.Duration = 24 * time.Hour
 	}
@@ -1042,6 +1060,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Freshness.MaxSuites < 10 {
 		errs = append(errs, errors.New("freshness.max_suites must be at least 10"))
+	}
+	if w := c.Freshness.RevalidateWait.Duration; w < 0 || w > MaxRevalidateWait {
+		errs = append(errs, fmt.Errorf("freshness.revalidate_wait must be between 0s and %s", MaxRevalidateWait))
 	}
 	if c.Integrity.ValidateAtRestInterval.Duration < 0 {
 		errs = append(errs, errors.New("integrity.validate_at_rest_interval must not be negative"))

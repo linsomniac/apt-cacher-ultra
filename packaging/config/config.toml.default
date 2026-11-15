@@ -75,6 +75,11 @@ periodic_refresh         = "15m" # background refresh cadence
 # Explicit 0s for either duration above restores its default, not off.
 max_concurrent_adoptions = 2     # global adoption cap; 0 = unlimited
 max_suites               = 5000  # tracked suites; a tenth per host; at least 10
+# How long a request for a suite's InRelease/Release may wait while the
+# cache asks upstream and, if upstream has a new release, publishes it.
+# What is not done by then continues in the background and the current
+# snapshot is served. 0s serves at once and checks afterwards; at most 8s.
+revalidate_wait          = "5s"
 
 [adoption]
 # Adopt verified, coherent metadata snapshots atomically; failure retains

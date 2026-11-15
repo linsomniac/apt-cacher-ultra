@@ -392,9 +392,52 @@ of signed repository content over HTTP, but do not cover arbitrary unsigned file
 | `periodic_refresh` | duration | `"15m"` | Age after the last successful check at which a suite becomes due for background refresh. Scheduler checks for due suites every quarter of this duration, with a `5s` minimum tick. Nonnegative; `"0s"` selects the default and does not disable refresh. |
 | `max_concurrent_adoptions` | integer | `2` | Global concurrent snapshot-adoption limit. `0` means unlimited; must be nonnegative. Shared by adoptions, repairs and reconciles; see *Capacity and fairness*. |
 | `max_suites` | integer | `5000` | Most suites tracked (checked, adopted, shown on the status page) at once, and at most a tenth of it per upstream host (`http` and `https` counted together). At least `10`; an explicit `0` is an error. See *Tracked suites*. |
+| `revalidate_wait` | duration | `"5s"` | How long a request for a suite's `InRelease` or `Release` may wait while the cache asks upstream and, when upstream has a new release, adopts and publishes it. Whatever is not finished by then goes on in the background, and the request is answered from the current snapshot. `"0s"` turns the wait off: the anchor is served at once and the check runs after the response, as before 1.1.0. Between `"0s"` and `"8s"`. See *Checking upstream when a client asks*. |
 
 Freshness checks detect changed repository metadata. `[adoption]` determines
 whether a changed suite is staged and published as a new coherent snapshot.
+
+### Checking upstream when a client asks
+
+A suite is checked in two ways: in the background, once `periodic_refresh`
+has passed since its last successful check, and when a client asks for its
+`InRelease` or `Release`, at most once per `cooldown`.
+
+With `revalidate_wait` (the default), the client's check runs *before* the
+response. The request waits for the check, and — when upstream has a new
+release — for its adoption, for at most `revalidate_wait` in all:
+
+- upstream unchanged: one conditional request, then the snapshot is served;
+- upstream has a new release that adopts within the wait: the client gets
+  the new release on this very request;
+- anything slower — an upstream that does not answer, an adoption with
+  many or large indexes — stops holding the request at `revalidate_wait`:
+  the current snapshot is served and the check or adoption goes on in the
+  background, publishing when it is done.
+
+Without it (`"0s"`, and in every release before 1.1.0) the snapshot is
+served first and the check runs after the response, so the first
+`apt update` after an upstream publication always shows the previous
+release, and on a quiet cache that release can be as old as
+`periodic_refresh` plus a scheduler tick.
+
+The wait never changes what may be served: only a verified, adopted
+snapshot. It costs latency only: at most `revalidate_wait` per request
+for a suite's anchor, and only for requests that arrive when the suite
+was last checked more than `cooldown` ago, or within the first
+`revalidate_wait` of an adoption. A request that waited may then also
+wait in a flip hold (*Flip consistency*, at most 20 s); the 8 s limit
+keeps the two below apt's 30 s timeout. While upstream is unreachable,
+one request per suite per `cooldown` waits; the others are served at
+once. Only `InRelease` and `Release` wait: indexes and packages are
+served as before.
+
+Each `InRelease`/`Release` request line records what happened: `reval`
+(`current`, `published`, `pending`, `unknown` or `other`), the check
+behind it, how long the request waited, the snapshot it was served from,
+how long ago upstream was last asked, and — when the cache already knew
+of newer upstream content it had not published — for how long
+(`behind_s`). See [log fields](log-fields.md#anchor-requests).
 
 ### Tracked suites
 

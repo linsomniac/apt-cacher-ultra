@@ -30,6 +30,11 @@ type suiteReq struct {
 	// deferred Done covers a registration made after the suite's row was
 	// created (phase C carry-forward).
 	tok *flipgate.Token
+	// anchor is the request's trace for its request line when it asks for
+	// a suite's anchor (revalidate.go); nil otherwise. revalidated: the
+	// suite's check ran before the response, so none is fired after it.
+	anchor      *anchorTrace
+	revalidated bool
 }
 
 func newSuiteReq(req *proxy.Request) *suiteReq {

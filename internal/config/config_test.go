@@ -1693,3 +1693,37 @@ func TestFreshnessMaxSuites_DefaultAndBounds(t *testing.T) {
 		}
 	}
 }
+
+// freshness.revalidate_wait: default 5s; 0s is meaningful (off) and is
+// kept, not rescued to the default; above 8s is refused, so that a request
+// that also waits in a flip hold (20 s at most) stays below apt's 30 s
+// timeout.
+func TestFreshnessRevalidateWait_DefaultOffAndBounds(t *testing.T) {
+	load := func(extra string) (*Config, error) {
+		dir := t.TempDir()
+		return Load(writeTOML(t, dir, "config.toml", "[cache]\ndir = \""+dir+"\"\n"+extra))
+	}
+	cfg, err := load("")
+	if err != nil {
+		t.Fatalf("default: %v", err)
+	}
+	if cfg.Freshness.RevalidateWait.Duration != 5*time.Second {
+		t.Fatalf("default = %s, want 5s", cfg.Freshness.RevalidateWait.Duration)
+	}
+	for _, good := range []string{"0s", "1s", "8s"} {
+		cfg, err := load("[freshness]\nrevalidate_wait = \"" + good + "\"\n")
+		if err != nil {
+			t.Fatalf("explicit %s: %v", good, err)
+		}
+		want, _ := time.ParseDuration(good)
+		if cfg.Freshness.RevalidateWait.Duration != want {
+			t.Fatalf("explicit %s = %s", good, cfg.Freshness.RevalidateWait.Duration)
+		}
+	}
+	for _, bad := range []string{"9s", "1m", "-1s"} {
+		_, err := load("[freshness]\nrevalidate_wait = \"" + bad + "\"\n")
+		if err == nil || !strings.Contains(err.Error(), "freshness.revalidate_wait must be between 0s and 8s") {
+			t.Errorf("revalidate_wait = %s: err = %v, want the revalidate_wait bound", bad, err)
+		}
+	}
+}

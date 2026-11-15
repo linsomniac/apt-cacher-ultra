@@ -369,6 +369,7 @@ func serveListeners(
 		"freshness_periodic_refresh", cfg.Freshness.PeriodicRefresh.Duration,
 		"freshness_max_concurrent_adoptions", cfg.Freshness.MaxConcurrentAdoptions,
 		"freshness_max_suites", cfg.Freshness.MaxSuites,
+		"freshness_revalidate_wait", cfg.Freshness.RevalidateWait.Duration,
 		"adoption_enabled", cfg.Adoption.Enabled,
 		"adoption_require_signature", cfg.Adoption.RequireSignature,
 		"adoption_require_pinned_signer", cfg.Adoption.RequirePinnedSigner,
@@ -1299,6 +1300,13 @@ func handlerConfig(
 	if freshChecker != nil && adopter != nil {
 		adoptions = freshChecker
 	}
+	// Request-time revalidation (freshness.revalidate_wait): the same
+	// check a client's request triggers, run before the anchor is served.
+	// A nil checker must stay a nil interface here too.
+	var revalidator handler.Revalidator
+	if freshChecker != nil {
+		revalidator = freshChecker
+	}
 	return handler.Config{
 		Parser:                parser,
 		Cache:                 c,
@@ -1315,6 +1323,8 @@ func handlerConfig(
 		MaxSuites:             cfg.Freshness.MaxSuites,
 		SuiteGuard:            guard,
 		Adoptions:             adoptions,
+		Revalidator:           revalidator,
+		RevalidateWait:        cfg.Freshness.RevalidateWait.Duration,
 	}
 }
 

@@ -558,7 +558,8 @@ func unsignedRefusedInsideTheCommit(t *testing.T, suite, served string) {
 		mu := &sync.Mutex{}
 		mu.Lock()
 		before := adoptionTotalFor(t, "h")
-		chk.spawnAdoption(mu, req, mustAcquire(t, chk.admission, "h", false))
+		spawnKey := suiteKey(r.suite.CanonicalScheme, r.suite.CanonicalHost, r.suite.SuitePath)
+		chk.spawnAdoption(mu, req, mustAcquire(t, chk.admission, "h", false), spawnKey, chk.beginActivity(spawnKey))
 		time.Sleep(25 * time.Second) // the adoption waits in the barrier; its 20 s deadline passes
 		tok.Done()                   // the commit runs 10 s later, after the race
 		chk.WaitForAdoptions()

@@ -238,6 +238,11 @@ type Checker struct {
 	// Reconcile that loaded it unwinds, or after a read error (LockCount).
 	locks sync.Map
 
+	// active holds, per suite key, the check in flight and the adoption it
+	// started (*suiteActivity, revalidate.go): what an anchor request waits
+	// for. At most one per suite (the suite's mutex is held throughout).
+	active sync.Map
+
 	// repairs holds the repair or reconcile goroutine in flight per suite
 	// key (*repairRun), from spawnRepair until the goroutine releases the
 	// suite's mutex: what a check asks to give way (repair_yield.go). At
@@ -508,6 +513,16 @@ func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) check
 	if !ok {
 		return rep
 	}
+	// What an anchor request may wait for (revalidate.go). It ends when
+	// this check does, unless the check starts an adoption: then the
+	// adoption goroutine ends it, once the suite's mutex is released.
+	act := c.beginActivity(key)
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			c.endActivity(key, act)
+		}
+	}()
 	// Spec C4: the upstream part of a check (the host slot and the
 	// conditional GETs) runs under a 2-minute deadline. Cache reads and
 	// writes keep the caller's context, so a check that hits the deadline
@@ -520,9 +535,11 @@ func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) check
 	defer cancel()
 	out, ok := c.checkLockedSafe(ctx, fetchCtx, scheme, host, suitePath, opts)
 	if !ok {
+		act.setResult("failed")
 		mu.Unlock()
 		return checkReport{result: "failed"}
 	}
+	act.setResult(out.report.result)
 	if out.vanished {
 		// I-4: keep the lock map to suites with rows.
 		c.unlockDropped(key, mu)
@@ -535,7 +552,8 @@ func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) check
 			out.req.trigger.source = "client"
 		}
 		out.req.trigger.reason, out.req.trigger.detail = out.report.result, out.report.reason
-		c.spawnAdoption(mu, out.req, out.lease)
+		handedOff = true
+		c.spawnAdoption(mu, out.req, out.lease, key, act)
 	case out.lease != nil && out.repair != nil:
 		c.spawnRepair(mu, out)
 	default:
@@ -609,8 +627,8 @@ func (c *Checker) suiteRowExists(ctx context.Context, ref SuiteRef) bool {
 // adoption.max_duration (a request closing must not abort it).
 //
 // AIDEV-NOTE: defer order is load-bearing — in the order they run:
-// cancel, recoverAdoption, lease release, Unlock, inflight.end (signed
-// adoptions only), Done (last). The failure record is written before the
+// cancel, recoverAdoption, lease release, Unlock, the activity's end
+// (revalidate.go), inflight.end (signed adoptions only), Done (last). The failure record is written before the
 // mutex is released on both the error and the panic path (spec C7), and
 // inflight.end runs after the commit and the Unlock, so a strict-mode
 // request it wakes re-reads package_hash rows the new snapshot already
@@ -624,7 +642,7 @@ func (c *Checker) suiteRowExists(ctx context.Context, ref SuiteRef) bool {
 // any error once the lifetime context has ended (deferred minor C-20) — is
 // never counted, logged or recorded as a failure (INFO
 // adoption_abandoned_at_shutdown).
-func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) {
+func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease, key string, act *suiteActivity) {
 	c.adoptionWg.Add(1)
 	// Spec C10: a signed adoption is in flight from here (before the
 	// goroutine runs, so a request right after the check sees it) until
@@ -638,6 +656,9 @@ func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) 
 		if signed {
 			defer c.inflight.end(req.suite.CanonicalHost)
 		}
+		// After the Unlock: an anchor request that waited for this adoption
+		// (AwaitSuite) goes on to a snapshot pointer nothing is switching.
+		defer c.endActivity(key, act)
 		defer mu.Unlock()
 		defer l.release()
 		// SPEC5 §10.4.3 / §9.7.7: time the adoption from goroutine
@@ -657,6 +678,9 @@ func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) 
 			membersDone:         func() { pipelineDone = true; l.releaseHost() },
 			stop:                c.lifetimeCtx,
 		})
+		if err == nil {
+			act.setPublished()
+		}
 		// A flip abandoned in the barrier means shutdown: main closes the
 		// gate at the signal, while the lifetime context still runs (or
 		// that context ended). Shutdown is never a failure (spec C7,

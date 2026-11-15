@@ -21,7 +21,7 @@ func TestMaybeFireFreshness_RecoversPanic(t *testing.T) {
 	var logs bytes.Buffer
 	h.logger = slog.New(slog.NewTextHandler(&logs, nil))
 	h.maybeFireFreshness(&proxy.Request{CanonicalScheme: "https", CanonicalHost: "h",
-		Path: "/r/dists/x/InRelease", IsMetadata: true, SuitePath: "/r/dists/x"})
+		Path: "/r/dists/x/InRelease", IsMetadata: true, SuitePath: "/r/dists/x"}, nil)
 	h.Close() // blocks until the goroutine finishes; returns only if Done ran
 	out := logs.String()
 	if !strings.Contains(out, "freshness_check_panicked") || !strings.Contains(out, "where=t1") {

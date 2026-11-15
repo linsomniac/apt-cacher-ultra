@@ -63,6 +63,22 @@ type FreshnessChecker interface {
 	Check(ctx context.Context, scheme, host, suitePath string)
 }
 
+// Revalidator is the freshness checker's side of request-time
+// revalidation (freshness.revalidate_wait; *freshness.Checker implements
+// it). Before the handler serves a suite's anchor it runs the suite's
+// check and waits, within its bound, for the check and for the adoption of
+// a new release (revalidateAnchor).
+type Revalidator interface {
+	// CheckNow runs the suite's freshness check as Check does and returns
+	// how it ended: the freshness_check result, or busy, skipped or failed.
+	CheckNow(ctx context.Context, scheme, host, suitePath string) string
+	// AwaitSuite waits while a check of the suite, or the adoption a check
+	// started, is in flight — at most until start + wait, and not at all
+	// for one already wait old — and reports that check's result, whether
+	// its adoption published a new snapshot, and whether it had ended.
+	AwaitSuite(ctx context.Context, scheme, host, suitePath string, start time.Time, wait time.Duration) (check string, published, settled bool)
+}
+
 // AdoptionWaiter is strict mode's view of the freshness checker's signed
 // adoptions in flight (spec C10, D10; *freshness.Checker implements it).
 // nil (adoption disabled) refuses at once, as before.
@@ -102,6 +118,15 @@ type Config struct {
 	// request's host before refusing an unvouched .deb (spec C10). nil:
 	// no wait.
 	Adoptions AdoptionWaiter
+
+	// Revalidator and RevalidateWait are request-time revalidation
+	// (freshness.revalidate_wait): how long a request for a suite's
+	// InRelease or Release may wait for the cache to ask upstream and to
+	// publish a new release before it is answered from the current
+	// snapshot. A nil Revalidator or a zero wait is off: anchors are
+	// served at once and the check runs after the response, as before.
+	Revalidator    Revalidator
+	RevalidateWait time.Duration
 
 	// Serve is the SPEC §6.4 / §8 stale-serve policy. Zero value is
 	// safe (both flags off): the handler will always 502 on a metadata
@@ -182,8 +207,12 @@ type Handler struct {
 	sem       *hostsem.Sem
 	freshness FreshnessChecker
 	adoptions AdoptionWaiter
-	serve     config.ServeConfig
-	logger    *slog.Logger
+	// revalidator and revalidateWait: request-time revalidation
+	// (revalidate.go). nil or zero: off.
+	revalidator    Revalidator
+	revalidateWait time.Duration
+	serve          config.ServeConfig
+	logger         *slog.Logger
 
 	// SPEC3 §6.1 strict-mode flags. refuseUnvouchedDebs gates the
 	// 502-on-unvouched-deb behavior; adoptionEnabled is checked
@@ -293,6 +322,8 @@ func New(cfg Config) (*Handler, error) {
 		sem:                     cfg.HostLimiter,
 		freshness:               cfg.Freshness,
 		adoptions:               cfg.Adoptions,
+		revalidator:             cfg.Revalidator,
+		revalidateWait:          cfg.RevalidateWait,
 		serve:                   cfg.Serve,
 		logger:                  logger,
 		refuseUnvouchedDebs:     cfg.RefuseUnvouchedDebs,
@@ -512,6 +543,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	sr := newSuiteReq(req)
 	defer func() { sr.tok.Done() }()
 
+	// An anchor request carries a trace for its request line, and — with
+	// freshness.revalidate_wait — first asks upstream, waiting within that
+	// bound for the answer and for a new release's adoption
+	// (revalidate.go). Before the barrier registration below: a request
+	// waiting for an adoption must not count as a serve of the old anchor.
+	if isAnchor(req) {
+		sr.anchor = &anchorTrace{checkedAgo: -1, behind: -1}
+		r = r.WithContext(context.WithValue(r.Context(), anchorTraceKey{}, sr.anchor))
+		h.revalidateAnchor(r, req, start, sr)
+		if clientLeft(w, r) {
+			h.logRequest(r, req.CanonicalHost, req.Path, "client_canceled", http.StatusServiceUnavailable, 0, false, 0, start)
+			return
+		}
+	}
+
 	// Spec C8: register an anchor serve with the flip barrier before
 	// anything reads the snapshot pointer (it may wait here while the
 	// suite's flip holds anchors) and before host-slot acquisition and
@@ -687,6 +733,7 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 		return false, 0, 0, false, false
 	}
 	snapshotID := *suite.CurrentSnapshotID
+	noteAnchorServe(sr, suite, snapshotID)
 
 	memberPath := suiteRelativePath(req.SuitePath, req.Path)
 	mem, err := h.cache.GetSnapshotMember(r.Context(), snapshotID, memberPath)
@@ -695,7 +742,7 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 		if ok, st, n := h.tryInlineRelease(w, r, req, snapshotID, memberPath, start); ok {
 			if st >= 200 && st < 300 || st == http.StatusNotModified {
 				go h.touchAsync(req, true, servedSuite(sr, st))
-				h.maybeFireFreshness(req)
+				h.maybeFireFreshness(req, sr)
 			}
 			return true, st, n, true, false
 		}
@@ -704,7 +751,7 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 		// fetched an earlier anchor asks for exactly those bytes.
 		if ok, st, n := h.tryDisplacedByHash(w, r, req, snapshotID, memberPath); ok {
 			go h.touchAsync(req, true, nil)
-			h.maybeFireFreshness(req)
+			h.maybeFireFreshness(req, sr)
 			return true, st, n, true, true
 		}
 		// SPEC2 §6.1: snapshot is the contract. Path not in the snapshot
@@ -773,7 +820,7 @@ func (h *Handler) trySnapshotHit(w http.ResponseWriter, r *http.Request, req *pr
 		return served, status, bytesWritten, true, false
 	}
 	go h.touchAsync(req, true, servedSuite(sr, status))
-	h.maybeFireFreshness(req)
+	h.maybeFireFreshness(req, sr)
 	return true, status, bytesWritten, true, false
 }
 
@@ -865,7 +912,7 @@ func (h *Handler) tryURLPathHit(w http.ResponseWriter, r *http.Request, req *pro
 	// only read its absent row and skip (I-4). The other T1 sites serve
 	// snapshot or known-suite content.
 	if sr.tracked {
-		h.maybeFireFreshness(req)
+		h.maybeFireFreshness(req, sr)
 	}
 	return true, "", status, bytesWritten, v
 }
@@ -973,7 +1020,7 @@ func (h *Handler) tryByHashContentAddressed(w http.ResponseWriter, r *http.Reque
 	// short-deadline ctx — the response is already on the wire and the
 	// client doesn't care if this write slips.
 	go h.recordByHashURLPath(req, hash)
-	h.maybeFireFreshness(req)
+	h.maybeFireFreshness(req, sr)
 	return true, status, bytesWritten
 }
 
@@ -1424,8 +1471,15 @@ func declaredAttrs(rows []cache.DeclaredHash) []map[string]any {
 // The goroutine registers with activeWG so Handler.Close drains it on
 // shutdown; lifecycleCtx is what the goroutine carries, so cancel
 // propagates through fetch.Conditional.
-func (h *Handler) maybeFireFreshness(req *proxy.Request) {
+//
+// A request whose check already ran before its response (request-time
+// revalidation, sr.revalidated) fires none: it would only be turned away
+// by the cooldown, or ask upstream a second time where there is none.
+func (h *Handler) maybeFireFreshness(req *proxy.Request, sr *suiteReq) {
 	if h.freshness == nil || !req.IsMetadata || req.SuitePath == "" {
+		return
+	}
+	if sr != nil && sr.revalidated {
 		return
 	}
 	// Increment must happen here (synchronously, before the goroutine
@@ -1643,7 +1697,7 @@ func (h *Handler) serveCacheMiss(w http.ResponseWriter, r *http.Request, req *pr
 	// through trySnapshotHit, which fires T1 too: the seed T1 then is a
 	// cooldown skip, one mutex peek (deferred minor E-64).
 	if res.created && !shared && h.adoptionEnabled {
-		defer h.maybeFireFreshness(req)
+		defer h.maybeFireFreshness(req, sr)
 	}
 	outcome, logOutcome := cacheMiss, "miss"
 	if shared {
@@ -2883,6 +2937,11 @@ func (h *Handler) logRequestWithValidation(r *http.Request, canonHost, path, out
 	if fetchAttempted {
 		attrs = append(attrs, "upstream_status", upstreamStatus)
 	}
+	// An anchor request's line says which snapshot was served, how long
+	// ago upstream was last asked, whether the cache knew of newer content
+	// it had not published, and what request-time revalidation did
+	// (revalidate.go). Each field only when it says something.
+	attrs = append(attrs, anchorLogAttrs(r.Context())...)
 	// SPEC6 §6.2.1 / §10.1: when the synthetic *http.Request was
 	// dispatched by the CONNECT pipeline, mark the request log line
 	// so operators can grep for MITM-tunneled requests. A plain
