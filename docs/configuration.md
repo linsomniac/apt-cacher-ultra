@@ -251,6 +251,20 @@ adoption leaves the previous snapshot serving. Automatic repair does not retry
 every optional `404`/`410` artifact; manual reconciliation is available through
 [`POST /reconcile`](../README.md#recovering-a-degraded-repository).
 
+Starting with 1.0.5, an uncompressed `Packages` or `Sources` response with the
+wrong size or checksum can be recovered from a `.gz` or `.xz` sibling declared
+by the same Release. ACU verifies the compressed file's size and SHA-256,
+decompresses it, and checks the plain file against its own declaration. Each
+reconstructed representation is limited to 256 MiB and its declared size.
+An undeclared sibling, unsupported codec, or bad checksum retains the failure.
+Recovery also applies during reconciliation and when restoring a missing
+cached snapshot index; these paths use the selected snapshot's declarations.
+No configuration change or weaker verification is needed.
+
+The default empty `architectures` list includes source indexes even when no
+client uses `deb-src`. To exclude them, explicitly list the binary architectures
+needed by your clients, for example `["amd64", "arm64", "armhf"]`.
+
 ## `[hot_packages]`, `[hold_packages]`, and `[retention]`: package working set
 
 | Section / key | Type | Default | Behavior and constraints |

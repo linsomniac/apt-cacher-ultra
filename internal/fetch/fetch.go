@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -44,6 +45,7 @@ var (
 	ErrInvalidURL          = errors.New("fetch: invalid target URL")
 	ErrRedirectBlocked     = errors.New("fetch: upstream redirect blocked")
 	ErrCacheWriteFailed    = errors.New("fetch: cache write failed")
+	ErrBodyTooLarge        = errors.New("fetch: response body exceeds the size expected")
 )
 
 // StatusError carries the upstream HTTP status code from any non-success
@@ -150,6 +152,10 @@ type Client struct {
 type Target struct {
 	CanonicalHost string
 	URL           string
+
+	// MaxBytes bounds the complete download, including resumed bytes.
+	// Zero leaves the existing unbounded behavior. Conditional uses its own bound.
+	MaxBytes int64
 }
 
 // FetchDst is the destination for the response body. Truncate must reset
@@ -494,6 +500,9 @@ func (c *Client) doAttempt(
 
 	switch resp.StatusCode {
 	case http.StatusOK:
+		if target.MaxBytes > 0 && resp.ContentLength > target.MaxBytes {
+			return out, fmt.Errorf("%w: declared %d bytes, at most %d expected", ErrBodyTooLarge, resp.ContentLength, target.MaxBytes)
+		}
 		if sendRange {
 			// Server invalidated our resume (If-Range mismatch or just
 			// ignored the Range header). SPEC §6.3: "the partial file is
@@ -502,7 +511,7 @@ func (c *Client) doAttempt(
 				return out, fmt.Errorf("fetch: truncate dst on restart: %w", err)
 			}
 		}
-		if err := streamBody(resp, dst); err != nil {
+		if err := streamBody(resp, dst, target.MaxBytes); err != nil {
 			return out, err
 		}
 		if resp.ContentLength > 0 && dst.Written() != resp.ContentLength {
@@ -539,8 +548,11 @@ func (c *Client) doAttempt(
 			return out, fmt.Errorf("%w: 206 last=%d >= total=%d",
 				ErrInvalidContentRange, last, total)
 		}
+		if target.MaxBytes > 0 && (total > target.MaxBytes || last >= target.MaxBytes) {
+			return out, fmt.Errorf("%w: 206 Content-Range %q, at most %d bytes expected", ErrBodyTooLarge, resp.Header.Get("Content-Range"), target.MaxBytes)
+		}
 		out.ContentLength = total
-		if err := streamBody(resp, dst); err != nil {
+		if err := streamBody(resp, dst, target.MaxBytes); err != nil {
 			return out, err
 		}
 		// The response covered [first, last] inclusive. Combined with
@@ -572,10 +584,33 @@ func (c *Client) doAttempt(
 // (e.g. disk full) from an upstream-side fault. Without this distinction
 // io.Copy returns the first error from either side; the outer retry loop
 // would then re-attempt on a cache write failure that won't recover by
-// re-asking the upstream.
-func streamBody(resp *http.Response, dst io.Writer) error {
-	_, err := io.Copy(&writeErrTagger{w: dst}, resp.Body)
-	return err
+// re-asking the upstream. With max > 0 it reads at most one byte past max
+// and fails with ErrBodyTooLarge when dst then holds more than max bytes.
+func streamBody(resp *http.Response, dst FetchDst, max int64) error {
+	src := io.Reader(resp.Body)
+	if max > 0 {
+		// max bounds what dst holds in all: a resume's prefix counts.
+		left := max - dst.Written()
+		if left < 0 {
+			left = 0
+		}
+		// AIDEV-NOTE: one byte past max tells "runs over" from "ends
+		// there", but at math.MaxInt64 that byte would wrap the limit
+		// negative and LimitReader would read nothing; no body runs past
+		// that max anyway (TestFetch_MaxBytesAtMaxInt64ReadsTheWholeBody).
+		n := left
+		if n < math.MaxInt64 {
+			n++
+		}
+		src = io.LimitReader(resp.Body, n)
+	}
+	if _, err := io.Copy(&writeErrTagger{w: dst}, src); err != nil {
+		return err
+	}
+	if max > 0 && dst.Written() > max {
+		return fmt.Errorf("%w: more than %d bytes", ErrBodyTooLarge, max)
+	}
+	return nil
 }
 
 // writeErrTagger wraps an io.Writer so any Write error is wrapped with
@@ -691,6 +726,9 @@ func isRetryable(err error) bool {
 		// the connect_timeout × max_retries hang returns whenever the
 		// probe path also times out, defeating the cooldown's purpose.
 		return false
+	}
+	if errors.Is(err, ErrBodyTooLarge) {
+		return false // Repeating a download cannot make an oversized representation fit.
 	}
 	if errors.Is(err, ErrCacheWriteFailed) {
 		// SPEC §11 row 14: a cache-side write failure (disk full, I/O

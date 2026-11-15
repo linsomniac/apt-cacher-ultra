@@ -28,7 +28,7 @@ func TestUpstreamProxy_CooldownSharedAcrossRepositories(t *testing.T) {
 		},
 	})
 	for i, host := range []string{"first.invalid", "second.invalid"} {
-		_, err := client.Fetch(context.Background(), &Target{host, "http://" + host + "/InRelease"}, &bufDst{})
+		_, err := client.Fetch(context.Background(), &Target{CanonicalHost: host, URL: "http://" + host + "/InRelease"}, &bufDst{})
 		if !errors.Is(err, ErrUpstreamUnavailable) {
 			t.Fatalf("repository %d error = %v, want unavailable", i, err)
 		}
