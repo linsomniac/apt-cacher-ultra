@@ -70,6 +70,8 @@ declare -A expected_mode=(
     [/etc/apt-cacher-ultra]="755"
     [/etc/apt-cacher-ultra/config.toml]="644"
     [/lib/systemd/system/apt-cacher-ultra.service]="644"
+    [/usr/lib/firewalld/services/apt-cacher-ultra.xml]="644"
+    [/usr/lib/firewalld/services/apt-cacher-ultra-admin.xml]="644"
     [/usr/share/doc/apt-cacher-ultra/copyright]="644"
 )
 for path in "${!expected_mode[@]}"; do

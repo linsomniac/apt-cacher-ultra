@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>apt-cacher-ultra</short>
+  <description>apt-cacher-ultra package caching proxy. Enable in a zone used by your trusted apt clients. This service covers the default proxy port; remote administration is a separate service.</description>
+  <port port="3142" protocol="tcp"/>
+</service>

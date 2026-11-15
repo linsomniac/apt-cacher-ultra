@@ -98,6 +98,11 @@ systemctl start apt-cacher-ultra
 #  allow 3142 through firewall if necessary:
 iptables -I INPUT -p tcp --dport 3142 -j ACCEPT
 ```
+
+For firewalld, the `.deb` includes separate proxy and admin service definitions.
+See [firewalld setup](docs/configuration.md#firewalld) to enable them in the
+appropriate zone; package installation leaves firewall rules unchanged.
+
 ### Manual build:
 
 ```sh

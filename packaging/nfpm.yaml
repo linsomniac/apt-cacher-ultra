@@ -47,6 +47,20 @@ contents:
       mode: 0644
       owner: root
       group: root
+  # Optional firewalld definitions. Administrators choose their zones and
+  # enable each service; package installation does not change firewall rules.
+  - src: ./packaging/firewalld/apt-cacher-ultra.xml
+    dst: /usr/lib/firewalld/services/apt-cacher-ultra.xml
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: ./packaging/firewalld/apt-cacher-ultra-admin.xml
+    dst: /usr/lib/firewalld/services/apt-cacher-ultra-admin.xml
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
   - src: ./packaging/copyright
     dst: /usr/share/doc/apt-cacher-ultra/copyright
     file_info:

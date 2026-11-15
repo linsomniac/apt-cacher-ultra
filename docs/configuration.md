@@ -42,6 +42,78 @@ using an HTTPS proxy must trust the cache CA. Restrict who can reach the proxy
 with its bind address and network access controls; `admin.htpasswd_file` protects
 only the admin listener.
 
+## Firewalld
+
+The `.deb` installs two optional service definitions in
+`/usr/lib/firewalld/services/`:
+
+| Service | Port | Purpose |
+| --- | --- | --- |
+| `apt-cacher-ultra` | TCP 3142 | Package proxy for apt clients. |
+| `apt-cacher-ultra-admin` | TCP 6789 | Optional remote admin interface, including operations that modify the cache. |
+
+The package does not depend on firewalld, enable either service, change zones,
+or reload the firewall. These definitions use the default listener ports.
+They are adapted from @charlescurley's contribution in
+[discussion #31](https://github.com/linsomniac/apt-cacher-ultra/discussions/31).
+
+### Enable access
+
+On a host already running firewalld, inspect the active zones and load the new
+definitions. Reloading applies the permanent configuration and discards
+runtime-only changes, so preserve any such changes you need first:
+
+```sh
+sudo firewall-cmd --get-active-zones
+sudo firewall-cmd --reload
+```
+
+Choose the zone containing the intended clients' interface or source network.
+The example uses `internal`; substitute your actual client zone. Enable the
+proxy service permanently and apply it to the running firewall:
+
+```sh
+sudo firewall-cmd --permanent --zone=internal --add-service=apt-cacher-ultra
+sudo firewall-cmd --zone=internal --add-service=apt-cacher-ultra
+sudo firewall-cmd --zone=internal --query-service=apt-cacher-ultra
+```
+
+In `firewall-config`, select **Permanent**, choose that zone, and check
+`apt-cacher-ultra` under **Services**; reload to apply it to runtime.
+
+Remote administration is a separate choice. The default `admin.listen` is
+`127.0.0.1:6789`, so opening the port alone does not make it reachable remotely.
+For direct remote access, bind it to the intended server address, configure
+`admin.htpasswd_file`, and use [admin HTTPS](server-tls.md) or protect the network
+path. Restart apt-cacher-ultra after changing its configuration. Then enable
+`apt-cacher-ultra-admin` with the same commands, selecting a zone restricted to
+your administrators. An SSH tunnel to the default loopback listener needs no
+admin firewall service.
+
+### Manual installation and custom ports
+
+For a standalone binary installation, run these commands from a source checkout,
+then follow the activation steps above:
+
+```sh
+sudo install -D -m 0644 packaging/firewalld/apt-cacher-ultra.xml \
+    /etc/firewalld/services/apt-cacher-ultra.xml
+sudo install -D -m 0644 packaging/firewalld/apt-cacher-ultra-admin.xml \
+    /etc/firewalld/services/apt-cacher-ultra-admin.xml
+```
+
+If you change `cache.listen` or `admin.listen`, or enable `cache.listen_tls`,
+adjust the corresponding service's TCP ports too. For a packaged definition,
+copy its XML from `/usr/lib/firewalld/services/` to `/etc/firewalld/services/`
+before editing the `<port>` entries, then reload firewalld. The `/etc` copy
+overrides the packaged definition and survives package upgrades. If you already
+installed the combined proxy/admin example from discussion #31, review that
+local override: it continues to take precedence over the new proxy-only file.
+
+See firewalld's [service setup](https://firewalld.org/documentation/howto/add-a-service.html)
+and [configuration directories](https://firewalld.org/documentation/configuration/directories.html)
+for details.
+
 ## `[cache]`: storage and proxy listeners
 
 | Key | Type | Default | Behavior and constraints |

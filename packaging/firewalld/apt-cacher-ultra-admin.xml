@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>apt-cacher-ultra administration</short>
+  <description>Optional remote access to the apt-cacher-ultra admin interface, including operations that modify the cache. Enable only for trusted administrators after configuring the admin listener and access protection.</description>
+  <port port="6789" protocol="tcp"/>
+</service>

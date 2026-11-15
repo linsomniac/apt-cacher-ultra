@@ -6,7 +6,8 @@ the detail an operator needs before upgrading.
 
 ## Unreleased: 1.1.0
 
-Collected until 1.1.0-rc1. The detail, and what to do before upgrading
+Collects changes throughout the release candidates for the final 1.1.0 release.
+The detail, and what to do before upgrading
 from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Added
@@ -18,6 +19,14 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   and completion, including retries and redirects, for traffic accounting.
 - Schema 10 remembers client-requested package identities across version changes
   and snapshot/URL reclamation. Prefetch never extends their hot-window timestamp.
+
+- Optional firewalld service definitions shipped in the `.deb`: separate
+  `apt-cacher-ultra` (TCP 3142) and `apt-cacher-ultra-admin` (TCP 6789)
+  services, with explicit zone activation and manual installation instructions.
+  Installation does not enable either service or require firewalld. Adapted
+  from @charlescurley's contribution in
+  [discussion #31](https://github.com/linsomniac/apt-cacher-ultra/discussions/31);
+  see [firewalld setup](docs/configuration.md#firewalld).
 - Persistent admin usage statistics: data fetched/served, cache hits, estimated
   net bytes saved and average effective transfer rates, with lifetime and
   since-start views in HTML and JSON. Includes background downloads and retries;

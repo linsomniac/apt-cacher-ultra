@@ -40,6 +40,12 @@ until its README's procedure says what to do.
    resolve in a GitHub release. A candidate may have concise notes in
    `docs/release-notes/1.1.0-rc1.md` linking to the full cycle's
    `docs/release-notes/1.1.0.md`; update that file's tag links too.
+   During the RC cycle, keep adding changes to the unreleased 1.1.0 section
+   of the changelog and to `docs/release-notes/1.1.0.md`, so the final notes
+   include changes from every candidate. Keep published candidates' notes
+   as records of those releases. Before the final tag, roll up the full
+   cycle, mark the changelog section released, and update the final notes'
+   tag links to `/blob/1.1.0/`.
 7. **Tag** the commit (`MAJOR.MINOR.PATCH`, or `-rcN`; no `v` prefix) and
    check the release workflow's `Verify no e2e test seam` step on the tag.
    The workflow creates the GitHub release with the matching version's
