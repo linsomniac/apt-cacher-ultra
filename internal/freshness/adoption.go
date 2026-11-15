@@ -107,9 +107,10 @@ var (
 // classifyAdoptionOutcome keeps working unchanged. errors.As(err,
 // &*AdoptionMemberError) recovers Path/Detail at the freshness layer.
 type AdoptionMemberError struct {
-	Path   string // suite-relative member path, e.g. "Contents-amd64"
-	Detail string // short reason, e.g. "served 114572 vs declared 1664594"
-	err    error  // wraps the category sentinel via %w
+	Path                   string // suite-relative member path, e.g. "Contents-amd64"
+	Detail                 string // short reason, e.g. "served 114572 vs declared 1664594"
+	err                    error  // wraps the category sentinel via %w
+	representationMismatch bool   // eligible for verified compressed-sibling recovery
 }
 
 func (e *AdoptionMemberError) Error() string { return e.err.Error() }
@@ -119,7 +120,7 @@ func (e *AdoptionMemberError) Unwrap() error { return e.err }
 // newMemberErr wraps a category sentinel with the failing member's
 // path + detail. The resulting error satisfies both errors.Is(…,
 // sentinel) and errors.As(…, **AdoptionMemberError).
-func newMemberErr(sentinel error, path, detail string) error {
+func newMemberErr(sentinel error, path, detail string) *AdoptionMemberError {
 	return &AdoptionMemberError{
 		Path:   path,
 		Detail: detail,
@@ -1097,6 +1098,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		requiredGroupDeclared = make(map[string]int)
 		requiredGroupFetched = make(map[string]bool)
 	}
+	declaredMembers := memberDeclarations(members)
 	for _, m := range members {
 		// SPEC6_5 §7.2: per-arch / per-source index filter. Inert when
 		// the allowlist is empty (Phase 6 default). Skipped members never
@@ -1134,7 +1136,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			}
 		}
 
-		blobHash, err := a.adoptMemberWithRetry(ctx, suite, m, acquireByHash)
+		blobHash, err := a.adoptMemberWithRetry(ctx, suite, m, acquireByHash, declaredMembers)
 		if err != nil {
 			if errors.Is(err, errAdoptionMemberSkipped) {
 				skippedCount++
@@ -1546,8 +1548,8 @@ func formName(f adoptionForm) string {
 // The sleep happens with NO host-semaphore slot held — adoptMember
 // acquires and releases per attempt — so a member in backoff never
 // starves other fetches to the same host.
-func (a *Adopter) adoptMemberWithRetry(ctx context.Context, suite SuiteRef, m ReleaseMember, acquireByHash bool) (string, error) {
-	blobHash, err := a.adoptMember(ctx, suite, m, acquireByHash)
+func (a *Adopter) adoptMemberWithRetry(ctx context.Context, suite SuiteRef, m ReleaseMember, acquireByHash bool, declared map[string]ReleaseMember) (string, error) {
+	blobHash, err := a.adoptMemberFromRelease(ctx, suite, m, acquireByHash, declared)
 	if err == nil || a.memberRetryCount == 0 {
 		return blobHash, err
 	}
@@ -1572,7 +1574,7 @@ func (a *Adopter) adoptMemberWithRetry(ctx context.Context, suite SuiteRef, m Re
 			break
 		}
 		retried = true
-		blobHash, err = a.adoptMember(ctx, suite, m, acquireByHash)
+		blobHash, err = a.adoptMemberFromRelease(ctx, suite, m, acquireByHash, declared)
 		if err == nil {
 			adoptionMemberRetriesTotal.Inc("success")
 			return blobHash, nil
@@ -1681,6 +1683,7 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 	target := &fetch.Target{
 		CanonicalHost: suite.CanonicalHost,
 		URL:           buildMemberURL(suite, byHashRelPath),
+		MaxBytes:      recoveryDownloadLimit(m),
 	}
 	w, err := a.cache.NewTempBlob()
 	if err != nil {
@@ -1720,6 +1723,7 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 	target := &fetch.Target{
 		CanonicalHost: suite.CanonicalHost,
 		URL:           upstreamURL,
+		MaxBytes:      recoveryDownloadLimit(m),
 	}
 
 	w, err := a.cache.NewTempBlob()
@@ -1772,8 +1776,9 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 			adoptionMembersSkippedTotal.Inc(reason)
 			return "", errAdoptionMemberSkipped
 		}
-		return "", newMemberErr(ErrAdoptionMemberFetchFailed, m.Path,
-			fmt.Sprintf("fetch: %v", err))
+		me := newMemberErr(ErrAdoptionMemberFetchFailed, m.Path, fmt.Sprintf("fetch: %v", err))
+		me.representationMismatch = errors.Is(err, fetch.ErrBodyTooLarge)
+		return "", me
 	}
 	// Size sanity: declared Size in the Release file should match
 	// what the fetch actually wrote. fetch.Client already honors
@@ -1782,8 +1787,13 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 	// than a hash mismatch (the bytes might still hash correctly,
 	// but a length mismatch is its own integrity violation).
 	if m.Size > 0 && res.ContentLength > 0 && res.ContentLength != m.Size {
-		return "", newMemberErr(ErrAdoptionMemberFetchFailed, m.Path,
+		return "", newRepresentationErr(ErrAdoptionMemberFetchFailed, m.Path,
 			fmt.Sprintf("served %d vs declared %d", res.ContentLength, m.Size))
+	}
+
+	if recoveryDownloadLimit(m) > 0 && w.Written() != m.Size {
+		return "", newRepresentationErr(ErrAdoptionMemberFetchFailed, m.Path,
+			fmt.Sprintf("served %d vs declared %d", w.Written(), m.Size))
 	}
 
 	hashHex, err := w.Finalize(res.ContentLength)
@@ -1804,7 +1814,7 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 			"declared_sha256", m.SHA256,
 			"actual_sha256", hashHex,
 		)
-		return "", newMemberErr(ErrAdoptionMemberMismatch, m.Path,
+		return "", newRepresentationErr(ErrAdoptionMemberMismatch, m.Path,
 			fmt.Sprintf("declared %s, got %s", shortHash(m.SHA256), shortHash(hashHex)))
 	}
 	if err := a.cache.PutBlob(ctx, hashHex, w.Written()); err != nil {

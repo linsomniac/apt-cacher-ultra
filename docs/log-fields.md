@@ -154,3 +154,16 @@ substituted.
   semantics (when a field appears vs is omitted) are also locked.
 - New fields may be added additively — log consumers parse the keys
   they care about and ignore the rest.
+
+## Index reconstruction (1.0.5)
+
+`index_reconstructed` at INFO records a plain Packages/Sources index recovered
+from a verified gzip/xz sibling. It carries `canonical_host`, `path`, and
+`compressed_path`; adoption/reconciliation also carries `suite_path`, while
+cached-file recovery carries `snapshot_id`. The path is suite-relative during
+adoption/reconciliation and the requested full path during cached-file recovery.
+
+`index_reconstruction_failed` at DEBUG carries the same context plus `err`.
+Another supported sibling may still recover the index; otherwise the original
+failure remains. Both representations must match the selected Release or
+snapshot's declared sizes and SHA-256 hashes.
