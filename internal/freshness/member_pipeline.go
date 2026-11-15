@@ -203,9 +203,9 @@ func (a *Adopter) requiredIndex(suitePath, path string) bool {
 // round-robin mirror serving the previous publication generation
 // mid-sync (SPEC6_7 §1). A 404 or 410 ("declared but not served") and a
 // local fault are not. Nor is a member whose upstream went silent
-// (memberUpstreamSilent): the fetch already retried that once, and each
-// round would hold the release for two more idle timeouts; an optional
-// one is skipped and left to repair, an index fails the attempt, which
+// (memberUpstreamSilent): each round would hold the release for the idle
+// timeout again; an optional one is skipped and left to repair, an index
+// (whose fetch already retried the silence once) fails the attempt, which
 // the short retry schedule brings back in a minute.
 func memberMayHeal(err error) bool {
 	return memberFailed(err) && !memberUpstreamSilent(err)

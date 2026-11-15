@@ -518,15 +518,13 @@ func TestAdopter_MemberNewInThisReleaseKeepsTheByHashProbe(t *testing.T) {
 	}
 }
 
-// errSilent is what a fetch returns when upstream went silent twice (the
-// fetch's own single retry included).
+// errSilent is what a fetch returns when it ended at a silent upstream.
 var errSilent = fmt.Errorf("%w: %w", fetch.ErrUpstreamUnavailable, fetch.ErrIdleTimeout)
 
-// A member whose upstream went silent has had its second chance inside the
-// fetch, and each further attempt would wait out the idle timeout twice
-// more. It is not tried again in the retry rounds: an optional one is
-// skipped (and left to repair) so the release publishes, instead of
-// holding it for the rounds' six more idle timeouts.
+// A member whose upstream went silent is not tried again in the retry
+// rounds: each attempt would wait out the idle timeout again. An optional
+// one is skipped (and left to repair) so the release publishes, instead of
+// being held for the rounds' further idle timeouts.
 func TestAdopter_SilentUpstreamMemberIsNotRetriedInRounds(t *testing.T) {
 	ctx := context.Background()
 	env := newAdoptionTestEnv(t)
@@ -624,5 +622,54 @@ func TestAdopter_WithoutToleranceASilentByHashStillAsksThePath(t *testing.T) {
 	}
 	if _, err := env.cache.GetSnapshotMember(ctx, currentSnapshotID(t, env), "main/Contents-amd64.gz"); err != nil {
 		t.Fatalf("the member was not adopted from its declared path: %v", err)
+	}
+}
+
+// noIdleRetryByURL maps each fetched member URL to the NoIdleRetry its
+// target carried.
+func noIdleRetryByURL(f *fakeFetcher) map[string]bool {
+	out := map[string]bool{}
+	for _, tg := range f.fetchTargets() {
+		out[tg.URL] = tg.NoIdleRetry
+	}
+	return out
+}
+
+// A member the snapshot can do without is fetched without the second
+// chance after a silent upstream (fetch.Target.NoIdleRetry): one idle
+// timeout, then it is skipped and left to repair. An index keeps the
+// retry, and so does every member when optional-member tolerance is off —
+// there a member's failure fails the attempt.
+func TestAdopter_OnlyMembersTheSnapshotCanDoWithoutGiveUpAtTheFirstSilence(t *testing.T) {
+	ctx := context.Background()
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64)})
+	contents := []byte(strings.Repeat("C", 100))
+	const pkgsPath, contentsPath = "main/binary-amd64/Packages", "main/Contents-amd64.gz"
+	for _, tc := range []struct {
+		name     string
+		tolerant bool
+		want     map[string]bool // member path → NoIdleRetry
+	}{
+		{"tolerance on", true, map[string]bool{pkgsPath: false, contentsPath: true}},
+		{"tolerance off", false, map[string]bool{pkgsPath: false, contentsPath: false}},
+	} {
+		env := newAdoptionTestEnv(t)
+		releaseText, decl := makeReleaseAcquireByHash(map[string][]byte{pkgsPath: pkgs, contentsPath: contents})
+		env.fetcher.put(byHashURL(pkgsPath, decl[pkgsPath]), pkgs)
+		env.fetcher.put(byHashURL(contentsPath, decl[contentsPath]), contents)
+		ad := env.adopter
+		if tc.tolerant {
+			ad = newTolerantAdopter(t, env)
+		}
+		if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+			t.Fatalf("%s: Run: %v", tc.name, err)
+		}
+		got := noIdleRetryByURL(env.fetcher)
+		for path, want := range tc.want {
+			u := byHashURL(path, decl[path])
+			if v, ok := got[u]; !ok || v != want {
+				t.Errorf("%s: %s fetched with NoIdleRetry=%v (fetched: %v), want %v", tc.name, path, v, ok, want)
+			}
+		}
 	}
 }

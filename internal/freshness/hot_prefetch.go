@@ -295,9 +295,13 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 	}
 	defer release()
 
+	// NoIdleRetry: the release is published whether or not this package
+	// arrives, so a silent upstream is not waited for twice; the package
+	// is fetched when a client asks for it.
 	target := &fetch.Target{
 		CanonicalHost: suite.CanonicalHost,
 		URL:           entry.upstreamURL,
+		NoIdleRetry:   true,
 	}
 	w, err := a.cache.NewTempBlob()
 	if err != nil {

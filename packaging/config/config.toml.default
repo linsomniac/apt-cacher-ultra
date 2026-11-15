@@ -40,7 +40,7 @@ trusted_proxies = []
 proxy                   = ""
 connect_timeout         = "30s"  # TCP dial and TLS handshake limit
 total_timeout           = "5m"   # whole fetch budget, including retries
-idle_read_timeout       = "60s"  # abandon an attempt whose upstream is silent this long; retried once
+idle_read_timeout       = "60s"  # abandon an attempt whose upstream is silent this long
 max_retries             = 3      # extra attempts for retryable failures
 max_concurrent_per_host = 8      # concurrent fetches per canonical host
 # The five settings above reject negatives; explicit zero restores defaults.

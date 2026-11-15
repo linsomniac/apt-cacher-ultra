@@ -204,9 +204,10 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   but ignored, so an upstream that went silent mid-response held a fetch — and
   an adoption or repair behind it — until `total_timeout` (5 minutes). A
   fetch that meets silence is retried once, whatever `max_retries` allows; a
-  second silence ends it. An adoption does not ask again for an optional file
-  whose upstream is silent: the file is skipped and left to repair, and the
-  release is published without it.
+  second silence ends it. What a release can be published without gets no
+  retry after a silence: a hot-package prefetch ends, and an optional file is
+  skipped and left to repair, so either holds a release back one idle timeout
+  at most.
 - Hot prefetch verifies and reuses cached package content instead of downloading
   unchanged packages on every snapshot update. Missing or corrupt content is
   fetched and verified; concurrent prefetches of one hash avoid duplicate downloads.

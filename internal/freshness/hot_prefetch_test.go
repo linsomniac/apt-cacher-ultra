@@ -538,6 +538,7 @@ func TestBuildPackageHashes_IncompleteIdentityBinarySkipped(t *testing.T) {
 type hotFakeFetcher struct {
 	mu       sync.Mutex
 	calls    int
+	targets  []fetch.Target // every target Fetch was called with, in order
 	bodies   map[string][]byte
 	errs     map[string]error
 	blocking map[string]time.Duration
@@ -572,6 +573,7 @@ func (f *hotFakeFetcher) setBlocking(url string, dur time.Duration) {
 func (f *hotFakeFetcher) Fetch(ctx context.Context, target *fetch.Target, dst fetch.FetchDst) (*fetch.FetchResult, error) {
 	f.mu.Lock()
 	f.calls++
+	f.targets = append(f.targets, *target)
 	body, hasBody := f.bodies[target.URL]
 	errInj, hasErr := f.errs[target.URL]
 	blockDur, hasBlock := f.blocking[target.URL]
@@ -619,4 +621,22 @@ func writeFixtureBlob(t *testing.T, c *cache.Cache, content []byte) string {
 		t.Fatalf("PutBlob: %v", err)
 	}
 	return hash
+}
+
+// A hot package is warmed so that the first client after publication does
+// not wait for it; the release is published whether or not it arrives. So
+// its fetch does not get the second chance after a silent upstream: the
+// first silence ends it, and the package is fetched when a client asks.
+// (The freshness lab, 2026-11-15: a stalled hot package held a release
+// two idle timeouts.)
+func TestRunHotPrefetch_ASilentUpstreamIsNotRetried(t *testing.T) {
+	f := newHotPrefetchFixture(t, 5*time.Second)
+	f.fetcher.setBody(f.debUpstreamURL, []byte("new deb bytes v2"))
+
+	f.adopter.runHotPrefetch(context.Background(), f.suite, f.candidate, f.candidatePackageHashes, nil)
+	f.fetcher.mu.Lock()
+	defer f.fetcher.mu.Unlock()
+	if len(f.fetcher.targets) != 1 || !f.fetcher.targets[0].NoIdleRetry {
+		t.Fatalf("hot prefetch targets = %+v, want one with NoIdleRetry", f.fetcher.targets)
+	}
 }

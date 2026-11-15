@@ -177,12 +177,13 @@ type AdoptionMemberError struct {
 	err                    error  // wraps the category sentinel via %w
 	representationMismatch bool   // eligible for verified compressed-sibling recovery
 	// upstreamSilent: the fetch ended because upstream sent nothing for
-	// upstream.idle_read_timeout, twice (fetch.ErrIdleTimeout: the fetch
-	// retries a silence once itself). Such a member is not tried again in
-	// the retry rounds (memberMayHeal), and one the snapshot can do
-	// without is not asked for at its other URL either (memberTolerated):
-	// every further attempt would wait out two more idle timeouts for a
-	// file upstream is not sending.
+	// upstream.idle_read_timeout (fetch.ErrIdleTimeout) — twice for a
+	// member the snapshot needs, since the fetch retries a silence once
+	// itself; once for one it can do without (memberTolerated, which
+	// fetches with NoIdleRetry). Such a member is not tried again in the
+	// retry rounds (memberMayHeal), and one the snapshot can do without is
+	// not asked for at its other URL either: every further attempt would
+	// wait out the idle timeout again for a file upstream is not sending.
 	upstreamSilent bool
 }
 
@@ -214,13 +215,15 @@ func silentMemberErr(path string, err error) *AdoptionMemberError {
 // member is not an IndexTarget. Such a member is skipped and left to
 // repair; any other member's failure fails the attempt.
 //
-// AIDEV-NOTE: this is also what decides whether a member keeps its second
-// URL after the first one went silent (adoptMember). A tolerated member
-// does not: the second URL would wait out two more idle timeouts for a
+// AIDEV-NOTE: this is also what decides how long a silent upstream is
+// waited for. A tolerated member is fetched without the retry after a
+// silence (fetch.Target.NoIdleRetry) and does not keep its second URL
+// after the first one went silent (adoptMember): it holds the release one
+// idle timeout, where the retry and the second URL made it four, for a
 // file the release can be published without. A member the snapshot needs
-// does, whatever it costs: a by-hash URL that hangs while the declared
-// path answers must not keep a suite unadopted, attempt after attempt
-// (robustness before speed).
+// keeps both, whatever they cost: a by-hash URL that hangs while the
+// declared path answers must not keep a suite unadopted, attempt after
+// attempt (robustness before speed).
 func (a *Adopter) memberTolerated(suitePath, path string) bool {
 	return a.tolerateOptionalMembers && !isIndexTarget(suitePath, path)
 }
@@ -2446,6 +2449,7 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 		CanonicalHost: suite.CanonicalHost,
 		URL:           buildMemberURL(suite, byHashRelPath),
 		MaxBytes:      memberMaxBytes(m),
+		NoIdleRetry:   a.memberTolerated(suite.SuitePath, m.Path),
 	}
 	// A local fault (the temp blob, the blob row) is ErrAdoptionDBFailed,
 	// as on the plain path, so the caller fails the member instead of
@@ -2498,6 +2502,7 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 		CanonicalHost: suite.CanonicalHost,
 		URL:           upstreamURL,
 		MaxBytes:      memberMaxBytes(m),
+		NoIdleRetry:   a.memberTolerated(suite.SuitePath, m.Path),
 	}
 
 	w, err := newMemberWriter(a.cache)

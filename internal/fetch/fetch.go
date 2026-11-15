@@ -171,6 +171,14 @@ type Target struct {
 	// with ErrBodyTooLarge, which is not retried. 0 is no limit. Only
 	// Fetch honours it: Conditional ignores it and takes its own maxBody.
 	MaxBytes int64
+
+	// NoIdleRetry ends the fetch at its first idle read timeout instead of
+	// retrying it once (see the retry loop in Fetch). For a caller that
+	// goes on without the file — hot prefetch, an adoption's optional
+	// members — and should not wait out a second idle timeout for it.
+	// Every other retryable failure keeps its retries. Only Fetch honours
+	// it.
+	NoIdleRetry bool
 }
 
 // FetchDst is the destination for the response body. Truncate must reset
@@ -483,9 +491,12 @@ func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (resul
 		// every further retry would wait out idle_read_timeout again: with
 		// the default three retries a stalled file cost four idle timeouts
 		// (240 s), which held an adoption that long (the freshness lab,
-		// 2026-11-15). Other failures keep all their retries.
+		// 2026-11-15). A caller that goes on without the file gives up at
+		// the first silence (Target.NoIdleRetry): the lab's stalled hot
+		// package still held its release two idle timeouts. Other failures
+		// keep all their retries.
 		if errors.Is(err, ErrIdleTimeout) {
-			if idled {
+			if idled || target.NoIdleRetry {
 				return nil, fmt.Errorf("%w: %w", ErrUpstreamUnavailable, err)
 			}
 			idled = true

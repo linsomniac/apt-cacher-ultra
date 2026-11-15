@@ -287,3 +287,57 @@ func TestFetch_OtherFailuresKeepTheirRetriesAfterAnIdleTimeout(t *testing.T) {
 		t.Errorf("body %q after %d requests, want ok after 4", dst.String(), calls.Load())
 	}
 }
+
+// A caller that can go on without the file says so (Target.NoIdleRetry):
+// the first silence ends its fetch, whatever max_retries allows. Hot
+// prefetch and the optional members of an adoption use it — the release is
+// published without the file, which is better than waiting out a second
+// idle timeout for it.
+func TestFetch_NoIdleRetryEndsAtTheFirstSilence(t *testing.T) {
+	var calls atomic.Int32
+	srv := stallServer(t, func(w http.ResponseWriter, r *http.Request, release <-chan struct{}) {
+		calls.Add(1)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	})
+	c := newIdleClient(t, 100*time.Millisecond, 3)
+
+	start := time.Now()
+	_, err := c.Fetch(context.Background(), &Target{CanonicalHost: "127.0.0.1", URL: srv.URL + "/x.deb", NoIdleRetry: true}, &bufDst{})
+	if !errors.Is(err, ErrIdleTimeout) || !errors.Is(err, ErrUpstreamUnavailable) {
+		t.Fatalf("err = %v, want ErrUpstreamUnavailable wrapping ErrIdleTimeout", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("upstream requests = %d, want 1: no retry after a silence", got)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("the fetch took %s, want about one idle timeout", took)
+	}
+	if got := ClassifyFetchOutcome(err); got != "idle_timeout" {
+		t.Errorf("outcome = %q, want idle_timeout", got)
+	}
+}
+
+// NoIdleRetry is about silence only: every other retryable failure keeps
+// its retries.
+func TestFetch_NoIdleRetryKeepsTheOtherRetries(t *testing.T) {
+	var calls atomic.Int32
+	srv := stallServer(t, func(w http.ResponseWriter, r *http.Request, release <-chan struct{}) {
+		if calls.Add(1) <= 2 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		_, _ = w.Write([]byte("ok"))
+	})
+	c := newIdleClient(t, 100*time.Millisecond, 3)
+
+	dst := &bufDst{}
+	if _, err := c.Fetch(context.Background(), &Target{CanonicalHost: "127.0.0.1", URL: srv.URL + "/x.deb", NoIdleRetry: true}, dst); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if dst.String() != "ok" || calls.Load() != 3 {
+		t.Errorf("body %q after %d requests, want ok after 3", dst.String(), calls.Load())
+	}
+}
