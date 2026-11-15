@@ -83,6 +83,19 @@ func (r *repairRun) yieldedTo() string {
 // repairGivesWay cancels maintenance after checkDuringRepair determined that
 // an ordinary locked check is needed. Unchanged probes and cooldown skips leave
 // maintenance running; slow optional/required members can finish across ticks.
+//
+// AIDEV-NOTE: why a probe decides, and not the repair's age. Until the
+// 2026-11-15 follow-up a repair gave way to any check of its suite once it
+// had run for the cooldown: by then the check would ask upstream, and a new
+// release might be waiting. Under steady client traffic that cost a member
+// needing longer than the cooldown its download at every check; with
+// periodic_refresh at one minute it would have cost it at every scheduled
+// check, traffic or not, and the member would never heal. The check now
+// asks upstream beside the repair (checkDuringRepair, maintenance_check.go)
+// and comes here only when the anchor changed or the probe could not settle
+// it: a pending change or failure record, a possible form upgrade, an
+// upstream or database error. The members a repair did finish are promoted
+// one by one and stay.
 func (c *Checker) repairGivesWay(key string, run *repairRun) bool {
 	select {
 	case <-run.done:

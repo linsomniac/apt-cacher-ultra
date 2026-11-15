@@ -47,6 +47,15 @@ func newBackgroundWork(logger *slog.Logger, suite SuiteRef, kind, adoptionID str
 
 // Short checks allocate no watchdog goroutine. finish and the callback serialize
 // so no progress event can appear after the work's terminal record.
+//
+// AIDEV-NOTE: adoption_finished tells an attempt's whole story, but only
+// once it has ended; an attempt that is stuck, or merely slow, was
+// invisible until then (the 2026-11-14 publication-delay review: "the
+// update is upstream and the cache does not have it" could not be told
+// from "an adoption has been in its flip barrier for two minutes").
+// adoption_in_progress first rode on the database heartbeat ticker
+// (adoption_log.go, logProgress); it is logged from this timer so that a
+// blocked database writer cannot silence it.
 func (w *backgroundWork) tick(interval time.Duration) {
 	w.timerMu.Lock()
 	defer w.timerMu.Unlock()

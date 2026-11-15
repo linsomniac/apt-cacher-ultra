@@ -661,7 +661,9 @@ func (c *Checker) suiteRowExists(ctx context.Context, ref SuiteRef) bool {
 // adoption.max_duration (a request closing must not abort it).
 //
 // AIDEV-NOTE: defer order is load-bearing — in the order they run:
-// cancel, recoverAdoption, lease release, Unlock, the activity's end
+// cancel, recoverAdoption, the watchdog's end (finishWork: after the
+// failure record, so that write is still watched and a busy check still
+// names its holder), lease release, Unlock, the activity's end
 // (revalidate.go), inflight.end (signed adoptions only), Done (last). The failure record is written before the
 // mutex is released on both the error and the panic path (spec C7), and
 // inflight.end runs after the commit and the Unlock, so a strict-mode
@@ -866,7 +868,8 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
 // adoptionWg mirror spawnAdoption; WaitForAdoptions drains both.
 //
 // AIDEV-NOTE: defer order is load-bearing: Done (last), the run's done,
-// Unlock, the run's removal, lease release, recover (first). See
+// Unlock, the run's removal, lease release, recover. Only the context's
+// cancels and the watchdog's end (finishWork) run before the recover. See
 // recoverGoroutine.
 // AIDEV-NOTE: a repair or reconcile that panics deterministically is
 // logged (adoption_panicked, where=repair: recoverGoroutine), not
@@ -1495,6 +1498,11 @@ func (c *Checker) Reconcile(ctx context.Context, scheme, host, suitePath string)
 	}
 	// Manual reconciliation uses the same cancellable lease as automatic
 	// repair. Administrative maintenance must not monopolize publication.
+	//
+	// AIDEV-NOTE: defer order is load-bearing, as in spawnRepair: Done
+	// (last), the run's done, Unlock, the run's removal, lease release,
+	// recover. Only the context's cancels and the watchdog's end
+	// (finishWork) run before the recover. See recoverGoroutine.
 	dctx, cancelDeadline := context.WithTimeout(c.lifetimeCtx, c.maxAdoptionDuration)
 	rctx, cancel := context.WithCancelCause(dctx)
 	run := &repairRun{snapshotID: snapID, started: time.Now(), cancel: cancel, done: make(chan struct{})}
