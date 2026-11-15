@@ -993,7 +993,7 @@ immediately. Reconciliation uses the stored Release's hashes; it does not fetch
 files that the snapshot's Release never declared.
 
 `404`/`410` member responses are generally skips, independently of optional-member
-tolerance, but the index-group guards can block the resulting adoption. Other
+tolerance, but the index-group guards can block the resulting adoption. Unrecoverable
 availability or integrity failures on required indexes abort adoption. A failed
 adoption leaves the previous snapshot serving. With
 `repair_skipped_members = true` (the default), an unchanged successful freshness
@@ -1001,6 +1001,25 @@ check also reconciles missing required index groups in existing snapshots,
 including Sources with the default empty architecture list. It does not retry
 every optional `404`/`410` artifact; manual reconciliation is available through
 [`POST /reconcile`](../README.md#recovering-a-degraded-repository).
+
+After 1.1.0-rc1, a wrong representation of an uncompressed `Packages` or
+`Sources` index can be recovered automatically. For example, Apache content
+negotiation may return `Sources.gz` when ACU asks for `Sources` (issue #32).
+ACU explicitly fetches or reuses a `.gz` or `.xz` sibling declared by the same
+Release, verifies its declared size and every SHA256/SHA512 digest, then
+decompresses and verifies the plain file against its own declaration. Both
+representations remain available under their correct paths and by-hash aliases.
+No configuration change or reduced integrity checking is needed.
+
+Reconstruction limits each representation to its declared size and at most
+256 MiB, checks codec trailers, and never trusts `Content-Location` or
+`Content-Type` as evidence of identity. It applies during adoption and
+reconciliation and when restoring a missing cached index. Cached-file recovery
+uses only the selected snapshot's already verified content hashes and sizes,
+even if the upstream has since changed. An undeclared sibling, unsupported
+codec, bad checksum, or failed reconstruction retains the original failure.
+`index_reconstructed` logs successful recovery at INFO;
+`index_reconstruction_failed` records failed fallback attempts at DEBUG.
 
 ### Upgrading an existing cache
 

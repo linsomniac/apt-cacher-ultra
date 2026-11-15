@@ -161,6 +161,12 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   unchanged packages on every snapshot update. Missing or corrupt content is
   fetched and verified; concurrent prefetches of one hash avoid duplicate downloads.
 
+- After 1.1.0-rc1: recover uncompressed `Packages`/`Sources` indexes when a
+  repository serves the wrong representation (Raspberry Pi's Apache content
+  negotiation in #32). Reconstruct from a declared gzip/xz sibling, verifying
+  both representations' sizes and hashes with bounded decompression. Adoption,
+  reconciliation and missing-blob recovery retain the selected snapshot's
+  contents; compressed bytes are never served under the plain index's hash.
 - Serve snapshot-consistent `Release` and `Release.gpg` files for repositories
   adopted from `InRelease`. Debian installer mirror checks now work with existing
   inline snapshots, including offline, without clearing the cache or re-adopting.

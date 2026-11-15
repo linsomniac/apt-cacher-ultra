@@ -1842,7 +1842,7 @@ func (h *Handler) serveSnapshotMemberMiss(
 	return true, cw.statusCode(), cw.bytes
 }
 
-// runSnapshotMemberFetch is the singleflight body for SPEC2 §6.2
+// fetchSnapshotMember performs the direct fetch for SPEC2 §6.2
 // metadata recovery. Fetches the upstream URL into a temp blob,
 // finalizes into pool/, and verifies the resulting hash against
 // mem.DeclaredSHA256. On mismatch the file is discarded and
@@ -1856,10 +1856,9 @@ func (h *Handler) serveSnapshotMemberMiss(
 //
 // blob row is upserted (PutBlob is INSERT OR IGNORE) so that a missing
 // blob row from any earlier abnormal teardown becomes consistent
-// again. The ContentLength comes from the fetch result so the row's
-// size column is accurate even if the original adoption row predates
-// any size schema change.
-func (h *Handler) runSnapshotMemberFetch(ctx context.Context, req *proxy.Request, mem *cache.SnapshotMember, snapshotID int64) sfResult {
+// again. The size comes from the bytes written, including for chunked
+// responses whose Content-Length is unknown.
+func (h *Handler) fetchSnapshotMember(ctx context.Context, req *proxy.Request, mem *cache.SnapshotMember, snapshotID int64, maxBytes int64) sfResult {
 	release, err := h.sem.Acquire(ctx, req.CanonicalHost)
 	if err != nil {
 		return sfResult{err: fmt.Errorf("handler: acquire host slot: %w", err)}
@@ -1871,7 +1870,7 @@ func (h *Handler) runSnapshotMemberFetch(ctx context.Context, req *proxy.Request
 		return sfResult{err: fmt.Errorf("handler: open temp blob: %w", err)}
 	}
 
-	target := &fetch.Target{CanonicalHost: req.CanonicalHost, URL: req.UpstreamURL}
+	target := &fetch.Target{CanonicalHost: req.CanonicalHost, URL: req.UpstreamURL, MaxBytes: maxBytes}
 	fres, ferr := h.fetch.Fetch(fetch.WithPurpose(ctx, "client"), target, bw)
 	if ferr != nil {
 		_ = bw.Abort()
@@ -1907,15 +1906,16 @@ func (h *Handler) runSnapshotMemberFetch(ctx context.Context, req *proxy.Request
 		return sfResult{err: fmt.Errorf("handler: finalize blob: %w", err), status: fres.UpstreamStatus()}
 	}
 
+	size := bw.Written()
 	dbCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if err := h.cache.PutBlob(dbCtx, hash, fres.ContentLength); err != nil {
+	if err := h.cache.PutBlob(dbCtx, hash, size); err != nil {
 		return sfResult{err: fmt.Errorf("handler: put blob row: %w", err), status: fres.UpstreamStatus()}
 	}
 	if err := h.cache.PutRepresentation(dbCtx, req.CanonicalScheme, req.CanonicalHost, req.Path, hash, fres.LastModified); err != nil {
 		return sfResult{err: fmt.Errorf("handler: store response metadata: %w", err), status: fres.UpstreamStatus()}
 	}
-	return sfResult{blobHash: hash, size: fres.ContentLength, status: fres.UpstreamStatus(), lastModified: fres.LastModified}
+	return sfResult{blobHash: hash, size: size, status: fres.UpstreamStatus(), lastModified: fres.LastModified}
 }
 
 // respondRecoveryError handles fetch errors from a SPEC2 §6.2 metadata

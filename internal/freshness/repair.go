@@ -86,7 +86,7 @@ func (a *Adopter) RepairSkippedMembers(ctx context.Context, suite SuiteRef, snap
 		// costs one extra 404 per attempt; the by-hash URL is the very
 		// reason this repair can succeed while the canonical path is
 		// still serving the previous generation.
-		blobHash, ferr := a.adoptMember(ctx, suite, m, true)
+		blobHash, ferr := a.adoptMemberFromRelease(ctx, suite, m, true, decl)
 		if ferr != nil {
 			adoptionMemberRepairsTotal.Inc("failure")
 			a.logger.Warn("adoption_member_repair_failed",
