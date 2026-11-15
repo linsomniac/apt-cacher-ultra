@@ -26,8 +26,8 @@ func TestAdoptMember_ReusedBlobSHA512MismatchLogsTheFullDigests(t *testing.T) {
 		t.Fatal(err)
 	}
 	declared := strings.Repeat("ab", 64)
-	_, err := r.ad.adoptMember(ctx, r.suite, ReleaseMember{Path: "main/binary-amd64/Packages", SHA256: shaOf(body),
-		SHA512: declared, Size: int64(len(body))}, false)
+	_, _, err := r.ad.adoptMember(ctx, r.suite, ReleaseMember{Path: "main/binary-amd64/Packages", SHA256: shaOf(body),
+		SHA512: declared, Size: int64(len(body))}, probePath)
 	if !errors.Is(err, ErrAdoptionMemberMismatch) {
 		t.Fatalf("adoptMember = %v, want ErrAdoptionMemberMismatch", err)
 	}

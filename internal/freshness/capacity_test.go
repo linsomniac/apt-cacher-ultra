@@ -588,11 +588,12 @@ func (f *cancelAfterFetcher) Fetch(ctx context.Context, target *fetch.Target, ds
 	return res, err
 }
 
-// The final review's R2 I-2: the member loop itself stops once its context
+// The final review's R2 I-2: the member pipeline stops once its context
 // has ended. Here the shutdown arrives as a member's fetch ends in a 404,
-// a skip that writes nothing and so returns no error: no later member is
-// filtered (WARN adoption_member_skipped, arch_not_in_allowlist), fetched
-// or skipped, and nothing commits.
+// a skip that writes nothing and so returns no error: no member is skipped
+// for a fetch the context cut short, and nothing commits. The architecture
+// filter runs before any fetch (the pipeline's first pass), so its WARN
+// for the arm64 index precedes the shutdown and is no part of it.
 func TestAdoption_EndedContextStopsTheMemberLoop(t *testing.T) {
 	env := newAdoptionTestEnv(t)
 	base := "http://archive.ubuntu.com/ubuntu/dists/noble/"
@@ -621,7 +622,7 @@ func TestAdoption_EndedContextStopsTheMemberLoop(t *testing.T) {
 		t.Fatalf("runShared = %v, want the shutdown (context.Canceled)", err)
 	}
 	for _, rec := range logRecords(t, logs, "adoption_member_skipped") {
-		if rec["path"] != "main/i18n/Translation-de" {
+		if rec["path"] != "main/i18n/Translation-de" && rec["reason"] != "arch_not_in_allowlist" {
 			t.Errorf("adoption_member_skipped %v after the context ended, want only the 404 that ended with it", rec)
 		}
 	}

@@ -93,8 +93,8 @@ func TestHotPrefetchConcurrentSuitesDownloadContentOnce(t *testing.T) {
 	for o := range outcomes {
 		counts[o]++
 	}
-	if f.fetcher.calls != 1 || counts[hotFetchOK] != 1 || counts[hotFetchReused] != 7 || f.adopter.hotBlobs.HostCount() != 0 {
-		t.Fatalf("calls=%d outcomes=%v locks=%d", f.fetcher.calls, counts, f.adopter.hotBlobs.HostCount())
+	if f.fetcher.calls != 1 || counts[hotFetchOK] != 1 || counts[hotFetchReused] != 7 || f.adopter.blobLocks.HostCount() != 0 {
+		t.Fatalf("calls=%d outcomes=%v locks=%d", f.fetcher.calls, counts, f.adopter.blobLocks.HostCount())
 	}
 }
 

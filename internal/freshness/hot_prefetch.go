@@ -95,6 +95,17 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 	if stats.hotCount == 0 {
 		return nil, stats
 	}
+	// stats is assigned, not returned directly: the deferred update of the
+	// attempt's record above reads it.
+	var rows []cache.PrefetchedURLPath
+	rows, stats = a.prefetchHotSet(adoptionCtx, suite, snapshotID, hotSet, tracker)
+	return rows, stats
+}
+
+// prefetchHotSet is the SPEC3 §7.5 step 10 loop over a computed hot set.
+func (a *Adopter) prefetchHotSet(adoptionCtx context.Context, suite SuiteRef, snapshotID int64,
+	hotSet []hotSetEntry, tracker *blobHeartbeatTracker) ([]cache.PrefetchedURLPath, hotPrefetchStats) {
+	stats := hotPrefetchStats{hotCount: len(hotSet)}
 
 	// Set up the prefetch context. SPEC3 §7.5 step 10: prefetchCtx is
 	// derived from adoptionCtx — a parent SIGTERM/lifecycle cancel
@@ -103,51 +114,51 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 	// flip itself (runShared Step 11) runs under its own commit context
 	// (WithoutCancel + commitTimeout, spec C4); a shutdown before it
 	// starts skips it.
-	prefetchCtx := adoptionCtx
-	prefetchCancel := func() {}
+	var (
+		prefetchCtx    context.Context
+		prefetchCancel context.CancelFunc
+	)
 	if a.hotPrefetchBudget > 0 {
 		prefetchCtx, prefetchCancel = context.WithTimeout(adoptionCtx, a.hotPrefetchBudget)
+	} else {
+		prefetchCtx, prefetchCancel = context.WithCancel(adoptionCtx)
 	}
 	defer prefetchCancel()
 
-	prefetched := make([]cache.PrefetchedURLPath, 0, stats.hotCount)
-
-	for i, entry := range hotSet {
-		// Top-of-iteration cancellation check. SPEC3 §7.5 step 10 routes
-		// "deb in flight when budget fires" through fetchHotDeb's failed
-		// bucket (it emits hot_prefetch_deb_failed for that path), so the
-		// only case that lands here is "a deadline already passed and we
-		// haven't even started entry i yet" — entry i and everything
-		// after it are unattempted. That's the §10.2 partial contract:
-		// missing = paths NOT YET ATTEMPTED at cancellation. The deadline
-		// (DeadlineExceeded) is hot_prefetch_budget's or the adoption
-		// context's own, adoption.max_duration: either is logged as
-		// adoption_hot_prefetch_partial, and the adoption goes on to its
-		// commit, which runs under its own bound (WithoutCancel +
-		// commitTimeout, spec C4).
-		//
-		// Parent adoptionCtx cancellation (Canceled, not DeadlineExceeded)
-		// is a shutdown (Phase 2 §9.5): end the loop silently. runShared's
-		// stopErr check before the flip barrier catches the shutdown and
-		// abandons the attempt, so nothing commits (the final review's
-		// R2 #3: the commit no longer fails under the cancelled context).
-		if err := prefetchCtx.Err(); err != nil {
-			stats.unattempted = stats.hotCount - i
-			if errors.Is(err, context.DeadlineExceeded) {
-				missing := make([]string, 0, stats.unattempted)
-				for _, e := range hotSet[i:] {
-					missing = append(missing, e.path)
-				}
-				a.adoptionLogger(adoptionCtx).Warn("adoption_hot_prefetch_partial",
-					"canonical_host", suite.CanonicalHost,
-					"suite_path", suite.SuitePath,
-					"snapshot_id", snapshotID,
-					"missing", missing,
-				)
-				hotPrefetchTotal.Inc("partial", suite.CanonicalHost)
-			}
-			break
+	// Each package is fetched by one of hotPrefetchWorkers workers, in
+	// the hot set's order of dispatch.
+	//
+	// AIDEV-NOTE: the prefetch runs before the new release is published,
+	// so its duration is time clients keep seeing the old one; packages
+	// used to be warmed one after another (the 2026-11-14
+	// publication-delay review). The fetches share the per-host limit
+	// with members and client downloads (fetchHotDeb takes a slot each).
+	//
+	// SPEC3 §7.5 step 10 / §10.2 contract, unchanged in substance:
+	//   - a package in flight when a deadline passes — hot_prefetch_budget
+	//     or the adoption context's own, adoption.max_duration — is
+	//     attempted: fetchHotDeb logs hot_prefetch_deb_failed and it
+	//     counts as failed;
+	//   - a package not started by then (or cancelled before its fetch
+	//     began: hotFetchCancelled) is unattempted, and the unattempted
+	//     paths are logged once, in hot-set order, as
+	//     adoption_hot_prefetch_partial — on a deadline only. A parent
+	//     shutdown (Canceled) ends the prefetch silently; runShared's
+	//     stopErr check before the flip barrier then abandons the attempt,
+	//     so nothing commits;
+	//   - the adoption goes on to its commit either way, under its own
+	//     bound (WithoutCancel + commitTimeout, spec C4).
+	type hotResult struct {
+		outcome   hotFetchOutcome
+		hash      string
+		attempted bool
+	}
+	results := make([]hotResult, len(hotSet))
+	forEachConcurrently(hotPrefetchWorkers, len(hotSet), prefetchCancel, func(i int) bool {
+		if prefetchCtx.Err() != nil {
+			return false // entry i and everything after it stay unattempted
 		}
+		entry := hotSet[i]
 		// Track the expected hash before local verification, which can take
 		// longer than the blob grace on slow disks. The periodic heartbeat
 		// protects reused, unreferenced content until the atomic URL commit.
@@ -155,28 +166,41 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 		if tracker != nil {
 			tracker.Add(entry.declaredSHA256)
 		}
-		blobHash, outcome := a.fetchHotDeb(prefetchCtx, suite, entry, snapshotID)
+		hash, outcome := a.fetchHotDeb(prefetchCtx, suite, entry, snapshotID)
 		// SPEC4 §7.5.2 site 4: heartbeat after every per-deb fetch
 		// terminates (success, failure, mismatch, or cancel). Uses
 		// adoptionCtx, not prefetchCtx, so a budget-elapsed
 		// prefetchCtx doesn't suppress the heartbeat — adoption is
 		// still alive even if the budget tripped. fetchHotDeb's
-		// per-deb fetches can each consume upstream.total_timeout ×
-		// max_retries; without this site the gap between the last
-		// member-fetch heartbeat (post-runHotPrefetch entry) and
-		// the next heartbeat (site 5 pre-CommitAdoption) could be
-		// hot_count × that budget under pathological upstreams.
+		// per-deb fetches can each consume upstream.total_timeout;
+		// without this site the gap between the last member-fetch
+		// heartbeat and the next one (site 5 pre-CommitAdoption) could
+		// be the whole prefetch under pathological upstreams.
 		a.heartbeat(adoptionCtx, suite.CanonicalHost, snapshotID, tracker)
-		switch outcome {
+		// Each worker writes its own index: no two share an element.
+		results[i] = hotResult{outcome: outcome, hash: hash, attempted: outcome != hotFetchCancelled}
+		return outcome != hotFetchCancelled
+	})
+
+	prefetched := make([]cache.PrefetchedURLPath, 0, stats.hotCount)
+	var missing []string
+	for i, r := range results {
+		entry := hotSet[i]
+		if !r.attempted {
+			stats.unattempted++
+			missing = append(missing, entry.path)
+			continue
+		}
+		switch r.outcome {
 		case hotFetchOK, hotFetchReused:
 			prefetched = append(prefetched, cache.PrefetchedURLPath{
 				CanonicalScheme: suite.CanonicalScheme,
 				CanonicalHost:   suite.CanonicalHost,
 				Path:            entry.path,
-				BlobHash:        blobHash,
+				BlobHash:        r.hash,
 				UpstreamURL:     entry.upstreamURL,
 			})
-			if outcome == hotFetchReused {
+			if r.outcome == hotFetchReused {
 				stats.reused++
 			} else {
 				stats.fetched++
@@ -192,34 +216,16 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 		case hotFetchMismatch:
 			stats.mismatched++
 			hotPrefetchTotal.Inc("hash_mismatch", suite.CanonicalHost)
-		case hotFetchCancelled:
-			// fetchHotDeb returns hotFetchCancelled in two narrow
-			// cases: parent adoptionCtx cancelled (Canceled) or
-			// hostSem.Acquire raced with a deadline firing — the
-			// budget's or adoption.max_duration's (DeadlineExceeded
-			// before any fetch was initiated).
-			// SPEC3 §10.2: adoption_hot_prefetch_partial fires ONLY on
-			// a deadline — hot_prefetch_budget or adoption.max_duration —
-			// but here entry i was never actually fetched, so partial
-			// includes it (hotSet[i:]). A parent shutdown ends the loop
-			// silently; runShared's stopErr check before the flip
-			// barrier abandons the attempt (the final review's R2 #3).
-			stats.unattempted = stats.hotCount - i
-			if errors.Is(prefetchCtx.Err(), context.DeadlineExceeded) {
-				missing := make([]string, 0, stats.unattempted)
-				for _, e := range hotSet[i:] {
-					missing = append(missing, e.path)
-				}
-				a.adoptionLogger(adoptionCtx).Warn("adoption_hot_prefetch_partial",
-					"canonical_host", suite.CanonicalHost,
-					"suite_path", suite.SuitePath,
-					"snapshot_id", snapshotID,
-					"missing", missing,
-				)
-				hotPrefetchTotal.Inc("partial", suite.CanonicalHost)
-			}
-			return prefetched, stats
 		}
+	}
+	if len(missing) > 0 && errors.Is(prefetchCtx.Err(), context.DeadlineExceeded) {
+		a.adoptionLogger(adoptionCtx).Warn("adoption_hot_prefetch_partial",
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+			"snapshot_id", snapshotID,
+			"missing", missing,
+		)
+		hotPrefetchTotal.Inc("partial", suite.CanonicalHost)
 	}
 	return prefetched, stats
 }
@@ -252,7 +258,7 @@ const (
 //     the rest of the warm.
 func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 	entry hotSetEntry, snapshotID int64) (string, hotFetchOutcome) {
-	unlock, err := a.hotBlobs.Acquire(ctx, entry.declaredSHA256)
+	unlock, err := a.blobLocks.Acquire(ctx, entry.declaredSHA256)
 	if err != nil {
 		return "", hotFetchCancelled
 	}

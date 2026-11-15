@@ -624,9 +624,21 @@ type Adopter struct {
 	fetcher  AdoptionFetcher
 	verifier Verifier
 	hostSem  *hostsem.Sem
-	// Serialize prefetches of identical content across concurrent suites.
-	// Entries disappear when the last holder/waiter leaves.
-	hotBlobs *hostsem.Sem
+	// blobLocks serializes the fetch of identical content, keyed by its
+	// declared hash: a hot package's prefetch across concurrent suites, and
+	// a Release member's fetch across suites and across the workers of one
+	// adoption (members that declare the same bytes under several paths are
+	// downloaded once; the others reuse the pool blob). Entries disappear
+	// when the last holder/waiter leaves.
+	//
+	// AIDEV-NOTE: lock order is blobLocks, then hostSem, never the reverse,
+	// and never two blobLocks at once (index recovery fetches the sibling
+	// after the plain member's lock is released).
+	blobLocks *hostsem.Sem
+
+	// memberWorkers is how many members one adoption fetches at once
+	// (memberFetchWorkers; tests may lower it).
+	memberWorkers int
 
 	// signers is verifier as a SignerVerifier, nil when it is not one: the
 	// signer downgrade guard (signer_guard.go) then stands down.
@@ -827,7 +839,8 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		verifier:                cfg.Verifier,
 		signers:                 signers,
 		hostSem:                 cfg.HostLimiter,
-		hotBlobs:                hostsem.New(1),
+		blobLocks:               hostsem.New(1),
+		memberWorkers:           memberFetchWorkers,
 		maxConcurrent:           cfg.MaxConcurrent,
 		maxDuration:             maxDur,
 		flipGate:                cfg.FlipGate,
@@ -1483,11 +1496,11 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	attempt.nextPhase("members")
 	attempt.memberCount = len(members)
 
-	// Step 5: prefetch declared members sequentially. Each member's
-	// declared_sha256 is the trust anchor — bytes that arrive from
-	// upstream are accepted only if their fresh hash matches.
+	// Step 5: prefetch the declared members (member_pipeline.go). Each
+	// member's declared_sha256 is the trust anchor — bytes that arrive
+	// from upstream are accepted only if their fresh hash matches.
 	//
-	// SPEC4 §7.5.2 site 2: heartbeat after each adoptMember return.
+	// SPEC4 §7.5.2 site 2: heartbeat after each member that verifies.
 	// Member fetches against degraded upstreams can take minutes;
 	// without this site the gap from row creation to the next
 	// in-runShared heartbeat (site 3 after Packages parsing)
@@ -1529,19 +1542,21 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		requiredGroupFetched = make(map[string]bool)
 	}
 	declaredMembers := memberDeclarations(members)
+	// A member the suite's current snapshot does not serve was not served
+	// at the last adoption: almost always a file the Release declares and
+	// upstream never serves. memberProbeFor asks for such a member at its
+	// declared path first, so that it costs one request, not two.
+	servedBefore := a.priorMemberPaths(ctx, suite, prior)
+
+	// Pass 1, in declared order: the architecture filter and the
+	// required-architecture bookkeeping. Nothing is fetched yet. A context
+	// that has already ended ends the pipeline before any member is
+	// filtered or fetched (see the AIDEV-NOTE below pass 2).
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: member pipeline: %w", ErrAdoptionMemberFetchFailed, err)
+	}
+	jobs := make([]*memberJob, 0, len(members))
 	for _, m := range members {
-		// AIDEV-NOTE: the final review's R2 I-2. An ended context —
-		// adoption.max_duration or shutdown — ends the pipeline here, and
-		// the tolerance below never takes a fetch it cut short for an
-		// optional member's integrity failure. Otherwise every remaining
-		// optional member was skipped (a WARN adoption_member_skipped and a
-		// repair record each) and, the commit running under WithoutCancel,
-		// a deadline committed a degraded snapshot as a success. The error
-		// carries the context's: spawnAdoption makes a deadline timed_out
-		// and a shutdown adoption_abandoned_at_shutdown.
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("%w: member pipeline: %w", ErrAdoptionMemberFetchFailed, err)
-		}
 		// SPEC6_5 §7.2: per-arch / per-source index filter. Inert when
 		// the allowlist is empty (Phase 6 default). Skipped members never
 		// reach upstream — saves bandwidth and pool disk on caches whose
@@ -1579,10 +1594,46 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 				}
 			}
 		}
+		jobs = append(jobs, &memberJob{
+			m:             m,
+			requiredGroup: requiredGroup,
+			probe:         a.memberProbeFor(suite, m, acquireByHash, servedBefore),
+		})
+	}
 
-		reusedBefore := attempt.membersReused
-		blobHash, err := a.adoptMemberWithRetry(ctx, suite, m, acquireByHash, declaredMembers)
-		if err != nil {
+	// Pass 2: the upstream work — every member, memberFetchWorkers at a
+	// time, then the SPEC6_7 §1 retry rounds for the members whose failure
+	// may heal (fetchMembers). SPEC4 §7.5.2 site 2: each member that
+	// verifies is added to the tracker and followed by a heartbeat, there.
+	fetchErr := a.fetchMembers(ctx, suite, snapshotID, jobs, declaredMembers, tracker)
+	// AIDEV-NOTE: the final review's R2 I-2. An ended context —
+	// adoption.max_duration or shutdown — ends the pipeline here, before
+	// any member's result is read: the tolerance below never takes a fetch
+	// the context cut short for an optional member's integrity failure.
+	// Otherwise every unfinished optional member was skipped (a WARN
+	// adoption_member_skipped and a repair record each) and, the commit
+	// running under WithoutCancel, a deadline committed a degraded
+	// snapshot as a success. The error carries the context's:
+	// spawnAdoption makes a deadline timed_out and a shutdown
+	// adoption_abandoned_at_shutdown. It is checked before fetchErr: with
+	// several members in flight when the context ends, one of them may
+	// report its cut-short cache write as a local fault, and the
+	// context's end is what ended the attempt.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: member pipeline: %w", ErrAdoptionMemberFetchFailed, err)
+	}
+	if fetchErr != nil {
+		return fetchErr // already wrapped with category
+	}
+
+	// Pass 3, in declared order: each member's result.
+	for _, job := range jobs {
+		m := job.m
+		if job.attempts == 0 {
+			// Never: fetchMembers attempts every job or returns an error.
+			return fmt.Errorf("%w: member pipeline: %s was not attempted", ErrAdoptionMemberFetchFailed, m.Path)
+		}
+		if err := job.err; err != nil {
 			if errors.Is(err, errAdoptionMemberSkipped) {
 				skippedCount++
 				attempt.membersSkipped++
@@ -1602,7 +1653,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			// IndexTarget members stay fatal regardless (isIndexTarget),
 			// and a local DB fault (ErrAdoptionDBFailed) is never
 			// tolerated — only upstream member fetch/mismatch failures, and
-			// never once ctx has ended (the AIDEV-NOTE above the loop).
+			// never once ctx has ended (the AIDEV-NOTE above this pass).
 			if a.tolerateOptionalMembers && ctx.Err() == nil && !isIndexTarget(suite.SuitePath, m.Path) &&
 				(errors.Is(err, ErrAdoptionMemberFetchFailed) || errors.Is(err, ErrAdoptionMemberMismatch)) {
 				detail := ""
@@ -1640,6 +1691,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			}
 			return err // already wrapped with category
 		}
+		blobHash := job.hash
 		memberRows = append(memberRows, cache.SnapshotMember{
 			SnapshotID:     snapshotID,
 			Path:           m.Path,
@@ -1648,15 +1700,15 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		})
 		pendingAliases = append(pendingAliases, aliasRows(snapshotID, m, blobHash)...)
 		attempt.membersReady++
-		if attempt.membersReused == reusedBefore {
+		if job.reused {
+			attempt.membersReused++
+		} else {
 			attempt.membersDownloaded++
 		}
 		fetchedMembers = append(fetchedMembers, verifiedMember(m, blobHash))
-		if requiredGroup != "" {
-			requiredGroupFetched[requiredGroup] = true
+		if job.requiredGroup != "" {
+			requiredGroupFetched[job.requiredGroup] = true
 		}
-		tracker.Add(blobHash)
-		a.heartbeat(ctx, suite.CanonicalHost, snapshotID, tracker)
 	}
 	fetchedCount := len(fetchedMembers)
 
@@ -2122,69 +2174,16 @@ func formName(f adoptionForm) string {
 	}
 }
 
-// adoptMemberWithRetry wraps adoptMember in the SPEC6_7 §1 retry loop.
-// Only integrity/availability failures (ErrAdoptionMemberFetchFailed /
-// ErrAdoptionMemberMismatch) are retried — the signature of a
-// round-robin mirror serving the previous publication generation
-// mid-sync, which heals within the retry window. Each fresh attempt
-// re-runs the full adoptMember sequence: pool-reuse check, by-hash
-// probe (the URL immune to the revision race — this is the expected
-// heal path), then the canonical fetch.
-//
-// Never retried:
-//   - errAdoptionMemberSkipped (404/410): "declared but does not
-//     serve" is a permanent publication artifact; retrying would burn
-//     the delay budget on guaranteed failures (~160 such members per
-//     Ubuntu suite).
-//   - ErrAdoptionDBFailed: local fault, not an upstream race.
-//   - any error once ctx is cancelled: shutdown path.
-//
-// The sleep happens with NO host-semaphore slot held — adoptMember
-// acquires and releases per attempt — so a member in backoff never
-// starves other fetches to the same host.
-func (a *Adopter) adoptMemberWithRetry(ctx context.Context, suite SuiteRef, m ReleaseMember, acquireByHash bool, declared map[string]ReleaseMember) (string, error) {
-	blobHash, err := a.adoptMemberFromRelease(ctx, suite, m, acquireByHash, declared)
-	if err == nil || a.memberRetryCount == 0 {
-		return blobHash, err
-	}
-	retried := false
-	for attempt := 1; attempt <= a.memberRetryCount; attempt++ {
-		if ctx.Err() != nil {
-			break
-		}
-		if !errors.Is(err, ErrAdoptionMemberFetchFailed) && !errors.Is(err, ErrAdoptionMemberMismatch) {
-			break
-		}
-		a.adoptionLogger(ctx).Info("adoption_member_retry",
-			"canonical_host", suite.CanonicalHost,
-			"suite_path", suite.SuitePath,
-			"path", m.Path,
-			"attempt", attempt,
-			"max_retries", a.memberRetryCount,
-			"delay", a.memberRetryDelay.String(),
-			"err", err,
-		)
-		if serr := a.retrySleep(ctx, a.memberRetryDelay); serr != nil {
-			break
-		}
-		retried = true
-		blobHash, err = a.adoptMemberFromRelease(ctx, suite, m, acquireByHash, declared)
-		if err == nil {
-			adoptionMemberRetriesTotal.Inc("success")
-			return blobHash, nil
-		}
-	}
-	if retried {
-		adoptionMemberRetriesTotal.Inc("exhausted")
-	}
-	return blobHash, err
-}
-
 // adoptMember handles step 5 for one declared member: try pool reuse
-// (with rehash defense), else fetch from upstream. Returns the blob
-// hash on success: the SHA-256 of bytes that matched every hash m
-// declares (spec C5) — m.SHA256 itself when it is declared, the derived
-// SHA-256 for a SHA512-only member (verifyMember).
+// (with rehash defense), else fetch from upstream, where probe says
+// (memberProbe). Returns the blob hash on success: the SHA-256 of bytes
+// that matched every hash m declares (spec C5) — m.SHA256 itself when it
+// is declared, the derived SHA-256 for a SHA512-only member
+// (verifyMember) — and whether the bytes were already in the pool
+// (reused: nothing was downloaded).
+//
+// One member of a given content is in here at a time (blobLocks, keyed by
+// the declared hash): a member that waited finds the bytes in the pool.
 //
 // AIDEV-NOTE: a SHA512-only member is never reused from the pool without
 // a fetch (its SHA-256 is not known before the fetch): it is fetched at
@@ -2195,13 +2194,22 @@ func (a *Adopter) adoptMemberWithRetry(ctx context.Context, suite SuiteRef, m Re
 // rehashPooled hook, rehashPooledBlob), and a corrupt one is logged
 // (pool_corruption_during_adoption), counted and evicted, so the verified
 // bytes replace it (review fix round 1, Task 2).
-func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMember, acquireByHash bool) (string, error) {
+func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMember, probe memberProbe) (hash string, reused bool, err error) {
+	if key := memberLockKey(m); key != "" {
+		unlock, lerr := a.blobLocks.Acquire(ctx, key)
+		if lerr != nil {
+			// The context ended while another fetch of the same bytes ran.
+			return "", false, fmt.Errorf("%w: wait for another fetch of %s: %v",
+				ErrAdoptionMemberFetchFailed, m.Path, lerr)
+		}
+		defer unlock()
+	}
 	exists := false
 	if m.SHA256 != "" {
 		var err error
 		exists, err = a.cache.BlobExists(m.SHA256)
 		if err != nil {
-			return "", fmt.Errorf("%w: BlobExists %s: %v", ErrAdoptionDBFailed, m.SHA256, err)
+			return "", false, fmt.Errorf("%w: BlobExists %s: %v", ErrAdoptionDBFailed, m.SHA256, err)
 		}
 	}
 	if exists {
@@ -2221,7 +2229,7 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 			actual, actual512, err = hashFileDigests(a.cache.BlobPath(m.SHA256))
 		}
 		if err != nil {
-			return "", fmt.Errorf("%w: rehash %s: %v", ErrAdoptionDBFailed, m.SHA256, err)
+			return "", false, fmt.Errorf("%w: rehash %s: %v", ErrAdoptionDBFailed, m.SHA256, err)
 		}
 		if actual == m.SHA256 && m.SHA512 != "" && actual512 != m.SHA512 {
 			// The pool bytes are exactly the declared SHA-256, so their
@@ -2236,7 +2244,7 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 				"declared_sha512", m.SHA512,
 				"actual_sha512", actual512,
 			)
-			return "", newMemberErr(ErrAdoptionMemberMismatch, m.Path,
+			return "", false, newMemberErr(ErrAdoptionMemberMismatch, m.Path,
 				fmt.Sprintf("declared SHA512 %s, got %s", shortHash(m.SHA512), shortHash(actual512)))
 		}
 		if actual == m.SHA256 {
@@ -2244,12 +2252,9 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 			// a stray pool file from a partial migration); PutBlob is
 			// idempotent.
 			if err := a.cache.PutBlob(ctx, m.SHA256, m.Size); err != nil {
-				return "", fmt.Errorf("%w: PutBlob reuse %s: %v", ErrAdoptionDBFailed, m.SHA256, err)
+				return "", false, fmt.Errorf("%w: PutBlob reuse %s: %v", ErrAdoptionDBFailed, m.SHA256, err)
 			}
-			if attempt := adoptionLogFromContext(ctx); attempt != nil {
-				attempt.membersReused++
-			}
-			return m.SHA256, nil
+			return m.SHA256, true, nil
 		}
 		// Pool blob is corrupted at rest. SPEC2 §7.5 step 5: log and
 		// evict; fall through to upstream fetch.
@@ -2262,7 +2267,7 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 		)
 		integrity.IncPoolCorruptionDuringAdoption()
 		if err := os.Remove(a.cache.BlobPath(m.SHA256)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("%w: evict corrupted %s: %v", ErrAdoptionDBFailed, m.SHA256, err)
+			return "", false, fmt.Errorf("%w: evict corrupted %s: %v", ErrAdoptionDBFailed, m.SHA256, err)
 		}
 		// Don't try to delete the blob row — Phase 4 GC handles
 		// refcount=0 cleanup. The next refetch will Put-Blob through.
@@ -2272,10 +2277,10 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 	// Adoption uses the same hostsem as the request path, so a
 	// member fetch contends with cache-miss fetches for the same
 	// per-host budget.
-	release, err := a.hostSem.Acquire(ctx, suite.CanonicalHost)
-	if err != nil {
-		return "", fmt.Errorf("%w: hostsem acquire %s: %v",
-			ErrAdoptionMemberFetchFailed, suite.CanonicalHost, err)
+	release, serr := a.hostSem.Acquire(ctx, suite.CanonicalHost)
+	if serr != nil {
+		return "", false, fmt.Errorf("%w: hostsem acquire %s: %v",
+			ErrAdoptionMemberFetchFailed, suite.CanonicalHost, serr)
 	}
 	defer release()
 
@@ -2296,21 +2301,48 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 	// the hook could not evict is logged and counted once (review fix
 	// round 2, Task 2). The probe uses the strongest declared hash, as apt
 	// does (spec §3).
-	if acquireByHash && m.Path != "" {
-		if hash, ferr := a.tryByHashFetch(ctx, suite, m, byHashProbePath(m)); ferr == nil {
-			return hash, nil
-		} else if errors.Is(ferr, ErrAdoptionDBFailed) {
-			return "", ferr
-		} else {
-			a.adoptionLogger(ctx).Debug("adoption_byhash_fallback",
-				"canonical_host", suite.CanonicalHost,
-				"suite_path", suite.SuitePath,
-				"path", m.Path,
-				"err", ferr,
-			)
-		}
+	if m.Path == "" {
+		probe = probePath
 	}
-	return a.fetchMemberURL(ctx, suite, m, m.Path)
+	switch probe {
+	case probeByHashFirst:
+		h, ferr := a.tryByHashFetch(ctx, suite, m, byHashProbePath(m))
+		if ferr == nil {
+			return h, false, nil
+		}
+		if errors.Is(ferr, ErrAdoptionDBFailed) {
+			return "", false, ferr
+		}
+		a.adoptionLogger(ctx).Debug("adoption_byhash_fallback",
+			"canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath,
+			"path", m.Path,
+			"err", ferr,
+		)
+	case probePathFirst:
+		// The member was not served at the suite's last adoption
+		// (memberProbeFor): its declared path is asked first, and a 404 or
+		// 410 there ends it with one request — the by-hash probe of a file
+		// upstream never serves is the request this saves. Any other
+		// failure of that path (another generation's bytes: a mirror
+		// mid-sync) still gets the by-hash URL, which is immune to that
+		// race; when by-hash fails too, the path's own error stands.
+		h, perr := a.fetchMemberURL(ctx, suite, m, m.Path)
+		if perr == nil || errors.Is(perr, errAdoptionMemberSkipped) ||
+			errors.Is(perr, ErrAdoptionDBFailed) || ctx.Err() != nil {
+			return h, false, perr
+		}
+		h, ferr := a.tryByHashFetch(ctx, suite, m, byHashProbePath(m))
+		if ferr == nil {
+			return h, false, nil
+		}
+		if errors.Is(ferr, ErrAdoptionDBFailed) {
+			return "", false, ferr
+		}
+		return "", false, perr
+	}
+	h, err := a.fetchMemberURL(ctx, suite, m, m.Path)
+	return h, false, err
 }
 
 // memberMaxBytes is a member download's limit (fetch.Target.MaxBytes): its

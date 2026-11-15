@@ -3273,7 +3273,7 @@ func TestAdoptMember_LimitsTheDownloadToTheDeclaredSize(t *testing.T) {
 			env.fetcher.fail503(byHashURL) // the probe fails, so the plain path runs too
 			env.fetcher.put(base+m.Path, tc.body)
 
-			if _, err := env.adopter.adoptMember(context.Background(), env.suite, m, true); err != nil {
+			if _, _, err := env.adopter.adoptMember(context.Background(), env.suite, m, probeByHashFirst); err != nil {
 				t.Fatalf("adoptMember: %v", err)
 			}
 			targets := env.fetcher.fetchTargets()
@@ -3410,7 +3410,7 @@ func TestAdoptMember_AMemberLongerThanDeclaredStopsAtItsSize(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	start := time.Now()
-	_, err = ad.adoptMember(ctx, suite, m, false)
+	_, _, err = ad.adoptMember(ctx, suite, m, probePath)
 	// A bound on time, not on the upstream's bytes (ruling HD-12): with a
 	// margin of some 50 times a passing run, it fails only a cache that
 	// keeps reading the endless body until its context ends.
@@ -3526,7 +3526,7 @@ func TestAdoptMember_AByHashFileLongerThanDeclaredFallsBackToThePlainPath(t *tes
 
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			hash, err := ad.adoptMember(ctx, suite, m, true)
+			hash, _, err := ad.adoptMember(ctx, suite, m, probeByHashFirst)
 			if err != nil {
 				t.Fatalf("adoptMember: %v (requests %v), want the plain path's bytes adopted", err, requests())
 			}
@@ -3579,7 +3579,7 @@ func TestAdoptMember_APlainPathMemberShortOfItsDeclaredSizeIsRefused(t *testing.
 
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			_, err := ad.adoptMember(ctx, suite, m, false)
+			_, _, err := ad.adoptMember(ctx, suite, m, probePath)
 			if !errors.Is(err, ErrAdoptionMemberFetchFailed) {
 				t.Fatalf("adoptMember error = %v, want ErrAdoptionMemberFetchFailed: the file is %d bytes, its Release declares %d",
 					err, len(body), m.Size)

@@ -123,7 +123,7 @@ func (a *Adopter) reconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 	var rows []cache.SnapshotMember
 	healedDecl := make([]ReleaseMember, 0, len(missing))
 	for _, m := range missing {
-		blobHash, ferr := a.adoptMemberFromRelease(ctx, suite, m, true, declaredMembers)
+		blobHash, _, ferr := a.adoptMemberFromRelease(ctx, suite, m, probeByHashFirst, declaredMembers)
 		if ferr != nil {
 			a.logger.Warn("adoption_reconcile_member_failed",
 				"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath,

@@ -155,7 +155,7 @@ func TestAdopter_ReconstructionPreservesPriorSnapshot(t *testing.T) {
 				members, _ := ParseRelease(release)
 				decl := memberDeclarations(members)
 				before := len(env.fetcher.requested())
-				_, _ = env.adopter.adoptMemberFromRelease(ctx, env.suite, decl[member], false, decl)
+				_, _, _ = env.adopter.adoptMemberFromRelease(ctx, env.suite, decl[member], probePath, decl)
 				for _, u := range env.fetcher.requested()[before:] {
 					if u != base+member {
 						t.Fatalf("unexpected fallback: %s", u)
