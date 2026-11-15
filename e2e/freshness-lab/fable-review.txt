@@ -1,0 +1,122 @@
+# ACU 1.0.2 stale-InRelease incident: review
+
+**Verdict:** your interpretation holds, and the evidence is weaker than you state. The sample proves a lag of only about 87 seconds and at most 11m19s, which fits a healthy 1.0.2 as well as a stuck one. The fix that matters most is not in HEAD or the diff as far as I can see: publication still waits on hot prefetch.
+
+I worked only from the excerpts, so references are file plus function; the excerpts carry no line numbers.
+
+## 1. Check of your analysis
+
+**Confirmed from the code**
+- **Blob mtime:** `serveBlobWithHeaders` passes `st.ModTime()` to `http.ServeContent`. The blob is written at adoption step 2 (`writeBlobBytes` in `runShared`), so 14:25:07 is when ACU first wrote those bytes, not an upstream date and not the commit time.
+- **Serve first, check later:** `trySnapshotHit` serves, then calls `maybeFireFreshness`, which runs `Check` in a goroutine.
+- **Silent skips:** a failed `TryLock` in `Check` and the cooldown gate in `checkLocked` both return with no log or metric.
+- **Lock scope:** the suite mutex is handed to the adoption goroutine and covers the `concurrencySem` wait (ctx-only, no deadline), sequential members, parsing, `runHotPrefetch` and `CommitAdoption`. The repair goroutine holds it across `RepairSkippedMembers` and `ReconcileSnapshot`.
+- **No overall deadline** in `runShared`, and `tick` checks suites serially.
+
+**Corrections**
+- **Lag arithmetic:** 11m28s is measured to the direct fetch. To the cache sample (15:33:51) it is 11m19s.
+- **Lower bound:** Last-Modified is when the file was generated, not when the CDN began serving it. Age 96 only shows that edge held the new body since 15:32:24, so the lag provable from headers alone is 87 seconds.
+- **"No check logs":** this is the only evidence favouring a held lock over normal operation, and it rests on recollection. Every completed check logs at INFO (`freshness_check` or `freshness check failed`). Silence longer than one cooldown under traffic would therefore mean a held lock or a blocked check; silence within one cooldown means nothing.
+- **Mirror-mode trigger:** `X-Cache-Snapshot: 1920` is only set via `trySnapshotHit`, which then calls `maybeFireFreshness` with the same guards. So the trigger was invoked with the adopted suite key for that request, unless `h.freshness` was nil.
+
+**Ranked mechanisms**
+
+| # | Mechanism | Status |
+|---|---|---|
+| 1 | Designed latency: remaining cooldown, plus sequential all-arch members, plus hot prefetch up to its budget, plus queueing | Sufficient alone; cannot be excluded |
+| 2 | Suite lock held by a queued or stalled adoption, or by repair/reconcile | Plausible; needed only if the log silence was real and long |
+| 3 | Host-semaphore starvation: `hostSem.Acquire` in `checkLockedInline` waits on the lifecycle ctx with the suite lock held | Variant of 2; plausible during a download storm |
+| 4 | Adoption failing repeatedly, then retried only at cooldown (with traffic) or refresh | Would have logged WARN; unknowable |
+| 5 | ACU's egress saw a stale upstream (other edge, mirror, or an upstream proxy; `proxyEnabled` exists) | Would log `not_modified`; more than about 2–4 minutes is unlikely at max-age=120 |
+| 6 | False 304 from validators | I found no path where validators get ahead of the adopted bytes; needs a weak upstream ETag |
+| 7 | Trigger not firing in mirror mode | Excluded for the sampled request |
+
+Mechanism 1 has a concrete variant worth testing. If security.debian.org regenerates all its suites in one run (I believe so, but check), several suites on one host change at once and compete for the global slots (two, per your description; the excerpt doesn't show the number). A hot set is largest exactly when a popular package updates. A suite queued third could then plausibly reach 9–11 minutes with no fault. The Ubuntu reports also point to something global rather than one stuck suite.
+
+## 2. Latent bugs and missing pathways (1.0.2)
+
+1. **Triggers are dropped, not remembered.** A T1 that loses `TryLock` or hits cooldown leaves no pending state, and nothing re-checks when an adoption finishes. A quiet suite's first requester always gets stale data when upstream has changed.
+2. **Unbounded waits under the suite lock.** `hostSem.Acquire` in checks and the `concurrencySem` wait in `runShared` have no deadline. `totalTimeout == 0` disables the timeout in `Conditional`, and a zero hot-prefetch budget disables that bound too.
+3. **Head-of-line blocking in `tick`.** A blocked host-slot wait or slow conditional GET for one suite stalls T2 for every suite and host behind it. T1 covers suites with traffic, so this alone does not explain the incident.
+4. **`LastSuccessAt` is bumped on "changed" before adoption runs.** After a failed adoption, T2 skips the suite for a full refresh, and the stale-suite gauge in `tick` never fires for a suite stuck in a detect-then-fail loop.
+5. **`InReleaseChangeSeenAt` is overwritten on every "changed" check.** It records the latest observation, not the first, so any pending-change age derived from it resets on each retry.
+6. **Repair/reconcile runs after every confirmed-unchanged check.** On a degraded snapshot it does network work under the lock, with no deadline visible, and blocks detection of a new InRelease.
+7. **By-hash across a flip (inference).** `trySnapshotHit` looks up only the current snapshot and 404s anything else. A client holding the old InRelease that requests an old by-hash index after the flip gets 404. I believe apt then falls back to the canonical path and fails with a hash mismatch. This matters more if flips get faster.
+8. **Validators.** The shape is safe: they change only on a byte-identical 200 or travel with the adoption request. Confirm that `CommitAdoption` copies them into `suite_freshness`; if it does not, the cost is only repeated 200s.
+9. **Rollback protection is not visible.** The already-adopted natural-key check blocks re-adopting old bytes, but not an older validly signed InRelease that ACU never adopted. Confirm the verifier enforces a monotonic `Date` and `Valid-Until`.
+10. **Client revalidation is ignored.** The excerpted hit path never looks at the client's `Cache-Control`, and I believe apt sends `max-age=0` on index requests.
+11. **Suite key includes scheme.** Verify that mirror-mode and proxy-mode clients canonicalise to one scheme; otherwise the same suite gets two locks, two snapshots and two adoption slots.
+
+## 3. Reproduction scenarios and pitfalls
+
+**Scenarios, most decisive first**
+1. **Same-host burst at default settings.** Three or more suites on one host publish together, with realistic member counts and a hot set. Record per-suite publication latency. This tests mechanism 1 directly.
+2. **Stalled hot .deb.** Publication should land at detection plus budget, with `adoption_hot_prefetch_started` followed by silence.
+3. **Publish v3 during a stalled v2 adoption.** The origin access log should show zero conditional GETs for that suite despite client requests. This is the decisive lock-suppression proof.
+4. **Global queue.** Stall two adoptions, then change a third suite. You should see "changed" logged, then nothing, with the lock held while queued.
+5. **Host-slot saturation.** Fill the per-host limit with slow cache-miss downloads, publish v2, and watch checks block silently and T2 stall for other hosts.
+6. **Failure loop.** Publish InRelease before its members exist. Measure retry cadence with and without traffic and confirm the stale gauge stays quiet.
+7. **First requester.** After a quiet period longer than cooldown, publish and run a single `apt-get update`.
+8. **Validator matrix.** Honest ETag and Last-Modified; always-200; a size-only ETag with a same-length republish (the incident bodies had equal length); a caching front with max-age=120.
+9. **Flip coherence.** Fetch InRelease, force a flip, then fetch the old by-hash index.
+
+**Pitfalls**
+- **Observer effect:** every probe through the cache fires T1. For T2-only runs, observe through the origin access log.
+- **Ground truth:** use the signed `Date:` field inside InRelease, body digests and snapshot IDs. Do not use HTTP dates or length.
+- **Client realism:** wget is not apt. Keep `/var/lib/apt/lists` for some runs so If-Modified-Since is exercised against blob mtimes.
+- **Hot set:** it only exists if the package was requested through the cache inside the hot window.
+- **Stall shape:** before headers, mid-body and blackhole hit different timeouts. Record `total_timeout` and retry settings.
+- **Acceleration:** timestamps are whole Unix seconds and the tick floor is 5 seconds, so keep cooldown at 10 seconds or more. Scale budget, timeouts and GC grace together.
+- **Lab origin:** `Conditional` enforces an allowlist and deny-CIDRs, so a loopback or private origin may be refused. A non-default port risks the `reconstructAnchor` port loss. The lab key must be pinned or adoption fails GPG.
+- **Hosts:** use at least two hostnames, or host and global limits cannot be separated.
+
+**Still recoverable from the incident:** if the two bodies were saved, compare their `Date:` lines. snapshot.debian.org can show when the previous generation was published, which tells you whether ACU ingested it promptly at 14:25.
+
+## 4. Fixes
+
+**Practical, in priority order**
+1. **Stop hot prefetch blocking the flip.** Flip once members verify, or after a short pre-flip budget (10–30 seconds), and continue warming afterwards. Offer a `before_flip` mode for operators who need warm packages at flip time. Parallelise the warm within the host limit.
+2. **Bound everything under the suite lock.** Add an overall adoption deadline, deadlines on slot waits in checks, and a deadline on repair/reconcile. Add a watchdog WARN naming the phase when a lock is held too long.
+3. **Make silence impossible.** Add skip counters by reason, one INFO line per adoption with phase durations, and a gauge for pending-change age from the first observation. Base the stale gauge on "confirmed current", not "upstream reachable". Serve the stored upstream Last-Modified (`inrelease_lastmod` already exists) plus a header showing the age of the last check.
+4. **Remember triggers and retry failures with backoff**, independent of client traffic.
+5. **Serve by-hash from recently superseded snapshots** of the same suite for a grace period.
+6. **Speed up members.** Reuse pool blobs by declared hash, fetch in parallel, and derive the default architecture set from observed demand.
+7. **Run scheduler checks concurrently per host**, with a per-check deadline.
+
+**Larger design changes**
+- **Bounded synchronous revalidation on InRelease.** If the last successful check is older than about 30–60 seconds, or the client sends `max-age=0`, do the conditional GET inline with a 1–2 second deadline. On change, wait a few seconds for the flip, otherwise serve stale and say so in a header. Offline behaviour stays intact.
+- **Lazy optional members.** Commit after the InRelease and requestable index targets are in; fetch Contents, dep11 and i18n on demand, validated against the signed hash. `serveSnapshotMemberMiss` already does this kind of fetch.
+- **Priority admission** by client demand and pending-change age, not just signed versus unsigned.
+
+Together these give signed metadata within seconds of detection, coherent indexes through hash pinning and by-hash retention, and warm packages shortly after the flip.
+
+## 5. HEAD and the uncommitted diff
+
+I saw only the admission code and the diff, so the rest of HEAD is inferred.
+
+**HEAD appears to fix**
+- **Queueing under the lock:** `tryAcquire` never waits, so no suite mutex is held while queued.
+- **Dropped triggers:** `item.waiting`, `pendingChange` and `bypassCooldown` suggest triggers are now remembered and retried.
+- **Panics:** `checkRecovered` converts a panicking check into a "failed" result.
+- **Dates:** `PutRepresentation` stores the origin Last-Modified per URL.
+
+**HEAD does not appear to fix**
+- **Prefetch before flip:** the diff still describes results going into "the atomic URL commit".
+- **Per-host serialisation:** the one-slot-per-host rule serialises member phases for all suites on a host. A security suite can wait behind a large suite, which matters where deb.debian.org serves both.
+- **Priority:** the reserved slot favours signed-current suites, which is nearly all of them, so it gives no priority by urgency.
+- **Not visible either way:** an overall deadline, synchronous revalidation and by-hash retention.
+
+**Uncommitted diff**
+- **What it helps:** reuse by content hash and the `hotBlobs` keyed lock remove duplicate downloads on retries and across suites that share a .deb. It does not help a first-time security .deb, so it does not address mechanism 1.
+- **Logging:** the `source` field (periodic or queued), `fetch.WithPurpose` and the per-adoption logger are the attribution this incident lacked. Confirm the request-triggered path sets a source too.
+- **Ordering risk:** `reuseHotBlob` verifies the file before `PutBlob`. If the file has no DB row, a GC sweep between the hash and `PutBlob` leaves a row for a missing file that then gets committed. Do `PutBlob` first, or re-stat afterwards.
+- **Shared blobs:** on corruption, `DiscardFinalizedBlob` deletes a file that other rows may reference. That is right if the refetch succeeds, but it leaves dangling references if the budget expires first; confirm the serve path recovers.
+- **Missing date:** a reused blob on a URL with no prior representation gets no `PutRepresentation` call; check what Last-Modified it serves.
+- **Small items:**
+  - The stats comment says five buckets but lists four.
+  - `adoption_hot_prefetch_complete` needs a `reused` field or its sum breaks.
+  - A budget expiry mid-rehash counts as unattempted, while mid-download counts as failed.
+  - A nil `a.hotBlobs` in test-built Adopters would panic.
+- **Not reviewable:** the diff depends on helpers outside the excerpt (`adoptionLogger`, `hotBlobs`, `checkOpts.source`, `WithPurpose`, `DiscardFinalizedBlob`).
+
+**Unknowable for this incident:** when the new InRelease reached ACU's egress, when snapshot 1920 was replaced, whether checks or WARNs were logged, the cooldown and semaphore values in force, and what the Ubuntu users actually saw.

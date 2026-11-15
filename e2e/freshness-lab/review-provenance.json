@@ -1,0 +1,8 @@
+{
+  "model": "claude-fable-5-2",
+  "canonical_model": "claude-fable-5-2",
+  "is_error": false,
+  "duration_ms": 415811,
+  "scope": "Fixed source excerpts from tag 1.0.2; HEAD admission code; narrowly scoped pre-existing hot-prefetch/scheduler diff; anonymized incident timing. Tool access disabled. No full-tree review.",
+  "head": "1ae10560e4219b44033ded642e4c0a4d088347ea"
+}

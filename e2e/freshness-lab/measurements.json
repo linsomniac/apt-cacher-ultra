@@ -1,0 +1,359 @@
+{
+  "note": "Single-run observations on a shared development host; no accelerated clocks. Synthetic faults do not establish the incident root cause.",
+  "runs": [
+    {
+      "run": "102-baseline-final",
+      "raw_results": "/tmp/acu-lab-102-baseline-final",
+      "environment": {
+        "t": 0.366188,
+        "unix": 1794714952.8669,
+        "event": "environment",
+        "scenario": "baseline",
+        "binary_sha256": "4f5b9cbf0ce5504f5c5fed9e416ea7cbdd6238e6e9d1c3b8a344a64fd801cebc",
+        "binary_version": "1.0.2-freshness-lab",
+        "apt_version": "apt 3.0.4 (amd64)",
+        "options": {
+          "scenario": "baseline",
+          "cooldown": "60s",
+          "refresh": "15m",
+          "prefetch_budget": "5m",
+          "delay": 90,
+          "client_interval": 5,
+          "max_wait": 600
+        }
+      },
+      "summary": {
+        "scenario": "baseline",
+        "publication_to_client_seconds": 61.08124,
+        "phases_seconds_after_publication": {
+          "InRelease changed at upstream": 55.931903,
+          "adoption_hot_prefetch_started": 55.958082,
+          "adoption_success": 55.970628
+        },
+        "old_client_observations": 12,
+        "faults": [],
+        "caveat": "Synthetic mechanism reproduction, not proof of the customer's root cause."
+      },
+      "installed_versions": [
+        "1.0",
+        "1.1",
+        "2.0"
+      ],
+      "before_first_upstream_check": {
+        "seconds": 55.931483,
+        "client_request_logs": 23,
+        "freshness_check_logs": 0
+      }
+    },
+    {
+      "run": "102-slow",
+      "raw_results": "/tmp/acu-lab-102-slow",
+      "environment": {
+        "t": 0.399901,
+        "unix": 1794714663.3464916,
+        "event": "environment",
+        "scenario": "slow-prefetch",
+        "binary_sha256": "4f5b9cbf0ce5504f5c5fed9e416ea7cbdd6238e6e9d1c3b8a344a64fd801cebc",
+        "binary_version": "1.0.2-freshness-lab",
+        "apt_version": "apt 3.0.4 (amd64)",
+        "options": {
+          "scenario": "slow-prefetch",
+          "cooldown": "60s",
+          "refresh": "15m",
+          "prefetch_budget": "5m",
+          "delay": 90,
+          "client_interval": 5,
+          "max_wait": 600
+        }
+      },
+      "summary": {
+        "scenario": "slow-prefetch",
+        "publication_to_client_seconds": 164.502267,
+        "phases_seconds_after_publication": {
+          "InRelease changed at upstream": 55.73677,
+          "adoption_hot_prefetch_started": 55.754736,
+          "adoption_success": 163.3706
+        },
+        "old_client_observations": 31,
+        "faults": [
+          {
+            "t": 123.424279,
+            "unix": 1794714786.370867,
+            "event": "fault_delay_started",
+            "path": "/debian-security/pool/main/a/acu-lab-php8.4/acu-lab-php8.4_2.0_amd64.deb",
+            "seconds": 90
+          }
+        ],
+        "caveat": "Synthetic mechanism reproduction, not proof of the customer's root cause."
+      },
+      "installed_versions": [
+        "1.0",
+        "1.1",
+        "2.0"
+      ],
+      "before_first_upstream_check": {
+        "seconds": 55.736385,
+        "client_request_logs": 23,
+        "freshness_check_logs": 0
+      }
+    },
+    {
+      "run": "102-repair",
+      "raw_results": "/tmp/acu-lab-102-repair",
+      "environment": {
+        "t": 0.302805,
+        "unix": 1794714666.1253123,
+        "event": "environment",
+        "scenario": "busy-repair",
+        "binary_sha256": "4f5b9cbf0ce5504f5c5fed9e416ea7cbdd6238e6e9d1c3b8a344a64fd801cebc",
+        "binary_version": "1.0.2-freshness-lab",
+        "apt_version": "apt 3.0.4 (amd64)",
+        "options": {
+          "scenario": "busy-repair",
+          "cooldown": "60s",
+          "refresh": "15m",
+          "prefetch_budget": "5m",
+          "delay": 90,
+          "client_interval": 5,
+          "max_wait": 600
+        }
+      },
+      "summary": {
+        "scenario": "busy-repair",
+        "publication_to_client_seconds": 113.086762,
+        "phases_seconds_after_publication": {
+          "InRelease changed at upstream": 105.209958,
+          "adoption_hot_prefetch_started": 108.851577,
+          "adoption_success": 108.861118
+        },
+        "old_client_observations": 20,
+        "faults": [
+          {
+            "t": 122.968385,
+            "unix": 1794714788.7908874,
+            "event": "fault_delay_started",
+            "path": "/debian-security/dists/trixie-security/main/dep11/Components-amd64.yml.gz",
+            "seconds": 90
+          }
+        ],
+        "caveat": "Synthetic mechanism reproduction, not proof of the customer's root cause."
+      },
+      "installed_versions": [
+        "1.0",
+        "1.1",
+        "2.0"
+      ],
+      "before_first_upstream_check": {
+        "seconds": 105.208123,
+        "client_request_logs": 39,
+        "freshness_check_logs": 0
+      }
+    },
+    {
+      "run": "102-short-budget",
+      "raw_results": "/tmp/acu-lab-102-short-budget",
+      "environment": {
+        "t": 0.403502,
+        "unix": 1794714708.7915611,
+        "event": "environment",
+        "scenario": "slow-prefetch",
+        "binary_sha256": "4f5b9cbf0ce5504f5c5fed9e416ea7cbdd6238e6e9d1c3b8a344a64fd801cebc",
+        "binary_version": "1.0.2-freshness-lab",
+        "apt_version": "apt 3.0.4 (amd64)",
+        "options": {
+          "scenario": "slow-prefetch",
+          "cooldown": "60s",
+          "refresh": "15m",
+          "prefetch_budget": "5s",
+          "delay": 90,
+          "client_interval": 5,
+          "max_wait": 600
+        }
+      },
+      "summary": {
+        "scenario": "slow-prefetch",
+        "publication_to_client_seconds": 60.776011,
+        "phases_seconds_after_publication": {
+          "InRelease changed at upstream": 55.654731,
+          "adoption_hot_prefetch_started": 55.680175,
+          "adoption_success": 60.700666
+        },
+        "old_client_observations": 12,
+        "faults": [
+          {
+            "t": 123.385798,
+            "unix": 1794714831.7738543,
+            "event": "fault_delay_started",
+            "path": "/debian-security/pool/main/a/acu-lab-php8.4/acu-lab-php8.4_2.0_amd64.deb",
+            "seconds": 90
+          }
+        ],
+        "caveat": "Synthetic mechanism reproduction, not proof of the customer's root cause."
+      },
+      "installed_versions": [
+        "1.0",
+        "1.1",
+        "2.0"
+      ],
+      "before_first_upstream_check": {
+        "seconds": 55.654329,
+        "client_request_logs": 23,
+        "freshness_check_logs": 0
+      }
+    },
+    {
+      "run": "head-baseline",
+      "raw_results": "/tmp/acu-lab-head-baseline",
+      "environment": {
+        "t": 0.593808,
+        "unix": 1794714705.8578112,
+        "event": "environment",
+        "scenario": "baseline",
+        "binary_sha256": "82ee5d2de8dc011c012a0255e09d5823b2238a2273e6681b57a13045ad68438c",
+        "binary_version": "1.1.0-rc1-freshness-lab",
+        "apt_version": "apt 3.0.4 (amd64)",
+        "options": {
+          "scenario": "baseline",
+          "cooldown": "60s",
+          "refresh": "15m",
+          "prefetch_budget": "5m",
+          "delay": 90,
+          "client_interval": 5,
+          "max_wait": 600
+        }
+      },
+      "summary": {
+        "scenario": "baseline",
+        "publication_to_client_seconds": 128.928906,
+        "phases_seconds_after_publication": {
+          "InRelease changed at upstream": 60.101716,
+          "adoption_hot_prefetch_started": 63.748702,
+          "adoption_success": 128.84304
+        },
+        "old_client_observations": 20,
+        "faults": [],
+        "caveat": "Synthetic mechanism reproduction, not proof of the customer's root cause."
+      },
+      "installed_versions": [
+        "1.0",
+        "1.1",
+        "2.0"
+      ],
+      "before_first_upstream_check": {
+        "seconds": 60.101091,
+        "client_request_logs": 19,
+        "freshness_check_logs": 0
+      }
+    },
+    {
+      "run": "head-repair",
+      "raw_results": "/tmp/acu-lab-head-repair",
+      "environment": {
+        "t": 0.634997,
+        "unix": 1794714792.795413,
+        "event": "environment",
+        "scenario": "busy-repair",
+        "binary_sha256": "82ee5d2de8dc011c012a0255e09d5823b2238a2273e6681b57a13045ad68438c",
+        "binary_version": "1.1.0-rc1-freshness-lab",
+        "apt_version": "apt 3.0.4 (amd64)",
+        "options": {
+          "scenario": "busy-repair",
+          "cooldown": "60s",
+          "refresh": "15m",
+          "prefetch_budget": "5m",
+          "delay": 90,
+          "client_interval": 5,
+          "max_wait": 600
+        }
+      },
+      "summary": {
+        "scenario": "busy-repair",
+        "publication_to_client_seconds": 158.255649,
+        "phases_seconds_after_publication": {
+          "InRelease changed at upstream": 92.260542,
+          "adoption_hot_prefetch_started": 92.283601,
+          "adoption_success": 158.175934
+        },
+        "old_client_observations": 29,
+        "faults": [
+          {
+            "t": 191.649916,
+            "unix": 1794714983.810327,
+            "event": "fault_delay_started",
+            "path": "/debian-security/dists/trixie-security/main/dep11/Components-amd64.yml.gz",
+            "seconds": 90
+          }
+        ],
+        "caveat": "Synthetic mechanism reproduction, not proof of the customer's root cause."
+      },
+      "installed_versions": [
+        "1.0",
+        "1.1",
+        "2.0"
+      ],
+      "before_first_upstream_check": {
+        "seconds": 92.260085,
+        "client_request_logs": 35,
+        "freshness_check_logs": 0
+      }
+    },
+    {
+      "run": "102-full-budget",
+      "raw_results": "/tmp/acu-lab-102-full-budget",
+      "environment": {
+        "t": 0.364754,
+        "unix": 1794715087.2931788,
+        "event": "environment",
+        "scenario": "slow-prefetch",
+        "binary_sha256": "4f5b9cbf0ce5504f5c5fed9e416ea7cbdd6238e6e9d1c3b8a344a64fd801cebc",
+        "binary_version": "1.0.2-freshness-lab",
+        "apt_version": "apt 3.0.4 (amd64)",
+        "options": {
+          "scenario": "slow-prefetch",
+          "cooldown": "60s",
+          "refresh": "15m",
+          "prefetch_budget": "5m",
+          "delay": 330.0,
+          "client_interval": 5,
+          "max_wait": 600
+        }
+      },
+      "summary": {
+        "scenario": "slow-prefetch",
+        "publication_to_client_seconds": 364.135371,
+        "phases_seconds_after_publication": {
+          "InRelease changed at upstream": 55.629936,
+          "adoption_hot_prefetch_started": 55.648256,
+          "adoption_success": 358.607034
+        },
+        "old_client_observations": 67,
+        "faults": [
+          {
+            "t": 123.016495,
+            "unix": 1794715209.9449158,
+            "event": "fault_delay_started",
+            "path": "/debian-security/pool/main/a/acu-lab-php8.4/acu-lab-php8.4_2.0_amd64.deb",
+            "seconds": 330.0
+          }
+        ],
+        "caveat": "Synthetic mechanism reproduction, not proof of the customer's root cause."
+      },
+      "installed_versions": [
+        "1.0",
+        "1.1",
+        "2.0"
+      ],
+      "before_first_upstream_check": {
+        "seconds": 55.629566,
+        "client_request_logs": 23,
+        "freshness_check_logs": 0
+      }
+    }
+  ],
+  "builds": {
+    "toolchain": "go version go1.26.8 linux/amd64",
+    "incident_source": "536a1ab29b0659dadfeb08935f237b1deb555647",
+    "head_source": "1ae10560e4219b44033ded642e4c0a4d088347ea",
+    "note": "Recompiled clean source archives, not the original distributed 1.0.2 executable; pre-existing working-tree edits excluded."
+  }
+}
