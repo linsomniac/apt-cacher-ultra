@@ -427,9 +427,12 @@ for a suite's anchor, and only for requests that arrive when the suite
 was last checked more than `cooldown` ago, or within the first
 `revalidate_wait` of an adoption. A request that waited may then also
 wait in a flip hold (*Flip consistency*, at most 20 s); the 8 s limit
-keeps the two below apt's 30 s timeout. While upstream is unreachable,
-one request per suite per `cooldown` waits; the others are served at
-once. Only `InRelease` and `Release` wait: indexes and packages are
+keeps the two below apt's 30 s timeout. While upstream does not answer,
+the requests that arrive in the first `revalidate_wait` of each check
+wait, at most that long; the others are served at once, and so is
+everything while the host is known unreachable
+(`upstream.unreachable_cooldown`: a failed connection is not retried for
+that long, so the check fails at once). Only `InRelease` and `Release` wait: indexes and packages are
 served as before.
 
 Each `InRelease`/`Release` request line records what happened: `reval`
@@ -770,7 +773,7 @@ with the number of suites, plus the usual `suite_forgotten` line for each.
 
 When an adoption fails (an untrusted or malformed signature, a member that will not download intact, a `Date` in the future, a timeout), the cache records the failing content and backs off: the same content is retried after 2, 4, 8, 16, 32 minutes and then hourly (each ±25 %). Until then each check asks upstream with the failing content's validators, so an unchanged upstream costs one small request and no download. **Any new content is tried at once.** A deterministic failure therefore costs about 30 attempts a day instead of one per `cooldown`.
 
-A member that did not arrive, or arrived with another size or hash (`member_fetch_failed`, `member_mismatch`), is almost always a mirror caught between two publications, which heals within minutes. These two failures retry on a shorter schedule — after 1, 2, 4, 8 minutes and then every 10 (each ±25 %) — and a failure of **new** content starts that schedule again, where every other failure carries its count over until an adoption succeeds. An attempt is cheap: members already verified are reused from the cache. A repository whose index stays broken therefore costs a few requests every ten minutes, about 145 attempts a day, and is still reported failing since its first failure (`adoption_failing_persistently` fires at 3, 6, 12, 24, … failures in a row — for these two failures, of the same content).
+A member that did not arrive, or arrived with another size or hash (`member_fetch_failed`, `member_mismatch`), is almost always a mirror caught between two publications, which heals within minutes. These two failures retry on a shorter schedule — after 1, 2, 4, 8 minutes and then every 10 (each ±25 %) — and a failure of **new** content starts that schedule again, where every other failure carries its count over until an adoption succeeds. An attempt is cheap: members already verified are reused from the cache. The short schedule lasts about two hours (fifteen attempts) per content; content that still fails then is not a mirror mid-sync, and is retried hourly like any other failure, so a repository whose index stays broken costs about 37 attempts on its first day and 24 a day after. It is still reported failing since its first failure (`adoption_failing_persistently` fires at 3, 6, 12, 24, … failures in a row — for these two failures, of the same content).
 
 If the cache cannot read the current snapshot when an adoption starts, the attempt fails as `db_failed` (and is retried on the backoff schedule) rather than skipping the rollback checks below.
 

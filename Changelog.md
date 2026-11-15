@@ -126,8 +126,9 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 - After 1.1.0-rc1: a failed adoption whose cause is a member that did not
   arrive or did not match (`member_fetch_failed`, `member_mismatch`: a mirror
   mid-sync) is retried after 1 minute doubling to 10, not 2 minutes doubling
-  to an hour, and new upstream content starts that schedule again. Other
-  failures and all refusals keep their schedule.
+  to an hour, and new upstream content starts that schedule again; content
+  that still fails after two hours returns to hourly retries. Other failures
+  and all refusals keep their schedule.
 - Snapshot adoption reuses transaction-scoped prepared INSERT statements for
   members, skipped members and package hashes, reducing commit time for large
   repositories without changing validation or transaction boundaries. Thanks

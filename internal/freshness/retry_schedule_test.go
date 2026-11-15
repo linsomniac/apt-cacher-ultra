@@ -97,3 +97,27 @@ func TestAdoptionFailure_OtherFailuresKeepTheLongSchedule(t *testing.T) {
 		t.Errorf("retry in %d s, want 960 (2 min × 2³)", got)
 	}
 }
+
+// The short schedule is for a fault that heals. Content that still fails
+// after about two hours of it (fifteen attempts) is not a mirror
+// mid-sync: from then on it is retried hourly, like any other failure, so
+// a repository that is simply broken does not cost an attempt every ten
+// minutes for ever.
+func TestAdoptionFailure_MirrorSyncScheduleEndsAfterTwoHours(t *testing.T) {
+	var total time.Duration
+	for n := int64(1); n <= syncRetryAttempts; n++ {
+		d := adoptionRetryDelay("member_mismatch", n)
+		if d > syncRetryMaxDelay {
+			t.Fatalf("attempt %d waits %s, more than the short schedule's %s", n, d, syncRetryMaxDelay)
+		}
+		total += d
+	}
+	if total < 115*time.Minute || total > 130*time.Minute {
+		t.Errorf("the short schedule lasts %s, want about two hours", total)
+	}
+	for _, n := range []int64{syncRetryAttempts + 1, syncRetryAttempts + 2, 100} {
+		if d := adoptionRetryDelay("member_fetch_failed", n); d != retryMaxDelay {
+			t.Errorf("attempt %d waits %s, want the general schedule's %s", n, d, retryMaxDelay)
+		}
+	}
+}

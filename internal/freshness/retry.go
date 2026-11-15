@@ -32,12 +32,20 @@ const (
 // waited an hour for its sixth try. A production log of 1,470
 // publications had 227 more than 15 minutes behind upstream and 57 more
 // than an hour, every one behind a run of such failures. An attempt costs
-// little — members already verified are reused from the pool — so the
-// short schedule's price is a few requests every ten minutes against a
-// repository that stays broken.
+// little — members already verified are reused from the pool.
+//
+// The short schedule is for a fault that heals. Content that has failed
+// syncRetryAttempts times in a row — about two hours of it — is not a
+// mirror mid-sync (a wrong suite path, an index upstream publishes
+// broken): from then on it is retried at the general schedule's cap, once
+// an hour, so a repository that is simply broken costs what it did
+// before. New content starts the short schedule again
+// (recordAdoptionFailure).
 const (
 	syncRetryBaseDelay = time.Minute
 	syncRetryMaxDelay  = 10 * time.Minute
+	// syncRetryAttempts: 1 + 2 + 4 + 8 min, then eleven waits of 10 min.
+	syncRetryAttempts = 15
 )
 
 // syncFailure reports a failure reason of the mirror-sync class:
@@ -59,10 +67,12 @@ func adoptionRetryDelay(reason string, count int64) time.Duration {
 	if !syncFailure(reason) {
 		return backoffDelay(count)
 	}
-	if count < 1 {
+	switch {
+	case count < 1:
 		return 0
-	}
-	if count > 5 { // 1 min << 4 already exceeds the cap; avoid shift overflow
+	case count > syncRetryAttempts:
+		return retryMaxDelay // it did not heal: the general schedule's cap
+	case count > 5: // 1 min << 4 already exceeds the cap; avoid shift overflow
 		return syncRetryMaxDelay
 	}
 	return min(syncRetryBaseDelay<<(count-1), syncRetryMaxDelay)
