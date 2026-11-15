@@ -54,7 +54,9 @@ func pipelineGeneration(env *adoptionTestEnv, gen int, absent []string) (release
 		bodies[p] = []byte(fmt.Sprintf("generation %d of %s", gen, p))
 	}
 	release, declared = makeReleaseAcquireByHash(bodies)
-	release = append(release, []byte(fmt.Sprintf("Generation: %d\n", gen))...)
+	// Clearsigned, as an adopted suite's anchor is: the next adoption reads
+	// what this one declared from the stored anchor.
+	release = asInRelease(append(release, []byte(fmt.Sprintf("Generation: %d\n", gen))...))
 	env.fetcher.put(byHashURL("main/binary-amd64/Packages", declared["main/binary-amd64/Packages"]), pkgs)
 	for _, p := range absent {
 		env.fetcher.fail404(byHashURL(p, declared[p]))
@@ -189,13 +191,13 @@ func TestAdopter_RequiredIndexKeepsTheByHashProbe(t *testing.T) {
 	// variant, so the guard lets the snapshot commit.
 	absent := []string{"main/binary-all/Packages.xz"}
 	publish := func(gen int) ([]byte, map[string]string) {
-		rel, decl, bodies := pipelineGeneration(env, gen, absent)
+		_, _, bodies := pipelineGeneration(env, gen, absent)
 		all := fakePackagesStanzas(map[string]string{
 			fmt.Sprintf("pool/main/d/doc/doc_%d_all.deb", gen): strings.Repeat("b", 64),
 		})
 		bodies["main/binary-all/Packages"] = all
-		rel, decl = makeReleaseAcquireByHash(bodies)
-		rel = append(rel, []byte(fmt.Sprintf("Generation: %d\n", gen))...)
+		rel, decl := makeReleaseAcquireByHash(bodies)
+		rel = asInRelease(append(rel, []byte(fmt.Sprintf("Generation: %d\n", gen))...))
 		env.fetcher.put(byHashURL("main/binary-all/Packages", decl["main/binary-all/Packages"]), all)
 		env.fetcher.put(byHashURL("main/binary-amd64/Packages", decl["main/binary-amd64/Packages"]), bodies["main/binary-amd64/Packages"])
 		for _, p := range absent {
@@ -486,4 +488,141 @@ func TestPrefetchHotSet_WorkerPanicReachesTheCaller(t *testing.T) {
 		}
 	}()
 	f.adopter.prefetchHotSet(context.Background(), f.suite, f.candidate, entries, nil)
+}
+
+// A member the Release declares for the first time is not one upstream
+// "never serves": nothing is known about it. It keeps the full sequence,
+// by hash first — a mirror mid-sync can have a new file by hash before it
+// appears at its path, and asking the path first would lose it for the
+// snapshot's lifetime. Only a member the current snapshot's own Release
+// declared, and that was not served then, is asked for at its path first.
+func TestAdopter_MemberNewInThisReleaseKeepsTheByHashProbe(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	rel1, _, _ := pipelineGeneration(env, 1, nil)
+	if err := env.adopter.Run(ctx, env.suite, rel1, "", ""); err != nil {
+		t.Fatalf("first adoption: %v", err)
+	}
+
+	// The second release adds a member: by hash it is there, at its path
+	// not yet.
+	const added = "main/i18n/Translation-fr"
+	rel2, decl2, bodies2 := pipelineGeneration(env, 2, []string{added})
+	env.fetcher.put(byHashURL(added, decl2[added]), bodies2[added])
+	delete(env.fetcher.errFor, byHashURL(added, decl2[added]))
+	if err := env.adopter.Run(ctx, env.suite, rel2, "", ""); err != nil {
+		t.Fatalf("second adoption: %v", err)
+	}
+	if _, err := env.cache.GetSnapshotMember(ctx, currentSnapshotID(t, env), added); err != nil {
+		t.Fatalf("the member new in this release was not adopted: %v", err)
+	}
+}
+
+// errSilent is what a fetch returns when upstream went silent twice (the
+// fetch's own single retry included).
+var errSilent = fmt.Errorf("%w: %w", fetch.ErrUpstreamUnavailable, fetch.ErrIdleTimeout)
+
+// A member whose upstream went silent has had its second chance inside the
+// fetch, and each further attempt would wait out the idle timeout twice
+// more. It is not tried again in the retry rounds: an optional one is
+// skipped (and left to repair) so the release publishes, instead of
+// holding it for the rounds' six more idle timeouts.
+func TestAdopter_SilentUpstreamMemberIsNotRetriedInRounds(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64)})
+	releaseText, _ := makeRelease(map[string][]byte{
+		"main/binary-amd64/Packages": pkgs,
+		"Contents-amd64.gz":          []byte(strings.Repeat("C", 100)),
+	})
+	env.fetcher.put(pipelineBase+"main/binary-amd64/Packages", pkgs)
+	env.fetcher.failWith(pipelineBase+"Contents-amd64.gz", errSilent)
+
+	var sleeps []time.Duration
+	ad := newRetryAdopter(t, env.cache, env.fetcher, 2, 30*time.Second, &sleeps)
+	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(sleeps) != 0 {
+		t.Errorf("retry waits = %v, want none: a silent upstream is not retried in rounds", sleeps)
+	}
+	if n := countURL(env.fetcher.requested(), pipelineBase+"Contents-amd64.gz"); n != 1 {
+		t.Errorf("the silent member was fetched %d times, want once", n)
+	}
+	rows, err := env.cache.ListRepairableSkippedMembers(ctx, currentSnapshotID(t, env))
+	if err != nil || len(rows) != 1 || rows[0].Path != "Contents-amd64.gz" {
+		t.Errorf("repairable skip records = %+v (err %v), want the silent member", rows, err)
+	}
+}
+
+// When the by-hash probe goes silent the member's declared path is not
+// asked as well: upstream is not answering for this file, and the second
+// URL would wait out the idle timeout all over again.
+func TestAdopter_SilentByHashProbeEndsTheMember(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64)})
+	contents := []byte(strings.Repeat("C", 100))
+	releaseText, decl := makeReleaseAcquireByHash(map[string][]byte{
+		"main/binary-amd64/Packages": pkgs,
+		"main/Contents-amd64.gz":     contents,
+	})
+	env.fetcher.put(byHashURL("main/binary-amd64/Packages", decl["main/binary-amd64/Packages"]), pkgs)
+	env.fetcher.failWith(byHashURL("main/Contents-amd64.gz", decl["main/Contents-amd64.gz"]), errSilent)
+	env.fetcher.put(pipelineBase+"main/Contents-amd64.gz", contents)
+
+	ad := newTolerantAdopter(t, env)
+	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if n := countURL(env.fetcher.requested(), pipelineBase+"main/Contents-amd64.gz"); n != 0 {
+		t.Errorf("the declared path was asked %d times after the by-hash probe went silent, want none", n)
+	}
+}
+
+// A member the snapshot cannot do without is another matter: if its
+// by-hash URL goes silent and its declared path answers, the suite is
+// adopted. Giving up on it would fail the attempt, and every retry would
+// ask the silent URL first again — a suite kept unadopted by one URL.
+// Robustness comes before the two idle timeouts this can cost.
+func TestAdopter_RequiredIndexSilentByHashStillAsksItsPath(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64)})
+	releaseText, decl := makeReleaseAcquireByHash(map[string][]byte{
+		"main/binary-amd64/Packages": pkgs,
+	})
+	env.fetcher.failWith(byHashURL("main/binary-amd64/Packages", decl["main/binary-amd64/Packages"]), errSilent)
+	env.fetcher.put(pipelineBase+"main/binary-amd64/Packages", pkgs)
+
+	ad := newTolerantAdopter(t, env)
+	if err := ad.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("Run: %v: the declared path had the index", err)
+	}
+	if _, err := env.cache.GetSnapshotMember(ctx, currentSnapshotID(t, env), "main/binary-amd64/Packages"); err != nil {
+		t.Fatalf("the index was not adopted from its declared path: %v", err)
+	}
+}
+
+// With optional-member tolerance off every member's failure fails the
+// attempt, so every member keeps its second URL.
+func TestAdopter_WithoutToleranceASilentByHashStillAsksThePath(t *testing.T) {
+	ctx := context.Background()
+	env := newAdoptionTestEnv(t)
+	pkgs := fakePackagesStanzas(map[string]string{"pool/main/f/foo/foo_1.deb": strings.Repeat("a", 64)})
+	contents := []byte(strings.Repeat("C", 100))
+	releaseText, decl := makeReleaseAcquireByHash(map[string][]byte{
+		"main/binary-amd64/Packages": pkgs,
+		"main/Contents-amd64.gz":     contents,
+	})
+	env.fetcher.put(byHashURL("main/binary-amd64/Packages", decl["main/binary-amd64/Packages"]), pkgs)
+	env.fetcher.failWith(byHashURL("main/Contents-amd64.gz", decl["main/Contents-amd64.gz"]), errSilent)
+	env.fetcher.put(pipelineBase+"main/Contents-amd64.gz", contents)
+
+	if err := env.adopter.Run(ctx, env.suite, releaseText, "", ""); err != nil {
+		t.Fatalf("Run: %v: the declared path had the member", err)
+	}
+	if _, err := env.cache.GetSnapshotMember(ctx, currentSnapshotID(t, env), "main/Contents-amd64.gz"); err != nil {
+		t.Fatalf("the member was not adopted from its declared path: %v", err)
+	}
 }

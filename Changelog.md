@@ -126,9 +126,11 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 - After 1.1.0-rc1: a failed adoption whose cause is a member that did not
   arrive or did not match (`member_fetch_failed`, `member_mismatch`: a mirror
   mid-sync) is retried after 1 minute doubling to 10, not 2 minutes doubling
-  to an hour, and new upstream content starts that schedule again; content
-  that still fails after two hours returns to hourly retries. Other failures
-  and all refusals keep their schedule.
+  to an hour, and a new upstream publication starts that schedule again
+  (content that merely differs at every attempt does not); a suite that
+  still fails after two hours returns to hourly retries. The failure count,
+  and the persistent-failure warning that reads it, carry across content as
+  before. Other failures and all refusals keep their schedule.
 - Snapshot adoption reuses transaction-scoped prepared INSERT statements for
   members, skipped members and package hashes, reducing commit time for large
   repositories without changing validation or transaction boundaries. Thanks
@@ -200,7 +202,11 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   check is due (`repair_yielded`), and resumes at the next unchanged check.
 - After 1.1.0-rc1: `upstream.idle_read_timeout` is enforced. It was accepted
   but ignored, so an upstream that went silent mid-response held a fetch — and
-  an adoption or repair behind it — until `total_timeout` (5 minutes).
+  an adoption or repair behind it — until `total_timeout` (5 minutes). A
+  fetch that meets silence is retried once, whatever `max_retries` allows; a
+  second silence ends it. An adoption does not ask again for an optional file
+  whose upstream is silent: the file is skipped and left to repair, and the
+  release is published without it.
 - Hot prefetch verifies and reuses cached package content instead of downloading
   unchanged packages on every snapshot update. Missing or corrupt content is
   fetched and verified; concurrent prefetches of one hash avoid duplicate downloads.

@@ -689,7 +689,7 @@ func TestCheck_GateCloseAbortsASkippedFirstAdoption(t *testing.T) {
 		mu := &sync.Mutex{}
 		mu.Lock()
 		spawnKey := suiteKey("http", rigHost, rigSuite)
-		chk.spawnAdoption(mu, req, mustAcquire(t, chk.admission, rigHost, false), spawnKey, chk.beginActivity(spawnKey))
+		chk.spawnAdoption(mu, req, mustAcquire(t, chk.admission, rigHost, false), chk.beginActivity(spawnKey))
 		chk.WaitForAdoptions()
 		sf, err := r.c.GetSuiteFreshness(ctx, "http", rigHost, rigSuite)
 		if err != nil {

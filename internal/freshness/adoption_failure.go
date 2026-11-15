@@ -81,21 +81,14 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 			count = 1 // a new state: its retry schedule starts over too
 		}
 	}
-	// AIDEV-NOTE: a mirror-sync failure of NEW content starts its schedule
-	// again (the 2026-11-14 publication-delay review). The count used to
-	// carry across publications until one adopted, so a release whose
-	// first attempt met a mirror mid-sync inherited the wait its
-	// predecessor had earned — up to an hour — although it is another
-	// publication and its fault usually heals in minutes. Only the count
-	// restarts: first, the streak's start, stays, so the suite still
-	// reads "failing since" its first failure. Other reasons keep their
-	// count across content (a missing key is not fixed by the next
-	// release), and the confirmation records above keep FW-3 (a)'s rule.
-	if syncFailure(reason) && cur.AdoptionFailCount > 0 &&
-		(cur.AdoptionFailHash == nil || *cur.AdoptionFailHash != req.key) {
-		count = 1
+	// The schedule: the general one runs on the streak's count; a
+	// mirror-sync failure runs on its own position (syncStep), which a new
+	// publication starts again.
+	step := count
+	if syncFailure(reason) {
+		step = c.syncStep(suiteKey(s.CanonicalScheme, s.CanonicalHost, s.SuitePath), req.key, cur.AdoptionFailCount == 0)
 	}
-	delay := jitterDelay(adoptionRetryDelay(reason, count), c.rand())
+	delay := jitterDelay(adoptionRetryDelay(reason, step), c.rand())
 	next := now.Add(delay).Unix()
 	f := cache.AdoptionFailure{
 		Hash: req.key, Reason: reason, Count: count, FirstAt: first, LastAt: now.Unix(),
@@ -153,6 +146,61 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 			"canonical_host", s.CanonicalHost, "suite_path", s.SuitePath,
 			"reason", reason, "fail_count", count, "failing_since_unixtime", first)
 	}
+}
+
+// syncStreak is where a suite's failing streak stands on the mirror-sync
+// schedule (retry.go): the content last attempted, how many times in a row
+// that content failed, and the schedule position its next retry is timed
+// by. In memory (Checker.syncStreaks), per suite.
+type syncStreak struct {
+	key      string
+	attempts int64
+	position int64
+}
+
+// syncStep records a mirror-sync failure of content key for the suite and
+// returns the position on the short schedule its retry is timed by
+// (adoptionRetryDelay). fresh: the suite has no failure record, so a new
+// streak begins.
+//
+// AIDEV-NOTE: the 2026-11-14 publication-delay review, as corrected by the
+// review of 2026-11-15. The streak's count carries across content until an
+// adoption succeeds (spec C7), so on that count a release whose first
+// attempt met a mirror mid-sync inherited the wait its predecessor had
+// earned — up to an hour — although it is another publication and its
+// fault usually heals in minutes. A new publication therefore starts the
+// short schedule again: position 1.
+//
+// But content that is new at every attempt — two mirrors that disagree, a
+// Release generated per request — is not a series of publications, and
+// restarting for it would retry the suite every minute for ever (the churn
+// FW-3 (a) guards the confirmation records against). The difference is
+// whether the previous content was stable: one that was retried (two
+// attempts or more) and then replaced is a publication; one attempted once
+// before it changed is churn, and the schedule goes on from where it was,
+// to the hourly retries.
+//
+// The count itself is never restarted here: adoption_failing_persistently
+// and the status page read it, and a suite that fails across ten releases
+// has failed ten times.
+//
+// In memory because the suite row has no column for it: after a restart
+// the next mirror-sync failure starts at position 1 — one early retry —
+// and the start-time spread (rescheduleFailingAdoptions) retries every
+// failing suite once anyway. Callers hold the suite's mutex
+// (recordAdoptionFailure's rule), so a suite's entry has one writer.
+func (c *Checker) syncStep(suite, key string, fresh bool) int64 {
+	st := syncStreak{key: key, attempts: 1, position: 1}
+	if prev, ok := c.syncStreaks.Load(suite); ok && !fresh {
+		switch p := prev.(syncStreak); {
+		case p.key == key:
+			st.attempts, st.position = p.attempts+1, p.position+1
+		case p.attempts < 2:
+			st.position = p.position + 1 // churn: the schedule goes on
+		}
+	}
+	c.syncStreaks.Store(suite, st)
+	return st.position
 }
 
 // restartsStreak reports a confirmation record (spec C4, C5) whose

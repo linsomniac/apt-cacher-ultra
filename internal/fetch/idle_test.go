@@ -44,7 +44,7 @@ func stallServer(t *testing.T, h func(w http.ResponseWriter, r *http.Request, re
 	return srv
 }
 
-func fetchWithin(t *testing.T, c *Client, url string, limit time.Duration) (*bufDst, error, time.Duration) {
+func fetchWithin(t *testing.T, c *Client, url string, limit time.Duration) (*bufDst, time.Duration, error) {
 	t.Helper()
 	dst := &bufDst{}
 	start := time.Now()
@@ -56,10 +56,10 @@ func fetchWithin(t *testing.T, c *Client, url string, limit time.Duration) (*buf
 	}()
 	select {
 	case r := <-done:
-		return dst, r.err, time.Since(start)
+		return dst, time.Since(start), r.err
 	case <-time.After(limit):
 		t.Fatalf("Fetch still running after %s: the stall was not cut at the idle read timeout", limit)
-		return nil, nil, 0
+		return nil, 0, nil
 	}
 }
 
@@ -78,7 +78,7 @@ func TestFetch_StalledBodyEndsAtTheIdleReadTimeout(t *testing.T) {
 	})
 	c := newIdleClient(t, 150*time.Millisecond, 0)
 
-	_, err, took := fetchWithin(t, c, srv.URL+"/x.deb", 10*time.Second)
+	_, took, err := fetchWithin(t, c, srv.URL+"/x.deb", 10*time.Second)
 	if !errors.Is(err, ErrIdleTimeout) {
 		t.Fatalf("err = %v, want ErrIdleTimeout", err)
 	}
@@ -103,7 +103,7 @@ func TestFetch_StalledHeadersEndAtTheIdleReadTimeout(t *testing.T) {
 	})
 	c := newIdleClient(t, 150*time.Millisecond, 0)
 
-	_, err, _ := fetchWithin(t, c, srv.URL+"/x.deb", 10*time.Second)
+	_, _, err := fetchWithin(t, c, srv.URL+"/x.deb", 10*time.Second)
 	if !errors.Is(err, ErrIdleTimeout) {
 		t.Fatalf("err = %v, want ErrIdleTimeout", err)
 	}
@@ -123,7 +123,7 @@ func TestFetch_SlowSteadyBodyIsNotIdle(t *testing.T) {
 	})
 	c := newIdleClient(t, 300*time.Millisecond, 0)
 
-	dst, err, took := fetchWithin(t, c, srv.URL+"/x.deb", 10*time.Second)
+	dst, took, err := fetchWithin(t, c, srv.URL+"/x.deb", 10*time.Second)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestFetch_IdleTimeoutIsRetriedAndResumes(t *testing.T) {
 	})
 	c := newIdleClient(t, 150*time.Millisecond, 1)
 
-	dst, err, _ := fetchWithin(t, c, srv.URL+"/x.deb", 10*time.Second)
+	dst, _, err := fetchWithin(t, c, srv.URL+"/x.deb", 10*time.Second)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -225,8 +225,65 @@ func TestFetch_ZeroIdleReadTimeoutIsNoBound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	_, ferr, _ := fetchWithin(t, c, srv.URL+"/x.deb", 10*time.Second)
+	_, _, ferr := fetchWithin(t, c, srv.URL+"/x.deb", 10*time.Second)
 	if !errors.Is(ferr, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want the total timeout's DeadlineExceeded", ferr)
+	}
+}
+
+// A fetch whose upstream went silent is tried again once, on the
+// expectation that the silence was that connection's. A second silence
+// ends the fetch: the remaining retries would each wait out the idle
+// timeout again for an upstream that is evidently not answering, and a
+// stalled file held an adoption four idle timeouts instead of two (the
+// freshness lab, 2026-11-15).
+func TestFetch_ASecondIdleTimeoutEndsTheFetch(t *testing.T) {
+	var calls atomic.Int32
+	srv := stallServer(t, func(w http.ResponseWriter, r *http.Request, release <-chan struct{}) {
+		calls.Add(1)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	})
+	c := newIdleClient(t, 100*time.Millisecond, 3) // three retries allowed
+
+	_, took, err := fetchWithin(t, c, srv.URL+"/x.deb", 10*time.Second)
+	if !errors.Is(err, ErrIdleTimeout) || !errors.Is(err, ErrUpstreamUnavailable) {
+		t.Fatalf("err = %v, want ErrUpstreamUnavailable wrapping ErrIdleTimeout", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("upstream requests = %d, want 2: the attempt and one retry", got)
+	}
+	if took > 2*time.Second {
+		t.Errorf("the fetch took %s, want about two idle timeouts", took)
+	}
+}
+
+// Other retryable failures keep all their retries, also after an idle
+// timeout: only a second silence ends the fetch early.
+func TestFetch_OtherFailuresKeepTheirRetriesAfterAnIdleTimeout(t *testing.T) {
+	var calls atomic.Int32
+	srv := stallServer(t, func(w http.ResponseWriter, r *http.Request, release <-chan struct{}) {
+		switch calls.Add(1) {
+		case 1: // silent
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		case 2, 3: // a server error, twice
+			w.WriteHeader(http.StatusBadGateway)
+		default:
+			_, _ = w.Write([]byte("ok"))
+		}
+	})
+	c := newIdleClient(t, 100*time.Millisecond, 3)
+
+	dst, _, err := fetchWithin(t, c, srv.URL+"/x.deb", 10*time.Second)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if dst.String() != "ok" || calls.Load() != 4 {
+		t.Errorf("body %q after %d requests, want ok after 4", dst.String(), calls.Load())
 	}
 }

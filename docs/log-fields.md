@@ -65,8 +65,8 @@ be answered from the request log: find the client's `InRelease` line.
 | Field | Present | Meaning |
 | --- | --- | --- |
 | `snapshot_id` | The anchor was served from an adopted snapshot. | That snapshot (also the response's `X-Cache-Snapshot`). Match it with `adoption_finished`'s `resulting_snapshot_id` to see when that release was published. |
-| `checked_ago_s` | The suite has had a successful upstream check. | Seconds since the suite's last successful check, at the time of the response: how old the cache's knowledge of upstream was. After a request-time check it is about 0. |
-| `behind_s` | The cache knew of upstream content newer than what it served. | Seconds since it first saw that content: an adoption was running, waiting for a slot, or failing. Absent means the cache knew of nothing newer — not that upstream had nothing newer (`checked_ago_s` bounds that). |
+| `checked_ago_s` | The anchor was served from an adopted snapshot, and the suite has had a successful upstream check. | Seconds since the suite's last successful check, at the time of the response: how old the cache's knowledge of upstream was. After a request-time check it is about 0. |
+| `behind_s` | The anchor was served from an adopted snapshot, and the cache knew of upstream content newer than it. | Seconds since it first saw that content: an adoption was running, waiting for a slot, or failing. Absent means the cache knew of nothing newer — not that upstream had nothing newer (`checked_ago_s` bounds that). |
 | `reval` | A request-time check ran for this request (`freshness.revalidate_wait`) and was not simply turned away by the cooldown. | What the wait achieved, below. |
 | `reval_check` | With `reval`. | The `freshness_check` result behind it (`not_modified`, `changed`, `changed_queued`, `failed`, …), or `busy` when the suite was busy with something the request could not wait for; empty when the check had not ended. |
 | `reval_wait_ms` | With `reval`. | How long the request waited before it was served; part of `duration_ms`. |
@@ -83,7 +83,9 @@ be answered from the request log: find the client's `InRelease` line.
 
 A request the cooldown turned away (the suite was checked less than
 `freshness.cooldown` ago) has no `reval`: nothing was asked, and
-`checked_ago_s` says how recent the last answer is. A request whose client
+`checked_ago_s` says how recent the last answer is. An anchor that is not
+served from a snapshot — a suite not adopted yet, or adoption disabled —
+has `reval` fields only. A request whose client
 left during the wait is logged `client_canceled`, like one that left
 during a flip hold.
 
@@ -611,7 +613,7 @@ file events and the daemon's `main`).
 | `adoption_retries_reschedule_failed` | WARN | `err` | The start-time retry spread could not be written; failing suites keep their schedule. |
 | `repair_yielded` | INFO | `canonical_scheme`, `canonical_host`, `suite_path`, `snapshot_id`, `to` (`adoption`: an adoption needed the repair's adoption slots — one of another suite on the same host, or any when the pool was full; `check`: a check of the repair's own suite was due), `ran_seconds` | A repair or reconcile stopped before it was done so that a new release could be noticed or adopted: it holds its suite's lock and adoption slots while it runs, and a repair heals a snapshot that is already serving. Nothing is recorded against the members it had not finished (being stopped is no evidence about upstream), the ones it had finished stay, and the next unchanged check starts it again. Counted in `acu_repair_yielded_total{to}`. A suite whose repair gives way at every check, under steady traffic, has a member whose download takes longer than `freshness.cooldown`; it is fetched at the suite's next adoption. |
 | `adoption_in_progress` | INFO | `adoption_id`, `canonical_scheme`, `canonical_host`, `suite_path`, `phase` (as `adoption_finished`'s `phase_seconds` keys), `phase_seconds`, `elapsed_seconds` | An adoption attempt has been running for a minute, and for every minute after: where it is. An attempt that ends sooner logs none. `adoption_finished` gives the complete picture; this line is for the attempt that has not finished — a slow upstream, a long flip barrier, a deep write queue. |
-| `adoption_read_prior_members_failed` | WARN | `canonical_host`, `suite_path`, `snapshot_id`, `err` | The adoption could not list the members of the suite's current snapshot, which tells it which declared files upstream did not serve last time. It goes on and asks for every member by hash first, then by path, as a first adoption does: slower, never less complete. |
+| `adoption_read_prior_members_failed` | WARN | `canonical_host`, `suite_path`, `snapshot_id`, `err` | The adoption could not read the suite's current snapshot — its member rows, or the `Release` it was adopted from — which together tell it which declared files upstream did not serve last time. It goes on and asks for every member by hash first, then by path, as a first adoption does: slower, never less complete. |
 | `adoption_member_retry` | INFO | `canonical_host`, `suite_path`, `path`, `attempt`, `max_retries`, `delay`, `waiting_members`, `err` | A member's fetch failed in a way a mirror mid-sync explains (it did not come, or its size or hash differed) and will be tried again after `delay` (`adoption.member_retry_delay`). The members that failed in a round wait together: one line per member, one delay for all `waiting_members` of them. |
 | `adoption_repair_list_failed` | WARN | `canonical_host`, `suite_path`, `snapshot_id`, `err` | The repair decision could not list the snapshot's repairable skipped members; no repair runs this check, the next unchanged check asks again. |
 | `freshness_clamp_adoption_retry_failed` | WARN | `canonical_host`, `suite_path`, `err` | A retry time left in the future by a backward clock step could not be clamped; the next check tries again. |

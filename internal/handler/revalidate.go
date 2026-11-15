@@ -126,8 +126,13 @@ func (h *Handler) revalidateAnchor(r *http.Request, req *proxy.Request, start ti
 	if h.revalidator == nil || h.revalidateWait <= 0 || sr.anchor == nil {
 		return
 	}
+	// A host the allowlist forbids gets no per-suite work: its request is
+	// refused right after the hit lookup (SPEC §6.6), and a check of it
+	// could only fail.
+	if !h.fetch.HostAllowed(req.CanonicalHost) {
+		return
+	}
 	tr := sr.anchor
-	sr.revalidated = true
 	done := make(chan string, 1)
 	h.activeWG.Add(1)
 	go func() {
@@ -152,6 +157,8 @@ func (h *Handler) revalidateAnchor(r *http.Request, req *proxy.Request, start ti
 	case check = <-done:
 	case <-timer.C:
 		// The check is still asking upstream (or waiting for a host slot).
+		// It is this request's check and it goes on: none after the response.
+		sr.revalidated = true
 		tr.reval, tr.revalWait = revalUnknown, time.Since(start)
 		return
 	case <-r.Context().Done():
@@ -159,6 +166,16 @@ func (h *Handler) revalidateAnchor(r *http.Request, req *proxy.Request, start ti
 	case <-h.lifecycleCtx.Done():
 		return
 	}
+	// AIDEV-NOTE: the check before the response replaces the check after
+	// it (maybeFireFreshness) only when it ran. One the checker turned away
+	// — skipped: the cooldown, or a suite that has no row yet; busy —
+	// leaves the check after the response in place. That matters most on a
+	// suite's first contact: there is no row before the response, the miss
+	// creates it, and the check after the response is what starts the
+	// suite's first adoption (spec C3, T1-on-seed). Suppressing it left a
+	// new suite unadopted until some later request or the scheduler came
+	// by (review of 2026-11-15).
+	sr.revalidated = check != "skipped" && check != "busy"
 	published := false
 	switch check {
 	case "skipped", "not_modified", "unchanged", "failed":

@@ -35,8 +35,9 @@ type suiteActivity struct {
 	done    chan struct{} // closed when the check, and its adoption if it started one, has ended
 
 	mu        sync.Mutex
-	result    string // how the check ended: its freshness_check result, or failed; "" while it runs
-	published bool   // the adoption the check started committed a new snapshot
+	result    string    // how the check ended: its freshness_check result, or failed; "" while it runs
+	published bool      // the adoption the check started committed a new snapshot
+	ended     time.Time // monotonic; zero while the activity is in flight
 }
 
 func (a *suiteActivity) setResult(result string) {
@@ -57,8 +58,17 @@ func (a *suiteActivity) outcome() (result string, published bool) {
 	return a.result, a.published
 }
 
+// endedSince reports whether the activity has ended, and did so at or
+// after t.
+func (a *suiteActivity) endedSince(t time.Time) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return !a.ended.IsZero() && !a.ended.Before(t)
+}
+
 // beginActivity records that a check of the suite key holds its mutex.
-// The caller holds that mutex, so there is at most one activity per suite.
+// The caller holds that mutex, so there is at most one activity in flight
+// per suite; it replaces the suite's previous, ended one.
 func (c *Checker) beginActivity(key string) *suiteActivity {
 	act := &suiteActivity{started: time.Now(), done: make(chan struct{})}
 	c.active.Store(key, act)
@@ -69,8 +79,19 @@ func (c *Checker) beginActivity(key string) *suiteActivity {
 // the suite's mutex is released — by check for a check that started no
 // adoption, by the adoption goroutine otherwise — so a request that wakes
 // reads a snapshot pointer nothing is about to switch.
-func (c *Checker) endActivity(key string, act *suiteActivity) {
-	c.active.CompareAndDelete(key, act)
+//
+// AIDEV-NOTE: the ended activity stays in c.active, as the suite's latest,
+// until the suite's next check replaces it or the suite's row goes
+// (unlockDropped). An adoption can end between the check that started it
+// and the request's AwaitSuite — every member already in the pool — and a
+// request that then found nothing in the map was told nothing had
+// happened, although it was served the new release (logged pending, not
+// published; review of 2026-11-15). One entry per suite: bounded by the
+// suite table, like the lock map.
+func (c *Checker) endActivity(act *suiteActivity) {
+	act.mu.Lock()
+	act.ended = time.Now()
+	act.mu.Unlock()
 	close(act.done)
 }
 
@@ -92,7 +113,8 @@ func (c *Checker) CheckNow(ctx context.Context, scheme, host, suitePath string) 
 // whether it had ended by the time AwaitSuite returned.
 //
 // The wait ends at start + wait, when ctx ends, and — for a request that
-// arrives late — once the activity itself is wait old.
+// arrives late — once the activity itself is wait old. An activity that
+// ended after start, before this call, is reported as waited for.
 //
 // AIDEV-NOTE: the second bound is what keeps a slow adoption from taxing
 // every request. An adoption that needs longer than wait publishes too
@@ -107,6 +129,19 @@ func (c *Checker) AwaitSuite(ctx context.Context, scheme, host, suitePath string
 		return "", false, true
 	}
 	act := v.(*suiteActivity)
+	select {
+	case <-act.done:
+		// The suite's latest activity has ended. It is this request's
+		// business only if it ended after the request arrived (its own
+		// check, or one it found the suite busy with): then it is reported
+		// as waited for. An older one is history.
+		if !act.endedSince(start) {
+			return "", false, true
+		}
+		check, published = act.outcome()
+		return check, published, true
+	default:
+	}
 	until := start.Add(wait)
 	if byAge := act.started.Add(wait); byAge.Before(until) {
 		until = byAge

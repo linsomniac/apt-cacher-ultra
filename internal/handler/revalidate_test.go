@@ -366,3 +366,93 @@ func TestRevalidate_AdoptionDisabledFirstRequestGetsTheNewRelease(t *testing.T) 
 		t.Errorf("the index after the new InRelease is not the new release's")
 	}
 }
+
+// revalDouble is a Revalidator whose check ends as it is told to, with
+// nothing in flight afterwards.
+type revalDouble struct {
+	result string
+	calls  atomic.Int32
+}
+
+func (d *revalDouble) CheckNow(context.Context, string, string, string) string {
+	d.calls.Add(1)
+	return d.result
+}
+
+func (d *revalDouble) AwaitSuite(context.Context, string, string, string, time.Time, time.Duration) (string, bool, bool) {
+	return "", false, true
+}
+
+// The check before the response replaces the check after it only when it
+// actually ran. On a suite's first contact there is no row yet, so the
+// check before the response is turned away; the miss then creates the row,
+// and the check after the response — the one that starts the suite's first
+// adoption (spec C3, T1-on-seed) — must still fire.
+func TestRevalidate_FirstContactMissStillFiresTheCheckAfterIt(t *testing.T) {
+	r := newSuiteRig(t, true, 0)
+	d := &revalDouble{result: "skipped"}
+	r.h.revalidator, r.h.revalidateWait = d, time.Second
+	r.serve("/r/dists/s/InRelease", upFile{body: rowInRelease})
+
+	if rec := r.get("/r/dists/s/InRelease"); rec.Code != http.StatusOK || r.suite("/r/dists/s") == nil {
+		t.Fatalf("the creating miss = %d", rec.Code)
+	}
+	r.h.activeWG.Wait()
+	if n := d.calls.Load(); n != 1 {
+		t.Errorf("checks before the response = %d, want 1", n)
+	}
+	if calls := r.fresh.snapshot(); len(calls) != 1 || calls[0].suitePath != "/r/dists/s" {
+		t.Fatalf("checks after the response = %v, want one for /r/dists/s: the suite's first adoption depends on it", calls)
+	}
+}
+
+// A check that ran before the response is not run again after it; one that
+// was turned away (the cooldown, a busy suite) leaves the check after the
+// response in place, as before.
+func TestRevalidate_OnlyACheckThatRanReplacesTheCheckAfterTheResponse(t *testing.T) {
+	for _, tc := range []struct {
+		result string
+		after  int
+	}{
+		{"not_modified", 0},
+		{"changed_queued", 0},
+		{"failed", 0},
+		{"skipped", 1},
+		{"busy", 1},
+	} {
+		r := newSuiteRig(t, true, 0)
+		r.serve("/r/dists/s/InRelease", upFile{body: rowInRelease})
+		if rec := r.get("/r/dists/s/InRelease"); rec.Code != http.StatusOK {
+			t.Fatalf("%s: prime = %d", tc.result, rec.Code)
+		}
+		r.h.activeWG.Wait()
+		primed := len(r.fresh.snapshot())
+
+		d := &revalDouble{result: tc.result}
+		r.h.revalidator, r.h.revalidateWait = d, time.Second
+		if rec := r.get("/r/dists/s/InRelease"); rec.Code != http.StatusOK {
+			t.Fatalf("%s: hit = %d", tc.result, rec.Code)
+		}
+		r.h.activeWG.Wait()
+		if got := len(r.fresh.snapshot()) - primed; got != tc.after {
+			t.Errorf("check before the response ended %s: %d checks after it, want %d", tc.result, got, tc.after)
+		}
+	}
+}
+
+// A host the allowlist forbids is refused before any per-suite work: no
+// check is started for it.
+func TestRevalidate_ForbiddenHostIsNotChecked(t *testing.T) {
+	r := newSuiteRig(t, true, 0)
+	d := &revalDouble{result: "skipped"}
+	r.h.revalidator, r.h.revalidateWait = d, time.Second
+	rec := httptest.NewRecorder()
+	r.h.ServeHTTP(rec, proxyReq("GET", "http://forbidden.example", "/r/dists/s/InRelease"))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+	r.h.activeWG.Wait()
+	if n := d.calls.Load(); n != 0 {
+		t.Errorf("checks started for a forbidden host = %d, want none", n)
+	}
+}

@@ -70,6 +70,8 @@ func (c *Checker) unlockDropped(key string, mu *sync.Mutex) {
 	c.locks.CompareAndDelete(key, mu)
 	c.absentAnswered.Delete(key) // ruling PE-10 (b): the suite's row is gone
 	c.lateralHolds.Delete(key)   // ruling PE-11
+	c.active.Delete(key)         // the suite's latest activity (revalidate.go)
+	c.syncStreaks.Delete(key)    // its place on the mirror-sync schedule
 	if c.unlockDroppedHook != nil {
 		c.unlockDroppedHook(key)
 	}

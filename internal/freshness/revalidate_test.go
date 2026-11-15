@@ -222,3 +222,30 @@ func TestAwaitSuite_ASecondRequestWaitsForTheCheckInFlight(t *testing.T) {
 		t.Fatal("AwaitSuite did not return once the first check had ended")
 	}
 }
+
+// An adoption can finish between the check that started it and the
+// request's wait for it (a release whose files are all in the pool adopts
+// in milliseconds). The request is still told what happened: its wait
+// began before the adoption ended.
+func TestAwaitSuite_AnAdoptionThatEndedBeforeTheWaitIsStillReported(t *testing.T) {
+	ctx := context.Background()
+	r := newRetryRig(t, 0)
+	r.adopt()
+	r.up.set(r.release("v2", 0))
+
+	start := time.Now()
+	if got := r.checker.CheckNow(ctx, "http", rigHost, rigSuite); got != "changed" {
+		t.Fatalf("CheckNow = %q, want changed", got)
+	}
+	r.checker.WaitForAdoptions() // the adoption has ended before anyone waits for it
+	check, published, settled := r.checker.AwaitSuite(ctx, "http", rigHost, rigSuite, start, 10*time.Second)
+	if check != "changed" || !published || !settled {
+		t.Fatalf("AwaitSuite = (%q, published %v, settled %v), want the adoption this request's check started", check, published, settled)
+	}
+
+	// A request that arrives after it ended has nothing to be told.
+	check, published, settled = r.checker.AwaitSuite(ctx, "http", rigHost, rigSuite, time.Now(), 10*time.Second)
+	if check != "" || published || !settled {
+		t.Fatalf("a later request: AwaitSuite = (%q, published %v, settled %v), want nothing in flight", check, published, settled)
+	}
+}

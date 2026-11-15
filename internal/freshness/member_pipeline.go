@@ -10,8 +10,8 @@ package freshness
 //
 // Now:
 //   - members are fetched MemberFetchWorkers at a time (fetchMemberRound);
-//   - a member the suite's current snapshot does not serve is asked for at
-//     its declared path first (memberProbeFor, adoptMember's
+//   - a member the suite's current snapshot declared and does not serve is
+//     asked for at its declared path first (memberProbeFor, adoptMember's
 //     probePathFirst), so a file upstream never serves costs one request;
 //   - the members whose failure may heal — a mirror mid-sync — are tried
 //     again together, after one shared delay per round (fetchMembers).
@@ -52,7 +52,7 @@ const (
 	probeByHashFirst
 	// probePathFirst: the declared path, then — unless that path answered
 	// 404 or 410 — the by-hash URL. For members the suite's current
-	// snapshot does not serve (memberProbeFor).
+	// snapshot declared and does not serve (memberProbeFor).
 	probePathFirst
 )
 
@@ -79,16 +79,36 @@ func memberLockKey(m ReleaseMember) string {
 	return m.SHA512
 }
 
-// priorMemberPaths returns the suite-relative paths prior — the suite's
-// current snapshot — serves, or nil when there is no prior snapshot or its
-// members cannot be read (logged). nil turns the path-first probe off:
+// priorMembers is what the suite's current snapshot knows about upstream
+// from its own adoption: the paths its Release declared, and the paths it
+// serves (the members that were fetched, and their by-hash aliases).
+type priorMembers struct {
+	declared map[string]struct{}
+	served   map[string]struct{}
+}
+
+// notServed reports a member the current snapshot's Release declared and
+// the snapshot does not serve: upstream did not have it at that adoption.
+// False for a nil receiver (nothing is known) and for a path that Release
+// did not declare (the member is new: nothing is known about it either).
+func (p *priorMembers) notServed(path string) bool {
+	if p == nil {
+		return false
+	}
+	_, declared := p.declared[path]
+	_, served := p.served[path]
+	return declared && !served
+}
+
+// priorMemberPaths reads what prior — the suite's current snapshot —
+// declared and serves, or returns nil when there is no prior snapshot or
+// either cannot be read (logged). nil turns the path-first probe off:
 // every member then gets the full sequence, as at a first adoption.
-func (a *Adopter) priorMemberPaths(ctx context.Context, suite SuiteRef, prior *cache.SuiteSnapshot) map[string]struct{} {
+func (a *Adopter) priorMemberPaths(ctx context.Context, suite SuiteRef, prior *cache.SuiteSnapshot) *priorMembers {
 	if prior == nil {
 		return nil
 	}
-	rows, err := a.cache.ListSnapshotMembers(ctx, prior.SnapshotID)
-	if err != nil {
+	unavailable := func(err error) *priorMembers {
 		a.adoptionLogger(ctx).Warn("adoption_read_prior_members_failed",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
@@ -97,41 +117,62 @@ func (a *Adopter) priorMemberPaths(ctx context.Context, suite SuiteRef, prior *c
 		)
 		return nil
 	}
-	paths := make(map[string]struct{}, len(rows))
-	for _, r := range rows {
-		paths[r.Path] = struct{}{}
+	rows, err := a.cache.ListSnapshotMembers(ctx, prior.SnapshotID)
+	if err != nil {
+		return unavailable(err)
 	}
-	return paths
+	// The declared set comes from the snapshot's own pinned anchor
+	// (reparseSnapshotRelease, the trust anchor reconcile uses).
+	declared, err := a.reparseSnapshotRelease(ctx, prior.SnapshotID)
+	if err != nil {
+		return unavailable(err)
+	}
+	pm := &priorMembers{
+		declared: make(map[string]struct{}, len(declared)),
+		served:   make(map[string]struct{}, len(rows)),
+	}
+	for _, m := range declared {
+		pm.declared[m.Path] = struct{}{}
+	}
+	for _, r := range rows {
+		pm.served[r.Path] = struct{}{}
+	}
+	return pm
 }
 
 // memberProbeFor decides where m is looked for. A suite without
 // Acquire-By-Hash has only the declared path. With it, by hash first
-// (REC 2) — except a member the suite's current snapshot does not serve
-// (servedBefore), which is asked for at its declared path first.
+// (REC 2) — except a member the suite's current snapshot's Release
+// declared and the snapshot does not serve (priorMembers.notServed),
+// which is asked for at its declared path first.
 //
 // AIDEV-NOTE: why the snapshot is evidence. A Release declares many files
 // its archive never serves: every uncompressed variant on Debian (148 of
 // trixie-security's 372 members, measured 2026-11-14), the foreign
 // architectures and more on Ubuntu's main archive (312 of noble-security's
 // 414). Each cost a by-hash 404 and a path 404 at every adoption. A member
-// absent from the current snapshot was not served when that snapshot was
-// adopted, so its path is the cheaper first question; if the path answers
-// with anything but "not here", adoptMember still tries by hash, so a
-// member that has appeared since, or one caught mid-sync last time, is
-// adopted as before. What this gives up: a member that was absent
-// everywhere last time and has since become available by hash only. For
-// the indexes that matter that cannot happen here — the ones the
-// serve-contract guard requires (requiredIndex) always keep the by-hash
-// probe — and for any other requestable index the unchanged-check
-// reconcile runs the full sequence again.
-func (a *Adopter) memberProbeFor(suite SuiteRef, m ReleaseMember, acquireByHash bool, servedBefore map[string]struct{}) memberProbe {
+// that was declared at the current snapshot's adoption and is absent from
+// it was not served then, so its path is the cheaper first question; if
+// the path answers with anything but "not here", adoptMember still tries
+// by hash, so a member that has appeared since, or one caught mid-sync
+// last time, is adopted as before.
+//
+// A member this Release declares for the first time is NOT such a member:
+// nothing is known about it, and a mirror mid-sync can have a new file by
+// hash before it appears at its path, so it keeps by-hash-first (review of
+// 2026-11-15: asking the path first lost it for the snapshot's lifetime).
+//
+// What this gives up: a member that was absent everywhere at the last
+// adoption and has since become available by hash only. For the indexes
+// that matter that cannot happen here — the ones the serve-contract guard
+// requires (requiredIndex) always keep the by-hash probe — and for any
+// other requestable index the unchanged-check reconcile runs the full
+// sequence again.
+func (a *Adopter) memberProbeFor(suite SuiteRef, m ReleaseMember, acquireByHash bool, prior *priorMembers) memberProbe {
 	if !acquireByHash || m.Path == "" {
 		return probePath
 	}
-	if servedBefore == nil {
-		return probeByHashFirst
-	}
-	if _, served := servedBefore[m.Path]; served || a.requiredIndex(suite.SuitePath, m.Path) {
+	if !prior.notServed(m.Path) || a.requiredIndex(suite.SuitePath, m.Path) {
 		return probeByHashFirst
 	}
 	return probePathFirst
@@ -161,8 +202,20 @@ func (a *Adopter) requiredIndex(suitePath, path string) bool {
 // not see: the bytes did not come, or were not the declared ones — a
 // round-robin mirror serving the previous publication generation
 // mid-sync (SPEC6_7 §1). A 404 or 410 ("declared but not served") and a
-// local fault are not.
+// local fault are not. Nor is a member whose upstream went silent
+// (memberUpstreamSilent): the fetch already retried that once, and each
+// round would hold the release for two more idle timeouts; an optional
+// one is skipped and left to repair, an index fails the attempt, which
+// the short retry schedule brings back in a minute.
 func memberMayHeal(err error) bool {
+	return memberFailed(err) && !memberUpstreamSilent(err)
+}
+
+// memberFailed reports a member's own failure: its fetch failed, or its
+// bytes were not the declared ones. What it means for the snapshot is
+// runShared's to decide (tolerated for an optional member, fatal for an
+// index).
+func memberFailed(err error) bool {
 	return errors.Is(err, ErrAdoptionMemberFetchFailed) || errors.Is(err, ErrAdoptionMemberMismatch)
 }
 
@@ -171,7 +224,7 @@ func memberMayHeal(err error) bool {
 // context. Every other member error is the member's own — skipped,
 // tolerated or failed on by runShared.
 func memberEndsAttempt(err error) bool {
-	return err != nil && !errors.Is(err, errAdoptionMemberSkipped) && !memberMayHeal(err)
+	return err != nil && !errors.Is(err, errAdoptionMemberSkipped) && !memberFailed(err)
 }
 
 // fetchMembers does Step 5's upstream work for jobs: every member once,

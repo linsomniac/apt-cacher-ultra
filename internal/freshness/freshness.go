@@ -238,9 +238,17 @@ type Checker struct {
 	// Reconcile that loaded it unwinds, or after a read error (LockCount).
 	locks sync.Map
 
-	// active holds, per suite key, the check in flight and the adoption it
-	// started (*suiteActivity, revalidate.go): what an anchor request waits
-	// for. At most one per suite (the suite's mutex is held throughout).
+	// syncStreaks holds, per suite key, where the suite's failing streak
+	// stands on the mirror-sync retry schedule (syncStreak,
+	// adoption_failure.go). Written under the suite's mutex, dropped with
+	// its lock-map entry (unlockDropped). In memory only.
+	syncStreaks sync.Map
+
+	// active holds, per suite key, the suite's latest check and the
+	// adoption it started (*suiteActivity, revalidate.go) — in flight, or
+	// ended and not yet replaced: what an anchor request waits for. One per
+	// suite (the suite's mutex is held while one is in flight), dropped
+	// with the suite's lock-map entry (unlockDropped).
 	active sync.Map
 
 	// repairs holds the repair or reconcile goroutine in flight per suite
@@ -520,7 +528,7 @@ func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) check
 	handedOff := false
 	defer func() {
 		if !handedOff {
-			c.endActivity(key, act)
+			c.endActivity(act)
 		}
 	}()
 	// Spec C4: the upstream part of a check (the host slot and the
@@ -553,7 +561,7 @@ func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) check
 		}
 		out.req.trigger.reason, out.req.trigger.detail = out.report.result, out.report.reason
 		handedOff = true
-		c.spawnAdoption(mu, out.req, out.lease, key, act)
+		c.spawnAdoption(mu, out.req, out.lease, act)
 	case out.lease != nil && out.repair != nil:
 		c.spawnRepair(mu, out)
 	default:
@@ -642,7 +650,7 @@ func (c *Checker) suiteRowExists(ctx context.Context, ref SuiteRef) bool {
 // any error once the lifetime context has ended (deferred minor C-20) — is
 // never counted, logged or recorded as a failure (INFO
 // adoption_abandoned_at_shutdown).
-func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease, key string, act *suiteActivity) {
+func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease, act *suiteActivity) {
 	c.adoptionWg.Add(1)
 	// Spec C10: a signed adoption is in flight from here (before the
 	// goroutine runs, so a request right after the check sees it) until
@@ -658,7 +666,7 @@ func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease, 
 		}
 		// After the Unlock: an anchor request that waited for this adoption
 		// (AwaitSuite) goes on to a snapshot pointer nothing is switching.
-		defer c.endActivity(key, act)
+		defer c.endActivity(act)
 		defer mu.Unlock()
 		defer l.release()
 		// SPEC5 §10.4.3 / §9.7.7: time the adoption from goroutine
@@ -863,19 +871,27 @@ func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
 		defer c.recoverGoroutine("repair", rp.suite)
 		defer cancelDeadline()
 		defer cancel(nil)
+		// gaveWay is read right after each piece of work returns: a request
+		// to give way that arrives once the work is done changes nothing,
+		// and is not logged or counted as a repair that gave way.
+		gaveWay := false
 		if needRepair {
 			c.adopter.RepairSkippedMembers(rctx, rp.suite, rp.snapshotID)
+			gaveWay = yielded(rctx)
 		}
-		if needReconcile && !yielded(rctx) {
+		if needReconcile && !gaveWay {
 			// ReconcileSnapshot leaves logging to its caller; log like the
 			// on-demand path (Reconcile) so a fail-closed anchor (R-1
 			// decode error) is visible, not a silent non-heal. A reconcile
 			// that gave way is no failure.
-			if _, err := c.adopter.reconcileSnapshot(rctx, rp.suite, rp.snapshotID, declared, false); err != nil && !yielded(rctx) {
+			_, err := c.adopter.reconcileSnapshot(rctx, rp.suite, rp.snapshotID, declared, false)
+			gaveWay = yielded(rctx)
+			if err != nil && !gaveWay {
 				c.logReconcileFailure(rctx, "heal", rp.suite, rp.snapshotID, err)
 			}
 		}
-		if to := run.yieldedTo(); to != "" {
+		if gaveWay {
+			to := run.yieldedTo()
 			repairYieldedTotal.Inc(to)
 			c.logger.Info("repair_yielded",
 				"canonical_scheme", rp.suite.CanonicalScheme,

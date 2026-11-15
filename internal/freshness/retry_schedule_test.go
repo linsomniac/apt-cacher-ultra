@@ -6,6 +6,7 @@ package freshness
 // short schedule, and new upstream content starts that schedule again.
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -42,7 +43,9 @@ func TestAdoptionFailure_MirrorSyncFailuresRetryOnAShortSchedule(t *testing.T) {
 
 // A new publication is a new chance: its first failure waits the
 // schedule's first step, not the step the previous content had reached.
-// The streak's start stays, so "failing since" still tells the truth.
+// The streak itself goes on — its count and its start — so the suite still
+// reads as failing since its first failure, and the persistent-failure
+// warning still counts every attempt.
 func TestAdoptionFailure_NewContentStartsTheShortScheduleAgain(t *testing.T) {
 	r := newRetryRig(t, 0)
 	r.staleMirror()
@@ -62,8 +65,8 @@ func TestAdoptionFailure_NewContentStartsTheShortScheduleAgain(t *testing.T) {
 	if strOf(row.AdoptionFailHash) != hashOf(gen2) {
 		t.Fatalf("record hash = %q, want the new content's", strOf(row.AdoptionFailHash))
 	}
-	if row.AdoptionFailCount != 1 {
-		t.Errorf("count = %d for the new content's first failure, want 1", row.AdoptionFailCount)
+	if row.AdoptionFailCount != 5 {
+		t.Errorf("count = %d, want 5: the streak goes on across the new content", row.AdoptionFailCount)
 	}
 	if got := i64Of(row.AdoptionNextRetryAt) - r.clock.now().Unix(); got != 60 {
 		t.Errorf("retry in %d s, want 60: the schedule's first step", got)
@@ -119,5 +122,58 @@ func TestAdoptionFailure_MirrorSyncScheduleEndsAfterTwoHours(t *testing.T) {
 		if d := adoptionRetryDelay("member_fetch_failed", n); d != retryMaxDelay {
 			t.Errorf("attempt %d waits %s, want the general schedule's %s", n, d, retryMaxDelay)
 		}
+	}
+}
+
+// Content that is new at every attempt — two mirrors that disagree, a
+// Release generated per request — is not a series of new publications: if
+// each one restarted the short schedule, the suite would be retried every
+// minute for ever and never reach the persistent-failure warning. Content
+// that was attempted only once before it changed does not restart the
+// schedule: the suite goes on down it, to the hourly retries, and the
+// warning fires at its usual counts (the review of 2026-11-15; spec C7's
+// FW-3 (a) made the same rule for the confirmation records).
+func TestAdoptionFailure_ContentThatChangesAtEveryAttemptGoesOnDownTheSchedule(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.staleMirror()
+	want := []int64{60, 120, 240, 480, 600, 600}
+	for i, w := range want {
+		r.up.set(r.release(fmt.Sprintf("churn-%d", i), 0)) // new content every time
+		r.check()
+		row := r.row()
+		if row.AdoptionFailCount != int64(i+1) {
+			t.Fatalf("attempt %d: count = %d", i+1, row.AdoptionFailCount)
+		}
+		if got := i64Of(row.AdoptionNextRetryAt) - r.clock.now().Unix(); got != w {
+			t.Fatalf("attempt %d: retry in %d s, want %d", i+1, got, w)
+		}
+		r.clock.advance(time.Duration(w) * time.Second)
+	}
+	var counts []float64
+	for _, e := range r.events("adoption_failing_persistently") {
+		counts = append(counts, e["fail_count"].(float64))
+	}
+	if len(counts) != 2 || counts[0] != 3 || counts[1] != 6 {
+		t.Fatalf("persistent warnings at %v, want [3 6]", counts)
+	}
+}
+
+// Content that was retried and then replaced is a new publication, however
+// long the streak: the new content starts at the first step.
+func TestAdoptionFailure_AStableContentReplacedStartsAgainEachTime(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.staleMirror()
+	for gen := 0; gen < 3; gen++ {
+		r.up.set(r.release(fmt.Sprintf("gen-%d", gen), 0))
+		for i, w := range []int64{60, 120, 240} {
+			r.check()
+			if got := i64Of(r.row().AdoptionNextRetryAt) - r.clock.now().Unix(); got != w {
+				t.Fatalf("release %d, attempt %d: retry in %d s, want %d", gen, i+1, got, w)
+			}
+			r.clock.advance(time.Duration(w) * time.Second)
+		}
+	}
+	if got := r.row().AdoptionFailCount; got != 9 {
+		t.Errorf("count = %d after nine failures in a row, want 9", got)
 	}
 }

@@ -34,13 +34,13 @@ const (
 // than an hour, every one behind a run of such failures. An attempt costs
 // little — members already verified are reused from the pool.
 //
-// The short schedule is for a fault that heals. Content that has failed
-// syncRetryAttempts times in a row — about two hours of it — is not a
+// The short schedule is for a fault that heals. A suite that has gone
+// syncRetryAttempts steps down it — about two hours — is not looking at a
 // mirror mid-sync (a wrong suite path, an index upstream publishes
 // broken): from then on it is retried at the general schedule's cap, once
 // an hour, so a repository that is simply broken costs what it did
-// before. New content starts the short schedule again
-// (recordAdoptionFailure).
+// before. A new publication starts the short schedule again; content that
+// merely differs at every attempt does not (Checker.syncStep).
 const (
 	syncRetryBaseDelay = time.Minute
 	syncRetryMaxDelay  = 10 * time.Minute
@@ -59,10 +59,11 @@ func syncFailure(reason string) bool {
 	return reason == "member_fetch_failed" || reason == "member_mismatch"
 }
 
-// adoptionRetryDelay is the wait before the count-th consecutive failed
-// attempt's content is tried again, before jitter: the mirror-sync
-// schedule for a syncFailure reason, the general one (backoffDelay)
-// otherwise.
+// adoptionRetryDelay is the wait before a failed attempt's content is
+// tried again, before jitter. For a syncFailure reason it is the
+// mirror-sync schedule and count is the suite's position on it
+// (Checker.syncStep); otherwise the general schedule (backoffDelay) and
+// count is the streak's failure count.
 func adoptionRetryDelay(reason string, count int64) time.Duration {
 	if !syncFailure(reason) {
 		return backoffDelay(count)

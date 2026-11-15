@@ -176,6 +176,14 @@ type AdoptionMemberError struct {
 	Detail                 string // short reason, e.g. "served 114572 vs declared 1664594"
 	err                    error  // wraps the category sentinel via %w
 	representationMismatch bool   // eligible for verified compressed-sibling recovery
+	// upstreamSilent: the fetch ended because upstream sent nothing for
+	// upstream.idle_read_timeout, twice (fetch.ErrIdleTimeout: the fetch
+	// retries a silence once itself). Such a member is not tried again in
+	// the retry rounds (memberMayHeal), and one the snapshot can do
+	// without is not asked for at its other URL either (memberTolerated):
+	// every further attempt would wait out two more idle timeouts for a
+	// file upstream is not sending.
+	upstreamSilent bool
 }
 
 func (e *AdoptionMemberError) Error() string { return e.err.Error() }
@@ -191,6 +199,37 @@ func newMemberErr(sentinel error, path, detail string) *AdoptionMemberError {
 		Detail: detail,
 		err:    fmt.Errorf("%w: %s: %s", sentinel, path, detail),
 	}
+}
+
+// silentMemberErr is the member-fetch failure of a member whose upstream
+// went silent (AdoptionMemberError.upstreamSilent).
+func silentMemberErr(path string, err error) *AdoptionMemberError {
+	me := newMemberErr(ErrAdoptionMemberFetchFailed, path, fmt.Sprintf("fetch: %v", err))
+	me.upstreamSilent = true
+	return me
+}
+
+// memberTolerated reports a member whose fetch or integrity failure a
+// snapshot survives (REC 1): optional-member tolerance is on and the
+// member is not an IndexTarget. Such a member is skipped and left to
+// repair; any other member's failure fails the attempt.
+//
+// AIDEV-NOTE: this is also what decides whether a member keeps its second
+// URL after the first one went silent (adoptMember). A tolerated member
+// does not: the second URL would wait out two more idle timeouts for a
+// file the release can be published without. A member the snapshot needs
+// does, whatever it costs: a by-hash URL that hangs while the declared
+// path answers must not keep a suite unadopted, attempt after attempt
+// (robustness before speed).
+func (a *Adopter) memberTolerated(suitePath, path string) bool {
+	return a.tolerateOptionalMembers && !isIndexTarget(suitePath, path)
+}
+
+// memberUpstreamSilent reports a member failure that ended at a silent
+// upstream.
+func memberUpstreamSilent(err error) bool {
+	var me *AdoptionMemberError
+	return errors.As(err, &me) && me.upstreamSilent
 }
 
 // memberErrorFields recovers the failing member path + detail from an
@@ -1562,11 +1601,12 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		requiredGroupFetched = make(map[string]bool)
 	}
 	declaredMembers := memberDeclarations(members)
-	// A member the suite's current snapshot does not serve was not served
-	// at the last adoption: almost always a file the Release declares and
-	// upstream never serves. memberProbeFor asks for such a member at its
-	// declared path first, so that it costs one request, not two.
-	servedBefore := a.priorMemberPaths(ctx, suite, prior)
+	// A member the suite's current snapshot declared and does not serve
+	// was not served at the last adoption: almost always a file the
+	// Release declares and upstream never serves. memberProbeFor asks for
+	// such a member at its declared path first, so that it costs one
+	// request, not two.
+	priorKnown := a.priorMemberPaths(ctx, suite, prior)
 
 	// Pass 1, in declared order: the architecture filter and the
 	// required-architecture bookkeeping. Nothing is fetched yet. A context
@@ -1617,7 +1657,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		jobs = append(jobs, &memberJob{
 			m:             m,
 			requiredGroup: requiredGroup,
-			probe:         a.memberProbeFor(suite, m, acquireByHash, servedBefore),
+			probe:         a.memberProbeFor(suite, m, acquireByHash, priorKnown),
 		})
 	}
 
@@ -1674,7 +1714,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			// and a local DB fault (ErrAdoptionDBFailed) is never
 			// tolerated — only upstream member fetch/mismatch failures, and
 			// never once ctx has ended (the AIDEV-NOTE above this pass).
-			if a.tolerateOptionalMembers && ctx.Err() == nil && !isIndexTarget(suite.SuitePath, m.Path) &&
+			if a.memberTolerated(suite.SuitePath, m.Path) && ctx.Err() == nil &&
 				(errors.Is(err, ErrAdoptionMemberFetchFailed) || errors.Is(err, ErrAdoptionMemberMismatch)) {
 				detail := ""
 				var me *AdoptionMemberError
@@ -2333,6 +2373,12 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 		if errors.Is(ferr, ErrAdoptionDBFailed) {
 			return "", false, ferr
 		}
+		if errors.Is(ferr, fetch.ErrIdleTimeout) && a.memberTolerated(suite.SuitePath, m.Path) {
+			// Upstream is not sending this file, and the snapshot can do
+			// without it: its declared path would only wait out the idle
+			// timeout again (memberTolerated).
+			return "", false, silentMemberErr(m.Path, ferr)
+		}
 		a.adoptionLogger(ctx).Debug("adoption_byhash_fallback",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
@@ -2349,7 +2395,8 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 		// race; when by-hash fails too, the path's own error stands.
 		h, perr := a.fetchMemberURL(ctx, suite, m, m.Path)
 		if perr == nil || errors.Is(perr, errAdoptionMemberSkipped) ||
-			errors.Is(perr, ErrAdoptionDBFailed) || ctx.Err() != nil {
+			errors.Is(perr, ErrAdoptionDBFailed) || ctx.Err() != nil ||
+			(memberUpstreamSilent(perr) && a.memberTolerated(suite.SuitePath, m.Path)) {
 			return h, false, perr
 		}
 		h, ferr := a.tryByHashFetch(ctx, suite, m, byHashProbePath(m))
@@ -2506,6 +2553,7 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 		}
 		me := newMemberErr(ErrAdoptionMemberFetchFailed, m.Path, fmt.Sprintf("fetch: %v", err))
 		me.representationMismatch = errors.Is(err, fetch.ErrBodyTooLarge)
+		me.upstreamSilent = errors.Is(err, fetch.ErrIdleTimeout)
 		return "", me
 	}
 	// Size sanity: declared Size in the Release file should match

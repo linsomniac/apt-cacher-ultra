@@ -408,6 +408,7 @@ func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (resul
 		initial     *FetchResult
 		attempts    int
 		lastErr     error
+		idled       bool // an attempt of this fetch already ended at the idle read timeout
 	)
 
 	for {
@@ -474,6 +475,20 @@ func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (resul
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
+		}
+		// AIDEV-NOTE: an idle timeout is retried once, whatever max_retries
+		// allows. The retry is for a silence that was the connection's (a
+		// stuck backend, a dead path): a fresh attempt then answers at once.
+		// A second silence says upstream is not answering for this URL, and
+		// every further retry would wait out idle_read_timeout again: with
+		// the default three retries a stalled file cost four idle timeouts
+		// (240 s), which held an adoption that long (the freshness lab,
+		// 2026-11-15). Other failures keep all their retries.
+		if errors.Is(err, ErrIdleTimeout) {
+			if idled {
+				return nil, fmt.Errorf("%w: %w", ErrUpstreamUnavailable, err)
+			}
+			idled = true
 		}
 		// SPEC §10: emit one structured log per retry attempt so an
 		// operator watching upstream flap can quantify it.
