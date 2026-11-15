@@ -238,6 +238,13 @@ type Checker struct {
 	// Reconcile that loaded it unwinds, or after a read error (LockCount).
 	locks sync.Map
 
+	// repairs holds the repair or reconcile goroutine in flight per suite
+	// key (*repairRun), from spawnRepair until the goroutine releases the
+	// suite's mutex: what a check asks to give way (repair_yield.go). At
+	// most one per suite — the suite's mutex is held throughout — so it
+	// is bounded by the lock map.
+	repairs sync.Map
+
 	// absentAnswered holds the keys of suites whose last answered check
 	// ended anchor_absent (ruling PE-10 b, pacedAbsentAnswer): set and
 	// cleared by the check tails (finishCheck, failCheck), dropped with the
@@ -493,40 +500,13 @@ func (c *Checker) Check(ctx context.Context, scheme, host, suitePath string) {
 func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) checkReport {
 	scheme, host, suitePath := ref.CanonicalScheme, ref.CanonicalHost, ref.SuitePath
 	key := suiteKey(scheme, host, suitePath)
-	// A suite whose mutex is held answers busy with no database read: peek
-	// at the lock map without storing (FW-6, final review concurrency M3).
-	//
-	// AIDEV-NOTE: T1 fires on every metadata hit of a tracked suite, so a
-	// burst of N index fetches is N checks; before this peek each paid a
-	// row read even when busy (N reads, against about one). The peek's
-	// TryLock holds a free mutex for an instant: a concurrent lockSuite on
-	// the same suite may then answer busy, which every caller already
-	// treats as "someone else is on it". The peek never stores, so I-4's
-	// "a row before LoadOrStore" stands; checkLocked's read after TryLock
-	// stays the re-validation.
-	if entry, ok := c.locks.Load(key); ok {
-		mu := entry.(*sync.Mutex)
-		if !mu.TryLock() {
-			return checkReport{result: resultBusy}
-		}
-		mu.Unlock()
+	mu, rep, ok := c.acquireSuite(ctx, ref, key)
+	if !ok && rep.result == resultBusy && c.repairGivesWay(key) {
+		// The suite's repair gave way to this check (repair_yield.go).
+		mu, rep, ok = c.acquireSuite(ctx, ref, key)
 	}
-	// I-4 (spec C3): only a suite with a row is checked, and only it gets
-	// a lock-map entry; a minted path's T1 costs one indexed existence read.
-	if !c.suiteRowExists(ctx, ref) {
-		return checkReport{result: resultSkipped}
-	}
-	mu, st := c.lockSuite(key)
-	switch st {
-	case lockBusy:
-		// Another goroutine is on it; SPEC §7.3 says skip.
-		return checkReport{result: resultBusy}
-	case lockStale:
-		// I-4: the mutex counts only while the lock map still holds it. Cap
-		// eviction (and phase F's reaper) drops the entry of a suite it
-		// deleted while holding this mutex; a check that loaded it before
-		// then must not run beside one that loads the new entry.
-		return checkReport{result: resultSkipped}
+	if !ok {
+		return rep
 	}
 	// Spec C4: the upstream part of a check (the host slot and the
 	// conditional GETs) runs under a 2-minute deadline. Cache reads and
@@ -565,6 +545,49 @@ func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) check
 		mu.Unlock()
 	}
 	return out.report
+}
+
+// acquireSuite takes the suite's mutex for a check: ok with the mutex
+// held, or the report the check ends with — resultBusy when another
+// goroutine holds it, resultSkipped when the suite has no row or its
+// lock-map entry went stale.
+func (c *Checker) acquireSuite(ctx context.Context, ref SuiteRef, key string) (*sync.Mutex, checkReport, bool) {
+	// A suite whose mutex is held answers busy with no database read: peek
+	// at the lock map without storing (FW-6, final review concurrency M3).
+	//
+	// AIDEV-NOTE: T1 fires on every metadata hit of a tracked suite, so a
+	// burst of N index fetches is N checks; before this peek each paid a
+	// row read even when busy (N reads, against about one). The peek's
+	// TryLock holds a free mutex for an instant: a concurrent lockSuite on
+	// the same suite may then answer busy, which every caller already
+	// treats as "someone else is on it". The peek never stores, so I-4's
+	// "a row before LoadOrStore" stands; checkLocked's read after TryLock
+	// stays the re-validation.
+	if entry, ok := c.locks.Load(key); ok {
+		mu := entry.(*sync.Mutex)
+		if !mu.TryLock() {
+			return nil, checkReport{result: resultBusy}, false
+		}
+		mu.Unlock()
+	}
+	// I-4 (spec C3): only a suite with a row is checked, and only it gets
+	// a lock-map entry; a minted path's T1 costs one indexed existence read.
+	if !c.suiteRowExists(ctx, ref) {
+		return nil, checkReport{result: resultSkipped}, false
+	}
+	mu, st := c.lockSuite(key)
+	switch st {
+	case lockBusy:
+		// Another goroutine is on it; SPEC §7.3 says skip.
+		return nil, checkReport{result: resultBusy}, false
+	case lockStale:
+		// I-4: the mutex counts only while the lock map still holds it. Cap
+		// eviction (and phase F's reaper) drops the entry of a suite it
+		// deleted while holding this mutex; a check that loaded it before
+		// then must not run beside one that loads the new entry.
+		return nil, checkReport{result: resultSkipped}, false
+	}
+	return mu, checkReport{}, true
 }
 
 // suiteRowExists reports whether the suite has a suite_freshness row
@@ -780,8 +803,9 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
 // suite/snapshotID ARE the current snapshot. Mutex handoff and
 // adoptionWg mirror spawnAdoption; WaitForAdoptions drains both.
 //
-// AIDEV-NOTE: defer order is load-bearing: Done (last), Unlock, lease
-// release, recover (first). See recoverGoroutine.
+// AIDEV-NOTE: defer order is load-bearing: Done (last), the run's done,
+// Unlock, the run's removal, lease release, recover (first). See
+// recoverGoroutine.
 // AIDEV-NOTE: a repair or reconcile that panics deterministically is
 // logged (adoption_panicked, where=repair: recoverGoroutine), not
 // recorded: the spec C7 record is keyed on upstream content, and an
@@ -790,24 +814,53 @@ func (c *Checker) planRepair(ctx context.Context, out *checkOutcome) {
 // B deviation 7; kept in phase E: v7 has no record keyed on a snapshot).
 func (c *Checker) spawnRepair(mu *sync.Mutex, out *checkOutcome) {
 	rp, l, needRepair, needReconcile, declared := out.repair, out.lease, out.needRepair, out.needReconcile, out.declared
+	// The repair gives way when asked (repair_yield.go): its context can be
+	// cancelled with errRepairYielded, by an adoption that needs its slots
+	// (through the lease) or by a check of this suite (through c.repairs).
+	//
+	// AIDEV-NOTE: nothing here may panic: the suite mutex is held with no
+	// defer until the goroutine below owns it (check's hand-off rule).
+	key := suiteKey(rp.suite.CanonicalScheme, rp.suite.CanonicalHost, rp.suite.SuitePath)
+	dctx, cancelDeadline := context.WithTimeout(c.lifetimeCtx, c.maxAdoptionDuration)
+	rctx, cancel := context.WithCancelCause(dctx)
+	run := &repairRun{started: time.Now(), cancel: cancel, done: make(chan struct{})}
+	c.repairs.Store(key, run)
+	l.setYield(run.yield)
 	c.adoptionWg.Add(1)
 	go func() {
 		defer c.adoptionWg.Done()
+		// After the Unlock: a check that waited for the repair to give way
+		// finds the mutex free.
+		defer close(run.done)
 		defer mu.Unlock()
+		// Before the Unlock: the suite's next repair stores its own run.
+		defer c.repairs.CompareAndDelete(key, run)
 		defer l.release()
 		defer c.recoverGoroutine("repair", rp.suite)
-		rctx, cancel := context.WithTimeout(c.lifetimeCtx, c.maxAdoptionDuration)
-		defer cancel()
+		defer cancelDeadline()
+		defer cancel(nil)
 		if needRepair {
 			c.adopter.RepairSkippedMembers(rctx, rp.suite, rp.snapshotID)
 		}
-		if needReconcile {
+		if needReconcile && !yielded(rctx) {
 			// ReconcileSnapshot leaves logging to its caller; log like the
 			// on-demand path (Reconcile) so a fail-closed anchor (R-1
-			// decode error) is visible, not a silent non-heal.
-			if _, err := c.adopter.reconcileSnapshot(rctx, rp.suite, rp.snapshotID, declared, false); err != nil {
+			// decode error) is visible, not a silent non-heal. A reconcile
+			// that gave way is no failure.
+			if _, err := c.adopter.reconcileSnapshot(rctx, rp.suite, rp.snapshotID, declared, false); err != nil && !yielded(rctx) {
 				c.logReconcileFailure(rctx, "heal", rp.suite, rp.snapshotID, err)
 			}
+		}
+		if to := run.yieldedTo(); to != "" {
+			repairYieldedTotal.Inc(to)
+			c.logger.Info("repair_yielded",
+				"canonical_scheme", rp.suite.CanonicalScheme,
+				"canonical_host", rp.suite.CanonicalHost,
+				"suite_path", rp.suite.SuitePath,
+				"snapshot_id", rp.snapshotID,
+				"to", to,
+				"ran_seconds", time.Since(run.started).Seconds(),
+			)
 		}
 	}()
 }

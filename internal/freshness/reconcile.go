@@ -125,6 +125,12 @@ func (a *Adopter) reconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 	for _, m := range missing {
 		blobHash, _, ferr := a.adoptMemberFromRelease(ctx, suite, m, probeByHashFirst, declaredMembers)
 		if ferr != nil {
+			if yielded(ctx) {
+				// The heal gave way (repair_yield.go): nothing is healed
+				// this time and nothing failed. The members fetched so far
+				// are in the pool; the next unchanged check reuses them.
+				return 0, nil
+			}
 			a.logger.Warn("adoption_reconcile_member_failed",
 				"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath,
 				"snapshot_id", snapshotID, "path", m.Path, "err", ferr)
@@ -135,7 +141,7 @@ func (a *Adopter) reconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 		rows = append(rows, memberRows(snapshotID, m, blobHash)...)
 		healedDecl = append(healedDecl, verifiedMember(m, blobHash))
 	}
-	if len(rows) == 0 {
+	if len(rows) == 0 || yielded(ctx) {
 		return 0, nil
 	}
 	// Build package_hash rows for the healed indexes (declared set = full

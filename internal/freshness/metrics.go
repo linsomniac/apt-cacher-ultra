@@ -91,6 +91,17 @@ var (
 		"host",
 	)
 
+	// repairYieldedTotal counts repairs and reconciles that gave way
+	// (repair_yield.go), by what they gave way to: adoption (an adoption
+	// needed the repair's slots) or check (a check of the repair's own
+	// suite was due). A closed two-value enum.
+	repairYieldedTotal = metrics.NewCounterWithCap(
+		"acu_repair_yielded_total",
+		"Repairs and reconciles that gave way, by what to: adoption or check.",
+		metrics.DefaultMaxSeries,
+		"to",
+	)
+
 	// suitesReapedTotal counts the suites the suite reaper deleted, by
 	// reason (spec C9, design review M-16): a closed three-value enum —
 	// idle, non_canonical, junk — so dashboards see reaping without

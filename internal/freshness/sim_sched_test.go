@@ -92,15 +92,17 @@ func seedSimSuites(t *testing.T, c *cache.Cache, host string, suites []string, l
 // and suites whose upstream changes on every request (C on h2, C3 on h3)
 // contend for the two adoption slots, checks continue everywhere and
 // goroutines stay bounded. Repair and adoption goroutines must never hold
-// a check worker (spec C4): while R's repair and C's adoption hold both
-// slots, all checkWorkers workers are still checking.
+// a check worker (spec C4): while two adoptions hold both slots, all
+// checkWorkers workers are still checking.
 //
 // Timeline (virtual): the first tick (15 m) checks R, C and C3 first on
-// their hosts. R's repair (two 10-minute member fetches) holds a slot
-// until 35 m; C's adoption (one 10-minute member fetch) holds the other
-// until 25 m. C3 answers 1 s later, finds no slot and is queued; it is
-// offered on h3's first free turn after C's slot is released (25–27 m)
-// and adopts for 10 minutes.
+// their hosts. R's repair (two 10-minute member fetches) and C's adoption
+// (one 10-minute member fetch) take both slots. C3 answers 1 s later and
+// finds no slot free — but one is a repair's, and a repair gives way to an
+// adoption (repair_yield.go): R's repair stops, C3 adopts at once, and
+// the two adoptions hold both slots until 25 m. Before the 2026-11-14
+// publication-delay review C3 was queued behind the repair until C's slot
+// was released.
 func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()
@@ -220,21 +222,21 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 			}
 			time.Sleep(until - time.Since(t0))
 		}
-		// The worker bound: from 16 m 30 s to 24 m 30 s R's repair and C's
-		// adoption hold both slots, and the stalling suites keep all four
+		// The worker bound: from 16 m 30 s to 24 m 30 s C's and C3's
+		// adoptions hold both slots, and the stalling suites keep all four
 		// workers busy. A repair or adoption run on a check worker would
 		// leave at most three checks in flight.
 		sample(16*time.Minute + 30*time.Second)
 		if inUse, _ := chk.admission.usage(); inUse != 2 {
-			t.Fatalf("at 16m30s %d adoption slots were in use, want 2 (R's repair and C's adoption)", inUse)
+			t.Fatalf("at 16m30s %d adoption slots were in use, want 2 (C's and C3's adoptions)", inUse)
 		}
 		up.ResetMax()
 		sample(24*time.Minute + 30*time.Second)
 		if inUse, _ := chk.admission.usage(); inUse != 2 {
-			t.Fatalf("at 24m30s %d adoption slots were in use, want 2 (R's repair and C's adoption)", inUse)
+			t.Fatalf("at 24m30s %d adoption slots were in use, want 2 (C's and C3's adoptions)", inUse)
 		}
 		if total, _ := up.MaxInFlight(); total < checkWorkers {
-			t.Errorf("while a repair and an adoption held both slots, at most %d checks ran at once, want %d"+
+			t.Errorf("while two adoptions held both slots, at most %d checks ran at once, want %d"+
 				" (a repair or adoption is holding a check worker)", total, checkWorkers)
 		}
 		sample(95 * 61 * time.Second) // ~1 h 37 min, off the tick grid
@@ -256,20 +258,26 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 				t.Errorf("%s checked %d times in ~1h37m, want its checks to continue (>= 2)", u, n)
 			}
 		}
-		// Every unchanged check of R spawned a repair: a slot was always
-		// free for it (C and C3 never hold both when R is checked).
-		repairs := 0
-		for _, u := range members.requested() {
-			if u == rByHash {
-				repairs++
+		// Every unchanged check of R started a repair: a slot was always
+		// free for it (C and C3 never hold both when R is checked). And
+		// every one of them gave way to an adoption: C3's, which needs the
+		// repair's slot a second after each of R's checks.
+		unchanged := countChecks(t, logs.String(), "h1", "/r/dists/s", "unchanged", "not_modified")
+		yieldedToAdoption := 0
+		for _, rec := range logRecords(t, logs, "repair_yielded") {
+			if rec["canonical_host"] == "h1" && rec["suite_path"] == "/r/dists/s" && rec["to"] == "adoption" {
+				yieldedToAdoption++
 			}
 		}
-		unchanged := countChecks(t, logs.String(), "h1", "/r/dists/s", "unchanged", "not_modified")
-		if repairs < 2 || repairs != unchanged {
-			t.Errorf("R's repair ran %d times for %d unchanged checks, want one per unchanged check (>= 2)", repairs, unchanged)
+		if unchanged < 2 || yieldedToAdoption != unchanged {
+			t.Errorf("R's repair gave way to an adoption %d times for %d unchanged checks, want once per unchanged check (>= 2)",
+				yieldedToAdoption, unchanged)
 		}
-		// The changing suites adopted new content, C3 only after it was
-		// queued for a slot (and offered one when C's was released).
+		if deferred := strings.Count(logs.String(), "freshness_repair_deferred_no_adoption_slot"); deferred != 0 {
+			t.Errorf("R's repair was deferred %d times for want of a slot, want never", deferred)
+		}
+		// The changing suites adopted new content, and neither ever waited
+		// for a slot: the one a repair held was theirs for the asking.
 		for _, s := range []struct{ host, seeded string }{{"h2", cSeeded}, {"h3", c3Seeded}} {
 			sf, err := c.GetSuiteFreshness(ctx, "http", s.host, cSuite)
 			if err != nil || sf.CurrentSnapshotID == nil {
@@ -280,8 +288,10 @@ func TestSimScheduler_LatencyBoundEightHosts(t *testing.T) {
 				t.Errorf("%s never adopted new content (err %v)", s.host, err)
 			}
 		}
-		if n := countChecks(t, logs.String(), "h3", cSuite, "changed_queued"); n == 0 {
-			t.Error("C3 was never queued for a slot: the slots were never contended")
+		for _, host := range []string{"h2", "h3"} {
+			if n := countChecks(t, logs.String(), host, cSuite, "changed_queued"); n != 0 {
+				t.Errorf("%s was queued for a slot %d times behind a repair, want never", host, n)
+			}
 		}
 		// The goroutine bound (limit, above).
 		if maxG > limit {

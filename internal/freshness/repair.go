@@ -88,6 +88,12 @@ func (a *Adopter) RepairSkippedMembers(ctx context.Context, suite SuiteRef, snap
 		// still serving the previous generation.
 		blobHash, _, ferr := a.adoptMemberFromRelease(ctx, suite, m, probeByHashFirst, decl)
 		if ferr != nil {
+			if yielded(ctx) {
+				// The repair gave way (repair_yield.go). Being stopped says
+				// nothing about the member: no failure is logged or
+				// counted, and the next unchanged check tries it again.
+				return
+			}
 			adoptionMemberRepairsTotal.Inc("failure")
 			a.logger.Warn("adoption_member_repair_failed",
 				"canonical_host", suite.CanonicalHost,
@@ -115,6 +121,9 @@ func (a *Adopter) RepairSkippedMembers(ctx context.Context, suite SuiteRef, snap
 					"snapshot_id", snapshotID,
 				)
 				return
+			}
+			if yielded(ctx) {
+				return // the promotion was cut short as the repair gave way
 			}
 			adoptionMemberRepairsTotal.Inc("failure")
 			a.logger.Warn("adoption_member_repair_failed",

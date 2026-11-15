@@ -503,7 +503,8 @@ func signedForm(form cache.AnchorForm) bool {
 }
 
 // admit takes an admission slot for req (spec C4: TryAcquire before
-// spawning, never wait) and returns req with the result to log: result
+// spawning, never wait — except, briefly, for a repair it asked to give
+// way: admitPastRepairs) and returns req with the result to log: result
 // when a slot was free (out.lease holds it), or queued with no request
 // when none was — the suite's last_success_at then keeps its previous
 // value (prevSuccess). With no adopter wired nothing is admitted and req
@@ -520,6 +521,10 @@ func (c *Checker) admit(out *checkOutcome, cur *cache.SuiteFreshness, req *adopt
 		return req, result
 	}
 	l, ok := c.admission.tryAcquire(req.suite.CanonicalHost, signedCurrent)
+	if !ok {
+		// Only repairs in the way: they give way to an adoption.
+		l, ok = c.admitPastRepairs(req.suite.CanonicalHost, signedCurrent)
+	}
 	if !ok {
 		cur.LastSuccessAt = prevSuccess
 		return nil, queued
