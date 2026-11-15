@@ -107,6 +107,15 @@ func classifyError(err error, conditional bool) string {
 		return "host_unreachable"
 	}
 
+	// idle_timeout BEFORE unavailable, for the same reason: a fetch whose
+	// retries all ended at upstream.idle_read_timeout returns
+	// ErrUpstreamUnavailable wrapping ErrIdleTimeout, and the label should
+	// name the cause. ErrIdleTimeout never carries a context error
+	// (idle.go), so its place relative to the context rows does not matter.
+	if errors.Is(err, ErrIdleTimeout) {
+		return "idle_timeout"
+	}
+
 	// Rows 15-16: context errors.
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):

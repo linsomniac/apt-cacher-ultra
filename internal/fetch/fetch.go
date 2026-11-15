@@ -47,6 +47,10 @@ var (
 	ErrRedirectBlocked     = errors.New("fetch: upstream redirect blocked")
 	ErrCacheWriteFailed    = errors.New("fetch: cache write failed")
 	ErrBodyTooLarge        = errors.New("fetch: response body exceeds the size expected")
+	// ErrIdleTimeout: upstream sent nothing — no response headers, or no
+	// further body bytes — for upstream.idle_read_timeout. Retryable, like
+	// a dropped connection. It never wraps a context error (idle.go).
+	ErrIdleTimeout = errors.New("fetch: upstream sent nothing within the idle read timeout")
 )
 
 // StatusError carries the upstream HTTP status code from any non-success
@@ -90,11 +94,16 @@ const defaultUserAgent = "apt-cacher-ultra/0.1"
 // timeouts mean "no timeout" at the transport level and rely on
 // TotalTimeout (set by Defaults) for the overall budget.
 type Options struct {
-	Usage            *usage.Collector // optional aggregate accounting shared with the cache handler
-	Proxy            string           // explicit HTTP(S) proxy URL; empty means direct; may contain credentials
-	ConnectTimeout   time.Duration
-	TotalTimeout     time.Duration
-	IdleReadTimeout  time.Duration // currently informational; per-byte read timeouts are a Phase 2 candidate.
+	Usage          *usage.Collector // optional aggregate accounting shared with the cache handler
+	Proxy          string           // explicit HTTP(S) proxy URL; empty means direct; may contain credentials
+	ConnectTimeout time.Duration
+	TotalTimeout   time.Duration
+	// IdleReadTimeout is upstream.idle_read_timeout: an attempt whose
+	// upstream sends nothing for this long — no response headers, or no
+	// further body bytes — is abandoned with ErrIdleTimeout and retried
+	// like any dropped connection (idle.go). Zero is no bound; config
+	// defaults it to 60s.
+	IdleReadTimeout  time.Duration
 	MaxRetries       int
 	AllowedHostRegex []string
 	DenyTargetRanges []string
@@ -140,6 +149,7 @@ type Client struct {
 	allow        []*regexp.Regexp
 	maxRetries   int
 	totalTimeout time.Duration
+	idleTimeout  time.Duration // upstream.idle_read_timeout; 0 = no bound
 	userAgent    string
 	logger       *slog.Logger
 	unreachable  *unreachableTracker // nil when UnreachableCooldown <= 0
@@ -216,6 +226,9 @@ func New(opts Options) (*Client, error) {
 	}
 	if opts.TotalTimeout < 0 {
 		return nil, fmt.Errorf("fetch: total_timeout must be >= 0, got %v", opts.TotalTimeout)
+	}
+	if opts.IdleReadTimeout < 0 {
+		return nil, fmt.Errorf("fetch: idle_read_timeout must be >= 0, got %v", opts.IdleReadTimeout)
 	}
 	if opts.ConnectTimeout < 0 {
 		return nil, fmt.Errorf("fetch: connect_timeout must be >= 0, got %v", opts.ConnectTimeout)
@@ -312,6 +325,7 @@ func New(opts Options) (*Client, error) {
 		proxyEnabled: proxyURL != nil,
 		maxRetries:   opts.MaxRetries,
 		totalTimeout: opts.TotalTimeout,
+		idleTimeout:  opts.IdleReadTimeout,
 		userAgent:    ua,
 		logger:       logger,
 		unreachable:  tracker,
@@ -484,15 +498,24 @@ func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (resul
 // *FetchResult plus an error when the response headers arrived but body
 // streaming failed; the outer loop uses this to capture validators for
 // the next retry.
+//
+// The attempt runs under upstream.idle_read_timeout (idle.go): silence
+// from upstream for that long ends it with ErrIdleTimeout, which the outer
+// loop retries, resuming from the bytes already written.
 func (c *Client) doAttempt(
-	ctx context.Context,
+	parent context.Context,
 	target *Target,
 	dst FetchDst,
 	sendRange bool,
 	rangeStart int64,
 	validator string,
 	expectedTotal int64,
-) (*FetchResult, error) {
+) (out *FetchResult, retErr error) {
+	ctx, idle := watchIdle(parent, c.idleTimeout)
+	defer func() {
+		idle.stop()
+		retErr = idle.attemptErr(parent, retErr)
+	}()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.URL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("fetch: new request: %w", err)
@@ -502,7 +525,9 @@ func (c *Client) doAttempt(
 		req.Header.Set("Range", "bytes="+strconv.FormatInt(rangeStart, 10)+"-")
 		req.Header.Set("If-Range", validator)
 	}
+	idle.arm() // the wait for the response headers
 	resp, err := c.httpClient.Do(req)
+	idle.disarm()
 	if err != nil {
 		if errors.Is(err, errDialDenied) {
 			return nil, fmt.Errorf("%w: %v", ErrTargetDenied, err)
@@ -525,7 +550,8 @@ func (c *Client) doAttempt(
 		return nil, ErrProxyAuthRequired
 	}
 
-	out := &FetchResult{
+	body := idle.reader(resp.Body)
+	out = &FetchResult{
 		Status:        resp.StatusCode,
 		ContentType:   resp.Header.Get("Content-Type"),
 		ContentLength: resp.ContentLength,
@@ -580,7 +606,7 @@ func (c *Client) doAttempt(
 				return out, fmt.Errorf("%w: truncate dst on restart: %v", ErrCacheWriteFailed, err)
 			}
 		}
-		if err := streamBody(resp, dst, target.MaxBytes); err != nil {
+		if err := streamBody(body, dst, target.MaxBytes); err != nil {
 			return out, err
 		}
 		if resp.ContentLength > 0 && dst.Written() != resp.ContentLength {
@@ -624,7 +650,7 @@ func (c *Client) doAttempt(
 				ErrBodyTooLarge, resp.Header.Get("Content-Range"), target.MaxBytes)
 		}
 		out.ContentLength = total
-		if err := streamBody(resp, dst, target.MaxBytes); err != nil {
+		if err := streamBody(body, dst, target.MaxBytes); err != nil {
 			return out, err
 		}
 		// The response covered [first, last] inclusive. Combined with
@@ -658,8 +684,8 @@ func (c *Client) doAttempt(
 // would then re-attempt on a cache write failure that won't recover by
 // re-asking the upstream. With max > 0 it reads at most one byte past max
 // and fails with ErrBodyTooLarge when dst then holds more than max bytes.
-func streamBody(resp *http.Response, dst FetchDst, max int64) error {
-	src := io.Reader(resp.Body)
+func streamBody(body io.Reader, dst FetchDst, max int64) error {
+	src := body
 	if max > 0 {
 		// max bounds what dst holds in all: a resume's prefix counts.
 		left := max - dst.Written()
@@ -674,7 +700,7 @@ func streamBody(resp *http.Response, dst FetchDst, max int64) error {
 		if n < math.MaxInt64 {
 			n++
 		}
-		src = io.LimitReader(resp.Body, n)
+		src = io.LimitReader(body, n)
 	}
 	if _, err := io.Copy(&writeErrTagger{w: dst}, src); err != nil {
 		return err

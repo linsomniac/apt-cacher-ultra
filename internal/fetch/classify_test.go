@@ -46,6 +46,10 @@ func TestClassifyFetchOutcome_AllSentinels(t *testing.T) {
 		{"ErrInvalidContentRange", ErrInvalidContentRange, "invalid_content_range"},
 		{"ErrTotalSizeMismatch", ErrTotalSizeMismatch, "total_size_mismatch"},
 		{"ErrHostUnreachable", ErrHostUnreachable, "host_unreachable"},
+		{"ErrIdleTimeout", ErrIdleTimeout, "idle_timeout"},
+		// As Fetch wraps it once every retry ended at the idle bound: the
+		// label names the cause, not "unavailable".
+		{"ErrIdleTimeout after retries", fmt.Errorf("%w: %w", ErrUpstreamUnavailable, ErrIdleTimeout), "idle_timeout"},
 		{"context.DeadlineExceeded", context.DeadlineExceeded, "timeout"},
 		{"context.Canceled", context.Canceled, "canceled"},
 		{"StatusError 503", &StatusError{Code: 503}, "5xx"},

@@ -106,6 +106,16 @@ func (c *Client) Conditional(
 		defer cancel()
 	}
 
+	// upstream.idle_read_timeout (idle.go): a probe whose upstream goes
+	// silent ends with ErrIdleTimeout instead of holding its suite's lock
+	// until the check deadline.
+	parent := ctx
+	ctx, idle := watchIdle(parent, c.idleTimeout)
+	defer func() {
+		idle.stop()
+		retErr = idle.attemptErr(parent, retErr)
+	}()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.URL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("fetch: new request: %w", err)
@@ -118,7 +128,9 @@ func (c *Client) Conditional(
 		req.Header.Set("If-Modified-Since", lastmod)
 	}
 
+	idle.arm() // the wait for the response headers
 	resp, err := c.httpClient.Do(req)
+	idle.disarm()
 	if err != nil {
 		if errors.Is(err, errDialDenied) {
 			return nil, fmt.Errorf("%w: %v", ErrTargetDenied, err)
@@ -154,7 +166,7 @@ func (c *Client) Conditional(
 		// surface ErrConditionalBodyTooLarge so the freshness layer
 		// can log and back off — silently truncating would yield a
 		// false hash mismatch on next compare.
-		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
+		body, err := io.ReadAll(io.LimitReader(idle.reader(resp.Body), maxBody+1))
 		if err != nil {
 			return nil, fmt.Errorf("fetch: read conditional body: %w", err)
 		}
