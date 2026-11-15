@@ -125,7 +125,7 @@ func (a *Adopter) prefetchHotSet(adoptionCtx context.Context, suite SuiteRef, sn
 	}
 	defer prefetchCancel()
 
-	// Each package is fetched by one of hotPrefetchWorkers workers, in
+	// Each package is fetched by one of HotPrefetchWorkers workers, in
 	// the hot set's order of dispatch.
 	//
 	// AIDEV-NOTE: the prefetch runs before the new release is published,
@@ -154,7 +154,7 @@ func (a *Adopter) prefetchHotSet(adoptionCtx context.Context, suite SuiteRef, sn
 		attempted bool
 	}
 	results := make([]hotResult, len(hotSet))
-	forEachConcurrently(hotPrefetchWorkers, len(hotSet), prefetchCancel, func(i int) bool {
+	forEachConcurrently(HotPrefetchWorkers, len(hotSet), prefetchCancel, func(i int) bool {
 		if prefetchCtx.Err() != nil {
 			return false // entry i and everything after it stay unattempted
 		}

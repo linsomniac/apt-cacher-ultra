@@ -637,7 +637,7 @@ type Adopter struct {
 	blobLocks *hostsem.Sem
 
 	// memberWorkers is how many members one adoption fetches at once
-	// (memberFetchWorkers; tests may lower it).
+	// (MemberFetchWorkers; tests may lower it).
 	memberWorkers int
 
 	// signers is verifier as a SignerVerifier, nil when it is not one: the
@@ -840,7 +840,7 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		signers:                 signers,
 		hostSem:                 cfg.HostLimiter,
 		blobLocks:               hostsem.New(1),
-		memberWorkers:           memberFetchWorkers,
+		memberWorkers:           MemberFetchWorkers,
 		maxConcurrent:           cfg.MaxConcurrent,
 		maxDuration:             maxDur,
 		flipGate:                cfg.FlipGate,
@@ -1601,7 +1601,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		})
 	}
 
-	// Pass 2: the upstream work — every member, memberFetchWorkers at a
+	// Pass 2: the upstream work — every member, MemberFetchWorkers at a
 	// time, then the SPEC6_7 §1 retry rounds for the members whose failure
 	// may heal (fetchMembers). SPEC4 §7.5.2 site 2: each member that
 	// verifies is added to the tracker and followed by a heartbeat, there.

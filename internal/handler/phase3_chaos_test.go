@@ -471,6 +471,22 @@ func chaos3DebSpecs() []chaos3DebSpec {
 	}
 }
 
+// chaos3DebSpecsN builds n (Package, Arch)-distinct .debs whose
+// alphabetical order is their index order (pkg00 < pkg01 < …): the order
+// the hot set visits them in.
+func chaos3DebSpecsN(n int) []chaos3DebSpec {
+	specs := make([]chaos3DebSpec, n)
+	for i := range specs {
+		name := fmt.Sprintf("pkg%02d", i)
+		specs[i] = chaos3DebSpec{
+			rel:          fmt.Sprintf("pool/main/p/%s/%s_1.0_amd64.deb", name, name),
+			packageName:  name,
+			architecture: "amd64",
+		}
+	}
+	return specs
+}
+
 // chaos3SuiteRef is the SuiteRef the §12.3 chaos tests adopt against.
 // scheme/host/path mirror chaos2 fixtures so port-rewriting
 // chaos2RewritingFetcher continues to work without per-test setup.
@@ -483,34 +499,33 @@ func chaos3SuiteRef(upstream *url.URL) freshness.SuiteRef {
 }
 
 // TestPhase3Chaos_HotPrefetchBudget_HungFirst is SPEC3 §12.3 variant 1:
-// the hung deb is FIRST in iteration order. With budget=200ms and the
-// hung deb's fetch hanging forever, the hot-prefetch loop attempts the
-// hung one, prefetchCtx fires DeadlineExceeded mid-flight,
-// fetchHotDeb logs hot_prefetch_deb_failed (the in-flight-cancel-as-
-// failed contract per the §12.3 ordering pin), and the next loop
-// iteration's top check emits adoption_hot_prefetch_partial with
-// `missing` set to the N-1 remaining (unattempted) paths — NOT the
-// hung one. Adoption flips despite the cancelled prefetch (CommitAdoption
-// runs under adoptionCtx, the §7.5 step-10 context split). On first
-// post-flip request, the hung deb's path returns 502 — its url_path
-// row was never inserted because no prefetch succeeded for it AND
-// the snapshot-B miss-path fetch is still hung.
+// the hung debs are FIRST in iteration order. Hot packages are warmed
+// freshness.HotPrefetchWorkers at a time, so the test hangs that many: the
+// first debs the hot set visits take every worker and never answer. With
+// budget=200ms, prefetchCtx fires DeadlineExceeded with them in flight,
+// fetchHotDeb logs hot_prefetch_deb_failed for each (the in-flight-cancel-
+// as-failed contract per the §12.3 ordering pin), and
+// adoption_hot_prefetch_partial reports `missing` as the remaining
+// (never started) paths — NOT the hung ones. Adoption flips despite the
+// cancelled prefetch (CommitAdoption runs under adoptionCtx, the §7.5
+// step-10 context split). On first post-flip request, a hung deb's path
+// returns 502 — its url_path row was never inserted because no prefetch
+// succeeded for it AND the snapshot-B miss-path fetch is still hung.
+//
+// Before hot packages were warmed concurrently one hung deb was enough:
+// the debs behind it were never started. Now a single hung deb costs only
+// itself (the others are warmed beside it: variant 3 below).
 func TestPhase3Chaos_HotPrefetchBudget_HungFirst(t *testing.T) {
 	if testing.Short() {
 		t.Skip("phase 3 chaos test skipped in -short mode")
 	}
 
-	specs := chaos3DebSpecs()
+	const unstarted = 2
+	specs := chaos3DebSpecsN(freshness.HotPrefetchWorkers + unstarted)
 	snapA := makeChaos3Snapshot("A", specs)
 	snapB := makeChaos3Snapshot("B", specs)
-	hung := specs[0] // aaa-pkg — alphabetical first; hot-set ORDER BY visits this first
-	hungCanonical := debCanonicalPath(hung)
-	// Stall key matches the URL path the upstream httptest handler
-	// observes — the cache fetches at canonical /ubuntu/pool/...
-	// (debCanonicalPath), NOT the suite-relative /ubuntu/dists/noble/...
-	// that the test driver uses for prime GETs. Stall on the canonical
-	// path so the upstream's WaitIfStalled key matches.
-	hungUpstreamPath := hungCanonical
+	hungSpecs := specs[:freshness.HotPrefetchWorkers] // the first the hot-set ORDER BY visits
+	hungCanonical := debCanonicalPath(hungSpecs[0])
 
 	var current atomic.Pointer[chaos3Snapshot]
 	current.Store(&snapA)
@@ -535,7 +550,15 @@ func TestPhase3Chaos_HotPrefetchBudget_HungFirst(t *testing.T) {
 	// suite-relative URL the upstream handler sees (chaos3Suite +
 	// "/" + rel); the canonical cache-side path is "/ubuntu/" + rel.
 	current.Store(&snapB)
-	stalls.Stall(hungUpstreamPath)
+	// Stall keys match the URL path the upstream httptest handler
+	// observes — the cache fetches at canonical /ubuntu/pool/...
+	// (debCanonicalPath), NOT the suite-relative /ubuntu/dists/noble/...
+	// that the test driver uses for prime GETs.
+	hungPaths := map[string]bool{}
+	for _, h := range hungSpecs {
+		stalls.Stall(debCanonicalPath(h))
+		hungPaths[debCanonicalPath(h)] = true
+	}
 
 	// Trigger adoption: a single InRelease GET drives the freshness
 	// conditional path to observe the new ETag and spawn the
@@ -563,47 +586,47 @@ func TestPhase3Chaos_HotPrefetchBudget_HungFirst(t *testing.T) {
 		t.Errorf("adoption_hot_prefetch_started for newID=%d: count=%d, want 1", newID, n)
 	}
 
-	// hot_prefetch_deb_failed must fire for the hung deb's canonical
+	// hot_prefetch_deb_failed must fire for every hung deb's canonical
 	// path. SPEC3 §12.3 variant 1: in-flight cancellation by budget
 	// elapse maps to deb_failed (NOT cancelled-and-silent).
-	foundHungInFailed := false
+	failedPaths := map[string]bool{}
 	for _, r := range stack.logBuf.findAll("hot_prefetch_deb_failed") {
 		if extractInt64(r, "snapshot_id") != newID {
 			continue
 		}
-		if p, _ := r["path"].(string); p == hungCanonical {
-			foundHungInFailed = true
-			break
+		if p, _ := r["path"].(string); hungPaths[p] {
+			failedPaths[p] = true
 		}
 	}
-	if !foundHungInFailed {
-		t.Errorf("hot_prefetch_deb_failed: no record for hung path %s on snapshot %d", hungCanonical, newID)
+	if len(failedPaths) != len(hungPaths) {
+		t.Errorf("hot_prefetch_deb_failed: records for %d of the %d hung paths on snapshot %d",
+			len(failedPaths), len(hungPaths), newID)
 	}
 
 	// adoption_hot_prefetch_partial fires once with `missing` = the
-	// N-1 paths that were never attempted. The hung deb is in
-	// deb_failed instead — must NOT appear in missing.
+	// paths that were never started. The hung debs are in deb_failed
+	// instead — they must NOT appear in missing.
 	partialRec, partialN := stack.logBuf.findForSnapshot("adoption_hot_prefetch_partial", newID)
 	if partialN != 1 {
 		t.Fatalf("adoption_hot_prefetch_partial for newID=%d: count=%d, want 1", newID, partialN)
 	}
 	missing := extractMissing(partialRec)
-	wantMissing := []string{
-		debCanonicalPath(specs[1]),
-		debCanonicalPath(specs[2]),
+	var wantMissing []string
+	for _, spec := range specs[freshness.HotPrefetchWorkers:] {
+		wantMissing = append(wantMissing, debCanonicalPath(spec))
 	}
 	sort.Strings(wantMissing)
 	if !equalStringSlice(missing, wantMissing) {
 		t.Errorf("partial.missing = %v, want %v", missing, wantMissing)
 	}
 	for _, p := range missing {
-		if p == hungCanonical {
+		if hungPaths[p] {
 			t.Errorf("partial.missing contains hung deb path %s — should be in deb_failed instead", p)
 		}
 	}
 
 	// adoption_hot_prefetch_complete: hot_count=N, fetched=0,
-	// failed=1, mismatched=0, unattempted=N-1.
+	// failed=the hung debs, mismatched=0, unattempted=the rest.
 	completeRec, completeN := stack.logBuf.findForSnapshot("adoption_hot_prefetch_complete", newID)
 	if completeN != 1 {
 		t.Fatalf("adoption_hot_prefetch_complete for newID=%d: count=%d, want 1", newID, completeN)
@@ -614,14 +637,14 @@ func TestPhase3Chaos_HotPrefetchBudget_HungFirst(t *testing.T) {
 	if got := extractInt64(completeRec, "fetched"); got != 0 {
 		t.Errorf("complete.fetched=%d, want 0", got)
 	}
-	if got := extractInt64(completeRec, "failed"); got != 1 {
-		t.Errorf("complete.failed=%d, want 1", got)
+	if got := extractInt64(completeRec, "failed"); got != int64(len(hungSpecs)) {
+		t.Errorf("complete.failed=%d, want %d", got, len(hungSpecs))
 	}
 	if got := extractInt64(completeRec, "mismatched"); got != 0 {
 		t.Errorf("complete.mismatched=%d, want 0", got)
 	}
-	if got := extractInt64(completeRec, "unattempted"); got != int64(len(specs)-1) {
-		t.Errorf("complete.unattempted=%d, want %d", got, len(specs)-1)
+	if got := extractInt64(completeRec, "unattempted"); got != unstarted {
+		t.Errorf("complete.unattempted=%d, want %d", got, unstarted)
 	}
 
 	// First post-flip request for the hung deb's path: cache miss

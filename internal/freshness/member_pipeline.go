@@ -9,7 +9,7 @@ package freshness
 // held its host's adoption slot.
 //
 // Now:
-//   - members are fetched memberFetchWorkers at a time (fetchMemberRound);
+//   - members are fetched MemberFetchWorkers at a time (fetchMemberRound);
 //   - a member the suite's current snapshot does not serve is asked for at
 //     its declared path first (memberProbeFor, adoptMember's
 //     probePathFirst), so a file upstream never serves costs one request;
@@ -30,15 +30,16 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
 
-// memberFetchWorkers is how many of a suite's Release members an adoption
+// MemberFetchWorkers is how many of a suite's Release members an adoption
 // fetches at once (a constant, not a knob: upstream.max_concurrent_per_host
 // is the operator's bound, and these fetches take their host slots from it
-// like every other upstream request).
-const memberFetchWorkers = 4
+// like every other upstream request). Exported for the handler package's
+// chaos tests, which stage as many stalled fetches as there are workers.
+const MemberFetchWorkers = 4
 
-// hotPrefetchWorkers is how many hot packages an adoption warms at once (a
-// constant, like memberFetchWorkers, and for the same reason).
-const hotPrefetchWorkers = 4
+// HotPrefetchWorkers is how many hot packages an adoption warms at once (a
+// constant, like MemberFetchWorkers, and for the same reason).
+const HotPrefetchWorkers = 4
 
 // memberProbe says where adoptMember looks for a member upstream.
 type memberProbe int

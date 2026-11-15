@@ -1,6 +1,6 @@
 package freshness
 
-// Hot packages are warmed hotPrefetchWorkers at a time (the 2026-11-14
+// Hot packages are warmed HotPrefetchWorkers at a time (the 2026-11-14
 // publication-delay review): the prefetch runs before the new release is
 // published, so its duration is time clients keep seeing the old one.
 
@@ -31,15 +31,15 @@ func hotEntries(f *hotPrefetchFixture, n int) []hotSetEntry {
 func TestPrefetchHotSet_PackagesAreFetchedConcurrently(t *testing.T) {
 	f := newHotPrefetchFixture(t, time.Minute)
 	entries := hotEntries(f, 10)
-	gate := &gateFetcher{inner: f.fetcher, want: hotPrefetchWorkers, open: make(chan struct{})}
+	gate := &gateFetcher{inner: f.fetcher, want: HotPrefetchWorkers, open: make(chan struct{})}
 	f.adopter.fetcher = gate
 
 	rows, stats := f.adopter.prefetchHotSet(context.Background(), f.suite, f.candidate, entries, nil)
 	if stats.hotCount != 10 || stats.fetched != 10 || stats.failed+stats.mismatched+stats.unattempted+stats.reused != 0 {
 		t.Fatalf("stats = %+v, want 10 fetched of 10", stats)
 	}
-	if got := gate.highest.Load(); got != hotPrefetchWorkers {
-		t.Errorf("most package fetches in flight at once = %d, want %d", got, hotPrefetchWorkers)
+	if got := gate.highest.Load(); got != HotPrefetchWorkers {
+		t.Errorf("most package fetches in flight at once = %d, want %d", got, HotPrefetchWorkers)
 	}
 	// The rows the commit inserts keep the hot set's order, whatever
 	// order the downloads finished in.
@@ -86,9 +86,9 @@ func TestPrefetchHotSet_BudgetReportsThePackagesNotStarted(t *testing.T) {
 	if len(rows) != 0 {
 		t.Errorf("prefetched rows = %d, want none", len(rows))
 	}
-	if stats.failed != hotPrefetchWorkers || stats.unattempted != 9-hotPrefetchWorkers || stats.fetched != 0 {
+	if stats.failed != HotPrefetchWorkers || stats.unattempted != 9-HotPrefetchWorkers || stats.fetched != 0 {
 		t.Fatalf("stats = %+v, want %d failed (in flight at the budget) and %d unattempted",
-			stats, hotPrefetchWorkers, 9-hotPrefetchWorkers)
+			stats, HotPrefetchWorkers, 9-HotPrefetchWorkers)
 	}
 	if sum := stats.fetched + stats.reused + stats.failed + stats.mismatched + stats.unattempted; sum != stats.hotCount {
 		t.Errorf("buckets add up to %d, hot count is %d", sum, stats.hotCount)
@@ -98,11 +98,11 @@ func TestPrefetchHotSet_BudgetReportsThePackagesNotStarted(t *testing.T) {
 		t.Fatalf("adoption_hot_prefetch_partial lines = %d, want one", len(partial))
 	}
 	missing, _ := partial[0]["missing"].([]any)
-	if len(missing) != 9-hotPrefetchWorkers {
-		t.Fatalf("missing = %v, want the %d packages not started", missing, 9-hotPrefetchWorkers)
+	if len(missing) != 9-HotPrefetchWorkers {
+		t.Fatalf("missing = %v, want the %d packages not started", missing, 9-HotPrefetchWorkers)
 	}
 	for i, m := range missing {
-		if want := entries[hotPrefetchWorkers+i].path; m != want {
+		if want := entries[HotPrefetchWorkers+i].path; m != want {
 			t.Errorf("missing[%d] = %v, want %s (hot-set order)", i, m, want)
 		}
 	}

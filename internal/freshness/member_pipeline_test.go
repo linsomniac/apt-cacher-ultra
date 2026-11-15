@@ -1,6 +1,6 @@
 package freshness
 
-// The member pipeline (Step 5): members are fetched memberFetchWorkers at a
+// The member pipeline (Step 5): members are fetched MemberFetchWorkers at a
 // time, a member the suite's current snapshot does not serve is asked for
 // at its declared path first (one request for a file upstream never
 // serves, not two), and members whose failure may heal share one retry
@@ -345,7 +345,7 @@ func (g *gateFetcher) Fetch(ctx context.Context, target *fetch.Target, dst fetch
 	return g.inner.Fetch(ctx, target, dst)
 }
 
-// Members are fetched memberFetchWorkers at a time, never more: the
+// Members are fetched MemberFetchWorkers at a time, never more: the
 // per-host limit they share with client downloads keeps its headroom.
 func TestAdopter_MembersAreFetchedConcurrently(t *testing.T) {
 	ctx := context.Background()
@@ -360,14 +360,14 @@ func TestAdopter_MembersAreFetchedConcurrently(t *testing.T) {
 	for p, b := range members {
 		env.fetcher.put(pipelineBase+p, b)
 	}
-	gate := &gateFetcher{inner: env.fetcher, want: memberFetchWorkers, open: make(chan struct{})}
+	gate := &gateFetcher{inner: env.fetcher, want: MemberFetchWorkers, open: make(chan struct{})}
 	env.adopter.fetcher = gate
 
 	if err := env.adopter.Run(ctx, env.suite, releaseText, "", ""); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if got := gate.highest.Load(); got != memberFetchWorkers {
-		t.Errorf("most member fetches in flight at once = %d, want %d", got, memberFetchWorkers)
+	if got := gate.highest.Load(); got != MemberFetchWorkers {
+		t.Errorf("most member fetches in flight at once = %d, want %d", got, MemberFetchWorkers)
 	}
 	members2, err := env.cache.ListSnapshotMembers(ctx, currentSnapshotID(t, env))
 	if err != nil {
