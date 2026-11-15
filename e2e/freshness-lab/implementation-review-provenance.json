@@ -1,0 +1,54 @@
+{
+  "base_commit": "59f69a29b4efdc4322843a595188045b91495a67",
+  "reviews": [
+    {
+      "stage": "initial",
+      "model": "claude-fable-5-2",
+      "canonical_models": [
+        "claude-fable-5-2"
+      ],
+      "is_error": false,
+      "duration_ms": 551316,
+      "input_sha256": "9adf8be5db3c81c975a13b2889d129cba5e14c6cb31d09231685743fa6d49d3e",
+      "output": "fable-implementation-review.txt",
+      "scope": "Fixed source bundle, tools disabled; static review only."
+    },
+    {
+      "stage": "followup",
+      "model": "claude-fable-5-2",
+      "canonical_models": [
+        "claude-fable-5-2"
+      ],
+      "is_error": false,
+      "duration_ms": 217091,
+      "input_sha256": "487541d06b344692f4367a44a23b7557ea8dcbb8e91c560009d9b031e1c0cab9",
+      "output": "fable-implementation-followup.txt",
+      "scope": "Fixed source bundle, tools disabled; static review only."
+    },
+    {
+      "stage": "third",
+      "model": "claude-fable-5-2",
+      "canonical_models": [
+        "claude-fable-5-2"
+      ],
+      "is_error": false,
+      "duration_ms": 156060,
+      "input_sha256": "048ccbb2e81156ae865bd1dabf48b73cf5c80079c4011bebef30765a865bdd49",
+      "output": "fable-implementation-third-review.txt",
+      "scope": "Fixed source bundle, tools disabled; static review only."
+    },
+    {
+      "stage": "reserved-slot",
+      "model": "claude-fable-5-2",
+      "canonical_models": [
+        "claude-fable-5-2"
+      ],
+      "is_error": false,
+      "duration_ms": 122254,
+      "input_sha256": "5621511ee7bb05d91030caefba2fd4944af373f2d96ae1c8f0b7316a76d590f4",
+      "output": "fable-implementation-reserved-slot-review.txt",
+      "scope": "Fixed source bundle, tools disabled; static review only."
+    }
+  ],
+  "final_followup_verification": "Confirmed probe() delegates directly to Conditional(); neither acquires the bulk semaphore. Reserved-slot regression runs with the bulk slot occupied."
+}

@@ -21,6 +21,6 @@ if [[ ${ACU_FRESHNESS_LAB_SKIP_BUILD:-0} != 1 ]]; then
 fi
 # All three participants live inside one disposable network namespace.
 # No host ports, Docker socket, real cache, or host apt configuration is mounted.
-docker run --rm --init --network none --add-host repo.test:127.0.0.1 \
-    -v "$binary:/lab/acu:ro" -v "$lab_dir/lab.py:/lab/lab.py:ro" \
+docker run --rm --init --network none --add-host repo.test:127.0.0.1 --add-host repo2.test:127.0.0.1 \
+    -v "$binary:/lab/acu:ro" -v "$lab_dir/lab.py:/lab/lab.py:ro" -v "$lab_dir/burst.py:/lab/burst.py:ro" \
     -v "$output:/results" "$image" "$@"

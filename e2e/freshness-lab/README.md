@@ -51,8 +51,11 @@ ACU_FRESHNESS_LAB_SKIP_BUILD=1 bash e2e/freshness-lab/run.sh \
   --scenario slow-prefetch --delay 330
 ```
 
-The default cooldown is **60 seconds**, periodic refresh **15 minutes**, and
-hot-prefetch budget **5 minutes**. The client runs `apt-get update` every five
+The default cooldown is **60 seconds**. Refresh and prefetch budget are now
+omitted from the generated configuration unless explicitly supplied, so each
+binary uses its own defaults. The historical measurements below used **15
+minutes** and **5 minutes**, respectively; the updated defaults are **1 minute**
+and **15 seconds**. The client runs `apt-get update` every five
 seconds, retaining its list files and using normal conditional requests. There
 is no accelerated daemon clock. `--cooldown`, `--refresh`, `--prefetch-budget`,
 `--client-interval`, `--delay`, and `--max-wait` are configurable and recorded.
@@ -250,3 +253,152 @@ Pre-existing working-tree changes add adoption phase logs and reuse cached hot
 package blobs. Those help diagnostics and redundant transfers, but a new
 security-package version still needs its first download. The measurements here
 use clean tag/HEAD binaries and do not claim to validate those unrelated edits.
+
+## Publication burst experiment
+
+The optional burst mode creates six suites split across two upstream hostnames
+(or `--hosts 1` for a single-host burst). Each suite declares twelve metadata
+files: main/contrib, amd64/arm64, plain/gzip/xz Packages. Main and contrib
+are identical, giving six distinct blobs per suite and exercising content reuse.
+Each index has 5,000
+catalog entries and eight real hot packages; each real package has a 128 KiB
+payload. The filler artifacts are catalog-only and cannot be downloaded.
+The fixture installs all real packages before and after publication.
+
+```sh
+ACU_FRESHNESS_LAB_SKIP_BUILD=1 bash e2e/freshness-lab/run.sh \
+  /tmp/acu-publication-after /tmp/acu-burst-after \
+  --burst --suites 6 --hosts 2 --catalog-size 5000 --hot-count 8 \
+  --member-delay 0.15 --deb-delay 8 --max-wait 1200
+
+# No APT/cache requests during measured detection and adoption. Only a read-only
+# DB observer runs; APT updates and installs after all snapshots are published.
+ACU_FRESHNESS_LAB_SKIP_BUILD=1 bash e2e/freshness-lab/run.sh \
+  /tmp/acu-publication-after /tmp/acu-burst-periodic \
+  --burst --periodic-only --max-wait 1200
+```
+
+Both hosts resolve to the container's isolated loopback origin. Origin delays
+apply only to generation 2.0 and are removed before the final installation,
+as in the single-suite experiment. Each suite has distinct package content, so local
+reuse cannot turn the burst into one shared warm. `summary.json` includes each
+suite's detection, adoption start, publication and phase durations. Run compared
+binaries sequentially to avoid making them compete for host resources. This
+exercises larger catalogs and queueing, but is not a full Debian/Ubuntu mirror
+benchmark or a five-minute availability guarantee.
+
+
+## Implementation and follow-up measurements (2026-11-15)
+
+The starting point was `fix/publication-delay` at `59f69a29b4ef`.
+That overnight work already added concurrent metadata/hot-package fetches,
+cancellable automatic maintenance, shorter mirror-sync retries, request-time
+revalidation, and adoption phase/lag logs. This follow-up keeps those changes
+and adds:
+
+- One-minute background refresh and a 15-second default prepublication warming
+  budget, including hot-set computation. Operators can explicitly retain a
+  larger budget; warming remains best effort, not a publication prerequisite.
+- Manual reconcile yields like automatic repair. Unchanged metadata probes run
+  beside maintenance so a slow repair can finish across refresh intervals.
+  One extra metadata-probe slot per host keeps bulk downloads from starving
+  those probes. Changed/inconclusive metadata enters the ordinary locked
+  check and verification path.
+- Independent work watchdogs from verification/candidate creation through
+  failure recording, including database writes, upstream operations, host
+  slots and content locks. Busy logs identify the owner and phase, are rate
+  limited, and complement pending-change age/count metrics and request
+  last-check/pending-age fields.
+
+Four Claude Code reviews used the canonical `claude-fable-5-2` model, with
+fixed source bundles and tools disabled. The final reserved-slot review found
+no concrete blocker in its scoped files. Its conditional concern was checked:
+`probe()` delegates directly to `Conditional()` and neither acquires the bulk
+host semaphore. The earlier reviews led to regression tests for unchanged
+repair progress, cancellation/no-op stamps, pending state, held signature
+upgrades, reserved probe capacity, panic cleanup and blocked database writers.
+Review text and input hashes are in `implementation-review-provenance.json`.
+Residual policy/refusal or inconclusive upstream states can still interrupt
+maintenance on due checks; they use the normal retry/security state machine.
+
+The continuous-client burst used six suites on two hostnames, 5,000 catalog
+rows per index, 48 real packages, 150 ms member delays and 30 s package delays.
+Both binaries used their own default refresh/warming settings and the same
+60 s cooldown. All 48 packages were installed at versions 1.0, 1.1 and 2.0.
+
+| Experiment | Earlier result | Follow-up client visibility |
+| --- | ---: | ---: |
+| Six-suite burst, overnight branch versus follow-up | 508.54 s | 243.21 s |
+| One healthy suite, historical 1.0.2 versus follow-up | 61.1 s | 67.43 s |
+| One package stalled 330 s, historical 1.0.2 versus follow-up | 364.1 s | 121.70 s |
+| Optional repair fault lasting 90 s, historical 1.0.2 versus follow-up | 113.1 s | 185.38 s |
+
+The repair row is deliberately included despite worse publication latency.
+Detection improved from 105.2 s to 58.2 s, but the fault delays **every** request
+for the optional member, including the new adoption. That adoption spent
+about 60 s in members and 67 s waiting for the publication barrier. This
+experiment therefore measures more than contention with the old repair. The
+overnight branch also introduced a 60 s upstream-silence timeout, which ends
+the 90 s repair stall near the next due check; deterministic blocked-fetch
+tests separately establish cancellation priority and unchanged-repair progress.
+
+The burst's warming phase normally fell from about 60 s to 15 s per suite.
+One follow-up warm phase lasted 39 s because its post-fetch database heartbeat
+also waited. Commit phases ranged up to 34 s, and publication barriers up to
+71 s. The new live logs exposed `database_write` and `flip_wait` separately.
+The warming budget cancels best-effort work; it is not a hard limit on database
+synchronization, commit, queueing, or client-coherence waits.
+
+With the final binary and the same six-suite workload, background-only
+publication took **153.70 s**; the subsequent APT update saw all candidates at
+**153.91 s**. No client cache requests ran during measured detection/adoption.
+Detection occurred 19.10–76.99 s after publication, including scheduler phase
+and local write delays. All 48 packages installed successfully afterwards.
+This validates the one-minute background cadence independently of T1 requests.
+
+The final-binary repair rerun detected the update in **60.37 s**, published in
+**158.21 s**, and the client saw it in **169.95 s**; installation succeeded.
+The intermediate binary's 185.38 s observation remains in the table above so
+both measurements are retained. Neither repair run beats the historical
+113.1 s publication result, despite substantially earlier detection.
+
+These are single runs on a shared host, with variable filesystem/test load and
+refresh phase. They establish mechanisms and a useful improvement, not a
+latency distribution or five-minute guarantee. The continuous-client runs used
+an intermediate implementation binary; final maintenance refinements are
+covered by the final-binary experiments and focused race tests. Detailed
+options, binary hashes, per-suite timings and raw-output locations are recorded
+in `publication-measurements.json`. The original measurements remain unchanged
+in `measurements.json`.
+
+Existing installations must change explicit old settings to receive the new
+latency defaults:
+
+```toml
+[freshness]
+periodic_refresh = "1m"
+
+[adoption]
+hot_prefetch_budget = "15s"
+```
+
+A startup warning identifies settings that retain long refresh/warming delays.
+Packages left unwarmed are fetched on demand. Faults are removed before the
+lab's final installation: the experiment establishes metadata visibility and
+installability, not package-download latency during a continuing outage.
+
+
+### Validation
+
+The complete `internal/freshness` suite passes on the final implementation.
+Focused `-race` coverage passes for maintenance probes, repair/reconcile yield,
+blocked-writer watchdogs and panic cleanup. The affected config, fetch, cache,
+host-semaphore, observability and command package tests also passed, as did
+`go vet`, `git diff --check`, Python parsing and shell syntax checks.
+
+The handler suite passed all functional regressions after updating expected
+budget-expiry log names. Its load-sensitive `TestChaos_HungUpstreamGated`
+latency assertion measured p99 117 ms against a 100 ms threshold during the
+combined run; rerunning that test alone passed. This host also had another
+full race-test run in progress, so the wall-clock experiments should not be
+treated as a controlled throughput benchmark. No timing thresholds were relaxed.

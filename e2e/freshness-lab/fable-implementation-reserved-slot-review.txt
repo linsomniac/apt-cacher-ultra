@@ -1,0 +1,17 @@
+**Verdict: no concrete blockers in the three files as shown.** I read them only (no tools), so nothing was compiled or run.
+
+One thing I could not confirm from what was pasted: that `c.probe` and `c.fetcher.Conditional` do not take the bulk host slot internally. If either does, the dedicated semaphore buys nothing: the probe waits behind repair downloads, times out, and yields maintenance. The earlier version acquiring at this same call site suggests they don't, but check it.
+
+What I checked and found sound:
+- **Probe slot:** it is released on every path, including panic, and the early release before the stamp is safe because the releaser is once-guarded. The 2 s wait is bounded and its cancel is not leaked. Total per host is bulk+1, since the up-to-three requests are sequential under one token.
+- **Contention returns busy:** this cannot starve a suite indefinitely. A holder is bounded by `checkDeadline`, and one that stalls exits through the yield path and leaves the set of contenders.
+- **Cooldown ordering:** a future stamp beyond tolerance goes to the ordinary check, the cooldown skip comes next, and the pending/failure guard comes last. Bypass with pending or failure state reaches the ordinary check.
+- **`repairGivesWay`:** the done fast path is correct. A replaced or missing run returns false, so the check ends busy, which is right.
+- **Defer order:** the recover runs after the unlock, cancel, finish and release defers, and the ctx override runs last. A panic before confirmation yields; after confirmation it ends busy.
+
+Non-blocking residuals:
+1. **Active failure with a slow repair:** while `AdoptionFailCount > 0` or a change is pending, the repair is cancelled once per cooldown. It still progresses member by member, but a single member that takes longer than the cooldown cannot finish until the failure clears. This follows from the routing you chose.
+2. **Detached or unsigned suites on hosts that answer 403 for a missing `InRelease`:** `authDenied()` sends every due probe to the ordinary check, so these suites get the old cancel-per-check behaviour. You accepted this for unsigned; it applies equally to detached.
+3. **Stale run at the top of `checkDuringRepair`:** it returns handled busy, so the immediate mutex retry is not reached when the repair finishes just before the probe starts. That costs one tick. Returning `false` there would use the fast path.
+4. **Tests with a `Checker{}` literal:** a nil `maintenanceProbeSem` panics, is recovered, and looks like a yield rather than a failure.
+5. **Header comment:** it says only the timestamp update writes. That holds only if `lateralHeld` is a pure read.

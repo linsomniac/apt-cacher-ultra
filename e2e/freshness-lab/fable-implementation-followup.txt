@@ -1,0 +1,37 @@
+**Verdict:** I found no deadlock, lock leak or data race, and the stamp cannot mark a different snapshot fresh. The probe's fall-through paths, though, still cancel maintenance in cases where no locked check is needed, and one of them delays detection. Nothing was run; this is from reading the bundle.
+
+## Bugs, in priority order
+
+1. **A confirmed-unchanged probe can still cancel the repair** (`checkDuringRepair`, after `ConfirmSnapshotUnchanged`). `err != nil || !updated` returns unhandled, and `repairGivesWay` then reloads the run by key and cancels it. The three ways to get there:
+   - **Same-second stamp:** `last_check_at < ?` is strict, so a `bypassCooldown` check (`CheckNow`, `waiting`/`pendingChange` items) in the same second as the previous stamp updates nothing. The locked check that follows is itself skipped only if it honours the cooldown.
+   - **Write fails or times out:** the write uses `probeCtx`, against the AIDEV-NOTE in `check`, and can expire while queued behind another suite's commit.
+   - **Run replaced during the GET:** the old run finished and a locked check started a new one, so the stale probe cancels the new run.
+   - **Fix:** once upstream is confirmed unchanged, always return handled. Pass the probed `run` to `repairGivesWay` instead of reloading by key.
+
+2. **The probe waits for a host slot the repair may hold.** If member workers or other traffic saturate the per-host limit, the probe sits in `host_slot` for up to `checkDeadline` (2 minutes), holding `probeMu` and a check worker. It then yields the repair anyway, so a real change is detected 2 minutes late and the livelock returns. I could not see the limit against the worker count. **Fix:** bound the slot wait to a second or two, then yield.
+
+3. **Caller cancellation is treated as "inconclusive".** A cancelled `ctx`, such as an admin hanging up on `CheckNow`, fails the first read and yields the repair. The re-run then fails on the same dead context if `suiteRowExists` honours it, which I could not see. **Fix:** if `ctx.Err() != nil`, return busy without yielding.
+
+4. **The probe ignores pending state.** It sends the row's validators directly, bypassing `retryGate.validators`. If a locked check ever stores a pending or failed candidate's validators on the row, a 304 beside a manual reconcile reads as "unchanged" and swallows the adoption retry. I could not see `check.go`. **Fix either way:** return unhandled when `InReleaseChangeSeenAt != nil` or `AdoptionFailCount > 0`, and add the same condition to the `UPDATE`.
+
+5. **Detached suites with a present but held InRelease yield on every check.** If the locked check then ends unchanged and replans the repair, the livelock is back at refresh cadence. Verify against the lateral-hold path.
+
+## Smaller issues
+
+- **Result string:** the probe reports `"unchanged"` for both a 304 and an identical 200. If the locked path uses `not_modified`, callers and dashboards see a new value.
+- **T1 cost during a repair:** every hit now pays `rand.Text`, a timer and a row read before the cooldown test, which undoes the "busy with no database read" property. Do the cooldown test first.
+- **Watchdog after a logger panic:** `tick` re-arms after the log call, so one handler panic ends the watchdog for that work. Re-arm first.
+- **Startup WARN:** `hot_prefetch_budget = 0` is unbounded in `prefetchHotSetContext` but passes the `> time.Minute` test.
+- **Refused gauge:** it keys on `AdoptionFailReason` alone. If the reason outlives a reset count, a new pending change is hidden from `oldest_pending_seconds`; also require `AdoptionFailCount > 0`.
+- **Hot-set budget:** when `computeHotSet` uses up the budget, it still logs the WARN "hot-set computation failed" and counts nothing under `budget_elapsed`.
+- **Host slot held across the stamp write:** release it before `ConfirmSnapshotUnchanged`.
+- **Stale comment:** the `repair_yield.go` header still describes the run-age rule.
+
+## Missing tests
+
+1. Two `CheckNow` calls in one clock second beside a held repair: no yield.
+2. Stamp write blocked (`HoldWriterForTest`) past the probe deadline: no yield.
+3. Host limit saturated by the repair: a changed release is detected within seconds.
+4. Caller context cancelled mid-probe: the repair survives.
+5. Reconcile beside a failure record at its retry time: the retry runs.
+6. Old run finishes during the probe GET and a new run starts: the new run is not cancelled.

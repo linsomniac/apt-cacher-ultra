@@ -191,12 +191,12 @@ allowed_host_regex = ["^repo[.]test$"]
 deny_target_ranges = []
 [freshness]
 cooldown = "{self.args.cooldown}"
-periodic_refresh = "{self.args.refresh}"
+{f'periodic_refresh = "{self.args.refresh}"' if self.args.refresh else ""}
 max_concurrent_adoptions = 2
 [adoption]
 enabled = true
 keyring_dirs = ["{WORK}/keys"]
-hot_prefetch_budget = "{self.args.prefetch_budget}"
+{f'hot_prefetch_budget = "{self.args.prefetch_budget}"' if self.args.prefetch_budget else ""}
 member_retry_count = {retries}
 repair_skipped_members = true
 [hot_packages]
@@ -248,6 +248,9 @@ upstream = "http://repo.test{BASE}/"
                     lab.event("fault_delay_started", path=self.path, seconds=lab.args.delay)
                     lab.blocked.set()
                     time.sleep(lab.args.delay)
+                extra_delay = lab.origin_delay(self.path, generation)
+                if extra_delay:
+                    time.sleep(extra_delay)
                 etag = '"' + hashlib.sha256(data).hexdigest() + '"'
                 stamp = int(path.stat().st_mtime)
                 unchanged = self.headers.get("If-None-Match") == etag
@@ -273,6 +276,9 @@ upstream = "http://repo.test{BASE}/"
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 80), Origin)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def origin_delay(self, path, generation):
+        return 0
 
     def get_anchor(self):
         url = f"http://127.0.0.1:3142{MIRROR}/dists/{SUITE}/InRelease"
@@ -394,15 +400,29 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", choices=("baseline", "slow-prefetch", "busy-repair"), default="baseline")
     parser.add_argument("--cooldown", default="60s")
-    parser.add_argument("--refresh", default="15m")
-    parser.add_argument("--prefetch-budget", default="5m")
+    parser.add_argument("--refresh", help="omit to use the binary default")
+    parser.add_argument("--prefetch-budget", help="omit to use the binary default")
     parser.add_argument("--delay", type=float, default=90)
     parser.add_argument("--client-interval", type=float, default=5)
     parser.add_argument("--max-wait", type=float, default=600)
+    parser.add_argument("--burst", action="store_true", help="measure simultaneous multi-suite publications")
+    parser.add_argument("--suites", type=int, default=6)
+    parser.add_argument("--hosts", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--catalog-size", type=int, default=5000)
+    parser.add_argument("--hot-count", type=int, default=8)
+    parser.add_argument("--member-delay", type=float, default=0.15)
+    parser.add_argument("--deb-delay", type=float, default=8)
+    parser.add_argument("--periodic-only", action="store_true")
     args = parser.parse_args()
     if min(args.delay, args.client_interval, args.max_wait) <= 0:
         parser.error("delay, client-interval, and max-wait must be positive")
-    lab = Lab(args)
+    if args.suites < 1 or args.catalog_size < 1 or args.hot_count < 1 or min(args.member_delay, args.deb_delay) < 0:
+        parser.error("invalid burst dimensions")
+    if args.burst:
+        from burst import BurstLab
+        lab = BurstLab(args)
+    else:
+        lab = Lab(args)
     try:
         lab.run()
     except Exception as error:

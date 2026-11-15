@@ -1,0 +1,103 @@
+# Review: publication-delay fixes (branch on 59f69a2 plus current changes)
+
+**Verdict:** the code fixes the mechanisms the lab reproduced, but a config kept from 1.0.2 probably does not get the two new defaults. The shipped `config.toml.default` set `periodic_refresh = "15m"` and `hot_prefetch_budget = "5m"` explicitly, so the customer's file likely still does. I found no lock leak, deadlock or data race in the new lifecycle code, but two behavioural bugs in the repair yield, four smaller correctness issues, and several log-noise regressions.
+
+Nothing was run; this is from reading the bundle. References are file plus function because the bundle has no line numbers.
+
+## Bugs
+
+1. **Repairs can livelock under the new 1m refresh** (`repair_yield.go` `repairGivesWay`, `spawnRepair`).
+   - A repair yields to any check once it is one cooldown (60s) old. The next periodic check now arrives 60–75s after the check that started the repair, even with no client traffic.
+   - That check ends `not_modified`, `planRepair` starts a new repair, and the unfinished member restarts from byte zero.
+   - A single member that needs longer than about a minute is re-downloaded every minute and never heals. This includes a reconcile of a required index, which clients see as a 404, and a manual `Reconcile`.
+   - The AIDEV-NOTE accepts this cost "under steady client traffic"; with 1m refresh it is unconditional.
+   - Repairs can also starve behind adoptions: the changed `sim_sched_test` now expects the repair to yield on every unchanged check.
+   - **Fix:** keep a per-suite count of consecutive yields to a check, reset on a completed run or a new snapshot, and require `cooldown << yields` (capped near 10m) of run time before the next yield.
+
+2. **Manual Reconcile blocks detection for up to one cooldown** (`freshness.go` `Reconcile`).
+   - The age test in `repairGivesWay` assumes the run started right after a check stamped `last_check_at`. A manual reconcile stamps nothing, so a check that is due is turned away busy for up to 60s.
+   - `TestManualReconcileGivesWayToFreshness` uses cooldown 0 and cannot see this.
+   - **Fix:** mark the `repairRun` as manual and skip the age test for it; add a test with a non-zero cooldown.
+
+3. **The budget context shadows `adoptionCtx`** (`hot_prefetch.go` `runHotPrefetch`).
+   - `prefetchHotSet` now receives the budget-bound context, so its "site 4" heartbeat uses an expired context once the budget passes. The `DeadlineExceeded` is suppressed, so it silently does nothing, which contradicts the comment beside it.
+   - The impact is small, because site 5 and the ticker follow.
+   - **Fix:** name the bounded context `budgetCtx`, use it for `computeHotSet` and the fetches, and keep the original for heartbeats and logging.
+
+4. **The watchdog stops before the failure record on the panic path** (`spawnAdoption`).
+   - `defer c.finishWork(work)` is registered after `defer c.recoverAdoption`, so it runs first. The panic failure record is then written with no watchdog and no `c.work` entry, and busy checks report `suite_lock` with no log line.
+   - **Fix:** declare `work` earlier and register a nil-guarded `finishWork` defer before `recoverAdoption`.
+   - `recordAdoptionFailure` takes no context, so `waits` will likely not show `database_write` during `record_result` on the normal path either. I could not confirm this from the bundle.
+
+5. **Content-lock waits are labelled `host_slot`.** `blobLocks` is a `hostsem.Sem`, and `Sem.Acquire` hard-codes that name. A member waiting on another fetch of the same bytes shows up as host-slot starvation. **Fix:** give `Sem` a wait name.
+
+6. **The pending gauges count every suite with `InReleaseChangeSeenAt` set** (`scheduler.go` `tick`).
+   - Refused and deferred suites keep that stamp, so `acu_freshness_oldest_pending_seconds` can stay at days and cannot be used to alert on publication lag.
+   - **Fix:** skip records where `cache.IsRefusalReason` is true, or add a state label.
+
+7. **A worker panic logs its stack every time.** `workerPanic.String()` puts the stack in the `panic` attribute, which defeats the once-per-kind rule in `logPanic`.
+
+## Log noise
+
+- **Stale WARN:** the threshold is `4 × refresh`, now 4 minutes, and the line is logged on every 15s tick. One upstream outage, or one adopted suite on a dead mirror, gives 240 WARN lines an hour. Log on a change of count or every N minutes, or floor the threshold at 15m.
+- **`freshness_check`:** this INFO line is now 15 times as frequent, 1,440 a day per suite. Consider DEBUG for `not_modified`.
+- **`freshness_check_busy`:** the rate limit is per work object, and every short check is a new one. Colliding T1 checks during an `apt update` burst each log a line. Limit per suite key, or skip holders of kind `check` younger than a second or two.
+- **`background_work_finished`:** it fires for every `HoldSuite` (reaper and cap eviction), every adoption (next to `adoption_finished`) and every repair. Suppress short `suite_maintenance` holds as you do for checks.
+- **`adoption_hot_prefetch_partial`:** at 15s this WARN is a routine outcome, and its `missing` list is unbounded. Demote budget-caused lines to INFO, cap the list and add a count. Budget cancellations also count as `deb_failed`; give them their own label.
+- **Watchdog panic event:** it is logged as `freshness_check_panicked`, including for adoptions.
+- **Check overhead:** every lock-holding check, including each cooldown skip, starts a goroutine and a ticker and waits for the handshake in `finish`. A `time.AfterFunc` would avoid that on the T1 path.
+
+## Changed defaults and compatibility
+
+- **Kept configs:** the shipped file set both keys explicitly, so `IsDefined` is true for any config derived from it and the new defaults do not apply.
+  - The customer still gets `revalidate_wait` (a new key), parallel fetches, the idle timeout and the yield.
+  - A slow but steady download can still consume the explicit 5m budget, which is the 6m04 case.
+  - Add a release note, and consider a startup WARN when adoption is on and the budget exceeds about 1m.
+- **`idle_read_timeout`:** it was inert and is now enforced, on client cache-miss downloads as well. An old explicit small value becomes live, and zero cannot disable it.
+- **Blackholed upstream:** each anchor request can wait the full `revalidate_wait` once per cooldown per suite. If apt sends them serially over one proxy connection, that is about N × 5s per `apt update` for N suites. It is cheap if the unreachable-host tracker short-circuits the probe, which I could not see; test it.
+- **Repair cadence:** confirmed-unchanged checks now come every minute, so a member that cannot be healed is re-fetched, and WARNs, every minute. Check that the skip rows' `RetryCount` caps this.
+- **Restart spread:** `rescheduleFailingAdoptions` spreads over `refresh`, now 1 minute instead of 15.
+- **Lab apt timeout:** the lab sets `Acquire::http::Timeout "20"`, but the design bound is 8s of revalidation plus a 20s flip hold under apt's 30s.
+
+## SLA and performance limits (not bugs)
+
+| Limit | Effect |
+|---|---|
+| Detection | At most refresh plus tick (75s) plus queueing. Periodic checks keep `last_check_at` fresh, so request-time revalidation is usually skipped by the cooldown. |
+| Check pool | Four workers, one probe per host at a time. A host with hundreds of suites cannot meet 1m; a silent host holds a worker up to 60s. |
+| Adoption admission | One per host, two globally, no priority. A security suite on `deb.debian.org` waits behind a large main-suite adoption for up to `max_duration`. |
+| Members before flip | Every member, optional ones included, must arrive first. Large Contents files dominate without an architecture allowlist. |
+| Flip barrier | Adds up to 140s after the pipeline when a quiet period is set. |
+| Mirror-sync retry | At least 1 minute, and it reruns the whole pipeline, including rehash and index parse. |
+| Large hot packages | Any package needing more than 15s is never warmed, and its partial bytes are discarded on each attempt. |
+| Load | One conditional GET and one writer-goroutine update per suite per minute, including suites nobody requests. A cheap mitigation is a longer refresh for suites with no recent `LastRequestedAt`. |
+| `release_age_seconds` | Measured from the signed `Date`, so it is an upper bound on lag, not the lag. |
+
+## Lab methodology
+
+- **The burst defaults sit on the budget.** Eight hot packages, four workers and 8s per package means two waves and 16s, against a 15s budget.
+  - Each suite will show a `hot_prefetch` phase of exactly 15s with four failures.
+  - The install then fetches 24 cold packages at 8s each, close to its 240s timeout.
+  - Use about 3s to test warming, or set the delay well past the budget on purpose, and assert the hot counters.
+- **Twelve variants are six distinct blobs.** `contrib` is byte-identical to `main`. This exercises the content lock but halves the member work.
+- **No by-hash coverage.** The Release has no `Acquire-By-Hash`, and uncompressed Packages is served. The production paths (by-hash first, path first, never-served 404s) are not exercised.
+- **Detection phase is random per run.** In `--periodic-only`, detection latency is uniform over 0–75s depending on where the last check fell. Repeat runs and report a distribution, or publish right after an observed `freshness_check`.
+- **The new signals are not captured.** `[admin] enabled = false` hides the gauges and counters. `summarize` ignores `first_seen_seconds`, `release_age_seconds`, the `reval` and `behind_s` request fields, and the busy and yield lines. Check `release_age_seconds` against the harness clock.
+- **Failed first attempts skew the summary.** `summarize` keeps the first `adoption_finished` time but the last outcome.
+- **One origin process serves both hosts.** That separates ACU's per-host limits but not origin behaviour. All stalls happen before headers; add a mid-body stall to exercise the idle reader.
+
+## Missing tests
+
+1. A repair or reconcile member that needs longer than refresh still completes under periodic checks.
+2. Manual reconcile with a non-zero cooldown.
+3. A panic with a blocked writer: watchdog and busy reason during the failure record, and afterwards lock, lease, `c.work` and `c.repairs` all clean. The same for a panic in a repair.
+4. `computeHotSet` consuming most or all of the budget: the flip proceeds, the buckets add up, and the heartbeat after the budget still writes.
+5. N concurrent short checks produce at most one busy line.
+6. Yield races: two adoptions asking the same repair, and a yield timeout ending queued with the mutex released.
+7. An anchor request while a repair holds the suite does not wait.
+8. An `-race` stress of idle-watch arm and disarm, and of watchdog `Snapshot` against four member workers.
+9. Config: explicit legacy values are honoured and logged at startup.
+10. Stale WARN rate at 1m refresh.
+11. The pending gauge with a refused suite, and its reset after publication.
+12. A scheduler simulation at 1m with hundreds of suites on one host.
+13. Blackholed upstream with ten suites: total `apt update` time.

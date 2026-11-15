@@ -1,0 +1,21 @@
+**Verdict:** I found no blocker in the stamp path, but two yield paths can still cancel maintenance without evidence of a change. I'd settle both before merge. This is from reading the bundle only; nothing was run, and `check()`, the member pipeline and `hostsem` were not in it.
+
+The six earlier findings all look addressed in the code as shown.
+
+## Settle before merge
+
+1. **A host-slot timeout yields the repair, and the repair may be what holds the slots.** In `checkDuringRepair`, a failed 2-second `hostSem.Acquire` returns unhandled, so `repairGivesWay` cancels maintenance.
+   - If the repair's own member fetches count against the same per-host semaphore and can reach the cap, every due check cancels the repair even when the release is unchanged. Heavy client traffic to that host would do the same.
+   - The tests would not catch this: `holdFetcher` takes no slot, and `TestMaintenanceProbeBoundsHostSlotWait` saturates the semaphore from outside.
+   - If the member fetches do share that pool, this is a blocker. The fix is either a reserved slot for the probe or repair parallelism capped at one below the host limit; which is your call.
+
+2. **The pending/failure guard runs before the cooldown test.** With `InReleaseChangeSeenAt != nil` or `AdoptionFailCount > 0`, every check returns unhandled, including ones the locked path would skip as not due.
+   - The realistic case is a manual `Reconcile` while an adoption is failing: the first check of any kind cancels it, and the locked check then does nothing.
+   - This is the same class as the CAS no-op finding: a yield with nothing gained.
+   - The fix is to apply the locked check's own "is anything due" test before returning unhandled. I can't tell from the bundle whether that is the cooldown alone or also the short retry schedule, so that one is yours to answer.
+
+## Minor, not blocking
+
+- **Repair ends on its own between probe and yield.** `repairGivesWay` returns false when the run is no longer registered, so a detected change may end busy and wait a tick. A non-blocking `<-run.done` check before the `Load` would return true and let the lock retry proceed.
+- **Backward clock step beyond tolerance.** The cooldown no longer applies and the `last_check_at < now` test never passes, so every check does a full upstream probe and ends busy for the life of the repair. Letting the update through when `last_check_at > now + tolerance` fixes it.
+- **Unsigned suites have no hold.** `lateralHeld` is consulted only for `FormDetached`. If the ordinary path also holds failed upgrades for unsigned suites, a persistently unverifiable `InRelease` or `Release.gpg` cancels the repair on every due check.
