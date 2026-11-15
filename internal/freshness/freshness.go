@@ -364,8 +364,10 @@ func New(cfg Config) (*Checker, error) {
 // constructs an adoptionRequest; the goroutine in Check just routes
 // to Run vs RunDetached based on form.
 type adoptionRequest struct {
-	suite SuiteRef
-	form  adoptionForm
+	trigger adoptionTrigger
+	log     *adoptionLog
+	suite   SuiteRef
+	form    adoptionForm
 
 	// Inline form (form == adoptionFormInline): bytes is the
 	// freshness-fetched clearsigned InRelease body.
@@ -440,6 +442,7 @@ type checkOutcome struct {
 // one per tick until it is parked. The cooldown's job — absorbing
 // client-triggered storms — does not apply to either.
 type checkOpts struct {
+	source         string // client (default), periodic, or queued
 	bypassCooldown bool
 }
 
@@ -448,6 +451,7 @@ type checkOpts struct {
 // result line was logged) and, with a queued result, whether the current
 // snapshot is signed, i.e. which kind of slot the suite may take.
 type checkReport struct {
+	reason        string
 	result        string
 	signedCurrent bool
 }
@@ -546,6 +550,11 @@ func (c *Checker) check(ctx context.Context, ref SuiteRef, opts checkOpts) check
 	}
 	switch {
 	case out.lease != nil && out.req != nil:
+		out.req.trigger.source = opts.source
+		if out.req.trigger.source == "" {
+			out.req.trigger.source = "client"
+		}
+		out.req.trigger.reason, out.req.trigger.detail = out.report.result, out.report.reason
 		c.spawnAdoption(mu, out.req, out.lease)
 	case out.lease != nil && out.repair != nil:
 		c.spawnRepair(mu, out)
@@ -616,12 +625,14 @@ func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) 
 		// in acu_adoption_duration_seconds.
 		start := time.Now()
 		defer c.recoverAdoption(req, start)
+		req.log = newAdoptionLog(req.trigger, start)
 		actx, cancel := context.WithTimeout(c.lifetimeCtx, c.maxAdoptionDuration)
 		defer cancel()
 		pipelineDone := false // set by membersDone, which runs on this goroutine (runShared Step 11)
 		err := c.adopter.runRequest(actx, req, runHooks{
-			membersDone: func() { pipelineDone = true; l.releaseHost() },
-			stop:        c.lifetimeCtx,
+			gpgReasonClassifier: c.gpgReasonClassifier,
+			membersDone:         func() { pipelineDone = true; l.releaseHost() },
+			stop:                c.lifetimeCtx,
 		})
 		// A flip abandoned in the barrier means shutdown: main closes the
 		// gate at the signal, while the lifetime context still runs (or
@@ -633,7 +644,7 @@ func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) 
 		// verification or member fetch cut short, or runShared's
 		// shutdown-before-the-commit check (deferred minor C-20).
 		if errors.Is(err, flipgate.ErrAborted) || (err != nil && c.lifetimeCtx.Err() != nil) {
-			c.logger.Info("adoption_abandoned_at_shutdown",
+			c.adoptionLogger(req).Info("adoption_abandoned_at_shutdown",
 				"canonical_host", req.suite.CanonicalHost,
 				"suite_path", req.suite.SuitePath,
 				"form", formName(req.form),
@@ -689,7 +700,7 @@ func (c *Checker) spawnAdoption(mu *sync.Mutex, req *adoptionRequest, l *lease) 
 			if outcome == "refused" {
 				level = slog.LevelInfo
 			}
-			c.logger.Log(context.Background(), level, "adoption_run_failed",
+			c.adoptionLogger(req).Log(context.Background(), level, "adoption_run_failed",
 				"canonical_host", req.suite.CanonicalHost,
 				"suite_path", req.suite.SuitePath,
 				"form", formName(req.form),

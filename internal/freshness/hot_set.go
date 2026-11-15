@@ -29,7 +29,7 @@ type hotSetEntry struct {
 // hot set":
 //   - no prior current_snapshot_id for this suite,
 //   - hotWindowSeconds == 0,
-//   - no eligible prior-snapshot rows have a fresh url_path.last_requested_at,
+//   - no recorded package identities have client interest within the window,
 //   - no Stage-1 (Package, Arch) tuple matches a candidate row.
 //
 // nil hot set falls through naturally — the §7.5 loop iterates over an
@@ -67,8 +67,8 @@ func (a *Adopter) computeHotSet(ctx context.Context, suite SuiteRef,
 }
 
 // priorCurrentSnapshotID returns the suite's pre-flip current_snapshot_id
-// from suite_freshness — the snapshot whose package_hash rows the
-// SPEC3 §7.5.3 Stage 1 query mines. Returns (0, false) when the
+// from suite_freshness — the snapshot identifying the suite whose persistent
+// client interest Stage 1 reads. Returns (0, false) when the
 // suite has no current snapshot (cold cache for this suite — no hot
 // set possible). DB errors collapse to (0, false) so a transient
 // SQLite hiccup doesn't poison adoption; the worst outcome is a single

@@ -15,7 +15,7 @@ import (
 // expects. Forward-only: a database tagged with a higher version is treated
 // as written by a newer binary and the cache refuses to open it. SPEC §4.3,
 // SPEC2 §4.3, SPEC3 §4.3, SPEC4 §4.3, flat-repositories design §6.
-const CurrentSchemaVersion = 9
+const CurrentSchemaVersion = 10
 
 // migrations is indexed such that migrations[N] migrates the database from
 // schema version N to N+1. migrations[0] (v0 → v1) creates the entire
@@ -405,6 +405,72 @@ CREATE TABLE usage_totals (
   fetch_nanoseconds INTEGER NOT NULL CHECK (fetch_nanoseconds >= 0),
   serve_nanoseconds INTEGER NOT NULL CHECK (serve_nanoseconds >= 0)
 );
+`,
+	// v9 → v10: client interest survives package version and snapshot GC.
+	`
+CREATE TABLE hot_package (
+  canonical_scheme TEXT NOT NULL,
+  canonical_host TEXT NOT NULL,
+  suite_path TEXT NOT NULL,
+  package_name TEXT NOT NULL CHECK (package_name <> ''),
+  architecture TEXT NOT NULL CHECK (architecture <> ''),
+  last_requested_at INTEGER NOT NULL,
+  PRIMARY KEY (canonical_scheme, canonical_host, suite_path, package_name, architecture),
+  FOREIGN KEY (canonical_scheme, canonical_host, suite_path)
+    REFERENCES suite_freshness(canonical_scheme, canonical_host, suite_path) ON DELETE CASCADE
+);
+INSERT INTO hot_package (canonical_scheme, canonical_host, suite_path, package_name, architecture, last_requested_at)
+SELECT ph.canonical_scheme, ph.canonical_host, s.suite_path,
+       ph.package_name, ph.architecture, MAX(u.last_requested_at)
+  FROM url_path u JOIN package_hash ph
+    ON ph.canonical_scheme = u.canonical_scheme AND ph.canonical_host = u.canonical_host
+   AND ph.path = u.path AND ph.declared_sha256 = u.blob_hash
+  JOIN suite_snapshot s ON s.snapshot_id = ph.snapshot_id
+  JOIN suite_freshness sf ON sf.canonical_scheme = s.canonical_scheme
+   AND sf.canonical_host = s.canonical_host AND sf.suite_path = s.suite_path
+ WHERE u.last_requested_at IS NOT NULL AND ph.package_name <> '' AND ph.architecture <> ''
+   AND s.adopted_at IS NOT NULL
+ GROUP BY ph.canonical_scheme, ph.canonical_host, s.suite_path, ph.package_name, ph.architecture
+ ON CONFLICT(canonical_scheme, canonical_host, suite_path, package_name, architecture)
+ DO UPDATE SET last_requested_at = MAX(hot_package.last_requested_at, excluded.last_requested_at);
+CREATE TRIGGER hot_package_insert AFTER INSERT ON url_path
+ WHEN NEW.last_requested_at IS NOT NULL
+ BEGIN
+INSERT INTO hot_package (canonical_scheme, canonical_host, suite_path, package_name, architecture, last_requested_at)
+SELECT ph.canonical_scheme, ph.canonical_host, s.suite_path,
+       ph.package_name, ph.architecture, MAX(u.last_requested_at)
+  FROM url_path u JOIN package_hash ph
+    ON ph.canonical_scheme = u.canonical_scheme AND ph.canonical_host = u.canonical_host
+   AND ph.path = u.path AND ph.declared_sha256 = u.blob_hash
+  JOIN suite_snapshot s ON s.snapshot_id = ph.snapshot_id
+  JOIN suite_freshness sf ON sf.canonical_scheme = s.canonical_scheme
+   AND sf.canonical_host = s.canonical_host AND sf.suite_path = s.suite_path
+ WHERE u.last_requested_at IS NOT NULL AND ph.package_name <> '' AND ph.architecture <> ''
+   AND s.adopted_at IS NOT NULL
+   AND u.canonical_scheme = NEW.canonical_scheme AND u.canonical_host = NEW.canonical_host AND u.path = NEW.path
+ GROUP BY ph.canonical_scheme, ph.canonical_host, s.suite_path, ph.package_name, ph.architecture
+ ON CONFLICT(canonical_scheme, canonical_host, suite_path, package_name, architecture)
+ DO UPDATE SET last_requested_at = MAX(hot_package.last_requested_at, excluded.last_requested_at);
+ END;
+CREATE TRIGGER hot_package_touch AFTER UPDATE OF last_requested_at ON url_path
+ WHEN NEW.last_requested_at IS NOT NULL
+ BEGIN
+INSERT INTO hot_package (canonical_scheme, canonical_host, suite_path, package_name, architecture, last_requested_at)
+SELECT ph.canonical_scheme, ph.canonical_host, s.suite_path,
+       ph.package_name, ph.architecture, MAX(u.last_requested_at)
+  FROM url_path u JOIN package_hash ph
+    ON ph.canonical_scheme = u.canonical_scheme AND ph.canonical_host = u.canonical_host
+   AND ph.path = u.path AND ph.declared_sha256 = u.blob_hash
+  JOIN suite_snapshot s ON s.snapshot_id = ph.snapshot_id
+  JOIN suite_freshness sf ON sf.canonical_scheme = s.canonical_scheme
+   AND sf.canonical_host = s.canonical_host AND sf.suite_path = s.suite_path
+ WHERE u.last_requested_at IS NOT NULL AND ph.package_name <> '' AND ph.architecture <> ''
+   AND s.adopted_at IS NOT NULL
+   AND u.canonical_scheme = NEW.canonical_scheme AND u.canonical_host = NEW.canonical_host AND u.path = NEW.path
+ GROUP BY ph.canonical_scheme, ph.canonical_host, s.suite_path, ph.package_name, ph.architecture
+ ON CONFLICT(canonical_scheme, canonical_host, suite_path, package_name, architecture)
+ DO UPDATE SET last_requested_at = MAX(hot_package.last_requested_at, excluded.last_requested_at);
+ END;
 `,
 }
 

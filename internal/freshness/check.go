@@ -120,6 +120,24 @@ func (c *Checker) checkLocked(ctx, fetchCtx context.Context, out *checkOutcome, 
 		return
 	}
 
+	// Preserve the state before this check mutates validators/failure records.
+	previous, previousKnown := int64(0), true
+	if cur.CurrentSnapshotID != nil {
+		previous = *cur.CurrentSnapshotID
+	}
+	failures, failureHash, failureReason := cur.AdoptionFailCount, cur.AdoptionFailHash, cur.AdoptionFailReason
+	defer func() {
+		if out.req == nil {
+			return
+		}
+		out.req.trigger.previousSnapshot, out.req.trigger.previousKnown = previous, previousKnown
+		out.req.trigger.previousFailures = failures
+		if failureReason != nil {
+			out.req.trigger.previousFailureReason = *failureReason
+		}
+		out.req.trigger.retry = failures > 0 && failureHash != nil && *failureHash == out.req.key
+	}()
+
 	// Cooldown gate. Spec C4 clock-step rule: a past-event stamp found in
 	// the future (backward wall-clock step) is treated as infinitely old,
 	// never as "just checked" — otherwise the suite freezes for the size
@@ -287,7 +305,7 @@ func (c *Checker) finishCheck(ctx context.Context, out *checkOutcome, cur *cache
 	if e.anchorlessRows {
 		logAttrs = append(logAttrs, "rows_replaced", e.rowsReplaced, "rows_deleted", e.rowsDeleted)
 	}
-	out.report = checkReport{result: e.result, signedCurrent: e.signedCurrent}
+	out.report = checkReport{result: e.result, reason: e.reason, signedCurrent: e.signedCurrent}
 	// Ruling PE-10 (b): the answer the next check is paced by
 	// (pacedAbsentAnswer).
 	if key := suiteKey(suite.CanonicalScheme, host, suitePath); e.result == "anchor_absent" {

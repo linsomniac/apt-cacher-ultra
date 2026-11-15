@@ -24,6 +24,7 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
 	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
+	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
 )
 
@@ -622,6 +623,9 @@ type Adopter struct {
 	fetcher  AdoptionFetcher
 	verifier Verifier
 	hostSem  *hostsem.Sem
+	// Serialize prefetches of identical content across concurrent suites.
+	// Entries disappear when the last holder/waiter leaves.
+	hotBlobs *hostsem.Sem
 
 	// signers is verifier as a SignerVerifier, nil when it is not one: the
 	// signer downgrade guard (signer_guard.go) then stands down.
@@ -822,6 +826,7 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		verifier:                cfg.Verifier,
 		signers:                 signers,
 		hostSem:                 cfg.HostLimiter,
+		hotBlobs:                hostsem.New(1),
 		maxConcurrent:           cfg.MaxConcurrent,
 		maxDuration:             maxDur,
 		flipGate:                cfg.FlipGate,
@@ -942,7 +947,7 @@ func (t *blobHeartbeatTracker) Snapshot() []string {
 func (a *Adopter) heartbeat(ctx context.Context, host string, snapshotID int64, tracker *blobHeartbeatTracker) {
 	if err := a.cache.HeartbeatSnapshot(ctx, snapshotID); err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			a.logger.Warn("adoption_heartbeat_failed",
+			a.adoptionLogger(ctx).Warn("adoption_heartbeat_failed",
 				"snapshot_id", snapshotID,
 				"err", err,
 			)
@@ -961,7 +966,7 @@ func (a *Adopter) heartbeat(ctx context.Context, host string, snapshotID int64, 
 	}
 	if err := a.cache.HeartbeatBlobs(ctx, hashes); err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			a.logger.Warn("adoption_heartbeat_blobs_failed",
+			a.adoptionLogger(ctx).Warn("adoption_heartbeat_blobs_failed",
 				"snapshot_id", snapshotID,
 				"hash_count", len(hashes),
 				"err", err,
@@ -1024,7 +1029,9 @@ const (
 // unsigned form — (releaseBytes) is set on entry; runShared populates the
 // *Hash fields once step 2 has stored the blobs in pool/.
 type adoptionPayload struct {
-	form adoptionForm
+	log                 *adoptionLog
+	gpgReasonClassifier func(error) string
+	form                adoptionForm
 
 	// Inline mode (form == adoptionFormInline).
 	inlineBytes []byte // clearsigned InRelease
@@ -1085,6 +1092,7 @@ func (a *Adopter) RunDetached(ctx context.Context, suite SuiteRef, releaseBytes,
 
 // runHooks is what the Checker passes into an adoption it spawned.
 type runHooks struct {
+	gpgReasonClassifier func(error) string
 	// membersDone runs once the member pipeline is over, before the flip
 	// barrier; the Checker frees the host slot there (spec C4).
 	membersDone func()
@@ -1095,7 +1103,7 @@ type runHooks struct {
 
 // runRequest runs the adoption a check requested; see runHooks.
 func (a *Adopter) runRequest(ctx context.Context, req *adoptionRequest, hooks runHooks) error {
-	p := &adoptionPayload{form: req.form, membersDone: hooks.membersDone, stop: hooks.stop}
+	p := &adoptionPayload{form: req.form, membersDone: hooks.membersDone, stop: hooks.stop, log: req.log, gpgReasonClassifier: hooks.gpgReasonClassifier}
 	switch req.form {
 	case adoptionFormInline:
 		p.inlineBytes = req.bytes
@@ -1122,7 +1130,24 @@ func (a *Adopter) runRequest(ctx context.Context, req *adoptionRequest, hooks ru
 //
 // The other steps are identical: parse, candidate insert, member
 // prefetch, by-hash, atomic flip, success log.
-func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayload, etag, lastmod string) error {
+func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayload, etag, lastmod string) (runErr error) {
+	attempt := p.log
+	if attempt == nil {
+		attempt = newAdoptionLog(adoptionTrigger{}, time.Now())
+	}
+	ctx = observability.WithAdoptionTrace(ctx, attempt.trace)
+	ctx = context.WithValue(ctx, adoptionLogKey{}, attempt)
+	defer func() {
+		if r := recover(); r != nil {
+			// Preserve the existing panic boundary and failure bookkeeping, even
+			// if a log handler itself panics while writing the terminal record.
+			unloggedPanic(func() { attempt.finish(a.logger, ctx, suite, p, runErr, true) })
+			panic(r)
+		}
+		attempt.finish(a.logger, ctx, suite, p, runErr, false)
+	}()
+	a.logger.Info("adoption_started", attempt.attrs(suite, p.form)...)
+
 	// Step 0a: capture the prior (current) snapshot. After
 	// CommitAdoption the prior snapshot is no longer current, so the
 	// lookup must happen before any mutation. Step 3a applies apt's Date
@@ -1134,14 +1159,21 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// those rules.
 	prior, err := a.priorSnapshot(ctx, suite)
 	if err != nil {
-		a.logger.Warn("adoption_read_prior_snapshot_failed",
+		a.adoptionLogger(ctx).Warn("adoption_read_prior_snapshot_failed",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"err", err,
 		)
 		return err
 	}
+	attempt.previousKnown = true
+	if prior != nil {
+		attempt.previous = prior.SnapshotID
+	} else {
+		attempt.previous = 0
+	}
 	priorForm, hadPrior := formOfSnapshot(prior)
+	attempt.nextPhase("verify")
 
 	// Step 1: GPG verify. The Verifier returns the verified Release-
 	// style plaintext (a clearsigned InRelease's signed text, as apt's
@@ -1175,7 +1207,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		releaseText = p.releaseBytes
 	}
 	if verifyErr != nil {
-		a.logger.Info("adoption_gpg_failed",
+		a.adoptionLogger(ctx).Info("adoption_gpg_failed",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"err", verifyErr,
@@ -1187,6 +1219,8 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		return fmt.Errorf("%w: %w", ErrAdoptionGPGFailed, verifyErr)
 	}
 
+	attempt.nextPhase("prepare")
+
 	// Step 2: persist the verified metadata blob(s) into pool/ BEFORE
 	// the candidate row references them. writeBlobBytes is idempotent
 	// and rehashes-on-reuse — a pre-existing pool blob with the same
@@ -1197,7 +1231,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	case adoptionFormInline:
 		h, err := a.writeBlobBytes(ctx, p.inlineBytes)
 		if err != nil {
-			a.logger.Warn("adoption: persist InRelease failed",
+			a.adoptionLogger(ctx).Warn("adoption: persist InRelease failed",
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
 				"err", err,
@@ -1208,7 +1242,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	case adoptionFormDetached:
 		rh, err := a.writeBlobBytes(ctx, p.releaseBytes)
 		if err != nil {
-			a.logger.Warn("adoption: persist Release failed",
+			a.adoptionLogger(ctx).Warn("adoption: persist Release failed",
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
 				"err", err,
@@ -1217,7 +1251,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		}
 		gh, err := a.writeBlobBytes(ctx, p.sigBytes)
 		if err != nil {
-			a.logger.Warn("adoption: persist Release.gpg failed",
+			a.adoptionLogger(ctx).Warn("adoption: persist Release.gpg failed",
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
 				"err", err,
@@ -1229,7 +1263,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	case adoptionFormUnsigned:
 		rh, err := a.writeBlobBytes(ctx, p.releaseBytes)
 		if err != nil {
-			a.logger.Warn("adoption: persist Release failed",
+			a.adoptionLogger(ctx).Warn("adoption: persist Release failed",
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
 				"err", err,
@@ -1245,7 +1279,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	acquireByHash := parseAcquireByHash(releaseText)
 	members, err := ParseRelease(releaseText)
 	if err != nil {
-		a.logger.Info("adoption_parse_failed",
+		a.adoptionLogger(ctx).Info("adoption_parse_failed",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"err", err,
@@ -1348,13 +1382,13 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			return fmt.Errorf("%w: %w", ErrAdoptionRollbackRefused, err)
 		}
 		if errors.Is(err, cache.ErrSnapshotNaturalKeyAdopted) {
-			a.logger.Warn("adoption: natural key already adopted",
+			a.adoptionLogger(ctx).Warn("adoption: natural key already adopted",
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
 				"err", err,
 			)
 		} else {
-			a.logger.Warn("adoption: insert candidate failed",
+			a.adoptionLogger(ctx).Warn("adoption: insert candidate failed",
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
 				"err", err,
@@ -1362,8 +1396,9 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		}
 		return fmt.Errorf("%w: insert candidate: %w", ErrAdoptionDBFailed, err)
 	}
+	attempt.candidate = snapshotID
 	if reused {
-		a.logger.Info("adoption: reusing orphaned candidate",
+		a.adoptionLogger(ctx).Info("adoption: reusing orphaned candidate",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"snapshot_id", snapshotID,
@@ -1433,7 +1468,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			// snapshot GC and the adoption fails at commit, which is safe.
 			defer func() {
 				if r := recover(); r != nil {
-					unloggedPanic(func() { logPanic(a.logger, "adoption_panicked", "heartbeat", suite, r) })
+					unloggedPanic(func() { logPanic(a.adoptionLogger(ctx), "adoption_panicked", "heartbeat", suite, r) })
 				}
 			}()
 			a.runHeartbeatTicker(tickerCtx, suite.CanonicalHost, snapshotID, tracker)
@@ -1443,6 +1478,9 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		tickerCancel()
 		tickerWG.Wait()
 	}()
+
+	attempt.nextPhase("members")
+	attempt.memberCount = len(members)
 
 	// Step 5: prefetch declared members sequentially. Each member's
 	// declared_sha256 is the trust anchor — bytes that arrive from
@@ -1509,7 +1547,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		if a.architectureAllowlist != nil {
 			if arch, filtered := archFromFilteredPath(suite.SuitePath, m.Path); filtered {
 				if _, ok := a.architectureAllowlist[arch]; !ok {
-					a.logger.Warn("adoption_member_skipped",
+					a.adoptionLogger(ctx).Warn("adoption_member_skipped",
 						"canonical_host", suite.CanonicalHost,
 						"suite_path", suite.SuitePath,
 						"path", m.Path,
@@ -1520,6 +1558,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 					)
 					adoptionMembersSkippedTotal.Inc("arch_not_in_allowlist")
 					skippedCount++
+					attempt.membersSkipped++
 					continue
 				}
 			}
@@ -1539,10 +1578,12 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			}
 		}
 
+		reusedBefore := attempt.membersReused
 		blobHash, err := a.adoptMemberWithRetry(ctx, suite, m, acquireByHash)
 		if err != nil {
 			if errors.Is(err, errAdoptionMemberSkipped) {
 				skippedCount++
+				attempt.membersSkipped++
 				continue
 			}
 			// REC 1: a non-IndexTarget member (Contents-*, dep11
@@ -1567,7 +1608,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 				if errors.As(err, &me) {
 					detail = me.Detail
 				}
-				a.logger.Warn("adoption_member_skipped",
+				a.adoptionLogger(ctx).Warn("adoption_member_skipped",
 					"canonical_host", suite.CanonicalHost,
 					"suite_path", suite.SuitePath,
 					"path", m.Path,
@@ -1592,6 +1633,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 					})
 				}
 				skippedCount++
+				attempt.membersSkipped++
 				continue
 			}
 			return err // already wrapped with category
@@ -1603,6 +1645,10 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			DeclaredSHA256: blobHash,
 		})
 		pendingAliases = append(pendingAliases, aliasRows(snapshotID, m, blobHash)...)
+		attempt.membersReady++
+		if attempt.membersReused == reusedBefore {
+			attempt.membersDownloaded++
+		}
 		fetchedMembers = append(fetchedMembers, verifiedMember(m, blobHash))
 		if requiredGroup != "" {
 			requiredGroupFetched[requiredGroup] = true
@@ -1630,7 +1676,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			if requiredGroupFetched[g] {
 				continue
 			}
-			a.logger.Warn("adoption_required_index_target_missing",
+			a.adoptionLogger(ctx).Warn("adoption_required_index_target_missing",
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
 				"group", g,
@@ -1673,7 +1719,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			if _, a2, ok := indexTargetGroup(suite.SuitePath, g); ok {
 				arch = a2
 			}
-			a.logger.Error("adoption_blocked_serve_target_missing",
+			a.adoptionLogger(ctx).Error("adoption_blocked_serve_target_missing",
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
 				"group", g,
@@ -1745,6 +1791,8 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		memberRows = append(memberRows, r)
 	}
 
+	attempt.nextPhase("parse_indexes")
+
 	// Step 8: parse every Packages member to populate package_hash
 	// rows. Deduped by .deb url-path within the adoption — multiple
 	// Packages variants (Packages, Packages.gz, Packages.xz) declare
@@ -1762,7 +1810,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// denominator (a 4xx-skipped Packages directory must drop
 	// coverage to false, not disappear from the count); fetchedMembers
 	// drives the parse loop (only those have blobs in the pool).
-	pkgHashRes, err := a.buildPackageHashes(suite, snapshotID, cand.Form, members, fetchedMembers)
+	pkgHashRes, err := a.buildPackageHashes(ctx, suite, snapshotID, cand.Form, members, fetchedMembers)
 	if err != nil {
 		return err // already wrapped with category
 	}
@@ -1783,7 +1831,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// alongside the existing Packages-variant disagreement check
 	// (SPEC6_5 §11 H7).
 	if !unsigned {
-		sourceRows, _, err := a.buildSourceHashes(suite, snapshotID, fetchedMembers)
+		sourceRows, _, err := a.buildSourceHashes(ctx, suite, snapshotID, fetchedMembers)
 		if err != nil {
 			return err
 		}
@@ -1801,7 +1849,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// Index disagreement on a patch path surfaces as
 	// ErrAdoptionParseFailed (§11 H7-equivalent).
 	if !unsigned {
-		pdiffRows, _, err := a.buildPdiffHashes(suite, snapshotID, fetchedMembers)
+		pdiffRows, _, err := a.buildPdiffHashes(ctx, suite, snapshotID, fetchedMembers)
 		if err != nil {
 			return err
 		}
@@ -1824,7 +1872,23 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// candidate's package_hash rows are passed in memory because the
 	// flip transaction below is what inserts them — Stage 2 of the
 	// hot-set computation cannot rely on them being DB-visible yet.
+	attempt.nextPhase("hot_prefetch")
+	hotStarted := time.Now()
 	prefetchedURLPaths, hotStats := a.runHotPrefetch(ctx, suite, snapshotID, packageHashes, tracker)
+	attempt.hot = hotStats
+	attempt.nextPhase("prepare_commit")
+	a.adoptionLogger(ctx).Info("adoption_hot_prefetch_complete",
+		"canonical_host", suite.CanonicalHost,
+		"suite_path", suite.SuitePath,
+		"snapshot_id", snapshotID,
+		"hot_count", hotStats.hotCount,
+		"duration_seconds", time.Since(hotStarted).Seconds(),
+		"fetched", hotStats.fetched,
+		"reused", hotStats.reused,
+		"failed", hotStats.failed,
+		"mismatched", hotStats.mismatched,
+		"unattempted", hotStats.unattempted,
+	)
 
 	// SPEC4 §7.5.2 site 5: heartbeat at the end of the member pipeline,
 	// before the flip barrier and CommitAdoption. The barrier may wait up
@@ -1841,6 +1905,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// may wait up to 140 s, and holding the host slot that long would stall
 	// the host's next adoption. Only the host slot is freed here
 	// (TestCheck_MembersDoneFreesOnlyTheHostSlot).
+	attempt.pipelineDone = true
 	if p.membersDone != nil {
 		p.membersDone()
 	}
@@ -1881,7 +1946,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			if errors.Is(err, errRemarkPoolRead) {
 				level = slog.LevelError
 			}
-			a.logger.Log(ctx, level, "adoption_signed_anchor_remark_failed",
+			a.adoptionLogger(ctx).Log(ctx, level, "adoption_signed_anchor_remark_failed",
 				"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "err", err)
 			return fmt.Errorf("%w: the cached signed anchors could not be re-marked: %w",
 				ErrAdoptionUnsignedDowngradeRefused, err)
@@ -1902,6 +1967,8 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// (5 min), and the unit's TimeoutStopSec (35 s) may SIGKILL first —
 	// SQLite rolls the transaction back, so nothing is lost.
 	commit := func() error {
+		attempt.nextPhase("commit")
+		defer attempt.nextPhase("finalize")
 		if a.commitDelay > 0 {
 			time.Sleep(a.commitDelay) // test seam: a slow transaction (SetCommitDelayForTest)
 		}
@@ -1910,9 +1977,14 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		}
 		commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
 		defer cancelCommit()
-		return a.cache.CommitAdoption(commitCtx, snapshotID, memberRows, integritySkipped, packageHashes,
+		err := a.cache.CommitAdoption(commitCtx, snapshotID, memberRows, integritySkipped, packageHashes,
 			prefetchedURLPaths, pkgHashRes.coverageComplete)
+		if err == nil {
+			attempt.resulting = snapshotID
+		}
+		return err
 	}
+	attempt.nextPhase("flip_wait")
 	if err := a.flip(ctx, suite, p, prior == nil, snapshotID, commit); err != nil {
 		if errors.Is(err, flipgate.ErrAborted) {
 			return fmt.Errorf("adoption: shutdown in the flip barrier: %w", err)
@@ -1925,7 +1997,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		if errors.Is(err, cache.ErrUnsignedDowngradeRefused) {
 			return fmt.Errorf("%w: %w", ErrAdoptionUnsignedDowngradeRefused, err)
 		}
-		a.logger.Warn("adoption: commit failed",
+		a.adoptionLogger(ctx).Warn("adoption: commit failed",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"snapshot_id", snapshotID,
@@ -1934,21 +2006,6 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		return fmt.Errorf("%w: commit: %w", ErrAdoptionDBFailed, err)
 	}
 
-	// Step 12 (SPEC3 §10.2): aggregate adoption_hot_prefetch_complete.
-	// Always emitted — even when hot_count = 0 — so an operator
-	// scanning the journal can confirm the loop ran. The four
-	// sum-bucket fields plus zero must equal hot_count by construction
-	// (every entry lands in exactly one bucket).
-	a.logger.Info("adoption_hot_prefetch_complete",
-		"canonical_host", suite.CanonicalHost,
-		"suite_path", suite.SuitePath,
-		"snapshot_id", snapshotID,
-		"hot_count", hotStats.hotCount,
-		"fetched", hotStats.fetched,
-		"failed", hotStats.failed,
-		"mismatched", hotStats.mismatched,
-		"unattempted", hotStats.unattempted,
-	)
 	hotPrefetchTotal.Inc("complete", suite.CanonicalHost)
 
 	// Step 10: success log + form-drift signal.
@@ -1963,7 +2020,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// Release.gpg). Suites that have just gone from no-prior-snapshot
 	// to first adoption don't drift.
 	if hadPrior && priorForm != p.form {
-		a.logger.Warn("adoption_form_drift",
+		a.adoptionLogger(ctx).Warn("adoption_form_drift",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"prior_form", formName(priorForm),
@@ -1977,7 +2034,7 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		adoptionFormDriftTotal.Inc(formName(priorForm), formName(p.form), suite.CanonicalHost)
 	}
 
-	a.logger.Info("adoption_success",
+	a.adoptionLogger(ctx).Info("adoption_success",
 		"canonical_host", suite.CanonicalHost,
 		"suite_path", suite.SuitePath,
 		"snapshot_id", snapshotID,
@@ -2096,7 +2153,7 @@ func (a *Adopter) adoptMemberWithRetry(ctx context.Context, suite SuiteRef, m Re
 		if !errors.Is(err, ErrAdoptionMemberFetchFailed) && !errors.Is(err, ErrAdoptionMemberMismatch) {
 			break
 		}
-		a.logger.Info("adoption_member_retry",
+		a.adoptionLogger(ctx).Info("adoption_member_retry",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"path", m.Path,
@@ -2170,7 +2227,7 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 			// A fetch would bring the same bytes; fail the member (spec
 			// C5: every declared hash must match), and keep the pool file.
 			// The WARN carries the full digests (deferred minor E-6).
-			a.logger.Warn("adoption_member_mismatch",
+			a.adoptionLogger(ctx).Warn("adoption_member_mismatch",
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
 				"path", m.Path,
@@ -2187,11 +2244,14 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 			if err := a.cache.PutBlob(ctx, m.SHA256, m.Size); err != nil {
 				return "", fmt.Errorf("%w: PutBlob reuse %s: %v", ErrAdoptionDBFailed, m.SHA256, err)
 			}
+			if attempt := adoptionLogFromContext(ctx); attempt != nil {
+				attempt.membersReused++
+			}
 			return m.SHA256, nil
 		}
 		// Pool blob is corrupted at rest. SPEC2 §7.5 step 5: log and
 		// evict; fall through to upstream fetch.
-		a.logger.Warn("pool_corruption_during_adoption",
+		a.adoptionLogger(ctx).Warn("pool_corruption_during_adoption",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"path", m.Path,
@@ -2240,7 +2300,7 @@ func (a *Adopter) adoptMember(ctx context.Context, suite SuiteRef, m ReleaseMemb
 		} else if errors.Is(ferr, ErrAdoptionDBFailed) {
 			return "", ferr
 		} else {
-			a.logger.Debug("adoption_byhash_fallback",
+			a.adoptionLogger(ctx).Debug("adoption_byhash_fallback",
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
 				"path", m.Path,
@@ -2294,11 +2354,11 @@ func (a *Adopter) tryByHashFetch(ctx context.Context, suite SuiteRef, m ReleaseM
 		return "", fmt.Errorf("%w: NewTempBlob %s: %v", ErrAdoptionDBFailed, byHashRelPath, err)
 	}
 	defer func() { _ = w.Abort() }() // no-op once a Finalize* wins
-	res, err := a.fetcher.Fetch(ctx, target, w)
+	res, err := a.fetcher.Fetch(fetch.WithPurpose(ctx, "adoption_member"), target, w)
 	if err != nil {
 		return "", err // by-hash 404 (pruned), transport, etc. — silent fallback
 	}
-	hashHex, err := verifyMember(w, m, m.Size, a.rehashPooledBlob(suite, m))
+	hashHex, err := verifyMember(w, m, m.Size, a.rehashPooledBlob(ctx, suite, m))
 	if err != nil {
 		return "", err
 	}
@@ -2345,7 +2405,7 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 	}
 	defer func() { _ = w.Abort() }() // no-op once Finalize wins
 
-	res, err := a.fetcher.Fetch(ctx, target, w)
+	res, err := a.fetcher.Fetch(fetch.WithPurpose(ctx, "adoption_member"), target, w)
 	if err != nil {
 		// SPEC2 §7.5.2 (Phase 2 clarification): only the explicit
 		// "resource not present" 4xx codes — 404 Not Found and 410
@@ -2378,7 +2438,7 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 			if isIndexTarget(suite.SuitePath, m.Path) {
 				reason = "4xx_index_target"
 			}
-			a.logger.Warn("adoption_member_skipped",
+			a.adoptionLogger(ctx).Warn("adoption_member_skipped",
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
 				"path", m.Path,
@@ -2417,7 +2477,7 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 	// member declared empty) still skips the check, its hash deciding.
 	// Use the Release's size: an empty 204 or an unknown response length
 	// must not disable verification of a declared nonzero member size.
-	hashHex, err := verifyMember(w, m, m.Size, a.rehashPooledBlob(suite, m))
+	hashHex, err := verifyMember(w, m, m.Size, a.rehashPooledBlob(ctx, suite, m))
 	var mm *memberHashMismatch
 	switch {
 	case errors.Is(err, ErrAdoptionDBFailed):
@@ -2431,7 +2491,7 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 		if mm.algo == "SHA512" {
 			suffix, prefix = "sha512", "SHA512 "
 		}
-		a.logger.Warn("adoption_member_mismatch",
+		a.adoptionLogger(ctx).Warn("adoption_member_mismatch",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"path", m.Path,
@@ -2462,7 +2522,7 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 // writeBlobBytes do, so Finalize moves the verified bytes in instead of
 // keeping it. A missing file is nothing to check. A read or evict error
 // is ErrAdoptionDBFailed (a local fault).
-func (a *Adopter) rehashPooledBlob(suite SuiteRef, m ReleaseMember) func(derived string) error {
+func (a *Adopter) rehashPooledBlob(ctx context.Context, suite SuiteRef, m ReleaseMember) func(derived string) error {
 	return func(derived string) error {
 		p := a.cache.BlobPath(derived)
 		actual, err := hashFile(p)
@@ -2474,7 +2534,7 @@ func (a *Adopter) rehashPooledBlob(suite SuiteRef, m ReleaseMember) func(derived
 		case actual == derived:
 			return nil
 		}
-		a.logger.Warn("pool_corruption_during_adoption",
+		a.adoptionLogger(ctx).Warn("pool_corruption_during_adoption",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"path", m.Path,
@@ -2514,7 +2574,7 @@ func (a *Adopter) writeBlobBytes(ctx context.Context, content []byte) (string, e
 			}
 			return hashHex, nil
 		}
-		a.logger.Warn("pool_corruption_during_adoption",
+		a.adoptionLogger(ctx).Warn("pool_corruption_during_adoption",
 			"hash", hashHex,
 			"actual_sha256", actual,
 			"context", "writeBlobBytes",
@@ -2666,7 +2726,7 @@ type debPathDecl struct {
 // counts neither as rows nor in coverage. Sources and pdiff hashing stay
 // dists-only (spec C6): their builders return nothing without a dists
 // repository root.
-func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64, form cache.AnchorForm, allMembers, fetchedMembers []ReleaseMember) (packageHashBuildResult, error) {
+func (a *Adopter) buildPackageHashes(ctx context.Context, suite SuiteRef, snapshotID int64, form cache.AnchorForm, allMembers, fetchedMembers []ReleaseMember) (packageHashBuildResult, error) {
 	if form == cache.FormUnsigned {
 		return packageHashBuildResult{}, nil
 	}
@@ -2682,7 +2742,7 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64, form cach
 		return shape(p) && (!flat || !strings.Contains(p, "/"))
 	}
 	if !ok {
-		a.logger.Info("package_coverage_incomplete",
+		a.adoptionLogger(ctx).Info("package_coverage_incomplete",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"snapshot_id", snapshotID,
@@ -2844,7 +2904,7 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64, form cach
 		// Observability only — coverage is intentionally NOT downgraded here
 		// (see the AIDEV-NOTE above). Lets operators spot a malformed upstream
 		// index without it silently degrading the suite's strict-mode posture.
-		a.logger.Info("package_hash_incomplete_binary_skipped",
+		a.adoptionLogger(ctx).Info("package_hash_incomplete_binary_skipped",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"snapshot_id", snapshotID,
@@ -2857,7 +2917,7 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64, form cach
 		// Release lists no Packages-basename members at all — a
 		// source-only suite or other corner case. Set 0 rather than
 		// vacuously 1.
-		a.logger.Info("package_coverage_incomplete",
+		a.adoptionLogger(ctx).Info("package_coverage_incomplete",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"snapshot_id", snapshotID,
@@ -2872,7 +2932,7 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64, form cach
 		}
 	}
 	if len(missingDirs) > 0 {
-		a.logger.Info("package_coverage_incomplete",
+		a.adoptionLogger(ctx).Info("package_coverage_incomplete",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"snapshot_id", snapshotID,
@@ -2891,7 +2951,7 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64, form cach
 		// AIDEV-NOTE: unlike the incomplete-identity skip above (round-5,
 		// non-punitive), one such stanza flips coverage: the spec names
 		// it, and the package it declares can never be vouched.
-		a.logger.Info("package_coverage_incomplete",
+		a.adoptionLogger(ctx).Info("package_coverage_incomplete",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"snapshot_id", snapshotID,
@@ -2910,7 +2970,7 @@ func (a *Adopter) buildPackageHashes(suite SuiteRef, snapshotID int64, form cach
 		// malformed case (len(rows) > 0) still keeps coverage per the round-5
 		// non-punitive decision: a few bad stanzas among good ones must not
 		// downgrade the suite.
-		a.logger.Info("package_coverage_incomplete",
+		a.adoptionLogger(ctx).Info("package_coverage_incomplete",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"snapshot_id", snapshotID,
@@ -2963,7 +3023,7 @@ type sourcePathDecl struct {
 // return (nil, 0, nil): source rows are simply not populated. Phase 1
 // trust-upstream still serves on hit; the cache just doesn't validate
 // the bytes.
-func (a *Adopter) buildSourceHashes(suite SuiteRef, snapshotID int64,
+func (a *Adopter) buildSourceHashes(ctx context.Context, suite SuiteRef, snapshotID int64,
 	fetchedMembers []ReleaseMember) ([]cache.PackageHash, int, error) {
 	repoRoot, ok := repoRootFromSuitePath(suite.SuitePath)
 	if !ok {
@@ -2992,7 +3052,7 @@ func (a *Adopter) buildSourceHashes(suite SuiteRef, snapshotID int64,
 		// disagreement below (log + drop, never fail the suite).
 		body, err := a.readPackagesBlob(m.Path, m.SHA256)
 		if err != nil {
-			a.logger.Warn("source_parse_failed",
+			a.adoptionLogger(ctx).Warn("source_parse_failed",
 				"suite_path", suite.SuitePath,
 				"member_path", m.Path,
 				"stage", "decompress",
@@ -3010,7 +3070,7 @@ func (a *Adopter) buildSourceHashes(suite SuiteRef, snapshotID int64,
 			// I-1): ParseSources fails a file whose every path it refused
 			// (stats come back with the error), and that file, which
 			// lost all its source rows, must still say so.
-			a.logger.Info("source_paths_skipped",
+			a.adoptionLogger(ctx).Info("source_paths_skipped",
 				"canonical_scheme", suite.CanonicalScheme,
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
@@ -3021,7 +3081,7 @@ func (a *Adopter) buildSourceHashes(suite SuiteRef, snapshotID int64,
 			)
 		}
 		if err != nil {
-			a.logger.Warn("source_parse_failed",
+			a.adoptionLogger(ctx).Warn("source_parse_failed",
 				"suite_path", suite.SuitePath,
 				"member_path", m.Path,
 				"stage", "parse",
@@ -3032,7 +3092,7 @@ func (a *Adopter) buildSourceHashes(suite SuiteRef, snapshotID int64,
 		}
 		adoptionSourcesParsedTotal.Inc("ok")
 		parsedCount++
-		a.logger.Debug("source_parsed",
+		a.adoptionLogger(ctx).Debug("source_parsed",
 			"canonical_scheme", suite.CanonicalScheme,
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
@@ -3056,7 +3116,7 @@ func (a *Adopter) buildSourceHashes(suite SuiteRef, snapshotID int64,
 					// — do NOT fail the whole suite. Binary Packages
 					// disagreement stays fatal (buildPackageHashes), since
 					// that feeds the strict .deb serving path.
-					a.logger.Warn("source_hash_conflict",
+					a.adoptionLogger(ctx).Warn("source_hash_conflict",
 						"canonical_host", suite.CanonicalHost,
 						"suite_path", suite.SuitePath,
 						"path", fullPath,
@@ -3071,7 +3131,7 @@ func (a *Adopter) buildSourceHashes(suite SuiteRef, snapshotID int64,
 					// claim the path. Benign for serving (keyed on
 					// path + hash), so keep the first-seen declaration;
 					// just log the inconsistency for operators.
-					a.logger.Warn("source_hash_conflict",
+					a.adoptionLogger(ctx).Warn("source_hash_conflict",
 						"canonical_host", suite.CanonicalHost,
 						"suite_path", suite.SuitePath,
 						"path", fullPath,
@@ -3140,7 +3200,7 @@ type pdiffPathDecl struct {
 // and an error.
 //
 // Non-/dists/ layouts return (nil, 0, nil) like buildSourceHashes.
-func (a *Adopter) buildPdiffHashes(suite SuiteRef, snapshotID int64,
+func (a *Adopter) buildPdiffHashes(ctx context.Context, suite SuiteRef, snapshotID int64,
 	fetchedMembers []ReleaseMember) ([]cache.PackageHash, int, error) {
 	repoRoot, ok := repoRootFromSuitePath(suite.SuitePath)
 	if !ok {
@@ -3161,7 +3221,7 @@ func (a *Adopter) buildPdiffHashes(suite SuiteRef, snapshotID int64,
 		// fail the adoption.
 		arch, archOK := archFromPdiffIndexPath(m.Path)
 		if !archOK {
-			a.logger.Warn("pdiff_index_parse_failed",
+			a.adoptionLogger(ctx).Warn("pdiff_index_parse_failed",
 				"suite_path", suite.SuitePath,
 				"member_path", m.Path,
 				"stage", "arch_extract",
@@ -3172,7 +3232,7 @@ func (a *Adopter) buildPdiffHashes(suite SuiteRef, snapshotID int64,
 		}
 		body, err := a.readPackagesBlob(m.Path, m.SHA256)
 		if err != nil {
-			a.logger.Warn("pdiff_index_parse_failed",
+			a.adoptionLogger(ctx).Warn("pdiff_index_parse_failed",
 				"suite_path", suite.SuitePath,
 				"member_path", m.Path,
 				"stage", "decompress",
@@ -3183,7 +3243,7 @@ func (a *Adopter) buildPdiffHashes(suite SuiteRef, snapshotID int64,
 		}
 		refs, err := ParsePdiffIndex(body)
 		if err != nil {
-			a.logger.Warn("pdiff_index_parse_failed",
+			a.adoptionLogger(ctx).Warn("pdiff_index_parse_failed",
 				"suite_path", suite.SuitePath,
 				"member_path", m.Path,
 				"stage", "parse",
@@ -3194,7 +3254,7 @@ func (a *Adopter) buildPdiffHashes(suite SuiteRef, snapshotID int64,
 		}
 		adoptionPdiffIndexesParsedTotal.Inc("ok")
 		parsedCount++
-		a.logger.Debug("pdiff_index_parsed",
+		a.adoptionLogger(ctx).Debug("pdiff_index_parsed",
 			"canonical_scheme", suite.CanonicalScheme,
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,

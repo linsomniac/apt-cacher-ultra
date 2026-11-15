@@ -116,8 +116,8 @@ func TestUsageMigrationPersistenceAndIsolation(t *testing.T) {
 			if _, err := c.db.Exec(`INSERT INTO usage_totals SELECT 2,since_unixtime,fetched_bytes,served_bytes,cache_hit_bytes,requests,cache_hit_requests,fetch_nanoseconds,serve_nanoseconds FROM usage_totals`); err == nil {
 				t.Fatal("accepted second row")
 			}
-			if v, err := readSchemaVersion(ctx, c.db); err != nil || v != 9 {
-				t.Fatalf("version %d, %v; want 9", v, err)
+			if v, err := readSchemaVersion(ctx, c.db); err != nil || v != CurrentSchemaVersion {
+				t.Fatalf("version %d, %v; want %d", v, err, CurrentSchemaVersion)
 			}
 		})
 	}

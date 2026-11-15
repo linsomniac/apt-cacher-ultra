@@ -11,6 +11,13 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 
 ### Added
 
+- Correlated adoption start/finish logs show trigger and retry reasons,
+  per-phase and total duration, snapshots, member/package reuse and downloads,
+  and actual upstream byte totals, including failed and abandoned attempts.
+- Upstream response logs record actual body bytes, purpose, destination, status,
+  and completion, including retries and redirects, for traffic accounting.
+- Schema 10 remembers client-requested package identities across version changes
+  and snapshot/URL reclamation. Prefetch never extends their hot-window timestamp.
 - Persistent admin usage statistics: data fetched/served, cache hits, estimated
   net bytes saved and average effective transfer rates, with lifetime and
   since-start views in HTML and JSON. Includes background downloads and retries;
@@ -99,7 +106,7 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 - The systemd service allows six minutes for shutdown and signals the daemon
   before its DNS worker, allowing bounded record cleanup after listeners stop.
 - The package upgrade restarts a running daemon.
-- The database migrates one way, from 1.0.x's schema 6 to schema 9, and a
+- The database migrates one way, from 1.0.x's schema 6 to schema 10, and a
   trust audit checks the snapshots 1.0.x adopted at the first start.
 - `POST /reconcile` requires the header `X-ACU-Admin: 1` and a local `Host`
   (or `admin.htpasswd_file`), and answers 400 for bad input.
@@ -149,6 +156,10 @@ from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
   updated (`govulncheck`: no known vulnerability the code reaches).
 
 ### Fixed
+
+- Hot prefetch verifies and reuses cached package content instead of downloading
+  unchanged packages on every snapshot update. Missing or corrupt content is
+  fetched and verified; concurrent prefetches of one hash avoid duplicate downloads.
 
 - Serve snapshot-consistent `Release` and `Release.gpg` files for repositories
   adopted from `InRelease`. Debian installer mirror checks now work with existing

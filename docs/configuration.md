@@ -1073,7 +1073,7 @@ Keep `ca/`: unless `tls_mitm.ca_storage_dir` is set, it holds the MITM CA the ca
 for every client that trusts the old one. The rest of `cache.dir`,
 `tmp/` and `staging/`, is scratch space that may go too. The audit then
 changes nothing, but the migration before it has:
-the database is at schema 9, which older binaries refuse, so going back to 1.0.x
+the database is at schema 10, which older binaries refuse, so going back to 1.0.x
 means restoring the `cache.db` copied before the upgrade: stop the
 daemon first (a refused start runs again every 5 seconds and would
 migrate the copy again, and a copy put back under a running daemon can be
@@ -1130,9 +1130,29 @@ its adoptions fails and is retried (see *Flat repositories*).
 | `hold_packages.window` | duration | `"24h"` | Grace after GC first notices a cached URL is no longer retained by recency or current-snapshot rules. `"0s"` permits deletion in that GC batch. Nonnegative. |
 | `retention.max_versions_per_package` | integer | `3` | Newest distinct Debian versions retained and eligible for hot prefetch per package name and architecture, per suite with a current snapshot (a reaped suite has none: see *Suite reaping* under `[gc]`). Must be at least `1`. |
 
-Hot prefetch runs **before** the snapshot switches, using package identities
-requested from the previous snapshot; it does not download every package in the
-repository. The first adoption has no prior hot set.
+Hot prefetch runs **before** the snapshot switches. It remembers client-requested
+package names and architectures per repository suite across version changes,
+restarts, and removal of old URLs or snapshots. Only real client requests extend
+the hot window; prefetching does not. The newest configured number of versions
+of these identities are eligible, rather than every package in the repository.
+The first adoption has no prior hot set.
+
+Prefetch verifies and reuses existing content by its declared SHA-256, including
+content cached from another URL or mirror. Missing or corrupt files are downloaded
+and verified. Concurrent hot prefetches of the same hash share the stored result.
+A large window is supported for machines rebuilt infrequently; it does not by
+itself require repeatedly downloading unchanged packages. Local verification
+still reads the cached files from disk.
+
+Schema 10 persists this package interest and backfills it from retained request
+timestamps and adopted package indexes. Requests whose identity was already lost
+before upgrade cannot be recovered. Interest timestamps are retained until the
+suite is forgotten or reaped; expiration stops prefetch selection without
+extending timestamps or inventing client requests. For a suite that may receive
+no client requests for months, also increase `gc.suite_idle_ttl` or set it to
+`"0s"`: the default 30-day suite reaper otherwise removes the suite and its
+interest. The hot window does not override suite removal or guarantee every
+package needed by a future installation has been cached.
 
 The version limit is not a hard cap on cached versions or disk usage. Recent
 requests within `gc.url_path_ttl` protect older versions too. Current snapshot
@@ -1886,8 +1906,9 @@ being served. Local pool mtimes and snapshot adoption times are not exposed as
 upstream modification dates. Missing, invalid and future dates are omitted.
 Dates already saved with URL rows and snapshot anchors survive the schema 8
 upgrade; objects whose upstream dates were never recorded have no date until
-fetched again. Schema 9 then adds persistent usage totals. The migrations are
-forward-only; binaries supporting only schema 8 or earlier cannot open schema 9.
+fetched again. Schema 9 adds persistent usage totals; schema 10 adds persistent
+hot-package identities. The migrations are forward-only; binaries supporting
+only schema 9 or earlier cannot open schema 10.
 
 Responses carry a strong content-based ETag. Clients using `If-None-Match` can
 receive 304 responses. Date-only conditional requests receive the full body:

@@ -93,7 +93,7 @@ func (a *Adopter) signerGuard(ctx context.Context, suite SuiteRef, prior *cache.
 	if !ok || current.Strong == "" {
 		return nil
 	}
-	a.logger.Warn("adoption_signer_downgrade",
+	a.adoptionLogger(ctx).Warn("adoption_signer_downgrade",
 		"canonical_host", suite.CanonicalHost,
 		"suite_path", suite.SuitePath,
 		"current_snapshot_id", prior.SnapshotID,
@@ -121,7 +121,7 @@ func (a *Adopter) signerGuard(ctx context.Context, suite SuiteRef, prior *cache.
 func (a *Adopter) currentSigners(ctx context.Context, suite SuiteRef, prior *cache.SuiteSnapshot) (signers Signers, ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			a.logger.Warn("adoption_signer_guard_panicked",
+			a.adoptionLogger(ctx).Warn("adoption_signer_guard_panicked",
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
 				"current_snapshot_id", prior.SnapshotID,
@@ -129,7 +129,7 @@ func (a *Adopter) currentSigners(ctx context.Context, suite SuiteRef, prior *cac
 				"stack", string(debug.Stack()),
 			)
 			signers, ok = Signers{}, false
-			a.logger.Info("adoption_signer_guard_skipped",
+			a.adoptionLogger(ctx).Info("adoption_signer_guard_skipped",
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
 				"current_snapshot_id", prior.SnapshotID,
@@ -139,7 +139,7 @@ func (a *Adopter) currentSigners(ctx context.Context, suite SuiteRef, prior *cac
 		}
 	}()
 	skip := func(reason string, err error) (Signers, bool) {
-		a.logger.Info("adoption_signer_guard_skipped",
+		a.adoptionLogger(ctx).Info("adoption_signer_guard_skipped",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"current_snapshot_id", prior.SnapshotID,

@@ -145,7 +145,7 @@ func (a *Adopter) reconcileSnapshot(ctx context.Context, suite SuiteRef, snapsho
 	if err != nil {
 		return 0, fmt.Errorf("reconcile: read snapshot: %w", err)
 	}
-	phRes, err := a.buildPackageHashes(suite, snapshotID, snap.Form, declared, healedDecl)
+	phRes, err := a.buildPackageHashes(ctx, suite, snapshotID, snap.Form, declared, healedDecl)
 	if err != nil {
 		return 0, fmt.Errorf("reconcile: build package hashes: %w", err)
 	}

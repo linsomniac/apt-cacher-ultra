@@ -14,6 +14,7 @@ import (
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
+	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 )
 
 // FlipGate returns the spec C8 flip barrier the adopter commits behind:
@@ -48,6 +49,9 @@ func (p *adoptionPayload) stopErr(ctx context.Context) error {
 // no shutdown signal: their barrier runs to its own bounds.
 func (p *adoptionPayload) barrierCtx(ctx context.Context) context.Context {
 	if p.stop != nil {
+		if trace := observability.AdoptionTraceFromContext(ctx); trace != nil {
+			return observability.WithAdoptionTrace(p.stop, trace)
+		}
 		return p.stop
 	}
 	return context.WithoutCancel(ctx)
@@ -75,12 +79,12 @@ func (a *Adopter) flip(ctx context.Context, suite SuiteRef, p *adoptionPayload, 
 			return fmt.Errorf("%w: %w", flipgate.ErrAborted, flipgate.ErrClosed)
 		}
 		err := commit()
-		a.logger.Info("adoption_flip_barrier", append(attrs, "outcome", barrierOutcome("not_needed", err))...)
+		a.adoptionLogger(ctx).Info("adoption_flip_barrier", append(attrs, "outcome", barrierOutcome("not_needed", err))...)
 		return err
 	}
 	res, err := a.flipGate.Flip(p.barrierCtx(ctx), flipgate.Key(suite.CanonicalScheme, suite.CanonicalHost, suite.SuitePath), commit)
 	if res.Outcome != flipgate.OutcomeAborted {
-		a.logger.Info("adoption_flip_barrier", append(attrs,
+		a.adoptionLogger(ctx).Info("adoption_flip_barrier", append(attrs,
 			"outcome", barrierOutcome(string(res.Outcome), err),
 			"phase_a_seconds", res.PhaseA.Seconds(),
 			"token_wait_seconds", res.TokenWait.Seconds(),
@@ -129,7 +133,7 @@ func (a *Adopter) servedAnchorUnchanged(ctx context.Context, suite SuiteRef, p *
 		if p.stopErr(ctx) != nil || errors.Is(err, context.Canceled) {
 			level = slog.LevelDebug
 		}
-		a.logger.Log(ctx, level, "adoption_served_anchor_read_failed",
+		a.adoptionLogger(ctx).Log(ctx, level, "adoption_served_anchor_read_failed",
 			"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath, "path", path, "err", err)
 	}
 	return err == nil && row.BlobHash != nil && *row.BlobHash == want

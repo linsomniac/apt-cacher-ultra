@@ -15,6 +15,7 @@ import (
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/apttext"
 	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
+	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 )
 
 // SignerPin is a parsed [[trusted_signer]] block. The HostRegex is
@@ -297,8 +298,8 @@ var (
 // defence in depth (TestVerifyInline_ZeroPlaintextIsAnErrorNotAPanic pins
 // the empty signed text).
 //
-// ctx is accepted for interface compatibility but VerifyInline does
-// no I/O — verification is CPU-bound and short.
+// ctx carries adoption log correlation. VerifyInline does no I/O —
+// verification is CPU-bound and short.
 func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, inRelease []byte) ([]byte, error) {
 	m, _, err := v.VerifyInlineSigners(ctx, suite, inRelease)
 	return m, err
@@ -308,12 +309,11 @@ func (v *Verifier) VerifyInline(ctx context.Context, suite freshness.SuiteRef, i
 // and the anchor's signers (checkSignatures) for the signer downgrade
 // guard (Task 9d).
 func (v *Verifier) VerifyInlineSigners(ctx context.Context, suite freshness.SuiteRef, inRelease []byte) ([]byte, freshness.Signers, error) {
-	_ = ctx
 	var none freshness.Signers
 
 	// Step 0: the suite's trust set; an unpinned suite under
 	// require_pinned_signer is refused here, whatever the anchor.
-	trust, err := v.resolveTrustSet(suite)
+	trust, err := v.resolveTrustSet(ctx, suite)
 	if err != nil {
 		return nil, none, err
 	}
@@ -349,7 +349,7 @@ func (v *Verifier) VerifyInlineSigners(ctx context.Context, suite freshness.Suit
 	}
 
 	// Steps 3-5.
-	signers, err := v.checkSignatures(suite, trust, cs.Message, pkts)
+	signers, err := v.checkSignatures(ctx, suite, trust, cs.Message, pkts)
 	if err != nil {
 		return nil, none, err
 	}
@@ -404,7 +404,6 @@ func (v *Verifier) VerifyDetached(ctx context.Context, suite freshness.SuiteRef,
 // VerifyDetached, and the anchor's signers (checkSignatures) for the
 // signer downgrade guard (Task 9d).
 func (v *Verifier) VerifyDetachedSigners(ctx context.Context, suite freshness.SuiteRef, releaseBytes, sigBytes []byte) ([]byte, freshness.Signers, error) {
-	_ = ctx
 	var none freshness.Signers
 
 	if len(releaseBytes) == 0 {
@@ -413,7 +412,7 @@ func (v *Verifier) VerifyDetachedSigners(ctx context.Context, suite freshness.Su
 	if len(sigBytes) == 0 {
 		return nil, none, errors.New("empty Release.gpg body")
 	}
-	trust, err := v.resolveTrustSet(suite)
+	trust, err := v.resolveTrustSet(ctx, suite)
 	if err != nil {
 		return nil, none, err
 	}
@@ -425,7 +424,7 @@ func (v *Verifier) VerifyDetachedSigners(ctx context.Context, suite freshness.Su
 	if err != nil {
 		return nil, none, fmt.Errorf("%w: %w", ErrMalformedSignature, err)
 	}
-	signers, err := v.checkSignatures(suite, trust, releaseBytes, pkts)
+	signers, err := v.checkSignatures(ctx, suite, trust, releaseBytes, pkts)
 	if err != nil {
 		return nil, none, err
 	}
@@ -448,7 +447,7 @@ func armorPackets(lines [][]byte, first int) ([]sigPacket, error) {
 // signers S2 counted (verifyAnyTrusted); the bypass verifies no packet, so
 // its anchor never has a strong signer and the downgrade guard never fires
 // on it (ruling G1).
-func (v *Verifier) checkSignatures(suite freshness.SuiteRef, trust suiteTrust, signed []byte, pkts []sigPacket) (freshness.Signers, error) {
+func (v *Verifier) checkSignatures(ctx context.Context, suite freshness.SuiteRef, trust suiteTrust, signed []byte, pkts []sigPacket) (freshness.Signers, error) {
 	if trust.bypass {
 		// SPEC2 §7.6.2 bypass: the anchor parsed structurally (T, A and
 		// P, so at least one signature packet: parseSigPackets refuses
@@ -463,7 +462,7 @@ func (v *Verifier) checkSignatures(suite freshness.SuiteRef, trust suiteTrust, s
 		// hardening plan's DN-8, recorded Open). Do not add it here
 		// without that decision. The structural layers are the same
 		// code on both paths (TestVerifier_BypassRefusesEveryMalformedRow).
-		v.logUnverifiedSignerOnce(suite, pkts[0])
+		v.logUnverifiedSignerOnce(ctx, suite, pkts[0])
 		return freshness.Signers{}, nil
 	}
 	if len(trust.entities) == 0 {
@@ -486,7 +485,7 @@ func (v *Verifier) checkSignatures(suite freshness.SuiteRef, trust suiteTrust, s
 			return freshness.Signers{}, err
 		}
 	}
-	signers, err := v.verifyAnyTrusted(suite, trust.entities, trust.fps, signed, checked)
+	signers, err := v.verifyAnyTrusted(ctx, suite, trust.entities, trust.fps, signed, checked)
 	if err == nil && signers.Strong == "" {
 		// The packets gpgv does not check (anyGpgvChecks: signature types
 		// that differ) are not counted either; the guard's WARN names them.
@@ -697,7 +696,7 @@ type suiteTrust struct {
 // below) whatever the anchor's shape; when Task 9b moved the layers
 // first, a malformed anchor hid it. It decides nothing about the anchor:
 // a pinned or unrequired suite's malformed anchor keeps its reason.
-func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (suiteTrust, error) {
+func (v *Verifier) resolveTrustSet(ctx context.Context, suite freshness.SuiteRef) (suiteTrust, error) {
 	var matched []SignerPin
 	for _, p := range v.pins {
 		if p.HostRegex.MatchString(suite.CanonicalHost) {
@@ -706,7 +705,7 @@ func (v *Verifier) resolveTrustSet(suite freshness.SuiteRef) (suiteTrust, error)
 	}
 	if len(matched) == 0 {
 		if v.requirePinned {
-			v.logger.Warn("adoption_unpinned_suite",
+			observability.AdoptionLogger(ctx, v.logger).Warn("adoption_unpinned_suite",
 				"canonical_host", suite.CanonicalHost,
 				"suite_path", suite.SuitePath,
 			)
@@ -927,7 +926,7 @@ var s2Hashes = map[byte]bool{8: true, 9: true, 10: true}
 //     is disabled, return ErrShortKeyID.
 //   - Else (no signature packets at all, or short-keyid fallback ran
 //     and matched no key in trustSet), ErrNoUsableSignature.
-func (v *Verifier) verifyAnyTrusted(
+func (v *Verifier) verifyAnyTrusted(ctx context.Context,
 	suite freshness.SuiteRef,
 	trustSet openpgp.EntityList,
 	trustFPs map[string]struct{},
@@ -1062,7 +1061,7 @@ func (v *Verifier) verifyAnyTrusted(
 			}
 			if len(signers.Counted) == 0 {
 				// The packet that accepts the anchor, as before Task 9d.
-				v.logShortKeyIDFallbackOnce(suite, matched, p.issuer)
+				v.logShortKeyIDFallbackOnce(ctx, suite, matched, p.issuer)
 			}
 			if count(sig, matched, i) {
 				return signers, nil
@@ -1110,7 +1109,7 @@ func (v *Verifier) verifyAnyTrusted(
 	case anyTrustedSeen && lastVerifyErr != nil:
 		return signers, fmt.Errorf("signature verification failed: %w", lastVerifyErr)
 	case anyUntrusted:
-		v.logUntrustedSignerOnce(suite, rejectedSigners)
+		v.logUntrustedSignerOnce(ctx, suite, rejectedSigners)
 		return signers, fmt.Errorf("%w: IssuerFingerprint not in trust set", ErrUntrustedSigner)
 	case anyShortKeyID && !v.allowShortKeyID:
 		return signers, ErrShortKeyID
@@ -1293,12 +1292,12 @@ func findUniqueEntityByKeyID(list openpgp.EntityList, keyID uint64) (*openpgp.En
 // signers as "fpr:<40-hex>" (long fingerprint form) or "keyid:<16-hex>"
 // (short-keyid form, when subpacket 33 was absent and the keyid did
 // not resolve in the trust set).
-func (v *Verifier) logUntrustedSignerOnce(suite freshness.SuiteRef, rejected []string) {
+func (v *Verifier) logUntrustedSignerOnce(ctx context.Context, suite freshness.SuiteRef, rejected []string) {
 	key := suite.CanonicalHost + "|" + suite.SuitePath
 	if !v.untrustedSignerLogged.first(key) {
 		return
 	}
-	v.logger.Info("adoption_untrusted_signer",
+	observability.AdoptionLogger(ctx, v.logger).Info("adoption_untrusted_signer",
 		"canonical_host", suite.CanonicalHost,
 		"suite_path", suite.SuitePath,
 		"rejected_signers", rejected,
@@ -1312,12 +1311,12 @@ func (v *Verifier) logUntrustedSignerOnce(suite freshness.SuiteRef, rejected []s
 // suite stay silent — this keeps the log surface a finite inventory
 // of "which repos rely on the legacy form" rather than a per-check
 // noise stream.
-func (v *Verifier) logShortKeyIDFallbackOnce(suite freshness.SuiteRef, matched *openpgp.Entity, keyID uint64) {
+func (v *Verifier) logShortKeyIDFallbackOnce(ctx context.Context, suite freshness.SuiteRef, matched *openpgp.Entity, keyID uint64) {
 	key := suite.CanonicalHost + "|" + suite.SuitePath
 	if !v.shortKeyIDLogged.first(key) {
 		return
 	}
-	v.logger.Info("adoption_short_keyid_fallback",
+	observability.AdoptionLogger(ctx, v.logger).Info("adoption_short_keyid_fallback",
 		"canonical_host", suite.CanonicalHost,
 		"suite_path", suite.SuitePath,
 		"issuer_keyid", fmt.Sprintf("%016X", keyID),
@@ -1334,7 +1333,7 @@ func (v *Verifier) logShortKeyIDFallbackOnce(suite freshness.SuiteRef, matched *
 // ID ("keyid:<16-hex>": layer P gives every packet one), so operators have
 // an audit trail of which signers their fleet has effectively trusted
 // under the relaxation.
-func (v *Verifier) logUnverifiedSignerOnce(suite freshness.SuiteRef, first sigPacket) {
+func (v *Verifier) logUnverifiedSignerOnce(ctx context.Context, suite freshness.SuiteRef, first sigPacket) {
 	key := suite.CanonicalHost + "|" + suite.SuitePath
 	if !v.unverifiedSignerLogged.first(key) {
 		return
@@ -1343,7 +1342,7 @@ func (v *Verifier) logUnverifiedSignerOnce(suite freshness.SuiteRef, first sigPa
 	if first.fpr != nil {
 		signer = "fpr:" + upperFP(first.fpr)
 	}
-	v.logger.Info("adoption_unverified_signer",
+	observability.AdoptionLogger(ctx, v.logger).Info("adoption_unverified_signer",
 		"canonical_host", suite.CanonicalHost,
 		"suite_path", suite.SuitePath,
 		"signer", signer,

@@ -237,9 +237,6 @@ func New(opts Options) (*Client, error) {
 	allowDowngrade := opts.AllowHTTPSToHTTPRedirect
 	tracker := newUnreachableTracker(opts.UnreachableCooldown, opts.UnreachableProbeTimeout, opts.now)
 	transport := newTransport(opts, deny, tracker, proxyURL)
-	if opts.Usage != nil {
-		transport = usage.Transport{Base: transport, Usage: opts.Usage}
-	}
 	ua := opts.UserAgent
 	if ua == "" {
 		ua = defaultUserAgent
@@ -248,6 +245,7 @@ func New(opts Options) (*Client, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	transport = usage.Transport{Base: transport, Usage: opts.Usage, Observe: logResponse(logger)}
 	return &Client{
 		httpClient: &http.Client{
 			Transport: transport,
@@ -357,6 +355,7 @@ func (c *Client) Fetch(ctx context.Context, target *Target, dst FetchDst) (resul
 	if target == nil {
 		return nil, errors.New("fetch: nil target")
 	}
+	ctx = withTransfer(ctx, target.CanonicalHost, "fetch")
 	if dst == nil {
 		return nil, errors.New("fetch: nil dst")
 	}

@@ -32,7 +32,7 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 	s := req.suite
 	defer func() {
 		if r := recover(); r != nil {
-			unloggedPanic(func() { c.reportPanic("adoption_panicked", "record", s, r) })
+			unloggedPanic(func() { logPanic(c.adoptionLogger(req), "adoption_panicked", "record", s, r) })
 		}
 	}()
 	if c.lifetimeCtx.Err() != nil {
@@ -63,7 +63,7 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 		if c.lifetimeCtx.Err() != nil {
 			level = slog.LevelDebug
 		}
-		c.logger.Log(ctx, level, "adoption_failure_record_failed",
+		c.adoptionLogger(req).Log(ctx, level, "adoption_failure_record_failed",
 			"canonical_host", s.CanonicalHost, "suite_path", s.SuitePath, "err", err)
 		return
 	}
@@ -102,7 +102,7 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 		if c.lifetimeCtx.Err() != nil {
 			level = slog.LevelDebug
 		}
-		c.logger.Log(ctx, level, "adoption_failure_record_failed",
+		c.adoptionLogger(req).Log(ctx, level, "adoption_failure_record_failed",
 			"canonical_host", s.CanonicalHost, "suite_path", s.SuitePath, "err", err)
 		return
 	}
@@ -118,24 +118,24 @@ func (c *Checker) recordAdoptionFailure(req *adoptionRequest, reason string) {
 		"retry_in_seconds", int64(delay / time.Second), "next_retry_unixtime", next,
 	}
 	if refusal {
-		c.logger.Info("adoption_refused", attrs...)
+		c.adoptionLogger(req).Info("adoption_refused", attrs...)
 		adoptionRefusedTotal.Inc(reason) // a closed enum: cache.IsRefusalReason
 	}
 	// Spec C7: adoption_deferred marks a state transition, not every attempt.
 	if cur.AdoptionFailCount == 0 || cur.AdoptionFailReason == nil || *cur.AdoptionFailReason != reason {
-		c.logger.Info("adoption_deferred", attrs...)
+		c.adoptionLogger(req).Info("adoption_deferred", attrs...)
 	}
 	switch {
 	case !isPersistentMilestone(count):
 	case !refusal:
-		c.logger.Warn("adoption_failing_persistently",
+		c.adoptionLogger(req).Warn("adoption_failing_persistently",
 			"canonical_host", s.CanonicalHost, "suite_path", s.SuitePath,
 			"reason", reason, "fail_count", count, "failing_since_unixtime", first)
 	case now.Unix()-first >= int64(refusalEscalateAge/time.Second):
 		// A refusal is a state, not a failure, but one that has lasted a
 		// day may be a silent freeze (a vendor that stopped emitting Date
 		// is refused upstream_older forever): make it alertable.
-		c.logger.Warn("adoption_refused_persistently",
+		c.adoptionLogger(req).Warn("adoption_refused_persistently",
 			"canonical_host", s.CanonicalHost, "suite_path", s.SuitePath,
 			"reason", reason, "fail_count", count, "failing_since_unixtime", first)
 	}
@@ -214,7 +214,7 @@ func (c *Checker) recoverAdoption(req *adoptionRequest, start time.Time) {
 	// plan): a panicking log handler must not skip the counters, and
 	// neither may escape the adoption goroutine or skip the record below,
 	// which recovers its own panics.
-	unloggedPanic(func() { c.reportPanic("adoption_panicked", "adoption", req.suite, r) })
+	unloggedPanic(func() { logPanic(c.adoptionLogger(req), "adoption_panicked", "adoption", req.suite, r) })
 	unloggedPanic(func() {
 		d := time.Since(start)
 		host := req.suite.CanonicalHost

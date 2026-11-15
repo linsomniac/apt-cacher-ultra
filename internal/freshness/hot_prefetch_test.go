@@ -366,7 +366,7 @@ func TestBuildPackageHashes_AllowsDuplicatePackageArch(t *testing.T) {
 	members := []ReleaseMember{
 		{Path: "main/binary-amd64/Packages", SHA256: pkgsBlob, Size: int64(len(pkgs))},
 	}
-	res, err := a.buildPackageHashes(suiteRef, 1, cache.FormInline, members, members)
+	res, err := a.buildPackageHashes(context.Background(), suiteRef, 1, cache.FormInline, members, members)
 	if err != nil {
 		t.Fatalf("buildPackageHashes: unexpected error: %v", err)
 	}
@@ -392,7 +392,7 @@ func TestBuildPackageHashes_AllowsDuplicatePackageArch(t *testing.T) {
 // binary Packages stanza without Version: is a malformed index entry (Debian
 // Policy makes Version mandatory; apt itself rejects such stanzas). It is
 // SKIPPED — no package_hash row is written — so the load-bearing invariant
-// "version='' => non-binary" holds and the round-4 GC empty-version fallback
+// "version=” => non-binary" holds and the round-4 GC empty-version fallback
 // can never keep a FRESH version-less binary (which would re-open the
 // fat-index leak). The skip is NON-PUNITIVE: it does NOT flip the snapshot's
 // coverage, so one malformed stanza can't downgrade strict mode for the whole
@@ -421,7 +421,7 @@ func TestBuildPackageHashes_VersionlessBinaryStanzaSkippedCoverageIntact(t *test
 	suiteRef := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.example", SuitePath: "/dists/noble"}
 	members := []ReleaseMember{{Path: "main/binary-amd64/Packages", SHA256: pkgsBlob, Size: int64(len(pkgs))}}
 
-	res, err := a.buildPackageHashes(suiteRef, 1, cache.FormInline, members, members)
+	res, err := a.buildPackageHashes(context.Background(), suiteRef, 1, cache.FormInline, members, members)
 	if err != nil {
 		t.Fatalf("buildPackageHashes: %v", err)
 	}
@@ -472,7 +472,7 @@ func TestBuildPackageHashes_AllVersionlessBinaryFlipsCoverage(t *testing.T) {
 	suiteRef := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.example", SuitePath: "/dists/noble"}
 	members := []ReleaseMember{{Path: "main/binary-amd64/Packages", SHA256: pkgsBlob, Size: int64(len(pkgs))}}
 
-	res, err := a.buildPackageHashes(suiteRef, 1, cache.FormInline, members, members)
+	res, err := a.buildPackageHashes(context.Background(), suiteRef, 1, cache.FormInline, members, members)
 	if err != nil {
 		t.Fatalf("buildPackageHashes: %v", err)
 	}
@@ -486,11 +486,11 @@ func TestBuildPackageHashes_AllVersionlessBinaryFlipsCoverage(t *testing.T) {
 
 // TestBuildPackageHashes_IncompleteIdentityBinarySkipped: a binary stanza with
 // a real Version: but missing Architecture: (or Package:) yields an
-// INCOMPLETE-identity package_hash row (arch='' or name=''). The §3 GC
-// empty-version fallback keeps ANY incomplete-identity row (name=='' ||
-// arch=='' || version==''), so such a row would ride that fallback forever and
+// INCOMPLETE-identity package_hash row (arch=” or name=”). The §3 GC
+// empty-version fallback keeps ANY incomplete-identity row (name==” ||
+// arch==” || version==”), so such a row would ride that fallback forever and
 // re-open the fat-index leak. The writer skip-gate must match the GC fallback's
-// FULL incomplete-identity condition, not just version=='' (round-9 finding).
+// FULL incomplete-identity condition, not just version==” (round-9 finding).
 func TestBuildPackageHashes_IncompleteIdentityBinarySkipped(t *testing.T) {
 	dir := t.TempDir()
 	c, err := cache.Open(context.Background(), dir, discardLogger())
@@ -518,7 +518,7 @@ func TestBuildPackageHashes_IncompleteIdentityBinarySkipped(t *testing.T) {
 	suiteRef := SuiteRef{CanonicalScheme: "http", CanonicalHost: "archive.example", SuitePath: "/dists/noble"}
 	members := []ReleaseMember{{Path: "main/binary-amd64/Packages", SHA256: pkgsBlob, Size: int64(len(pkgs))}}
 
-	res, err := a.buildPackageHashes(suiteRef, 1, cache.FormInline, members, members)
+	res, err := a.buildPackageHashes(context.Background(), suiteRef, 1, cache.FormInline, members, members)
 	if err != nil {
 		t.Fatalf("buildPackageHashes: %v", err)
 	}
@@ -537,6 +537,7 @@ func TestBuildPackageHashes_IncompleteIdentityBinarySkipped(t *testing.T) {
 // trigger ctx.Done.
 type hotFakeFetcher struct {
 	mu       sync.Mutex
+	calls    int
 	bodies   map[string][]byte
 	errs     map[string]error
 	blocking map[string]time.Duration
@@ -570,6 +571,7 @@ func (f *hotFakeFetcher) setBlocking(url string, dur time.Duration) {
 
 func (f *hotFakeFetcher) Fetch(ctx context.Context, target *fetch.Target, dst fetch.FetchDst) (*fetch.FetchResult, error) {
 	f.mu.Lock()
+	f.calls++
 	body, hasBody := f.bodies[target.URL]
 	errInj, hasErr := f.errs[target.URL]
 	blockDur, hasBlock := f.blocking[target.URL]

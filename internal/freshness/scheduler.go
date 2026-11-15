@@ -798,5 +798,9 @@ func (c *Checker) checkRecovered(ctx context.Context, item schedItem) (rep check
 			rep = checkReport{result: "failed"}
 		}
 	}()
-	return c.check(ctx, item.ref, checkOpts{bypassCooldown: item.waiting || item.pendingChange})
+	source := "periodic"
+	if item.waiting || item.pendingChange {
+		source = "queued"
+	}
+	return c.check(ctx, item.ref, checkOpts{source: source, bypassCooldown: item.waiting || item.pendingChange})
 }

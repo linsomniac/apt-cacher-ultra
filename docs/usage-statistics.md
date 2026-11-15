@@ -33,8 +33,8 @@ the dashboard localizes displayed timestamps to the browser's time zone.
 These are **application body-byte measurements**, not NIC counters or network
 line speeds. HTTP headers/framing, TLS/TCP overhead, socket-buffer read-ahead,
 unconsumed upstream bodies, error response bodies sent to clients, admin traffic,
-health probes and CA downloads are excluded. Upstream transparent decompression
-keeps its existing behavior, so fetched bytes can be decoded bytes. Multipart
+health probes and CA downloads are excluded. The upstream transport disables transparent decompression, so fetched bytes
+retain the upstream representation. Multipart
 range boundaries are included in served body bytes. A successful write means the
 server accepted the bytes; it does not prove that the client received them.
 
@@ -67,10 +67,11 @@ without discarding in-memory totals. Final-flush failure logs
 when retrying after an ambiguous database commit result. Loading invalid or
 unreadable saved statistics stops startup rather than silently resetting them.
 
-This feature upgrades the database from schema 8 to **schema 9**. Upgrades from
+Usage statistics were introduced in **schema 9**; current builds also migrate
+to **schema 10** for persistent hot-package identities. Upgrades from
 schema 7 first apply the existing schema-8 representation-metadata migration,
 then add usage totals. Existing origin dates and refresh generations are preserved.
-Binaries supporting only schema 8 or earlier refuse the newer schema. Before
+Binaries supporting only schema 9 or earlier refuse schema 10. Before
 upgrading, stop the daemon and retain a backup of the database and any adjacent
 WAL file if rollback is needed; see
 [upgrading an existing cache](configuration.md#upgrading-an-existing-cache).
@@ -108,3 +109,7 @@ The usage block is present in the daemon even before traffic arrives. Embedders
 that construct the admin server without a collector omit the optional block.
 Existing Prometheus metrics retain their original semantics; these persistent
 totals are exposed through the status JSON rather than changing those counters.
+
+Upstream INFO `upstream_response` events use the same byte counter and include
+purpose and destination. See [transfer logging](log-fields.md#upstream-transfer-accounting-and-hot-prefetch)
+for aggregation rules, partial transfers, and prefetch reuse summaries.

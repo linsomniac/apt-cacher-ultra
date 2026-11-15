@@ -2,21 +2,27 @@ package freshness
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
+	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
 )
 
 // hotPrefetchStats is the per-adoption tally that fills the SPEC3
-// §10.2 adoption_hot_prefetch_complete log line. The four bucket
+// §10.2 adoption_hot_prefetch_complete log line. The five bucket
 // counts always sum to hotCount by construction — every iteration of
 // the loop lands in exactly one bucket (success, retry-exhausted
 // failure, hash mismatch, or budget-cancelled before attempt).
 type hotPrefetchStats struct {
 	hotCount    int
 	fetched     int
+	reused      int
 	failed      int
 	mismatched  int
 	unattempted int
@@ -42,6 +48,9 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 	snapshotID int64, candidatePackageHashes []cache.PackageHash,
 	tracker *blobHeartbeatTracker) ([]cache.PrefetchedURLPath, hotPrefetchStats) {
 	var stats hotPrefetchStats
+	if attempt := adoptionLogFromContext(adoptionCtx); attempt != nil {
+		defer func() { attempt.hot = stats }()
+	}
 
 	// SPEC3 §7.5 step 9: build the hot set. Pass the candidate's
 	// in-memory package_hash rows — Stage 2 of ComputeHotSet looks
@@ -57,7 +66,7 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 		// post-flip requests fall back to the cache-miss path on first
 		// hit. A 502-storm here would be hugely disproportionate to
 		// what's a best-effort optimization.
-		a.logger.Warn("adoption: hot-set computation failed (skipping prefetch)",
+		a.adoptionLogger(adoptionCtx).Warn("adoption: hot-set computation failed (skipping prefetch)",
 			"canonical_host", suite.CanonicalHost,
 			"suite_path", suite.SuitePath,
 			"snapshot_id", snapshotID,
@@ -75,7 +84,7 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 	if a.hotPrefetchBudget > 0 {
 		budgetSeconds = int64(a.hotPrefetchBudget.Seconds())
 	}
-	a.logger.Info("adoption_hot_prefetch_started",
+	a.adoptionLogger(adoptionCtx).Info("adoption_hot_prefetch_started",
 		"canonical_host", suite.CanonicalHost,
 		"suite_path", suite.SuitePath,
 		"snapshot_id", snapshotID,
@@ -129,7 +138,7 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 				for _, e := range hotSet[i:] {
 					missing = append(missing, e.path)
 				}
-				a.logger.Warn("adoption_hot_prefetch_partial",
+				a.adoptionLogger(adoptionCtx).Warn("adoption_hot_prefetch_partial",
 					"canonical_host", suite.CanonicalHost,
 					"suite_path", suite.SuitePath,
 					"snapshot_id", snapshotID,
@@ -139,18 +148,14 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 			}
 			break
 		}
-		blobHash, outcome := a.fetchHotDeb(prefetchCtx, suite, entry, snapshotID)
-		// Track the warmed blob *before* the heartbeat so the same
-		// HeartbeatBlobs call refreshes its grace clock. SPEC4 §7.5.1
-		// Rule 1 race-window extension applies to hot-prefetched debs
-		// the same way it applies to member fetches — the
-		// CommitAdoption Step 3a url_path INSERT is what eventually
-		// pins the blob via PutURLPath-style FK, so any time before
-		// commit the blob is reachable only from this in-memory
-		// tracker.
-		if outcome == hotFetchOK && tracker != nil {
-			tracker.Add(blobHash)
+		// Track the expected hash before local verification, which can take
+		// longer than the blob grace on slow disks. The periodic heartbeat
+		// protects reused, unreferenced content until the atomic URL commit.
+		// For missing files this is harmless: heartbeat skips absent rows.
+		if tracker != nil {
+			tracker.Add(entry.declaredSHA256)
 		}
+		blobHash, outcome := a.fetchHotDeb(prefetchCtx, suite, entry, snapshotID)
 		// SPEC4 §7.5.2 site 4: heartbeat after every per-deb fetch
 		// terminates (success, failure, mismatch, or cancel). Uses
 		// adoptionCtx, not prefetchCtx, so a budget-elapsed
@@ -163,7 +168,7 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 		// hot_count × that budget under pathological upstreams.
 		a.heartbeat(adoptionCtx, suite.CanonicalHost, snapshotID, tracker)
 		switch outcome {
-		case hotFetchOK:
+		case hotFetchOK, hotFetchReused:
 			prefetched = append(prefetched, cache.PrefetchedURLPath{
 				CanonicalScheme: suite.CanonicalScheme,
 				CanonicalHost:   suite.CanonicalHost,
@@ -171,7 +176,11 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 				BlobHash:        blobHash,
 				UpstreamURL:     entry.upstreamURL,
 			})
-			stats.fetched++
+			if outcome == hotFetchReused {
+				stats.reused++
+			} else {
+				stats.fetched++
+			}
 		case hotFetchFailed:
 			// Includes both retry-exhaustion AND in-flight-at-budget
 			// cancellation per SPEC3 §12.3 variant 1/3 contract: "the
@@ -201,7 +210,7 @@ func (a *Adopter) runHotPrefetch(adoptionCtx context.Context, suite SuiteRef,
 				for _, e := range hotSet[i:] {
 					missing = append(missing, e.path)
 				}
-				a.logger.Warn("adoption_hot_prefetch_partial",
+				a.adoptionLogger(adoptionCtx).Warn("adoption_hot_prefetch_partial",
 					"canonical_host", suite.CanonicalHost,
 					"suite_path", suite.SuitePath,
 					"snapshot_id", snapshotID,
@@ -222,6 +231,7 @@ type hotFetchOutcome int
 
 const (
 	hotFetchOK hotFetchOutcome = iota
+	hotFetchReused
 	hotFetchFailed
 	hotFetchMismatch
 	hotFetchCancelled
@@ -242,6 +252,28 @@ const (
 //     the rest of the warm.
 func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 	entry hotSetEntry, snapshotID int64) (string, hotFetchOutcome) {
+	unlock, err := a.hotBlobs.Acquire(ctx, entry.declaredSHA256)
+	if err != nil {
+		return "", hotFetchCancelled
+	}
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return "", hotFetchCancelled
+	}
+	// Check by content hash, not URL: versions and mirrors can share bytes.
+	// Do this before taking a host slot so a cached package needs no upstream.
+	reused, err := a.reuseHotBlob(ctx, suite, entry)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", hotFetchCancelled
+		}
+		a.adoptionLogger(ctx).Warn("hot_prefetch_deb_failed", "canonical_host", suite.CanonicalHost,
+			"path", entry.path, "snapshot_id", snapshotID, "err", err)
+		return "", hotFetchFailed
+	}
+	if reused {
+		return entry.declaredSHA256, hotFetchReused
+	}
 	// SPEC §9.3 / §9.3.1: hot-prefetch fetches share the same per-host
 	// budget as metadata-member fetches. Sequential within an adoption
 	// keeps fan-out exactly the same as Phase 2.
@@ -263,7 +295,7 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 	}
 	w, err := a.cache.NewTempBlob()
 	if err != nil {
-		a.logger.Warn("hot_prefetch_deb_failed",
+		a.adoptionLogger(ctx).Warn("hot_prefetch_deb_failed",
 			"canonical_host", suite.CanonicalHost,
 			"path", entry.path,
 			"snapshot_id", snapshotID,
@@ -273,7 +305,7 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 	}
 	defer func() { _ = w.Abort() }() // no-op once Finalize wins
 
-	res, err := a.fetcher.Fetch(ctx, target, w)
+	res, err := a.fetcher.Fetch(fetch.WithPurpose(ctx, "hot_prefetch"), target, w)
 	if err != nil {
 		// Three-way disambiguation:
 		//   - ctx.Err() == DeadlineExceeded: the budget, or
@@ -294,7 +326,7 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 		//     prefetchCtx is still alive, so this is bucketed as a
 		//     real per-deb retry-exhaustion failure.
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			a.logger.Warn("hot_prefetch_deb_failed",
+			a.adoptionLogger(ctx).Warn("hot_prefetch_deb_failed",
 				"canonical_host", suite.CanonicalHost,
 				"path", entry.path,
 				"snapshot_id", snapshotID,
@@ -305,7 +337,7 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 		if ctx.Err() != nil {
 			return "", hotFetchCancelled
 		}
-		a.logger.Warn("hot_prefetch_deb_failed",
+		a.adoptionLogger(ctx).Warn("hot_prefetch_deb_failed",
 			"canonical_host", suite.CanonicalHost,
 			"path", entry.path,
 			"snapshot_id", snapshotID,
@@ -319,7 +351,7 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 	// (TestRunHotPrefetch_NoContentIsAFailure). The deferred Abort drops
 	// the temp; nothing reaches the pool.
 	if res.NoContent {
-		a.logger.Warn("hot_prefetch_deb_failed",
+		a.adoptionLogger(ctx).Warn("hot_prefetch_deb_failed",
 			"canonical_host", suite.CanonicalHost,
 			"path", entry.path,
 			"snapshot_id", snapshotID,
@@ -336,7 +368,7 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 	hashHex, err := w.FinalizeExpectingHash(entry.declaredSHA256, res.ContentLength)
 	if err != nil {
 		if errors.Is(err, cache.ErrHashMismatch) {
-			a.logger.Warn("hot_prefetch_hash_mismatch",
+			a.adoptionLogger(ctx).Warn("hot_prefetch_hash_mismatch",
 				"canonical_host", suite.CanonicalHost,
 				"path", entry.path,
 				"snapshot_id", snapshotID,
@@ -345,7 +377,7 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 			)
 			return "", hotFetchMismatch
 		}
-		a.logger.Warn("hot_prefetch_deb_failed",
+		a.adoptionLogger(ctx).Warn("hot_prefetch_deb_failed",
 			"canonical_host", suite.CanonicalHost,
 			"path", entry.path,
 			"snapshot_id", snapshotID,
@@ -354,7 +386,7 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 		return "", hotFetchFailed
 	}
 	if err := a.cache.PutBlob(ctx, hashHex, w.Written()); err != nil {
-		a.logger.Warn("hot_prefetch_deb_failed",
+		a.adoptionLogger(ctx).Warn("hot_prefetch_deb_failed",
 			"canonical_host", suite.CanonicalHost,
 			"path", entry.path,
 			"snapshot_id", snapshotID,
@@ -363,8 +395,64 @@ func (a *Adopter) fetchHotDeb(ctx context.Context, suite SuiteRef,
 		return "", hotFetchFailed
 	}
 	if err := a.cache.PutRepresentation(ctx, suite.CanonicalScheme, suite.CanonicalHost, entry.path, hashHex, res.LastModified); err != nil {
-		a.logger.Warn("hot_prefetch_deb_failed", "canonical_host", suite.CanonicalHost, "path", entry.path, "err", err)
+		a.adoptionLogger(ctx).Warn("hot_prefetch_deb_failed", "canonical_host", suite.CanonicalHost, "path", entry.path, "err", err)
 		return "", hotFetchFailed
 	}
 	return hashHex, hotFetchOK
+}
+
+// reuseHotBlob revalidates disk content against the candidate's declared hash.
+// Refresh the GC grace before reading, then PutBlob before returning it to the
+// adoption heartbeat/atomic URL commit. Preserve URL-specific origin dates;
+// local reuse is not a new upstream observation.
+func (a *Adopter) reuseHotBlob(ctx context.Context, suite SuiteRef, entry hotSetEntry) (bool, error) {
+	exists, err := a.cache.BlobExists(entry.declaredSHA256)
+	if err != nil || !exists {
+		return false, err
+	}
+	if err := a.cache.HeartbeatBlobs(ctx, []string{entry.declaredSHA256}); err != nil {
+		return false, err
+	}
+	f, err := os.Open(a.cache.BlobPath(entry.declaredSHA256))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	n, err := io.Copy(h, hotContextReader{ctx: ctx, r: f})
+	if err != nil {
+		return false, err
+	}
+	actual := hex.EncodeToString(h.Sum(nil))
+	if actual != entry.declaredSHA256 {
+		a.adoptionLogger(ctx).Warn("pool_corruption_during_adoption", "canonical_host", suite.CanonicalHost,
+			"suite_path", suite.SuitePath, "path", entry.path,
+			"declared_sha256", entry.declaredSHA256, "actual_sha256", actual)
+		integrity.IncPoolCorruptionDuringAdoption()
+		// FinalizeExpectingHash deduplicates against an existing pool file.
+		// Remove the bad copy so the verified download can replace it.
+		return false, a.cache.DiscardFinalizedBlob(entry.declaredSHA256)
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if err := a.cache.PutBlob(ctx, entry.declaredSHA256, n); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+type hotContextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r hotContextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
 }

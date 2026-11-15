@@ -1,14 +1,37 @@
 package gpg
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
 	"testing"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/freshness"
+	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 )
+
+func TestVerifierLogsAdoptionContext(t *testing.T) {
+	var logs bytes.Buffer
+	v := &Verifier{logger: slog.New(slog.NewJSONHandler(&logs, nil)), requirePinned: true}
+	suite := freshness.SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/s"}
+	first, second := observability.NewAdoptionTrace(), observability.NewAdoptionTrace()
+	_, _ = v.VerifyInline(observability.WithAdoptionTrace(t.Context(), first), suite, nil)
+	_, _ = v.VerifyDetached(observability.WithAdoptionTrace(t.Context(), second), suite, []byte("Release"), []byte("signature"))
+	_, _ = v.VerifyInline(t.Context(), suite, nil)
+	decoder := json.NewDecoder(&logs)
+	for _, want := range []any{first.ID, second.ID, nil} {
+		var event map[string]any
+		if err := decoder.Decode(&event); err != nil {
+			t.Fatal(err)
+		}
+		if event["msg"] != "adoption_unpinned_suite" || event["adoption_id"] != want {
+			t.Fatalf("verifier log: %v; want adoption_id=%v", event, want)
+		}
+	}
+}
 
 // Spec C9: each once-logger set holds at most 10,000 keys; a new key when
 // it is full starts the set over, so an earlier suite logs its once-line
@@ -64,9 +87,9 @@ func TestVerifier_EachOnceLoggerHasItsOwnSet(t *testing.T) {
 	signer := newTestEntity(t, "Once Logger", "once@example.invalid")
 	suite := freshness.SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/s"}
 	for range 2 {
-		v.logUntrustedSignerOnce(suite, nil)
-		v.logShortKeyIDFallbackOnce(suite, signer, signer.PrimaryKey.KeyId)
-		v.logUnverifiedSignerOnce(suite, sigPacket{n: 1, issuer: signer.PrimaryKey.KeyId})
+		v.logUntrustedSignerOnce(t.Context(), suite, nil)
+		v.logShortKeyIDFallbackOnce(t.Context(), suite, signer, signer.PrimaryKey.KeyId)
+		v.logUnverifiedSignerOnce(t.Context(), suite, sigPacket{n: 1, issuer: signer.PrimaryKey.KeyId})
 	}
 	for _, msg := range []string{"adoption_untrusted_signer", "adoption_short_keyid_fallback", "adoption_unverified_signer"} {
 		if n := h.n[msg]; n != 1 {
@@ -84,13 +107,13 @@ func TestVerifier_OnceLoggersAreBounded(t *testing.T) {
 	suite := func(path string) freshness.SuiteRef {
 		return freshness.SuiteRef{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: path}
 	}
-	v.logUntrustedSignerOnce(suite("/first"), nil)
-	v.logUntrustedSignerOnce(suite("/first"), nil)
+	v.logUntrustedSignerOnce(t.Context(), suite("/first"), nil)
+	v.logUntrustedSignerOnce(t.Context(), suite("/first"), nil)
 	for i := 1; i < onceSetMax; i++ {
-		v.logUntrustedSignerOnce(suite(fmt.Sprintf("/s%d", i)), nil)
+		v.logUntrustedSignerOnce(t.Context(), suite(fmt.Sprintf("/s%d", i)), nil)
 	}
-	v.logUntrustedSignerOnce(suite("/overflow"), nil)
-	v.logUntrustedSignerOnce(suite("/first"), nil)
+	v.logUntrustedSignerOnce(t.Context(), suite("/overflow"), nil)
+	v.logUntrustedSignerOnce(t.Context(), suite("/first"), nil)
 	if n := h.n["adoption_untrusted_signer"]; n != onceSetMax+2 {
 		t.Fatalf("adoption_untrusted_signer logged %d times, want %d", n, onceSetMax+2)
 	}

@@ -73,6 +73,7 @@ func (c *Client) Conditional(
 	if target == nil {
 		return nil, errors.New("fetch: nil target")
 	}
+	ctx = withTransfer(ctx, target.CanonicalHost, "conditional")
 	if maxBody <= 0 {
 		return nil, errors.New("fetch: maxBody must be > 0")
 	}

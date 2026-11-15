@@ -398,6 +398,116 @@ check and `anchor_absent` record it was, whatever the knob.
 
 ## Operational events
 
+### Upstream transfer accounting and hot prefetch
+
+`upstream_response` is emitted at INFO once per closed upstream HTTP response,
+or once when a transport attempt fails before receiving a response. Redirects
+and retries each produce their own event. It includes:
+
+| Field | Meaning |
+| --- | --- |
+| `canonical_host` | Original cache host; unchanged across redirects. |
+| `adoption_id` | Present for transfers inside an adoption attempt; links to its start, finish, and pipeline events. Preserved across redirects and retries. |
+| `purpose` | `client`, `hot_prefetch`, `adoption_member`, `conditional` (freshness probes), or `fetch` (other callers). |
+| `scheme`, `host`, `path`, `method` | Actual request destination, including a redirect destination. Path is URL-escaped. Userinfo, query strings and headers are omitted. |
+| `status` | HTTP response status; 0 when no response arrived. |
+| `bytes_read` | Actual upstream body bytes read, including partial, discarded and retried bytes; never the advertised Content-Length or decompressed package size. |
+| `duration_ms` | Time from transport dispatch through body closure/final concurrent read. |
+| `complete` | Body reached EOF or its known length without a read error. This does not assert hash validation or successful caching. |
+| `read_error` | Reading the response body returned an error other than EOF. |
+
+Summing `bytes_read` over these events reconstructs completed upstream traffic
+on the same basis as Usage's fetched-byte counter. Zero-byte events include 304s,
+rejected/unread response bodies, and dial failures. Transfers interrupted by a
+process crash may have no closing event. Logs are emitted with usage collection
+disabled too. Aggregate by `purpose`, `canonical_host`, or `path` to distinguish
+client demand, metadata updates, and package warming. Do not add the same bytes
+again from request or prefetch summary events.
+
+### Adoption lifecycle
+
+These events are enabled at INFO without additional configuration:
+
+| Event | Level | Fields | Meaning |
+| --- | --- | --- | --- |
+| `adoption_started` | INFO | `adoption_id`, `canonical_scheme`, `canonical_host`, `suite_path`, `form`, trigger and previous-snapshot fields below | One admitted attempt begins. |
+| `adoption_finished` | INFO | Start fields plus outcome, timing, traffic, snapshot, member and hot-package fields below | One attempt ends, including failures, refusals, cancellations and recovered panics. |
+| `upstream_response` | INFO | Transfer fields above, including `adoption_id` when applicable | One upstream response closes, or an attempt fails before receiving a response. |
+
+`adoption_id` is unique per attempt, including retries that reuse the same
+candidate snapshot. It also appears on adoption member, parser, signer-guard,
+heartbeat, prefetch, barrier, success, failure and retry-record logs. Separate
+repair/reconciliation runs and freshness probes are not adoption attempts.
+
+The start and finish records include:
+
+- `trigger_source`: `client` for a client-driven freshness check, `periodic`
+  for the scheduler, `queued` for a scheduler recheck after admission was
+  deferred, or `direct` for an explicit adopter call.
+- `trigger_reason`: the freshness check result that admitted this attempt,
+  such as `first_adoption`, `changed`, or `form_changed`; `explicit_run` for
+  direct calls. `trigger_detail` preserves the check's additional reason,
+  when present.
+- `retry`: true when retrying the same content as the recorded failed/refused
+  attempt. This is independent of source: either client or scheduler checks
+  can retry. `previous_failures` and `previous_failure_reason` describe the
+  existing failure record, even when this attempt has new content.
+- `previous_snapshot_id`: the snapshot before adoption, with 0 meaning none.
+  `previous_snapshot_known=false` means it has not been read successfully;
+  direct calls start with unknown state and resolve it during preparation.
+
+The finish record adds:
+
+- `outcome` and `reason`: adoption outcome/reason categories, plus
+  `abandoned_at_shutdown` and `canceled`. Shutdown remains excluded from the
+  adoption metrics and admin history. `err`, `member_path` and `detail`
+  accompany returned errors; `adoption_panicked` carries the panic diagnostic.
+- `duration_seconds`: elapsed monotonic time for the whole attempt, including
+  barrier waits and commit. It excludes the earlier freshness check and the
+  later failure-record write/backoff. `phase_seconds` breaks it down into
+  `prepare`, `verify`, `members`, `parse_indexes`, `hot_prefetch`,
+  `prepare_commit`, `flip_wait`, `commit`, and `finalize`. Only reached phases
+  appear; phases do not overlap. `last_phase` identifies where execution ended.
+- `candidate_snapshot_id`: candidate allocated or recovered, or 0 if none.
+  `resulting_snapshot_id`: newly committed snapshot, or 0 if no commit occurred.
+  A failure leaves the previous snapshot serving. A panic after a successful
+  commit can have both a committed snapshot and a non-success outcome.
+- `upstream_bytes`, `upstream_responses`: totals of `bytes_read` and response
+  events with this `adoption_id`. `member_upstream_bytes` and
+  `hot_prefetch_upstream_bytes` split the total by purpose. Includes failed,
+  partial, discarded and retried reads; excludes locally reused content.
+  Anchor freshness probes happen before adoption starts and remain separate
+  `upstream_response` events with `purpose=conditional`. Do not add summary
+  bytes to the per-response bytes when computing traffic totals.
+- `member_count`, `members_ready`, `members_downloaded`, `members_reused`,
+  `members_skipped`: declared metadata members and progress through them.
+  Ready members include both downloads and verified local reuse. Counts on
+  failure are progress so far, not a claim that a snapshot was committed.
+- `hot_count`, `hot_fetched`, `hot_reused`, `hot_failed`, `hot_mismatched`,
+  `hot_unattempted`: hot-package prefetch progress. Zero if prefetch was not
+  reached; use `phase_seconds` to distinguish that from an empty hot set.
+
+Filter by `adoption_id` to reconstruct one attempt, then compare its trigger,
+phase times, member/prefetch counts and upstream transfers. A start without a
+finish indicates an in-flight attempt, an abrupt process termination, or missing
+logs. Logging cannot guarantee a terminal record after SIGKILL or a process
+crash. Byte totals cover response bodies observed by the fetch transport, using
+the same accounting as usage statistics; they are not a wire-level measurement.
+
+`adoption_hot_prefetch_complete` now separates `fetched` (successful network
+downloads) from `reused` (existing pool content rehashed and verified locally).
+The invariant is `hot_count = fetched + reused + failed + mismatched + unattempted`.
+This event now fires immediately after prefetch, before the flip barrier and
+commit, and includes `duration_seconds` for hot-set computation and prefetch.
+It confirms completion of that phase; use `adoption_finished` to determine
+whether the snapshot was committed.
+Older versions counted every successful warm as `fetched` and had no `reused`.
+Reuse preserves stored upstream dates and client request timestamps. Corruption
+found during reuse emits `pool_corruption_during_adoption` before a repair fetch;
+an invalid replacement is discarded and cannot become a successful prefetch.
+
+### Other operational events
+
 Usage statistics add these warning events; see [usage statistics](usage-statistics.md)
 for checkpoint behavior and the admin persistence warning.
 

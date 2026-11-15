@@ -1872,7 +1872,7 @@ func (h *Handler) runSnapshotMemberFetch(ctx context.Context, req *proxy.Request
 	}
 
 	target := &fetch.Target{CanonicalHost: req.CanonicalHost, URL: req.UpstreamURL}
-	fres, ferr := h.fetch.Fetch(ctx, target, bw)
+	fres, ferr := h.fetch.Fetch(fetch.WithPurpose(ctx, "client"), target, bw)
 	if ferr != nil {
 		_ = bw.Abort()
 		status := 0
@@ -2085,7 +2085,7 @@ func (h *Handler) runFetch(ctx context.Context, req *proxy.Request, file aptpath
 		CanonicalHost: req.CanonicalHost,
 		URL:           upstreamURL,
 	}
-	fres, ferr := h.fetch.Fetch(ctx, target, bw)
+	fres, ferr := h.fetch.Fetch(fetch.WithPurpose(ctx, "client"), target, bw)
 	if ferr != nil {
 		status := 0
 		var se *fetch.StatusError

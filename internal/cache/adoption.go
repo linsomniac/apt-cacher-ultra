@@ -506,6 +506,13 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 			}
 		}
 
+		// Learn identities for requests made before this suite had an adopted
+		// index. This uses only real URL request timestamps; warming never
+		// creates or extends interest. It also handles newly attributed paths.
+		if err := recordSnapshotHotPackages(ctx, tx, snapshotID); err != nil {
+			return err
+		}
+
 		now := nowUnix()
 		// Keep the adoption ordering stamp monotonic, taken
 		// before Step 3c re-seeds the url_path anchor rows with now.

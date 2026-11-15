@@ -776,9 +776,10 @@ func (c *Cache) ListSuites(ctx context.Context) ([]SuiteFreshness, error) {
 }
 
 // ComputeHotSet runs the SPEC3 §7.5.3 two-stage hot-set query. Stage 1
-// finds (package_name, architecture) tuples that the *prior* snapshot
-// covered AND that have a hot url_path row (last_requested_at within
-// the hot window). Stage 2 resolves those tuples against the
+// finds persisted (package_name, architecture) interest for the prior
+// snapshot's suite, within the configured client-request window. Versions,
+// URL eviction and displaced snapshot GC do not erase this interest.
+// Stage 2 resolves those tuples against the
 // candidate's in-memory `[]PackageHash` rows — they are not yet in
 // the DB (CommitAdoption inserts them transactionally with the
 // current_snapshot_id flip), so the freshness adopter passes them
@@ -807,9 +808,8 @@ func (c *Cache) ListSuites(ctx context.Context) ([]SuiteFreshness, error) {
 //   - candidatePackageHashes empty / no (Package, Arch) match: drops
 //     the unmatchable pair from the hot set.
 //
-// Pre-v3 package_hash rows in the DB are excluded automatically —
-// they have empty package_name / architecture columns; Stage 1's
-// predicate filters them out. Pre-v3 entries in the candidate slice
+// Pre-v3 package_hash rows cannot seed interest because they have empty
+// package_name / architecture columns. Pre-v3 entries in the candidate slice
 // are also skipped (Stage 2 only indexes non-empty (Package, Arch)
 // keys). The first post-upgrade adoption populates name+arch on its
 // candidate's rows; hot prefetch first kicks in on the *second*
@@ -826,20 +826,15 @@ func (c *Cache) ComputeHotSet(ctx context.Context,
 		return nil, nil
 	}
 	const stage1Q = `
-SELECT DISTINCT ph.package_name, ph.architecture
-  FROM package_hash ph
-  JOIN url_path up
-    ON up.canonical_scheme = ph.canonical_scheme
-   AND up.canonical_host   = ph.canonical_host
-   AND up.path             = ph.path
- WHERE ph.snapshot_id        = ?
-   AND ph.package_name      <> ''
-   AND ph.architecture      <> ''
-   AND up.last_requested_at IS NOT NULL
-   AND up.last_requested_at >= ?
- ORDER BY ph.package_name, ph.architecture`
+SELECT hp.package_name, hp.architecture
+  FROM hot_package hp JOIN suite_snapshot s
+    ON hp.canonical_scheme = s.canonical_scheme AND hp.canonical_host = s.canonical_host
+   AND hp.suite_path = s.suite_path
+ WHERE s.snapshot_id = ? AND hp.canonical_scheme = ? AND hp.canonical_host = ?
+   AND hp.last_requested_at >= ?
+ ORDER BY hp.package_name, hp.architecture`
 	hotSince := now - hotWindowSeconds
-	rows, err := c.db.QueryContext(ctx, stage1Q, priorSnapshotID, hotSince)
+	rows, err := c.db.QueryContext(ctx, stage1Q, priorSnapshotID, scheme, host, hotSince)
 	if err != nil {
 		return nil, fmt.Errorf("ComputeHotSet stage 1: %w", err)
 	}

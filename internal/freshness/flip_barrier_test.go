@@ -226,11 +226,15 @@ func TestAdopter_BarrierOutlivesTheAdoptionDeadline(t *testing.T) {
 		if !errors.Is(ctx.Err(), context.DeadlineExceeded) || r.current(t) == 0 {
 			t.Fatalf("ctx err %v, current %d; want the deadline passed and a commit", ctx.Err(), r.current(t))
 		}
+		ends := logRecords(t, r.logs, "adoption_finished")
+		if len(ends) != 1 || ends[0]["outcome"] != "success" || ends[0]["duration_seconds"] != 54.5 || ends[0]["phase_seconds"].(map[string]any)["flip_wait"] != 54.5 {
+			t.Fatalf("deadline during barrier misreported: %v", ends)
+		}
 	})
 }
 
 // Ruling R-C2: shutdown while the adoption waits in the barrier commits
-// nothing; the adoption returns a shutdown error and logs no outcome.
+// nothing; the adoption returns a shutdown error and logs an abandoned attempt.
 func TestAdopter_ShutdownInTheBarrierCommitsNothing(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newBarrierRig(t, 10*time.Second, 0)
@@ -245,6 +249,10 @@ func TestAdopter_ShutdownInTheBarrierCommitsNothing(t *testing.T) {
 		if id := r.current(t); id != 0 || r.gate.Stats().Aborted != 1 || len(r.barrierEvents()) != 0 {
 			t.Fatalf("current %d, stats %+v, events %v; want no commit, one abort, no barrier event",
 				id, r.gate.Stats(), r.barrierEvents())
+		}
+		ends := logRecords(t, r.logs, "adoption_finished")
+		if len(ends) != 1 || ends[0]["outcome"] != "abandoned_at_shutdown" || ends[0]["duration_seconds"] != float64(5) || ends[0]["last_phase"] != "flip_wait" {
+			t.Fatalf("shutdown during barrier misreported: %v", ends)
 		}
 		// Not a commit failure either (merged from a duplicate test:
 		// deferred minor C-18): no DB-failure sentinel
@@ -457,6 +465,10 @@ func TestCheck_BarrierPastTheDeadlineKeepsTheCommitErrorsOutcome(t *testing.T) {
 		}
 		if evs := r.barrierEvents(); len(evs) != 1 || evs[0]["outcome"] != "commit_failed" || evs[0]["held_requests"] != 0.0 {
 			t.Fatalf("adoption_flip_barrier events = %v, want one commit_failed with the barrier's fields", evs)
+		}
+		ends := logRecords(t, r.logs, "adoption_finished")
+		if len(ends) != 1 || ends[0]["outcome"] != "db_failed" || ends[0]["resulting_snapshot_id"] != float64(0) {
+			t.Fatalf("commit failure misreported: %v", ends)
 		}
 	})
 }
