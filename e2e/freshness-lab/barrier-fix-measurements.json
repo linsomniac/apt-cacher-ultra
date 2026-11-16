@@ -1,0 +1,742 @@
+{
+ "experiment": "flip barrier: stop waiting for a busy suite's own quiet (setup transition and 2.0 burst)",
+ "date": "2026-11-15",
+ "base_commit": "5b65bd96e967f80061a7d6e562a8743e2608f3e6",
+ "options": [
+  "--burst",
+  "--suites",
+  "6",
+  "--hosts",
+  "2",
+  "--catalog-size",
+  "5000",
+  "--hot-count",
+  "8",
+  "--member-delay",
+  "0.15",
+  "--deb-delay",
+  "30",
+  "--max-wait",
+  "1800"
+ ],
+ "build": {
+  "CGO_ENABLED": "0",
+  "flags": [
+   "-buildvcs=false"
+  ],
+  "compiler": "go1.26.8 linux/amd64"
+ },
+ "image": "sha256:24fa402ece3dc39775ce21fc76dc55cbf1b5beab02755381ba52933b5dee7fa6",
+ "reference": {
+  "record": "v1.0.5-main-measurements.json",
+  "main": {
+   "setup_publication_to_all_candidates_seconds": 394.46,
+   "burst_publication_to_all_candidates_seconds": 163.69,
+   "setup_flips": [
+    {
+     "seconds_after_publication": 78.96,
+     "suite": "suite-02",
+     "outcome": "held",
+     "phase_a_seconds": 60.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 10.08,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 120.92,
+     "suite": "trixie-security",
+     "outcome": "held",
+     "phase_a_seconds": 60.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 7.04,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 189.12,
+     "suite": "suite-01",
+     "outcome": "held",
+     "phase_a_seconds": 60.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 7.55,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 257.35,
+     "suite": "suite-04",
+     "outcome": "held",
+     "phase_a_seconds": 60.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 7.58,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 325.94,
+     "suite": "suite-03",
+     "outcome": "held",
+     "phase_a_seconds": 60.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 7.84,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 394.2,
+     "suite": "suite-05",
+     "outcome": "held",
+     "phase_a_seconds": 60.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 7.53,
+     "held_requests": 1
+    }
+   ],
+   "burst_flips": [
+    {
+     "seconds_after_publication": 47.9,
+     "suite": "trixie-security",
+     "outcome": "held",
+     "phase_a_seconds": 4.27,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 0.36,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 58.18,
+     "suite": "suite-01",
+     "outcome": "held",
+     "phase_a_seconds": 4.31,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 0.28,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 68.47,
+     "suite": "suite-02",
+     "outcome": "held",
+     "phase_a_seconds": 4.35,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 0.28,
+     "held_requests": 0
+    },
+    {
+     "seconds_after_publication": 78.8,
+     "suite": "suite-03",
+     "outcome": "held",
+     "phase_a_seconds": 4.31,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 0.27,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 89.09,
+     "suite": "suite-04",
+     "outcome": "held",
+     "phase_a_seconds": 4.3,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 0.28,
+     "held_requests": 0
+    },
+    {
+     "seconds_after_publication": 163.39,
+     "suite": "suite-05",
+     "outcome": "held",
+     "phase_a_seconds": 60.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 8.49,
+     "held_requests": 1
+    }
+   ],
+   "held_requests": 10,
+   "longest_held_request_ms": 4999,
+   "client_updates": 93,
+   "longest_apt_get_update_seconds": 10.3,
+   "apt_get_updates_over_5_seconds": 12,
+   "packages_installed": {
+    "1.0": 48,
+    "1.1": 48,
+    "2.0": 48
+   },
+   "warn_or_error_messages": [
+    "admin_disabled",
+    "gc_disabled",
+    "mitm_ca_name_constraints_skipped"
+   ],
+   "evidence_sha256": {
+    "summary.json": "5c865d8164e0ae695416baa73bd49824a8f694f97419a3395d4175ee5d606f80",
+    "timeline.jsonl": "88c6e839d17da07b5b89a0d14522d73dcf02d90b52f4c78e1f0207cfa3a4663d",
+    "acu.jsonl": "8dce17f09cf05b0bea9d04e6be9687222aadd41e07acaed812781bd418052a63"
+   }
+  },
+  "v1.0.5": {
+   "setup_publication_to_all_candidates_seconds": 64.28,
+   "burst_publication_to_all_candidates_seconds": 794.15,
+   "client_updates": 162,
+   "longest_apt_get_update_seconds": 4.92,
+   "packages_installed": {
+    "1.0": 48,
+    "1.1": 48,
+    "2.0": 48
+   }
+  }
+ },
+ "fix": {
+  "source": "main 5b65bd9 plus the change to internal/flipgate/gate.go, exported from the working tree",
+  "binary_sha256": "ac4acd66cd62bdecfed11acded6f39b5d26aff277d62304e7db58a35ee12cde0",
+  "runs": [
+   {
+    "setup_publication_to_all_candidates_seconds": 106.32,
+    "burst_publication_to_all_candidates_seconds": 134.35,
+    "setup_flips": [
+     {
+      "seconds_after_publication": 21.64,
+      "suite": "suite-01",
+      "outcome": "held",
+      "phase_a_seconds": 13.71,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 5.99,
+      "held_requests": 1
+     },
+     {
+      "seconds_after_publication": 42.63,
+      "suite": "suite-02",
+      "outcome": "held",
+      "phase_a_seconds": 13.64,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 5.99,
+      "held_requests": 1
+     },
+     {
+      "seconds_after_publication": 53.15,
+      "suite": "trixie-security",
+      "outcome": "held",
+      "phase_a_seconds": 5.36,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 0.51,
+      "held_requests": 0
+     },
+     {
+      "seconds_after_publication": 63.68,
+      "suite": "suite-03",
+      "outcome": "held",
+      "phase_a_seconds": 13.62,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 6.04,
+      "held_requests": 1
+     },
+     {
+      "seconds_after_publication": 84.74,
+      "suite": "suite-04",
+      "outcome": "held",
+      "phase_a_seconds": 13.67,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 6.05,
+      "held_requests": 1
+     },
+     {
+      "seconds_after_publication": 105.76,
+      "suite": "suite-05",
+      "outcome": "held",
+      "phase_a_seconds": 13.65,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 6.02,
+      "held_requests": 1
+     }
+    ],
+    "burst_flips": [
+     {
+      "seconds_after_publication": 37.6,
+      "suite": "suite-04",
+      "outcome": "held",
+      "phase_a_seconds": 10.04,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 5.81,
+      "held_requests": 1
+     },
+     {
+      "seconds_after_publication": 64.55,
+      "suite": "suite-02",
+      "outcome": "held",
+      "phase_a_seconds": 13.34,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 6.19,
+      "held_requests": 1
+     },
+     {
+      "seconds_after_publication": 80.23,
+      "suite": "suite-03",
+      "outcome": "held",
+      "phase_a_seconds": 14.54,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 5.67,
+      "held_requests": 1
+     },
+     {
+      "seconds_after_publication": 91.01,
+      "suite": "trixie-security",
+      "outcome": "held",
+      "phase_a_seconds": 9.6,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 0.79,
+      "held_requests": 1
+     },
+     {
+      "seconds_after_publication": 101.44,
+      "suite": "suite-05",
+      "outcome": "held",
+      "phase_a_seconds": 4.66,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 0.42,
+      "held_requests": 1
+     },
+     {
+      "seconds_after_publication": 133.78,
+      "suite": "suite-01",
+      "outcome": "held",
+      "phase_a_seconds": 15.34,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 6.0,
+      "held_requests": 1
+     }
+    ],
+    "held_requests": 11,
+    "longest_held_request_ms": 5340,
+    "client_updates": 32,
+    "longest_apt_get_update_seconds": 10.72,
+    "apt_get_updates_over_5_seconds": 11,
+    "packages_installed": {
+     "1.0": 48,
+     "1.1": 48,
+     "2.0": 48
+    },
+    "warn_or_error_messages": [
+     "admin_disabled",
+     "gc_disabled",
+     "mitm_ca_name_constraints_skipped"
+    ],
+    "evidence_sha256": {
+     "summary.json": "0c483e43bc2563a2e1d11bf23f62aa42d01f105d17fef07ed8925a081af13301",
+     "timeline.jsonl": "4992db228c76fdf2dfbb5401e60651dfb5475d6ead37fda0c505f0c03a3c350b",
+     "acu.jsonl": "4f17f39205707a97e06022a5ed5af64289d8f75ce6bef24c94979329e072567a"
+    }
+   },
+   {
+    "setup_publication_to_all_candidates_seconds": 111.12,
+    "burst_publication_to_all_candidates_seconds": 133.13,
+    "setup_flips": [
+     {
+      "seconds_after_publication": 27.18,
+      "suite": "suite-01",
+      "outcome": "held",
+      "phase_a_seconds": 13.65,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 5.76,
+      "held_requests": 1
+     },
+     {
+      "seconds_after_publication": 48.28,
+      "suite": "suite-02",
+      "outcome": "held",
+      "phase_a_seconds": 13.66,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 6.09,
+      "held_requests": 1
+     },
+     {
+      "seconds_after_publication": 58.83,
+      "suite": "trixie-security",
+      "outcome": "held",
+      "phase_a_seconds": 5.52,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 0.54,
+      "held_requests": 0
+     },
+     {
+      "seconds_after_publication": 69.26,
+      "suite": "suite-03",
+      "outcome": "held",
+      "phase_a_seconds": 13.66,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 5.98,
+      "held_requests": 1
+     },
+     {
+      "seconds_after_publication": 90.07,
+      "suite": "suite-04",
+      "outcome": "held",
+      "phase_a_seconds": 13.68,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 5.8,
+      "held_requests": 1
+     },
+     {
+      "seconds_after_publication": 110.77,
+      "suite": "suite-05",
+      "outcome": "held",
+      "phase_a_seconds": 14.27,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 5.69,
+      "held_requests": 1
+     }
+    ],
+    "burst_flips": [
+     {
+      "seconds_after_publication": 44.24,
+      "suite": "suite-01",
+      "outcome": "held",
+      "phase_a_seconds": 14.81,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 5.57,
+      "held_requests": 1
+     },
+     {
+      "seconds_after_publication": 54.51,
+      "suite": "suite-04",
+      "outcome": "held",
+      "phase_a_seconds": 25.41,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 0.26,
+      "held_requests": 0
+     },
+     {
+      "seconds_after_publication": 80.41,
+      "suite": "suite-05",
+      "outcome": "held",
+      "phase_a_seconds": 14.55,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 5.54,
+      "held_requests": 1
+     },
+     {
+      "seconds_after_publication": 96.06,
+      "suite": "suite-02",
+      "outcome": "held",
+      "phase_a_seconds": 19.87,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 5.65,
+      "held_requests": 1
+     },
+     {
+      "seconds_after_publication": 106.43,
+      "suite": "trixie-security",
+      "outcome": "held",
+      "phase_a_seconds": 9.51,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 0.36,
+      "held_requests": 1
+     },
+     {
+      "seconds_after_publication": 132.8,
+      "suite": "suite-03",
+      "outcome": "held",
+      "phase_a_seconds": 14.94,
+      "token_wait_seconds": 0.0,
+      "hold_seconds": 5.64,
+      "held_requests": 1
+     }
+    ],
+    "held_requests": 10,
+    "longest_held_request_ms": 5053,
+    "client_updates": 32,
+    "longest_apt_get_update_seconds": 10.53,
+    "apt_get_updates_over_5_seconds": 11,
+    "packages_installed": {
+     "1.0": 48,
+     "1.1": 48,
+     "2.0": 48
+    },
+    "warn_or_error_messages": [
+     "admin_disabled",
+     "gc_disabled",
+     "mitm_ca_name_constraints_skipped"
+    ],
+    "evidence_sha256": {
+     "summary.json": "ace6fa3b7a68b3f38ea0fd31f2c7fcd5187a7ab81d16731f76d8cd8b5c22f07a",
+     "timeline.jsonl": "5387039b4517c9fdb53f6438533072e60b8b9ad02480096d44558d1c8e1162fe",
+     "acu.jsonl": "06858968c0113fc2750d43e011a9d7a720c9c5fa9afa5f6bd70f9b888aba925e"
+    }
+   }
+  ],
+  "note": "Two runs, one after the other, on a shared development host under other load (load average 6-12)."
+ },
+ "rejected_variants": {
+  "note": "Throwaway builds of main 5b65bd9 with one line changed, one run each, both at the same time on the loaded host.",
+  "phase_a_bounded_by_the_quiet_period": {
+   "change": "phaseAMax: cfg.Quiet",
+   "setup_publication_to_all_candidates_seconds": 113.09,
+   "burst_publication_to_all_candidates_seconds": 140.95,
+   "setup_flips": [
+    {
+     "seconds_after_publication": 27.6,
+     "suite": "suite-01",
+     "outcome": "held",
+     "phase_a_seconds": 10.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 10.36,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 48.68,
+     "suite": "suite-02",
+     "outcome": "held",
+     "phase_a_seconds": 10.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 9.84,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 59.64,
+     "suite": "trixie-security",
+     "outcome": "held",
+     "phase_a_seconds": 6.22,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 0.95,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 70.18,
+     "suite": "suite-03",
+     "outcome": "held",
+     "phase_a_seconds": 10.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 10.42,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 91.39,
+     "suite": "suite-04",
+     "outcome": "held",
+     "phase_a_seconds": 10.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 9.81,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 112.53,
+     "suite": "suite-05",
+     "outcome": "held",
+     "phase_a_seconds": 10.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 9.72,
+     "held_requests": 1
+    }
+   ],
+   "burst_flips": [
+    {
+     "seconds_after_publication": 40.58,
+     "suite": "suite-04",
+     "outcome": "held",
+     "phase_a_seconds": 10.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 8.33,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 76.97,
+     "suite": "suite-05",
+     "outcome": "held",
+     "phase_a_seconds": 10.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 17.98,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 87.93,
+     "suite": "suite-02",
+     "outcome": "held",
+     "phase_a_seconds": 10.0,
+     "token_wait_seconds": 9.14,
+     "hold_seconds": 10.96,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 109.19,
+     "suite": "suite-03",
+     "outcome": "held",
+     "phase_a_seconds": 10.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 5.86,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 119.62,
+     "suite": "trixie-security",
+     "outcome": "held",
+     "phase_a_seconds": 10.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 5.11,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 140.62,
+     "suite": "suite-01",
+     "outcome": "held",
+     "phase_a_seconds": 10.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 5.39,
+     "held_requests": 1
+    }
+   ],
+   "held_requests": 12,
+   "longest_held_request_ms": 13236,
+   "client_updates": 32,
+   "longest_apt_get_update_seconds": 13.64,
+   "apt_get_updates_over_5_seconds": 12,
+   "packages_installed": {
+    "1.0": 48,
+    "1.1": 48,
+    "2.0": 48
+   },
+   "warn_or_error_messages": [
+    "admin_disabled",
+    "gc_disabled",
+    "mitm_ca_name_constraints_skipped"
+   ],
+   "evidence_sha256": {
+    "summary.json": "7002ec4e150b912384d9f2911e2f43c5d4d5551d0e596ec6aaa9787b48879a4e",
+    "timeline.jsonl": "8aea8537630b4a4a6da1c39b176267ba539338ac8640f66d3826bb4eb9890246",
+    "acu.jsonl": "174be0b67d728450a3cd609f107b659908a20b6f3c80f17e29895aa3e4e47c18"
+   }
+  },
+  "hold_at_once": {
+   "change": "phaseAMax: 0",
+   "setup_publication_to_all_candidates_seconds": 69.07,
+   "burst_publication_to_all_candidates_seconds": 92.02,
+   "setup_flips": [
+    {
+     "seconds_after_publication": 15.66,
+     "suite": "suite-01",
+     "outcome": "held",
+     "phase_a_seconds": 0.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 8.33,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 26.48,
+     "suite": "suite-02",
+     "outcome": "held",
+     "phase_a_seconds": 0.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 10.08,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 36.88,
+     "suite": "suite-03",
+     "outcome": "held",
+     "phase_a_seconds": 0.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 9.07,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 47.21,
+     "suite": "suite-04",
+     "outcome": "held",
+     "phase_a_seconds": 0.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 9.08,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 57.82,
+     "suite": "suite-05",
+     "outcome": "held",
+     "phase_a_seconds": 0.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 9.3,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 68.41,
+     "suite": "trixie-security",
+     "outcome": "held",
+     "phase_a_seconds": 0.0,
+     "token_wait_seconds": 4.95,
+     "hold_seconds": 10.6,
+     "held_requests": 1
+    }
+   ],
+   "burst_flips": [
+    {
+     "seconds_after_publication": 26.93,
+     "suite": "suite-03",
+     "outcome": "held",
+     "phase_a_seconds": 0.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 4.67,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 37.84,
+     "suite": "suite-04",
+     "outcome": "held",
+     "phase_a_seconds": 0.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 7.84,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 54.62,
+     "suite": "suite-05",
+     "outcome": "held",
+     "phase_a_seconds": 0.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 11.03,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 67.54,
+     "suite": "trixie-security",
+     "outcome": "held",
+     "phase_a_seconds": 0.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 12.88,
+     "held_requests": 1
+    },
+    {
+     "seconds_after_publication": 78.54,
+     "suite": "suite-01",
+     "outcome": "held",
+     "phase_a_seconds": 0.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 7.26,
+     "held_requests": 0
+    },
+    {
+     "seconds_after_publication": 91.47,
+     "suite": "suite-02",
+     "outcome": "held",
+     "phase_a_seconds": 0.0,
+     "token_wait_seconds": 0.0,
+     "hold_seconds": 7.27,
+     "held_requests": 1
+    }
+   ],
+   "held_requests": 11,
+   "longest_held_request_ms": 6628,
+   "client_updates": 15,
+   "longest_apt_get_update_seconds": 47.94,
+   "apt_get_updates_over_5_seconds": 6,
+   "packages_installed": {
+    "1.0": 48,
+    "1.1": 48,
+    "2.0": 48
+   },
+   "warn_or_error_messages": [
+    "admin_disabled",
+    "gc_disabled",
+    "mitm_ca_name_constraints_skipped"
+   ],
+   "evidence_sha256": {
+    "summary.json": "74cd5b2b9858f522fca713d009edcd9757d1175f26292f11ee82e77c748580d4",
+    "timeline.jsonl": "a31d81264c77d9325b51a377a8b779b451a29113d4dcce20fc91f31b0556741d",
+    "acu.jsonl": "91d1014bd8c87c2d0589d4a4d04e14cbbaaae2d734eb79f44a01aac4b259ea01"
+   }
+  }
+ },
+ "caveats": [
+  "Single or double runs on a shared development host; not percentiles or an SLA.",
+  "Whether phase A finds a pause is sensitive to how the client's 5 s poll lines up with the 10 s quiet period, so runs differ by tens of seconds.",
+  "The setup transition publishes 1.1 seven seconds after first contact, while five first adoptions are still queued: every one of them then needs the barrier.",
+  "Raw output was written to a temporary directory and is not kept; the hashes identify it."
+ ]
+}

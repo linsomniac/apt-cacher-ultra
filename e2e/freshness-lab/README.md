@@ -478,3 +478,70 @@ ACU_FRESHNESS_LAB_SKIP_BUILD=1 bash e2e/freshness-lab/run.sh \
   --burst --suites 6 --hosts 2 --catalog-size 5000 --hot-count 8 \
   --member-delay 0.15 --deb-delay 30 --max-wait 1800
 ```
+
+## The setup transition after the barrier fix (2026-11-15)
+
+The slower setup transition above came from the publication barrier, and
+the daemon's own logs of that run say how. Each of the six switches spent
+`phase_a_seconds` = 60.00 waiting for the suite to go quiet by itself — ten
+seconds without an `InRelease` request — which a client that runs `apt-get
+update` every five seconds never allows; then it held one request for 7–10 s
+and switched. An adoption keeps its slot while it waits, and first adoptions
+may use only one of the two slots, so the five queued first adoptions ran
+back to back at about 68 s each. They needed the barrier at all because 1.1
+was published seven seconds after first contact, while they were still
+queued: the release they adopted was no longer the one clients had been
+served. Release 1.0.5 has no barrier; its 64 s is a 60 s cooldown and six
+sub-second adoptions, with nothing protecting a client that holds the
+previous `InRelease`. The same 60 s is the last switch of the 2.0 burst
+above (68.23 s in `flip_wait`); the other five found a pause after 4.3 s only
+because revalidation waits had stretched the client's polling past ten
+seconds.
+
+The barrier now stops waiting for a suite that is being read: once one of
+the suite's `InRelease`/`Release` responses has finished during the wait, a
+new request for it has arrived since, and the suite is still not quiet a
+quiet period after that response, it goes on to hold. A suite nobody asks
+for meanwhile, the wait for other suites' holds, and the conditions for the
+switch itself are unchanged. The same workload, with the
+same harness and image as the comparison above, was run twice with that
+build, one run after the other.
+[barrier-fix-measurements.json](barrier-fix-measurements.json) records every
+switch's barrier timings, the held requests and the evidence hashes.
+
+| | 1.0.5 | Main before | Fix, run 1 | Fix, run 2 |
+| --- | ---: | ---: | ---: | ---: |
+| Setup: all 1.1 candidates visible | 64.28 s | 394.46 s | 106.32 s | 111.12 s |
+| Burst: all 48 2.0 candidates visible | 794.15 s | 163.69 s | 134.35 s | 133.13 s |
+| Longest wait before a switch held (`phase_a_seconds`) | — | 60.00 s | 15.34 s | 25.41 s |
+| Longest hold | — | 10.08 s | 6.19 s | 6.09 s |
+| Requests held, and the longest | — | 10, 5.0 s | 11, 5.3 s | 10, 5.1 s |
+| Longest `apt-get update` | 4.92 s | 10.30 s | 10.72 s | 10.53 s |
+
+Every switch in both runs ended inside its hold (`held`); none was cut
+short, expired or went unheld, and no switch waited for another suite's
+hold token. All 48 packages installed at each of the three versions. A busy
+suite now takes about 20 s through the barrier: around 14 s until its pause
+is known to be broken (the first poll after the adoption is ready, then the
+quiet period), and a hold of about 6 s. Six of them in a row is the 106–111 s.
+The longest wait, 25.41 s, was a switch that found another suite's hold in
+its way and waited for it, and for the quiet period after it, without
+holding.
+What remains above 1.0.5 is that sequence: one suite at a time, each given
+the quiet period the barrier exists for. `adoption.flip_quiet_period` sets
+its length (10 s here); `0s` removes the barrier and the protection.
+
+Two simpler changes were measured first, as throwaway builds, and rejected.
+Holding at once (no wait for a pause) switched the setup in 69.07 s, but
+holds then follow each other without a gap and one client is caught by each
+in turn: one `apt-get update` took 47.94 s. Bounding the whole first phase
+by the quiet period gave 113.09 s and 140.95 s, but a switch that finds
+another suite's hold in its way then holds straight after it; one request
+waited 13.2 s in that run, and the pattern can chain whenever a hold
+outlasts the quiet period. The change made keeps the wait for other suites'
+holds as it was.
+
+These are two runs on a shared development host under other load. Whether
+a pause is found depends on how the five-second poll lines up with the
+ten-second quiet period, so single runs of this workload differ by tens of
+seconds; the comparison that matters is the 60 s per switch that is gone.
