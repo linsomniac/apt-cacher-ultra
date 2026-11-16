@@ -132,6 +132,20 @@ not included in the published 1.1.0-rc1.
 
 ### Changed
 
+- After 1.1.0-rc1: a suite that clients keep asking for no longer waits a
+  minute before it switches to a new snapshot. The flip barrier waited up to
+  60 s for a pause of `adoption.flip_quiet_period` (10 s) in the suite's
+  `InRelease`/`Release` requests; a suite asked for more often than that never
+  pauses, so every adoption of it sat the whole 60 s, then held its requests
+  anyway, and kept its adoption slot throughout — six such suites queued for
+  first adoption took 6m34s to appear in the freshness lab, against 1m04s on
+  1.0.5, which has no barrier. The barrier now goes on to hold once one of
+  the suite's `InRelease`/`Release` responses has finished during the wait,
+  a new request for it has arrived since, and the suite is still not quiet a
+  quiet period after that response. A suite nobody asks for meanwhile (slow
+  downloads already in progress included), the wait for other suites' holds,
+  and the conditions for the switch itself are unchanged. See [Flip
+  consistency](docs/configuration.md#flip-consistency).
 - After 1.1.0-rc1: `freshness.periodic_refresh` defaults to `"1m"` instead
   of `"15m"`, and `adoption.hot_prefetch_budget` to `"15s"` instead of `"5m"`.
   The warming budget includes hot-set computation. Warming remains best effort

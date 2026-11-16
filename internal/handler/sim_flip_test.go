@@ -102,13 +102,15 @@ func recordAnchorHeld(serve simtest.ServeFunc, held *[]time.Duration) simtest.Se
 }
 
 // Spec C8's purpose, end to end (§7: a busy suite, an anchor every 500 ms
-// for 120 s across a flip): clients read the anchor over 1 s links and ask
-// for its index right after. Without the barrier
+// for 120 s across a flip): clients read the anchor over 1.1 s links (1 s
+// and a little, so that no request arrives at the very instant the hold
+// starts, a quiet period after a read ended) and ask for its index right
+// after. Without the barrier
 // (flip_quiet_period = 0s, today's behaviour) the flip lands while two
 // anchors are in flight, and those clients get the new index for the old
-// anchor. With it (10s) phase A gives up at its cap, the hold holds new
-// anchor requests until the in-flight ones are done and the suite has
-// been quiet for 10 s, and no client straddles.
+// anchor. With it (10s) phase A gives up once the suite has broken a quiet
+// period, the hold holds new anchor requests until the in-flight ones are
+// done and the suite has been quiet for 10 s, and no client straddles.
 func TestSimFlip_BusySuiteStraddlesOnlyWithoutTheBarrier(t *testing.T) {
 	busySuiteSim(t, false)
 }
@@ -138,10 +140,11 @@ func busySuiteBubble(t *testing.T, detached bool, quiet time.Duration) {
 		const suite = "/u/dists/busy"
 		adopt := s.adopt
 		var sigMismatch atomic.Int64
-		serve := s.serve(time.Second, 100*time.Millisecond)
+		const link = 1100 * time.Millisecond
+		serve := s.serve(link, 100*time.Millisecond)
 		if detached {
 			adopt = s.adoptDetached
-			serve = s.serveDetached(time.Second, 100*time.Millisecond, &sigMismatch)
+			serve = s.serveDetached(link, 100*time.Millisecond, &sigMismatch)
 		}
 		adopt(suite, 1)
 		before := s.gate.Stats()
@@ -175,13 +178,16 @@ func busySuiteBubble(t *testing.T, detached bool, quiet time.Duration) {
 		if n := sigMismatch.Load(); n != 0 {
 			t.Fatalf("with the barrier: %d Release.gpg responses from another snapshot than their Release", n)
 		}
-		// The suite is never naturally quiet, so the hold starts at phase A's
-		// cap; the last anchor serve in flight then started at 89.511 s and
-		// finished at 90.511 s, and the commit follows the quiet period after
-		// it — well before HoldMax − CommitMargin. An anchor completion that
-		// failed to wake the hold would delay the commit to that cut.
-		holdStart := flipAt + flipgate.PhaseAMax
-		if want := holdStart + 504*time.Millisecond + quiet; committed != want {
+		// The suite is never naturally quiet. The first anchor serve to
+		// complete after the flip began started at 29.011 s and finished at
+		// 30.111 s; later serves break the quiet period it started, so phase
+		// A gives up at its end and the hold starts at 40.111 s. The last
+		// anchor serve in flight then started at 40.011 s and finished at
+		// 41.111 s, and the commit follows the quiet period after it — well
+		// before HoldMax − CommitMargin. An anchor completion that failed to
+		// wake the hold would delay the commit to that cut.
+		holdStart := flipAt + 104*time.Millisecond + quiet
+		if want := holdStart + time.Second + quiet; committed != want {
 			t.Fatalf("committed at %v, want %v (the quiet period after the last anchor in flight when the hold started at %v)",
 				committed, want, holdStart)
 		}
@@ -198,12 +204,25 @@ func busySuiteBubble(t *testing.T, detached bool, quiet time.Duration) {
 // Spec C8 DoD, the review's overlapping-hold trace (plan review
 // 2026-10-05, finding 6) through the real handler, adopter and cache, as
 // in internal/flipgate's model simulation: busy suites a and b on one
-// host leave phase A at its cap 0.1 s apart; the trace client gets a's
-// old anchor just before a's hold, spends 0.3 s on an unrelated download,
+// host start their flips 0.1 s apart; the trace client gets a's old
+// anchor just before a's hold, spends 0.3 s on an unrelated download,
 // then asks for b's anchor with a's index queued behind it. b is not
-// holding yet (one hold at a time), so neither anchor waits and the a
-// index arrives before a commits. 100 shared-queue clients cross both
-// flips; b commits at least a quiet period after a.
+// holding, so neither anchor waits and the a index arrives before a
+// commits. 100 shared-queue clients cross both flips; b commits at least
+// a quiet period after a.
+//
+// AIDEV-NOTE: since the 2026-11-15 publication-delay fix the production
+// bounds no longer put b in the token queue here. a breaks a quiet period
+// first and holds from 11.057 s; b finds a's hold in its way and waits in
+// phase A — for the hold and the quiet period after it — before it holds
+// its own anchors (phase A (b); a busy suite does not give that wait up,
+// TestFlip_BusySuiteStillWaitsOutAnotherSuitesHoldUnheld). The trace
+// therefore pins what a client sees with two busy suites flipping
+// together; "one hold at a time" for flips that are both past phase A is
+// pinned in the model, where phase A's bound can be shortened
+// (internal/flipgate's TestSimFlip_OverlappingHoldTrace). Before the fix
+// both left phase A at its 60 s cap and b queued; the instants below are
+// those less 50 s.
 //
 // AIDEV-NOTE: the trace's instants are literal, so the test checks its
 // own premise (final review, tests Minor 1): when the trace client asks
@@ -225,13 +244,13 @@ func TestSimFlip_SharedQueueTraceEndToEnd(t *testing.T) {
 		trace := simtest.NewLedger(10 * time.Second)
 		var wg sync.WaitGroup
 		t0 := time.Now()
-		until := t0.Add(100 * time.Second)
+		until := t0.Add(60 * time.Second)
 		flipReaders(l, fast, []simtest.Request{{Suite: a, Anchor: true}}, 11*time.Millisecond, 2*time.Second, until, &wg)
 		flipReaders(l, fast, []simtest.Request{{Suite: b, Anchor: true}}, 1011*time.Millisecond, 2*time.Second, until, &wg)
 		wg.Add(1)
 		go func() { // another b reader, on a slow link, still reading when b's hold could start
 			defer wg.Done()
-			time.Sleep(60950 * time.Millisecond)
+			time.Sleep(10950 * time.Millisecond)
 			l.RunUpdate(1000, []simtest.Request{{Suite: b, Anchor: true}}, s.serve(6*time.Second, 10*time.Millisecond))
 		}()
 		var traceHeld []time.Duration
@@ -245,7 +264,7 @@ func TestSimFlip_SharedQueueTraceEndToEnd(t *testing.T) {
 		wg.Add(1)
 		go func() { // the trace client
 			defer wg.Done()
-			time.Sleep(60853 * time.Millisecond)
+			time.Sleep(10853 * time.Millisecond)
 			trace.RunUpdate(2000, []simtest.Request{{Suite: a, Anchor: true}, {Filler: 300 * time.Millisecond}, {Suite: b, Anchor: true}},
 				recordAnchorHeld(premise, &traceHeld))
 		}()
@@ -254,7 +273,7 @@ func TestSimFlip_SharedQueueTraceEndToEnd(t *testing.T) {
 			if i%2 == 1 {
 				q[0], q[1] = q[1], q[0]
 			}
-			at := 51*time.Second + 7*time.Millisecond + time.Duration(i)*450*time.Millisecond
+			at := time.Second + 7*time.Millisecond + time.Duration(i)*450*time.Millisecond
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -284,7 +303,7 @@ func TestSimFlip_SharedQueueTraceEndToEnd(t *testing.T) {
 				holdsAtB, aGenAtB, a1)
 		}
 		if holdsAtB != 1 {
-			t.Fatalf("when the trace client asked for b's anchor, %d holds had started: b held alongside a (one hold at a time)", holdsAtB)
+			t.Fatalf("when the trace client asked for b's anchor, %d holds had started: b held alongside a (it waits in phase A while a holds)", holdsAtB)
 		}
 		if len(traceHeld) != 2 || traceHeld[0] != 0 || traceHeld[1] != 0 {
 			t.Fatalf("the trace client's anchors were held %v, want neither", traceHeld)
@@ -296,7 +315,7 @@ func TestSimFlip_SharedQueueTraceEndToEnd(t *testing.T) {
 			t.Fatalf("%d straddles, first %+v", len(st), st[0])
 		}
 		if bAt.Sub(aAt) < 10*time.Second {
-			t.Fatalf("b committed %v after a, want at least the quiet period (one hold at a time, then cross-suite quiet)", bAt.Sub(aAt))
+			t.Fatalf("b committed %v after a, want at least the quiet period (a's hold, then the cross-suite quiet)", bAt.Sub(aAt))
 		}
 		if st := s.gate.Stats(); st.Holds-before.Holds != 2 || st.HoldsExpired != before.HoldsExpired || st.HoldsSkipped != before.HoldsSkipped {
 			t.Fatalf("stats %+v (before %+v): want two holds, none expired or skipped", st, before)
@@ -314,16 +333,27 @@ func TestSimFlip_SharedQueueTraceEndToEnd(t *testing.T) {
 
 // Spec C8 phase B (b), end to end (final review, tests Minor 1): the
 // flipgate model's ClientReleasedFromAnotherHold through the real handler,
-// adopter and cache. a's readers are on 4 s links, so a's hold (from
-// 61.003 s) lasts ~13.5 s and ends normally; b's phase A gives up at
-// 63.003 s while a holds, so b waits for the token and holds from a's end.
-// The trace client gets b's old anchor at 64.053 s, waits in a's hold for
-// a's anchor, then asks for b's index — 14.5 s after b's anchor arrived,
-// 10.5 s of that in a's hold (4 s net, inside the window). b is quiet by
-// itself when a's hold ends; only the cross-suite quiet period keeps it
-// from committing before that index arrives. Disabling phase B (b) makes
-// the trace client straddle; concurrent holds make b hold its anchor. The
-// premise is checked as in SharedQueueTraceEndToEnd.
+// adopter and cache. a's readers are on 4 s links: the first read to end
+// during a's flip ends at 4.011 s, so a's hold starts a quiet period
+// later, at 14.011 s, lasts ~13.5 s and ends normally. b's flip starts at
+// 5.003 s and b breaks a quiet period at 15.311 s, while a holds, so it
+// stays in phase A. The trace client gets b's old anchor at 17.053 s, waits
+// in a's hold for a's anchor, then asks for b's index — about 14.5 s after
+// b's anchor arrived, 10.5 s of that in a's hold (4 s net, inside the
+// window). b is quiet by itself when a's hold ends (its readers stop at
+// 14 s); only the cross-suite quiet period keeps it from committing before
+// that index arrives. The premise is checked as in
+// SharedQueueTraceEndToEnd.
+//
+// AIDEV-NOTE: since the 2026-11-15 publication-delay fix the cross-suite
+// quiet period reaches b through phase A (b) here: b waits in phase A
+// until a quiet period after a's hold, and its own hold is then
+// zero-length. Before, b left phase A at its 60 s cap while a held, queued
+// for the token and waited out the same period inside its hold (phase B
+// (b)). Both rules ask for the same period, so disabling either one alone
+// no longer makes this trace client straddle; phase B (b) on its own is
+// pinned in the model (internal/flipgate's
+// TestSimFlip_ClientReleasedFromAnotherHold, phase A's bound shortened).
 func TestSimFlip_ClientReleasedFromAnotherHoldEndToEnd(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := newFlipStack(t, 10*time.Second)
@@ -338,8 +368,8 @@ func TestSimFlip_ClientReleasedFromAnotherHoldEndToEnd(t *testing.T) {
 		trace := simtest.NewLedger(10 * time.Second)
 		var wg sync.WaitGroup
 		t0 := time.Now()
-		flipReaders(l, slowA, []simtest.Request{{Suite: a, Anchor: true}}, 11*time.Millisecond, 500*time.Millisecond, t0.Add(100*time.Second), &wg)
-		flipReaders(l, fast, []simtest.Request{{Suite: b, Anchor: true}}, 261*time.Millisecond, 500*time.Millisecond, t0.Add(61*time.Second), &wg)
+		flipReaders(l, slowA, []simtest.Request{{Suite: a, Anchor: true}}, 11*time.Millisecond, 500*time.Millisecond, t0.Add(50*time.Second), &wg)
+		flipReaders(l, fast, []simtest.Request{{Suite: b, Anchor: true}}, 261*time.Millisecond, 500*time.Millisecond, t0.Add(14*time.Second), &wg)
 		var traceHeld []time.Duration
 		holdsAtB, genAtB := -1, ""
 		traceServe := func(rq simtest.Request) (string, time.Duration) {
@@ -354,7 +384,7 @@ func TestSimFlip_ClientReleasedFromAnotherHoldEndToEnd(t *testing.T) {
 		wg.Add(1)
 		go func() { // the trace client: b's anchor, then a's (held), then the indexes
 			defer wg.Done()
-			time.Sleep(64003 * time.Millisecond)
+			time.Sleep(17003 * time.Millisecond)
 			trace.RunUpdate(2000, []simtest.Request{{Suite: b, Anchor: true}, {Suite: a, Anchor: true}}, recordAnchorHeld(traceServe, &traceHeld))
 		}()
 		var aAt, bAt time.Time
@@ -362,13 +392,13 @@ func TestSimFlip_ClientReleasedFromAnotherHoldEndToEnd(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			time.Sleep(time.Second + 3*time.Millisecond) // a is busy by now
-			s.adopt(a, 2)                                // holds from 61.003 s to 74.511 s
+			s.adopt(a, 2)                                // holds from 14.011 s for ~13.5 s
 			aAt = time.Now()
 		}()
 		go func() {
 			defer wg.Done()
-			time.Sleep(3*time.Second + 3*time.Millisecond) // b is busy by now
-			s.adopt(b, 2)                                  // phase A gives up at 63.003 s, while a holds
+			time.Sleep(5*time.Second + 3*time.Millisecond) // b is busy by now
+			s.adopt(b, 2)                                  // breaks a quiet period at 15.311 s, while a holds: stays in phase A
 			bAt = time.Now()
 		}()
 		wg.Wait()
@@ -379,7 +409,7 @@ func TestSimFlip_ClientReleasedFromAnotherHoldEndToEnd(t *testing.T) {
 				holdsAtB, genAtB, a1+"/"+b1)
 		}
 		if holdsAtB != 1 {
-			t.Fatalf("when the trace client asked for b's anchor, %d holds had started: b held alongside a (one hold at a time)", holdsAtB)
+			t.Fatalf("when the trace client asked for b's anchor, %d holds had started: b held alongside a (it waits in phase A while a holds)", holdsAtB)
 		}
 		if len(traceHeld) != 2 || traceHeld[0] != 0 || traceHeld[1] == 0 {
 			t.Fatalf("the trace client's anchors were held %v, want b's not held and a's held", traceHeld)
@@ -391,7 +421,7 @@ func TestSimFlip_ClientReleasedFromAnotherHoldEndToEnd(t *testing.T) {
 			t.Fatalf("%d straddles, first %+v", len(st), st[0])
 		}
 		if d := bAt.Sub(aAt); d != 10*time.Second {
-			t.Fatalf("b committed %v after a, want exactly the quiet period (its hold starts at a's end; cross-suite quiet)", d)
+			t.Fatalf("b committed %v after a, want exactly the quiet period (it is quiet by itself; cross-suite quiet)", d)
 		}
 		if st := s.gate.Stats(); st.Holds-before.Holds != 2 || st.HoldsExpired != before.HoldsExpired ||
 			st.HoldsSkipped != before.HoldsSkipped || st.QuietCutShort != before.QuietCutShort {
@@ -408,7 +438,9 @@ func TestSimFlip_ClientReleasedFromAnotherHoldEndToEnd(t *testing.T) {
 // now with a commit that takes 200 ms, as a real one does). A busy suite
 // (an anchor every 500 ms over a 1 s link) and a reader on a 12 s or 25 s
 // link that starts half a second before the hold keep the suite from
-// going quiet before HoldMax − CommitMargin. No other hold ended, so the
+// going quiet before HoldMax − CommitMargin. The first read to end during
+// the flip ends at 1.011 s, so the hold starts a quiet period later, at
+// 11.011 s. No other hold ended, so the
 // hold commits then, inside its bound, and answers the ~31 held requests
 // from the new snapshot; only the slow reader — the late reader, counted
 // in acu_flip_quiet_cut_short_total — may straddle (the 12 s one fetched
@@ -438,7 +470,7 @@ func TestSimFlip_SlowReaderCommitsInsideTheHold(t *testing.T) {
 				wg.Add(1)
 				go func() { // starts half a second before the hold
 					defer wg.Done()
-					time.Sleep(60503 * time.Millisecond)
+					time.Sleep(10511 * time.Millisecond)
 					l.RunUpdate(1000, []simtest.Request{{Suite: suite, Anchor: true}}, s.serve(tc.slow, 10*time.Millisecond))
 				}()
 				flipAt := time.Second + 3*time.Millisecond
@@ -457,7 +489,7 @@ func TestSimFlip_SlowReaderCommitsInsideTheHold(t *testing.T) {
 						break
 					}
 				}
-				holdStart := flipAt + flipgate.PhaseAMax // the suite is never naturally quiet
+				holdStart := flipAt + 8*time.Millisecond + 10*time.Second // the suite is never naturally quiet
 				if want := holdStart + flipgate.HoldMax - flipgate.CommitMargin + commitLatency; committed != want || committed-holdStart > flipgate.HoldMax {
 					t.Errorf("committed at %v, want %v (the commit starts at HoldMax − CommitMargin), within the hold's %v",
 						committed, want, flipgate.HoldMax)
@@ -500,10 +532,12 @@ func TestSimFlip_SlowReaderCommitsInsideTheHold(t *testing.T) {
 // client's index long enough behind another suite's held anchor — nor an
 // anchor completion that fails to wake a waiting flip (the hold's cut at
 // HoldMax − CommitMargin bounds that to a later, still consistent commit).
-// "One hold at a time" and phase B (b) are pinned end to end by
+// "One hold at a time" and phase B (b) are pinned in the model by
+// internal/flipgate's trace simulations, and what a client sees of them
+// with the production bounds, end to end, by
 // TestSimFlip_SharedQueueTraceEndToEnd and
-// TestSimFlip_ClientReleasedFromAnotherHoldEndToEnd (and in the model by
-// internal/flipgate's trace simulations); the wake by
+// TestSimFlip_ClientReleasedFromAnotherHoldEndToEnd (see their notes: there
+// the second suite waits in phase A instead of queueing); the wake by
 // TestFlip_WaitsForQuietAfterTheLastAnchor and the busy-suite
 // simulations' exact commit instant.
 func TestSimFlip_SeededChaos(t *testing.T) {

@@ -7,7 +7,11 @@
 //   - Phase A waits, at most PhaseAMax, for natural quiet: no anchor of
 //     the suite in flight, none completed within the quiet period, no hold
 //     in progress anywhere, and none that held requests ended within the
-//     quiet period.
+//     quiet period. A suite that is being read is not waited for that
+//     long: once an anchor serve has completed during the flip, a request
+//     has arrived since, and the suite is still not quiet a quiet period
+//     after that completion, phase A ends as soon as no other suite's hold
+//     is in the way.
 //   - The flip then takes the process-wide hold token (FIFO, one holder at
 //     a time, waiting at most TokenWaitMax; on timeout it commits unheld).
 //   - Phase B holds the suite's new anchor requests until it is quiet and
@@ -57,6 +61,8 @@ const (
 	MinQuiet = time.Second
 	MaxQuiet = 15 * time.Second
 	// PhaseAMax bounds phase A, the wait for natural quiet without holds.
+	// A suite that is being read does not wait this long for its own
+	// quiet (Flip); the wait for other suites' holds can.
 	PhaseAMax = 60 * time.Second
 	// TokenWaitMax bounds the wait for the process-wide hold token; a flip
 	// that times out commits without a hold (acu_flip_hold_skipped_total).
@@ -173,11 +179,12 @@ type Gate struct {
 }
 
 type entry struct {
-	inflight map[*Token]struct{}
-	lastDone time.Time // completion of the newest counted anchor serve
-	hold     *hold     // this suite's hold, while phase B runs
-	flips    int       // Flip calls in progress for this key
-	lastUse  time.Time
+	inflight  map[*Token]struct{}
+	lastStart time.Time // start of the newest registered anchor serve
+	lastDone  time.Time // completion of the newest counted anchor serve
+	hold      *hold     // this suite's hold, while phase B runs
+	flips     int       // Flip calls in progress for this key
+	lastUse   time.Time
 }
 
 type hold struct {
@@ -474,11 +481,50 @@ func (g *Gate) Flip(ctx context.Context, key string, commit func() error) (Resul
 	}()
 
 	// Phase A: natural quiet, no holds.
+	//
+	// AIDEV-NOTE: the wait for the suite's own quiet (a) ends early for a
+	// suite that is being read. The first anchor serve to complete after
+	// the flip began (firstDone) starts a quiet period; when a request
+	// that arrived after it has kept the suite from going quiet by the end
+	// of that period, the pause was broken, and each further anchor served
+	// would only restart the wait: the flip stops waiting and holds.
+	// Before the 2026-11-15 publication-delay report it waited PhaseAMax
+	// regardless: a suite asked for every 5 s sat the whole 60 s, then held
+	// a request anyway, with its adoption slot held throughout — six
+	// queued suites took 394 s to switch. What is deliberately kept:
+	//   - Only a new request breaks a pause (e.lastStart after firstDone).
+	//     A suite nobody asks for after firstDone waits as before, however
+	//     long reads that were already being sent take (until
+	//     AnchorTimeout): there is no request to hold, and holding would
+	//     only bring the commit forward to the hold's cut, before a slow
+	//     reader has had its quiet period
+	//     (TestFlip_ReadsAlreadyInFlightDoNotBreakAPause).
+	//   - The other suites' holds (b) are waited for up to PhaseAMax, never
+	//     given up early: a flip that took the token as another hold ended
+	//     would hold straight after it and catch the clients that hold has
+	//     just released a second time
+	//     (TestFlip_BusySuiteStillWaitsOutAnotherSuitesHoldUnheld).
+	//   - The commit's conditions are phase B's, unchanged.
+	// What it costs: the hold of a suite that is being read starts sooner,
+	// so a read still being sent 5 s into it (HoldMax − CommitMargin −
+	// quiet) is a late reader of that hold where a longer phase A might
+	// have outwaited it — the same counted residual as before
+	// (acu_flip_quiet_cut_short_total), reached without the 60 s.
+	// firstDone is read from lastDone at the flip's first wake after it
+	// (every completion broadcasts); a flip that wakes late sees a later
+	// completion and gives up later, never sooner. A registration does not
+	// broadcast: a request that arrives after the period is over is seen
+	// when it completes, or at the flip's next wake.
 	limit := start.Add(g.phaseAMax)
+	var firstDone time.Time // the first anchor completion of the suite seen after the flip began
 	for {
 		g.mu.Lock()
 		now := time.Now()
 		closed := g.closed
+		if firstDone.IsZero() && e.lastDone.After(start) {
+			firstDone = e.lastDone
+		}
+		asked := !firstDone.IsZero() && e.lastStart.After(firstDone) // a request arrived after it
 		okLocal, atLocal := g.localQuietLocked(e, now)
 		okHolds, atHolds := g.holdsQuietLocked(now)
 		changed := g.changedLocked()
@@ -491,7 +537,15 @@ func (g *Gate) Flip(ctx context.Context, key string, commit func() error) (Resul
 		if (okLocal && okHolds) || !now.Before(limit) {
 			break
 		}
-		if !waitFor(ctx, changed, earliest(atLocal, atHolds), limit) {
+		at := earliest(atLocal, atHolds)
+		if !firstDone.IsZero() {
+			if broken := firstDone.Add(g.quiet); now.Before(broken) {
+				at = earliest(at, broken)
+			} else if asked && okHolds {
+				break // a new request broke its quiet period: the suite is being read, hold it
+			}
+		}
+		if !waitFor(ctx, changed, at, limit) {
 			res.PhaseA = time.Since(start)
 			err := g.abort(&res, ctx.Err())
 			return res, err
@@ -734,6 +788,7 @@ func (g *Gate) sweepLocked(now time.Time) {
 func (g *Gate) registerLocked(e *entry, now time.Time) *Token {
 	t := &Token{g: g, e: e, start: now}
 	e.inflight[t] = struct{}{}
+	e.lastStart = now
 	e.lastUse = now
 	return t
 }

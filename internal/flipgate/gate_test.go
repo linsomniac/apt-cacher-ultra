@@ -252,9 +252,10 @@ func TestFlip_IgnoresAnchorsInFlightPastAptsTimeout(t *testing.T) {
 	})
 }
 
-// A busy suite never goes quiet: phase A gives up after 60 s; the hold
-// then holds new anchor requests, commits once the suite is quiet, and
-// answers the held requests from the new generation (spec C8).
+// A busy suite never goes quiet: phase A gives up on it a quiet period
+// after the first read that completes during the flip; the hold then holds
+// new anchor requests, commits once the suite is quiet, and answers the
+// held requests from the new generation (spec C8).
 func TestFlip_BusySuiteIsHeldAndAnsweredFromTheNewGeneration(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		g := newTestGate(t)
@@ -294,12 +295,15 @@ func TestFlip_BusySuiteIsHeldAndAnsweredFromTheNewGeneration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res.PhaseA != PhaseAMax || res.Outcome != OutcomeHeld {
-			t.Fatalf("result = %+v, want phase A to give up after %v and the hold to end normally", res, PhaseAMax)
+		// The first read to complete after the flip began (at 0.25 s) ended
+		// at 0.6 s; the quiet period it started is over at 10.6 s, broken
+		// by every read since.
+		if want := 350*time.Millisecond + testQuiet; res.PhaseA != want || res.Outcome != OutcomeHeld {
+			t.Fatalf("result = %+v, want phase A to give up after %v and the hold to end normally", res, want)
 		}
-		// The last read before the hold started at 60.0 s and ended at
-		// 60.1 s; the commit follows the 10 s quiet period.
-		if got, want := committedAt.Sub(flipStart), PhaseAMax+9850*time.Millisecond; got != want {
+		// The last read before the hold started at 10.5 s and ended at
+		// 10.6 s; the commit follows the 10 s quiet period.
+		if got, want := committedAt.Sub(flipStart), 20350*time.Millisecond; got != want {
 			t.Fatalf("committed %v after the flip started, want %v", got, want)
 		}
 		wg.Wait()
@@ -326,9 +330,160 @@ func TestFlip_BusySuiteIsHeldAndAnsweredFromTheNewGeneration(t *testing.T) {
 	})
 }
 
+// The 2026-11-15 publication-delay report: a client that asks for a suite's
+// anchor every ~5 s never leaves the 10 s quiet period phase A needs, so
+// waiting longer for it is waiting for nothing — every flip in the lab sat
+// phase A's whole 60 s and then held a request anyway. Phase A now gives up
+// on the suite's own quiet once a quiet period that began during the flip
+// has been broken: a quiet period after the first poll that completes. The
+// flip is over within two quiet periods here (that wait, then the hold's
+// quiet period after the last anchor served), and the poll that arrives
+// during the hold is held, for less than a quiet period, and answered from
+// the new generation.
+//
+// AIDEV-NOTE: this is the regression test for that report. The general
+// bound for a suite polled every p < quiet is p + 2 × quiet, plus the
+// anchor's transfer and the commit: the first completion comes within p of
+// the flip's start.
+func TestFlip_SteadyPollerIsHeldOnceItBreaksAQuietPeriod(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := newTestGate(t)
+		var gen atomic.Int64
+		gen.Store(1)
+		type served struct {
+			start  time.Time
+			waited time.Duration
+			gen    int64
+		}
+		var mu sync.Mutex
+		var reads []served
+		var wg sync.WaitGroup
+		until := time.Now().Add(60 * time.Second)
+		wg.Add(1)
+		go func() { // apt-get update every 5.3 s, the anchor taking 250 ms
+			defer wg.Done()
+			for time.Now().Before(until) {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					start := time.Now()
+					tok := g.AnchorStart(bg, "k")
+					waited := time.Since(start)
+					v := gen.Load()
+					time.Sleep(250 * time.Millisecond)
+					tok.Done()
+					mu.Lock()
+					reads = append(reads, served{start: start, waited: waited, gen: v})
+					mu.Unlock()
+				}()
+				time.Sleep(5300 * time.Millisecond)
+			}
+		}()
+		time.Sleep(2 * time.Second) // off the request grid
+		flipStart := time.Now()
+		var committedAt time.Time
+		res, err := g.Flip(bg, "k", func() error { committedAt = time.Now(); gen.Store(2); return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The flip began at 2 s. The poll at 5.3 s ended at 5.55 s; the
+		// quiet period it started is over at 15.55 s, broken by the poll at
+		// 10.6 s.
+		if want := 13550 * time.Millisecond; res.PhaseA != want || res.Outcome != OutcomeHeld {
+			t.Fatalf("result = %+v, want phase A to give up on the suite's quiet after %v and the hold to end normally", res, want)
+		}
+		// That poll ended at 10.85 s, before the hold started; the commit
+		// follows its quiet period, at 20.85 s.
+		if got, want := committedAt.Sub(flipStart), 18850*time.Millisecond; got != want || got > 2*testQuiet {
+			t.Fatalf("committed %v after the flip started, want %v, within two quiet periods", got, want)
+		}
+		wg.Wait()
+		held := 0
+		for _, s := range reads {
+			switch {
+			case s.start.Before(res.HoldStart):
+				if s.gen != 1 || s.waited != 0 {
+					t.Errorf("a read before the hold waited %v and saw generation %d, want no wait and 1", s.waited, s.gen)
+				}
+			case s.start.Before(committedAt):
+				held++
+				if s.gen != 2 || s.waited >= testQuiet {
+					t.Errorf("a held read waited %v and saw generation %d, want less than %v and 2 (the new snapshot)", s.waited, s.gen, testQuiet)
+				}
+			default:
+				if s.gen != 2 || s.waited != 0 {
+					t.Errorf("a read after the commit waited %v and saw generation %d, want no wait and 2", s.waited, s.gen)
+				}
+			}
+		}
+		if held != 1 || res.Waiters != 1 {
+			t.Fatalf("%d reads were held, Result.Waiters = %d; want the one poll that arrived during the hold (at 15.9 s)", held, res.Waiters)
+		}
+	})
+}
+
+// Only a new request breaks a pause. Reads that were already being sent when
+// a quiet period began are what phase A has always waited for: a suite with
+// a slow reader and nobody else asking is not "being read", there is no
+// request to hold, and holding would only bring the commit forward to the
+// hold's cut — before the slow reader has had its quiet period (the review
+// of the 2026-11-15 fix found exactly that: two reads in flight when the
+// flip began, one of 1 s and one of 25 s, committed at 26 s, cut short).
+// Phase A waits such a suite out as it did before the fix: the commit comes
+// a quiet period after the slow read ends, with a hold of no length.
+//
+// AIDEV-NOTE: the second case pins "a request that arrived after the first
+// completion", not "a request that arrived after the flip began": the one
+// request during the flip is the first completion itself, and nothing
+// arrives after it.
+func TestFlip_ReadsAlreadyInFlightDoNotBreakAPause(t *testing.T) {
+	for name, early := range map[string]func(g *Gate){
+		"both reads in flight when the flip begins": func(g *Gate) {
+			tok := g.AnchorStart(bg, "k") // 0 s to 1 s
+			go func() { time.Sleep(time.Second); tok.Done() }()
+		},
+		"one request during the flip, then nobody": func(g *Gate) {
+			go func() { // 0.5 s to 0.55 s
+				time.Sleep(500 * time.Millisecond)
+				tok := g.AnchorStart(bg, "k")
+				time.Sleep(50 * time.Millisecond)
+				tok.Done()
+			}()
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				g := newTestGate(t)
+				cutShort := counterValue(t, "acu_flip_quiet_cut_short_total")
+				slow := g.AnchorStart(bg, "k") // 0 s to 25 s
+				go func() { time.Sleep(25 * time.Second); slow.Done() }()
+				early(g)
+				start := time.Now()
+				var committedAt time.Time
+				res, err := g.Flip(bg, "k", func() error { committedAt = time.Now(); return nil })
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, want := committedAt.Sub(start), 25*time.Second+testQuiet; got != want {
+					t.Fatalf("committed %v after the flip began, want %v (the slow read's end, then its quiet period); result %+v", got, want, res)
+				}
+				if res.Outcome != OutcomeHeld || res.PhaseA != 25*time.Second+testQuiet || res.HoldEnd != res.HoldStart || res.Waiters != 0 {
+					t.Fatalf("result = %+v, want phase A to wait the suite out and a hold of no length", res)
+				}
+				if got := counterValue(t, "acu_flip_quiet_cut_short_total") - cutShort; got != 0 {
+					t.Fatalf("acu_flip_quiet_cut_short_total rose by %v, want 0", got)
+				}
+			})
+		})
+	}
+}
+
 // Phase B is bounded by 20 s (spec §7 C8 "slow reader"): a read slower
 // than the hold (but faster than apt's timeout) is in flight when the
-// hold starts, so the suite never goes quiet. No other hold ended, so
+// hold starts, so the suite never goes quiet. The first read ends at 25 s;
+// the third, which starts at 40 s, is a new request after it and keeps the
+// suite from going quiet, so phase A gives up when it next wakes — as the
+// second read ends, at 45 s. No other hold ended, so
 // phase B (b) holds; the hold waits for local quiet only until HoldMax −
 // CommitMargin (15 s), then commits inside the hold and answers the held
 // requests from the new snapshot. The slow reader is the late reader: the
@@ -352,7 +507,7 @@ func TestFlip_SlowReaderCutsTheQuietShortInsideTheHold(t *testing.T) {
 		}
 		waited := make(chan time.Duration, 1)
 		go func() { // arrives during the hold
-			time.Sleep(70 * time.Second)
+			time.Sleep(55 * time.Second)
 			start := time.Now()
 			g.AnchorStart(bg, "k").Done()
 			waited <- time.Since(start)
@@ -367,8 +522,8 @@ func TestFlip_SlowReaderCutsTheQuietShortInsideTheHold(t *testing.T) {
 		if res.Outcome != OutcomeQuietCutShort || !res.Committed || res.HoldEnd.Sub(res.HoldStart) != HoldMax-CommitMargin {
 			t.Fatalf("result = %+v, want a hold that committed after %v, before the suite was quiet", res, HoldMax-CommitMargin)
 		}
-		if got := committedAt.Sub(start); got != PhaseAMax+HoldMax-CommitMargin {
-			t.Fatalf("committed %v after the start, want %v", got, PhaseAMax+HoldMax-CommitMargin)
+		if got, want := committedAt.Sub(start), 45*time.Second+HoldMax-CommitMargin; got != want {
+			t.Fatalf("committed %v after the start, want %v (the hold starts as the second read ends, at 45s, and is cut)", got, want)
 		}
 		if w := <-waited; w != 5*time.Second {
 			t.Fatalf("the held request waited %v, want 5s (until the commit at 15s into the hold)", w)
@@ -475,8 +630,13 @@ func TestFlip_SlowCommitEndsTheHoldAt20s(t *testing.T) {
 
 // One hold at a time, granted in request order; the next hold starts
 // when the previous one ends and commits no sooner than the quiet period
-// after that end. b's own readers stop at 55 s, so when its hold starts
-// (~70 s) only the cross-suite rule keeps it from committing at once:
+// after that end. Phase A's bound is shortened to 1 s, so that all three
+// flips are past it at once and queue for the token: with the production
+// bound a busy suite that finds another hold in its way waits in phase A
+// instead (TestFlip_BusySuiteStillWaitsOutAnotherSuitesHoldUnheld), and
+// the queue forms only when phase A (b) runs out or two flips leave phase
+// A at the same instant. b's own readers stop at 0.9 s, so when its hold
+// starts (~11 s) only the cross-suite rule keeps it from committing at once:
 // a's hold held requests, and clients released from it may still have
 // b's requests queued behind them (spec C8 phase B (b)). b's hold holds
 // nothing, so it starts no cross-suite quiet period (design note 17); c
@@ -485,13 +645,14 @@ func TestFlip_SlowCommitEndsTheHoldAt20s(t *testing.T) {
 func TestFlip_HoldsAreExclusiveFIFOAndQuietAfterEachOther(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		g := newTestGate(t)
+		g.phaseAMax = time.Second
 		var wg sync.WaitGroup
 		t0 := time.Now()
 		keys := []string{"a", "b", "c"}
 		for i, k := range keys {
-			until := t0.Add(120 * time.Second)
+			until := t0.Add(60 * time.Second)
 			if k == "b" {
-				until = t0.Add(55 * time.Second)
+				until = t0.Add(900 * time.Millisecond)
 			}
 			busyReaders(g, k, time.Duration(7*i)*time.Millisecond, 500*time.Millisecond, 50*time.Millisecond, until, &wg)
 		}
@@ -530,13 +691,18 @@ func TestFlip_PhaseAWaitsOutAnotherSuitesHold(t *testing.T) {
 		var wg sync.WaitGroup
 		busyReaders(g, "a", 0, 500*time.Millisecond, 50*time.Millisecond, time.Now().Add(90*time.Second), &wg)
 		time.Sleep(250 * time.Millisecond)
-		outA := flipAsync(bg, g, "a", noCommit) // holds from 60.25 s
-		time.Sleep(65 * time.Second)
+		outA := flipAsync(bg, g, "a", noCommit) // holds from 10.55 s to 20.55 s
+		time.Sleep(15 * time.Second)
+		bStart := time.Now()
 		resB, err := g.Flip(bg, "b", noCommit) // b is idle
 		if err != nil {
 			t.Fatal(err)
 		}
 		a := <-outA
+		if a.err != nil || a.res.Waiters == 0 || !bStart.After(a.res.HoldStart) || !bStart.Before(a.res.HoldEnd) {
+			t.Fatalf("a: %+v, %v; b started at %v; want b's flip to start during a hold of a's that held requests: the trace no longer overlaps what it tests",
+				a.res, a.err, bStart)
+		}
 		if !resB.HoldStart.Equal(a.res.HoldEnd.Add(testQuiet)) {
 			t.Errorf("b's hold started %v after a's ended, want exactly the quiet period (deferred minor C-4)",
 				resB.HoldStart.Sub(a.res.HoldEnd))
@@ -548,12 +714,61 @@ func TestFlip_PhaseAWaitsOutAnotherSuitesHold(t *testing.T) {
 	})
 }
 
+// Giving up on a busy suite's own quiet is not giving up on phase A (b): a
+// busy suite whose flip starts while another suite holds still waits,
+// without holding, until that hold has ended and its quiet period has
+// passed, and only then holds its own anchors. Holding straight after the
+// other hold would catch the clients that hold has just released a second
+// time, and so on down a queue of flips.
+//
+// AIDEV-NOTE: this pins the difference between "phase A stops waiting for a
+// busy suite's own quiet" (the rule) and "phase A ends for a busy suite"
+// (not the rule: b would take the token when a's hold ends and hold from
+// then).
+func TestFlip_BusySuiteStillWaitsOutAnotherSuitesHoldUnheld(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := newTestGate(t)
+		var wg sync.WaitGroup
+		until := time.Now().Add(60 * time.Second)
+		busyReaders(g, "a", 0, 500*time.Millisecond, 50*time.Millisecond, until, &wg)
+		busyReaders(g, "b", 7*time.Millisecond, 500*time.Millisecond, 50*time.Millisecond, until, &wg)
+		time.Sleep(250 * time.Millisecond)
+		outA := flipAsync(bg, g, "a", noCommit) // holds from 10.55 s to 20.55 s
+		time.Sleep(15 * time.Second)
+		bStart := time.Now()
+		resB, err := g.Flip(bg, "b", noCommit) // 15.25 s: a holds; b gives up on its own quiet at 25.557 s
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := <-outA
+		if a.err != nil || a.res.Outcome != OutcomeHeld || a.res.Waiters == 0 {
+			t.Fatalf("a: %+v, %v; want a hold that held requests", a.res, a.err)
+		}
+		if !bStart.Before(a.res.HoldEnd) {
+			t.Fatalf("b's flip started at %v, after a's hold ended (%v): the trace no longer overlaps what it tests", bStart, a.res.HoldEnd)
+		}
+		if !resB.HoldStart.Equal(a.res.HoldEnd.Add(testQuiet)) {
+			t.Errorf("b's hold started %v after a's ended, want exactly the quiet period: phase A (b) still waits without holding",
+				resB.HoldStart.Sub(a.res.HoldEnd))
+		}
+		if resB.TokenWait != 0 {
+			t.Errorf("b waited %v for the hold token, want none: it left phase A only once no hold was in the way", resB.TokenWait)
+		}
+		// b's last read before its hold is still being sent when it starts
+		// (50 ms), and the quiet period follows it.
+		if d := resB.HoldEnd.Sub(resB.HoldStart); d <= 0 || d > testQuiet+50*time.Millisecond {
+			t.Errorf("b held its anchors for %v, want at most the quiet period after its last read (b is busy)", d)
+		}
+		wg.Wait()
+	})
+}
+
 // Phase A (b) waits while another suite's hold is in progress, and must
 // wake the moment that hold ends (endHoldLocked broadcasts; final review,
 // concurrency Minor 3). a's hold holds nothing, so its end starts no
 // cross-suite quiet period (design note 17), and b — idle — commits at
-// once. Without the wake b would sleep to its 60 s cap and then hold its
-// clients; a's own readers cannot mask the bug here, because it has none.
+// once. Without the wake b would sleep to its 60 s cap; a's own readers
+// cannot mask the bug here, because it has none.
 func TestFlip_PhaseAWakesWhenAnotherSuitesHoldEnds(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		g := newTestGate(t)

@@ -212,22 +212,25 @@ func TestAdopter_DetachedFirstAdoptionComparesTheRelease(t *testing.T) {
 func TestAdopter_BarrierOutlivesTheAdoptionDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newBarrierRig(t, 10*time.Second, 0)
-		r.busyAnchor(45) // the last read ends at 44.5 s
+		// The first read ends at 0.5 s and the later ones break the quiet
+		// period it started, so the hold starts at 10.5 s — as the last
+		// read ends — and commits a quiet period later.
+		r.busyAnchor(11)
 		synctest.Wait()
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		start := time.Now()
 		if err := r.ad.runRequest(ctx, r.request("v1"), runHooks{stop: context.Background()}); err != nil {
 			t.Fatalf("an adoption whose deadline passed in the barrier failed: %v", err)
 		}
-		if d := time.Since(start); d != 54500*time.Millisecond {
-			t.Fatalf("committed after %v, want 54.5s (the last read ends at 44.5s, then the quiet period)", d)
+		if d := time.Since(start); d != 20500*time.Millisecond {
+			t.Fatalf("committed after %v, want 20.5s (the hold starts at 10.5s, then the quiet period), past the 15s deadline", d)
 		}
 		if !errors.Is(ctx.Err(), context.DeadlineExceeded) || r.current(t) == 0 {
 			t.Fatalf("ctx err %v, current %d; want the deadline passed and a commit", ctx.Err(), r.current(t))
 		}
 		ends := logRecords(t, r.logs, "adoption_finished")
-		if len(ends) != 1 || ends[0]["outcome"] != "success" || ends[0]["duration_seconds"] != 54.5 || ends[0]["phase_seconds"].(map[string]any)["flip_wait"] != 54.5 {
+		if len(ends) != 1 || ends[0]["outcome"] != "success" || ends[0]["duration_seconds"] != 20.5 || ends[0]["phase_seconds"].(map[string]any)["flip_wait"] != 20.5 {
 			t.Fatalf("deadline during barrier misreported: %v", ends)
 		}
 	})
@@ -296,17 +299,20 @@ func TestAdoption_ShutdownAfterTheDeadlineStillAbandonsTheCommit(t *testing.T) {
 func TestAdoption_HeartbeatRunsUntilTheCommit(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newBarrierRig(t, 10*time.Second, 10*time.Second)
-		r.busyAnchor(45)
+		// The barrier commits at 20.5 s (the hold starts at 10.5 s, as in
+		// TestAdopter_BarrierOutlivesTheAdoptionDeadline), so the ticker's
+		// heartbeats at 10 s and 20 s both come after the 5 s deadline.
+		r.busyAnchor(11)
 		synctest.Wait()
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		start := wallclock.Unix()
 		if err := r.ad.runRequest(ctx, r.request("v1"), runHooks{stop: context.Background()}); err != nil {
 			t.Fatal(err)
 		}
 		hb := readHeartbeatAtDirect(t, filepath.Join(r.c.Dir(), "cache.db"), r.current(t))
-		if hb < start+40 {
-			t.Fatalf("last heartbeat %ds after the start; the ticker stopped at the 20s deadline", hb-start)
+		if hb < start+20 {
+			t.Fatalf("last heartbeat %ds after the start; the ticker stopped at the 5s deadline", hb-start)
 		}
 	})
 }
@@ -775,9 +781,11 @@ func TestSimCapacity_TheBarrierHoldsTheGlobalSlotWithinItsBound(t *testing.T) {
 		chk, stop := startSched(t, Config{Cache: c, Fetcher: up, HostLimiter: hostsem.New(8), Refresh: refresh,
 			Cooldown: time.Minute, Adopter: ad, AdoptionRing: ring, Logger: simtest.DiscardLogger(),
 			rand: func() float64 { return 0.5 }})
-		// 30 s after the first tick both busy adoptions are in the barrier:
+		// 5 s after the first tick both busy adoptions are in the barrier
+		// (the first of them commits about 20 s after it: a quiet period
+		// until phase A gives up on a busy suite, and one more in the hold):
 		// two global slots held, no host slot, the third suite not admitted.
-		time.Sleep(tick + 30*time.Second + 7*time.Millisecond)
+		time.Sleep(tick + 5*time.Second + 7*time.Millisecond)
 		members.mu.Lock()
 		_, admitted := members.started["queued"]
 		members.mu.Unlock()

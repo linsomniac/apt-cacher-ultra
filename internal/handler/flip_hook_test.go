@@ -92,7 +92,7 @@ func TestServeHTTP_HeldAnchorIsAnsweredFromTheNewSnapshot(t *testing.T) {
 		wg.Add(1)
 		go func() { // a client every 500 ms, each reading the anchor over 1 s
 			defer wg.Done()
-			for time.Since(t0) < 75*time.Second {
+			for time.Since(t0) < 25*time.Second {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
@@ -106,10 +106,13 @@ func TestServeHTTP_HeldAnchorIsAnsweredFromTheNewSnapshot(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			time.Sleep(250 * time.Millisecond)
-			s.adopt(suite, 2) // phase A gives up at 60.25 s; the hold commits once quiet
+			// The first read to end during the flip ends at 1 s: phase A
+			// gives up a quiet period later, at 11 s; the hold commits once
+			// quiet, at about 21.5 s.
+			s.adopt(suite, 2)
 			committedAt = time.Now()
 		}()
-		time.Sleep(65 * time.Second) // the hold is in progress
+		time.Sleep(15 * time.Second) // the hold is in progress
 		sent := time.Now()
 		gen, code := s.get(suite+"/InRelease", 0)
 		answered := time.Now()
@@ -268,7 +271,7 @@ func TestHandler_CloseReleasesHeldAnchorRequests(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for time.Since(t0) < 65*time.Second {
+			for time.Since(t0) < 12*time.Second {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
@@ -281,9 +284,9 @@ func TestHandler_CloseReleasesHeldAnchorRequests(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			time.Sleep(250 * time.Millisecond)
-			s.adopt(suite, 2) // holds from 60.25 s, commits at 71 s
+			s.adopt(suite, 2) // holds from 11 s, commits at about 21.5 s
 		}()
-		time.Sleep(66 * time.Second)
+		time.Sleep(13 * time.Second)
 		answered := make(chan time.Time, 1)
 		go func() {
 			s.get(suite+"/InRelease", 0) // held

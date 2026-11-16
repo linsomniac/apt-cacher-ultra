@@ -92,10 +92,33 @@ func recordHeld(serve simtest.ServeFunc, held *[]time.Duration) simtest.ServeFun
 	}
 }
 
+// newQueueingGate is a gate whose phase A is bounded by the quiet period
+// instead of PhaseAMax, so that busy suites flipping together are all past
+// phase A at once and queue for the hold token — the state the token and
+// phase B (b) exist for.
+//
+// AIDEV-NOTE: with the production bound that state needs phase A (b) to
+// run out (60 s behind other suites' holds, as the last suite of
+// TestSimFlip_FiveBusySuitesAtTheProductionBound does) or two flips to
+// leave phase A at the same instant: since the 2026-11-15
+// publication-delay fix a busy suite leaves phase A as soon as it has
+// broken a quiet period, the first one takes the token, and the others
+// wait in phase A for its hold and the quiet period after it. The traces
+// below script the queue itself, so they shorten the bound; their instants
+// are the original ones (phase A bounded by 60 s for every suite) less
+// 50 s.
+func newQueueingGate(t *testing.T) *Gate {
+	t.Helper()
+	g := newTestGate(t)
+	g.phaseAMax = testQuiet
+	return g
+}
+
 // Spec C8 DoD, the review's overlapping-hold trace (plan review
 // 2026-10-05, finding 6) in a shared-queue simulation. Busy suites A and
-// B leave phase A at its cap 0.1 s apart. An apt client whose single
-// queue serves both (mirror mode) receives A's old anchor just before
+// B leave phase A at its cap 0.1 s apart (newQueueingGate). An apt client
+// whose single queue serves both (mirror mode) receives A's old anchor
+// just before
 // A's hold starts, spends 0.3 s on an unrelated download, then asks for
 // B's anchor with A's index queued behind it. Under concurrent holds B
 // would hold that request until B committed — after A — and the client
@@ -106,26 +129,26 @@ func recordHeld(serve simtest.ServeFunc, held *[]time.Duration) simtest.ServeFun
 // clients run across both flips.
 func TestSimFlip_OverlappingHoldTrace(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		g := newTestGate(t)
+		g := newQueueingGate(t)
 		m := newGateModel(g, "A", "B")
 		fast := m.serve(map[string]time.Duration{"A": 50 * time.Millisecond, "B": 50 * time.Millisecond})
 		l := simtest.NewLedger(testQuiet)
 		var wg sync.WaitGroup
 		t0 := time.Now()
-		until := t0.Add(111 * time.Second)
+		until := t0.Add(61 * time.Second)
 		clients(l, fast, []simtest.Request{{Suite: "A", Anchor: true}}, 0, 11*time.Millisecond, 500*time.Millisecond, until, &wg)
 		clients(l, fast, []simtest.Request{{Suite: "B", Anchor: true}}, 10000, 261*time.Millisecond, 500*time.Millisecond, until, &wg)
 		wg.Add(1)
 		go func() { // another B reader, on a slow link, still reading when B's hold could start
 			defer wg.Done()
-			time.Sleep(60950 * time.Millisecond)
+			time.Sleep(10950 * time.Millisecond)
 			l.RunUpdate(1000, []simtest.Request{{Suite: "B", Anchor: true}}, m.serve(map[string]time.Duration{"B": 6 * time.Second}))
 		}()
 		var traceHeld []time.Duration
 		wg.Add(1)
 		go func() { // the trace client
 			defer wg.Done()
-			time.Sleep(60853 * time.Millisecond)
+			time.Sleep(10853 * time.Millisecond)
 			l.RunUpdate(2000, []simtest.Request{{Suite: "A", Anchor: true}, {Filler: 300 * time.Millisecond}, {Suite: "B", Anchor: true}},
 				recordHeld(fast, &traceHeld))
 		}()
@@ -134,7 +157,7 @@ func TestSimFlip_OverlappingHoldTrace(t *testing.T) {
 			if i%2 == 1 {
 				q[0], q[1] = q[1], q[0]
 			}
-			at := 51*time.Second + 7*time.Millisecond + time.Duration(i)*300*time.Millisecond
+			at := time.Second + 7*time.Millisecond + time.Duration(i)*300*time.Millisecond
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -152,8 +175,8 @@ func TestSimFlip_OverlappingHoldTrace(t *testing.T) {
 		if a.err != nil || b.err != nil || a.res.Outcome != OutcomeHeld || b.res.Outcome != OutcomeHeld {
 			t.Fatalf("A: %+v, %v; B: %+v, %v; want both held", a.res, a.err, b.res, b.err)
 		}
-		if a.res.PhaseA != PhaseAMax || b.res.PhaseA != PhaseAMax {
-			t.Fatalf("phase A took %v and %v, want both to give up at %v (busy suites)", a.res.PhaseA, b.res.PhaseA, PhaseAMax)
+		if a.res.PhaseA != testQuiet || b.res.PhaseA != testQuiet {
+			t.Fatalf("phase A took %v and %v, want both to give up at %v (busy suites)", a.res.PhaseA, b.res.PhaseA, testQuiet)
 		}
 		if b.res.HoldStart != a.res.HoldEnd || b.at.Sub(a.res.HoldEnd) < testQuiet {
 			t.Fatalf("B held from %v and committed %v after A's hold ended (%v); want B's hold to start then and commit a quiet period later",
@@ -179,8 +202,9 @@ func TestSimFlip_OverlappingHoldTrace(t *testing.T) {
 // Spec C8 phase B (b): a client released from another suite's hold may
 // still have this suite's index queued behind the held request. A's hold
 // lasts ~13.5 s (its readers are on 4 s links), ending normally before
-// HoldMax − CommitMargin; B leaves phase A at its cap while A holds, so it
-// waits for the token. The trace client gets B's old anchor, then waits in
+// HoldMax − CommitMargin; B leaves phase A at its cap while A holds
+// (newQueueingGate), so it waits for the token. The trace client gets B's
+// old anchor, then waits in
 // A's hold for A's anchor, then asks for B's index — 14.5 s after B's
 // anchor arrived, 10.5 s of that in A's hold. B is quiet by itself when
 // A's hold ends; only the cross-suite quiet period keeps it from committing
@@ -188,26 +212,26 @@ func TestSimFlip_OverlappingHoldTrace(t *testing.T) {
 // its two index requests are shown to fall inside the window.
 func TestSimFlip_ClientReleasedFromAnotherHold(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		g := newTestGate(t)
+		g := newQueueingGate(t)
 		m := newGateModel(g, "A", "B")
 		serve := m.serve(map[string]time.Duration{"A": 4 * time.Second, "B": 50 * time.Millisecond})
 		l := simtest.NewLedger(testQuiet)
 		trace := simtest.NewLedger(testQuiet)
 		var wg sync.WaitGroup
 		t0 := time.Now()
-		clients(l, serve, []simtest.Request{{Suite: "A", Anchor: true}}, 0, 11*time.Millisecond, 500*time.Millisecond, t0.Add(100*time.Second), &wg)
-		clients(l, serve, []simtest.Request{{Suite: "B", Anchor: true}}, 10000, 261*time.Millisecond, 500*time.Millisecond, t0.Add(61*time.Second), &wg)
+		clients(l, serve, []simtest.Request{{Suite: "A", Anchor: true}}, 0, 11*time.Millisecond, 500*time.Millisecond, t0.Add(50*time.Second), &wg)
+		clients(l, serve, []simtest.Request{{Suite: "B", Anchor: true}}, 10000, 261*time.Millisecond, 500*time.Millisecond, t0.Add(11*time.Second), &wg)
 		var traceHeld []time.Duration
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			time.Sleep(64003 * time.Millisecond)
+			time.Sleep(14003 * time.Millisecond)
 			trace.RunUpdate(2000, []simtest.Request{{Suite: "B", Anchor: true}, {Suite: "A", Anchor: true}}, recordHeld(serve, &traceHeld))
 		}()
 		time.Sleep(time.Second + 3*time.Millisecond) // both suites are busy by now
-		outA := flipAsync(bg, g, "A", m.commit("A")) // holds from 61.003 s to 74.511 s
+		outA := flipAsync(bg, g, "A", m.commit("A")) // holds from 11.003 s to 24.511 s
 		time.Sleep(2 * time.Second)
-		outB := flipAsync(bg, g, "B", m.commit("B")) // phase A gives up at 63.003 s, while A holds
+		outB := flipAsync(bg, g, "B", m.commit("B")) // phase A gives up at 13.003 s, while A holds
 		a, b := <-outA, <-outB
 		wg.Wait()
 
@@ -233,7 +257,9 @@ func TestSimFlip_ClientReleasedFromAnotherHold(t *testing.T) {
 // Final review (concurrency Important 1), the expiry trace in the model: a
 // busy suite (an anchor every 500 ms over a 1 s link) and one slow reader
 // that starts 0.5 s before the hold, with a commit that takes 200 ms, as a
-// real one does. The slow reader keeps the suite from going quiet before
+// real one does. The suite breaks the quiet period its first read during
+// the flip started (it ended at 1.011 s), so phase A gives up at 11.011 s.
+// The slow reader keeps the suite from going quiet before
 // HoldMax − CommitMargin (its completion is less than a quiet period
 // before it, or still to come); phase B (b) holds, so the hold commits
 // then, inside the hold, and answers the ~31 held requests from the new
@@ -260,7 +286,7 @@ func TestSimFlip_SlowReaderCommitsInsideTheHold(t *testing.T) {
 				wg.Add(1)
 				go func() { // starts half a second before the hold
 					defer wg.Done()
-					time.Sleep(60503 * time.Millisecond)
+					time.Sleep(10511 * time.Millisecond)
 					l.RunUpdate(1000, []simtest.Request{{Suite: "K", Anchor: true}}, m.serve(map[string]time.Duration{"K": tc.slow}))
 				}()
 				time.Sleep(time.Second + 3*time.Millisecond) // the suite is busy by now
@@ -277,8 +303,8 @@ func TestSimFlip_SlowReaderCommitsInsideTheHold(t *testing.T) {
 						break
 					}
 				}
-				if err != nil || res.Outcome != OutcomeQuietCutShort || res.PhaseA != PhaseAMax {
-					t.Errorf("Flip = %+v, %v; want phase A to give up at its cap and the hold to commit before the suite was quiet", res, err)
+				if err != nil || res.Outcome != OutcomeQuietCutShort || res.PhaseA != testQuiet+8*time.Millisecond {
+					t.Errorf("Flip = %+v, %v; want phase A to give up a quiet period after the first read ended and the hold to commit before the suite was quiet", res, err)
 				}
 				if d := res.HoldEnd.Sub(res.HoldStart); d != HoldMax-CommitMargin+commitLatency || d > HoldMax {
 					t.Errorf("the hold lasted %v, want %v (the commit starts at HoldMax − CommitMargin), within %v",
@@ -310,8 +336,9 @@ func TestSimFlip_SlowReaderCommitsInsideTheHold(t *testing.T) {
 // reads in flight plus the 10 s quiet period (~19 s); each hold therefore
 // commits at HoldMax − CommitMargin (15 s), and its commit takes 200 ms,
 // as a real one does. No suite is ever quiet, so all five leave phase A
-// at its 60 s cap, 20 ms apart, and queue for the hold token in that
-// order. Holds never overlap and last at most 20 s; four fit inside the
+// at its cap, 20 ms apart, and queue for the hold token in that order
+// (newQueueingGate: phase A bounded by the quiet period). Holds never
+// overlap and last at most 20 s; four fit inside the
 // fifth's 60 s token wait (three holds of under 20 s cannot exhaust a
 // fourth's wait); the fifth commits unheld at its deadline and is counted;
 // held suites never straddle (their late readers fetched their indexes
@@ -319,7 +346,7 @@ func TestSimFlip_SlowReaderCommitsInsideTheHold(t *testing.T) {
 func TestSimFlip_FiveBusySuites(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const commitLatency = 200 * time.Millisecond
-		g := newTestGate(t)
+		g := newQueueingGate(t)
 		keys := []string{"s1", "s2", "s3", "s4", "s5"}
 		m := newGateModel(g, keys...)
 		slow := map[string]time.Duration{}
@@ -331,7 +358,7 @@ func TestSimFlip_FiveBusySuites(t *testing.T) {
 		skipped := counterValue(t, "acu_flip_hold_skipped_total")
 		var wg sync.WaitGroup
 		t0 := time.Now()
-		until := t0.Add(150 * time.Second)
+		until := t0.Add(100 * time.Second)
 		for i, k := range keys {
 			clients(l, serve, []simtest.Request{{Suite: k, Anchor: true}}, 10000*i, time.Duration(13*(i+1))*time.Millisecond, 500*time.Millisecond, until, &wg)
 		}
@@ -368,9 +395,9 @@ func TestSimFlip_FiveBusySuites(t *testing.T) {
 		if r5.Outcome != OutcomeHoldSkipped || r5.TokenWait != TokenWaitMax || !r5.HoldStart.IsZero() {
 			t.Fatalf("s5: %+v, want an unheld commit after the %v token wait", r5, TokenWaitMax)
 		}
-		if got := ends[4].Sub(starts[4]); got != PhaseAMax+TokenWaitMax+commitLatency {
+		if got := ends[4].Sub(starts[4]); got != testQuiet+TokenWaitMax+commitLatency {
 			t.Errorf("s5's commit returned %v after its flip started, want %v (its commit started at its token deadline)",
-				got, PhaseAMax+TokenWaitMax+commitLatency)
+				got, testQuiet+TokenWaitMax+commitLatency)
 		}
 		if got := ends[4].Sub(res[0].HoldStart) - commitLatency; got > TokenWaitMax+HoldMax {
 			t.Errorf("s5 committed %v after the first hold started, want at most %v", got, TokenWaitMax+HoldMax)
@@ -392,6 +419,94 @@ func TestSimFlip_FiveBusySuites(t *testing.T) {
 			}
 		}
 		for _, k := range keys[:4] {
+			if gens := l.AnchorGens(k); !slices.Equal(gens, []string{"1", "2"}) {
+				t.Errorf("%s: clients saw anchor generations %v, want [1 2]", k, gens)
+			}
+		}
+	})
+}
+
+// The same five busy suites with the production bounds (the 2026-11-15
+// publication-delay fix). s1 breaks the quiet period its first read during
+// the flip started and leaves phase A after 18 s, not 60; the others find
+// its hold in their way and wait in phase A — for that hold and the quiet
+// period after it, then for whichever of them took the token next — until
+// phase A (b) runs out for the last ones, which then queue. Nothing waits
+// 60 s for the token any more: all five commit inside a hold, none unheld,
+// and no client straddles. Which suite takes the token when several leave
+// phase A at the same instant is not specified, so the holds are checked in
+// the order they ran.
+func TestSimFlip_FiveBusySuitesAtTheProductionBound(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const commitLatency = 200 * time.Millisecond
+		g := newTestGate(t)
+		keys := []string{"s1", "s2", "s3", "s4", "s5"}
+		m := newGateModel(g, keys...)
+		slow := map[string]time.Duration{}
+		for _, k := range keys {
+			slow[k] = 9020 * time.Millisecond
+		}
+		serve := m.serve(slow)
+		l := simtest.NewLedger(testQuiet)
+		var wg sync.WaitGroup
+		t0 := time.Now()
+		until := t0.Add(150 * time.Second)
+		for i, k := range keys {
+			clients(l, serve, []simtest.Request{{Suite: k, Anchor: true}}, 10000*i, time.Duration(13*(i+1))*time.Millisecond, 500*time.Millisecond, until, &wg)
+		}
+		outs := make([]<-chan flipOut, len(keys))
+		starts := make([]time.Time, len(keys))
+		for i, k := range keys {
+			time.Sleep(time.Until(t0.Add(time.Second + time.Duration(5+20*i)*time.Millisecond))) // the suites are busy by now
+			starts[i] = time.Now()
+			outs[i] = flipAsync(bg, g, k, m.commitAfter(k, commitLatency))
+		}
+		res := make([]Result, len(keys))
+		for i, ch := range outs {
+			o := <-ch
+			if o.err != nil {
+				t.Fatalf("%s: %v", keys[i], o.err)
+			}
+			res[i] = o.res
+			if d := o.at.Sub(starts[i]) - commitLatency; d > PhaseAMax+TokenWaitMax+HoldMax {
+				t.Errorf("%s's flip took %v plus its commit, more than %v", keys[i], d, PhaseAMax+TokenWaitMax+HoldMax)
+			}
+		}
+		wg.Wait()
+
+		// s1's first read to complete after its flip began (at 1.005 s)
+		// started at 0.013 s and ended at 9.033 s.
+		if want := 18028 * time.Millisecond; res[0].PhaseA != want || res[0].TokenWait != 0 {
+			t.Errorf("s1: phase A took %v and the token wait %v, want %v (a quiet period after its first read ended) and none", res[0].PhaseA, res[0].TokenWait, want)
+		}
+		for i := 1; i < len(keys); i++ {
+			if !res[i].HoldStart.After(res[0].HoldEnd) {
+				t.Errorf("%s held from %v, want after s1's hold ended (%v)", keys[i], res[i].HoldStart, res[0].HoldEnd)
+			}
+		}
+		byStart := slices.Clone(res)
+		slices.SortFunc(byStart, func(a, b Result) int { return a.HoldStart.Compare(b.HoldStart) })
+		for i, r := range byStart {
+			if r.Outcome != OutcomeQuietCutShort || !r.Committed {
+				t.Errorf("hold %d: outcome %s, want quiet_cut_short (a commit inside the hold)", i, r.Outcome)
+			}
+			if d := r.HoldEnd.Sub(r.HoldStart); d <= 0 || d > HoldMax {
+				t.Errorf("hold %d lasted %v, want (0, %v]", i, d, HoldMax)
+			}
+			if r.TokenWait >= TokenWaitMax {
+				t.Errorf("hold %d waited %v for the token, want less than %v", i, r.TokenWait, TokenWaitMax)
+			}
+			if i > 0 && r.HoldStart.Before(byStart[i-1].HoldEnd) {
+				t.Errorf("holds overlap: one from %v, the one before until %v", r.HoldStart, byStart[i-1].HoldEnd)
+			}
+		}
+		if st := g.Stats(); st.Holds != 5 || st.HoldsSkipped != 0 || st.HoldsExpired != 0 || st.QuietCutShort != 5 {
+			t.Errorf("stats = %+v, want 5 holds (all cut short), none skipped, none expired", st)
+		}
+		if s := l.Straddles(); len(s) != 0 {
+			t.Errorf("%d straddles, first %+v", len(s), s[0])
+		}
+		for _, k := range keys {
 			if gens := l.AnchorGens(k); !slices.Equal(gens, []string{"1", "2"}) {
 				t.Errorf("%s: clients saw anchor generations %v, want [1 2]", k, gens)
 			}
