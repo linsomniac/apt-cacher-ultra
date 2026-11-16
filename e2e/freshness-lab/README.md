@@ -402,3 +402,79 @@ latency assertion measured p99 117 ms against a 100 ms threshold during the
 combined run; rerunning that test alone passed. This host also had another
 full race-test run in progress, so the wall-clock experiments should not be
 treated as a controlled throughput benchmark. No timing thresholds were relaxed.
+
+## Release 1.0.5 versus main (2026-11-15)
+
+The same client-driven burst was rerun against clean source archives of
+release **1.0.5** (`563c5719b9db`) and **main** (`5b65bd96e967`). Both were built
+with Go 1.26.8 and `CGO_ENABLED=0`, then run sequentially in the same isolated
+Docker image. [v1.0.5-main-measurements.json](v1.0.5-main-measurements.json)
+records full commit IDs, binary/image/harness hashes, options, per-suite
+observations, installation checks, host resource samples and raw-log locations.
+
+The workload matches the earlier continuous-client burst: six suites on two
+hostnames, 5,000 catalog rows per index, eight real hot packages per suite,
+150 ms metadata-member delays and 30 s package delays. APT polls every five
+seconds after each update completes. Both use a 60 s cooldown and two adoption
+slots; refresh and warming settings are omitted to exercise each binary's
+defaults (15 min/5 min for 1.0.5; 1 min/15 s for main).
+
+| Time from measured upstream publication | 1.0.5 | Main |
+| --- | ---: | ---: |
+| All six changes detected | 47.75 s | 52.91 s |
+| First updated package candidates visible to APT | 306.01 s (5m06s) | 53.16 s |
+| All six snapshots published | 789.04 s (13m09s) | 163.39 s (2m43s) |
+| All 48 updated candidates visible to APT | **794.15 s (13m14s)** | **163.69 s (2m44s)** |
+
+Main reduced full client-visible delay by **630.46 s (10m30s), or 79.4%**,
+giving **4.85 times faster** availability in this run. Each run successfully
+installed all 48 packages at versions 1.0, 1.1 and 2.0 and verified the installed
+versions and version files. Neither run had an APT failure or measured
+WARN/ERROR daemon log. The two disposable containers exited successfully.
+
+The main difference was after detection. On 1.0.5, the first pair of suites
+began warming at 49 s, the second at 305 s and the last at 548 s. Each downloaded
+its eight packages serially; the interval from warming start through commit
+was 240–253 s per suite. Its last snapshot stayed unpublished for more than
+twelve minutes despite detection in under one minute.
+
+Main's warming phases each lasted about 15 s. All new packages remained
+unwarmed: each suite recorded four in-flight downloads canceled by the budget
+and four unattempted downloads. Those cancellations were logged at INFO, and
+publication succeeded. Five suites spent about 4.3 s in `flip_wait`; the last
+spent 68.23 s there under continued client polling. The INFO watchdog identified
+that suite and phase while it waited. Commit phases were below 0.4 s in this
+run, whereas the earlier shared-host run had substantially longer database and
+barrier waits. This variation is another reason to avoid a five-minute SLA.
+
+### Slower setup transition on main
+
+The harness also exposes a separate result worth following up. Before the
+measured burst, it publishes version 1.1 to establish adopted snapshots and
+hot-package history. This transition has **no injected origin delays**, but
+starts with pass-through or only partially adopted cache state. All 1.1
+candidates became visible in **64.28 s on 1.0.5 versus 394.46 s (6m34s) on
+main**. Main's logs show five queued first adoptions and one update of an
+existing snapshot, with approximately 67–70 s of `flip_wait` per adoption.
+The queue and consistency barrier deserve a separate cold-cache investigation.
+This setup observation is retained in the JSON; it is not included in the
+established-snapshot 2.0 burst times above.
+
+These are one run per version on a shared development host, not production
+percentiles. Client requests trigger freshness checks, so this comparison does
+not isolate the periodic scheduler. The fixture uses canonical indexes without
+Acquire-By-Hash. Injected download delays are removed before the final install;
+successful installation demonstrates on-demand retrieval, not download latency
+during an ongoing outage or offline availability at publication. The source
+and harness were unchanged for these runs; only these experiment records were
+added to the repository.
+
+To repeat the workload with a freshly built static binary and a new output
+directory:
+
+```sh
+ACU_FRESHNESS_LAB_SKIP_BUILD=1 bash e2e/freshness-lab/run.sh \
+  /path/to/acu-binary /tmp/acu-new-comparison-run \
+  --burst --suites 6 --hosts 2 --catalog-size 5000 --hot-count 8 \
+  --member-delay 0.15 --deb-delay 30 --max-wait 1800
+```

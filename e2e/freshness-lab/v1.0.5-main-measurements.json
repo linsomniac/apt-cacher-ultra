@@ -1,0 +1,1257 @@
+{
+  "experiment": "v1.0.5 versus main: six-suite client-driven adoption burst",
+  "provenance": {
+    "started_at": "2026-11-15T19:11:34.898127+00:00",
+    "root": "/tmp/acu-105-main-20261115-121134",
+    "sources": {
+      "v1.0.5": {
+        "ref": "1.0.5",
+        "commit": "563c5719b9db94b803dbed14e50ab5512ef95408",
+        "source": "/tmp/acu-105-main-20261115-121134/source-v1.0.5",
+        "binary": "/tmp/acu-105-main-20261115-121134/acu-v1.0.5",
+        "binary_sha256": "29861063d69f973ea3de6fc7b861cc1cc7f12fb2129330acb7e7d5856959d09e",
+        "binary_version": "v1.0.5-freshness-lab"
+      },
+      "main": {
+        "ref": "main",
+        "commit": "5b65bd96e967f80061a7d6e562a8743e2608f3e6",
+        "source": "/tmp/acu-105-main-20261115-121134/source-main",
+        "binary": "/tmp/acu-105-main-20261115-121134/acu-main",
+        "binary_sha256": "c39755c511ea59fcc3b7cd357a917e55435db8a88ca5f456c58b14282caed0f8",
+        "binary_version": "main-freshness-lab"
+      }
+    },
+    "harness": {
+      "lab.py": "0d7d5d0d5ab27d99ea31203c14f1545a5464bbafc0cfa6c2dbeccb9b1aea1f74",
+      "burst.py": "ed4b45780e80e1d51c84228b274c2fbd8f906b4a2d25e8c370f16cc8b182fb50",
+      "run.sh": "b48732e6f6e55dc2f324912e5961b4bcb39e2d92d3feaca06063b23012bba2d2",
+      "Dockerfile": "f91714eea08e039a236a3b5e8a44bdb10cc812a035bd4ccac51efd3fe9ec6b80"
+    },
+    "compiler": "go version go1.26.8 linux/amd64",
+    "platform": "Linux-6.18.56-x86_64-with-glibc2.44",
+    "image": "sha256:24fa402ece3dc39775ce21fc76dc55cbf1b5beab02755381ba52933b5dee7fa6",
+    "build": {
+      "CGO_ENABLED": "0",
+      "GOCACHE": "/tmp/acu-go-cache",
+      "flags": [
+        "-buildvcs=false"
+      ],
+      "version_suffix": "-freshness-lab"
+    },
+    "options": [
+      "--burst",
+      "--suites",
+      "6",
+      "--hosts",
+      "2",
+      "--catalog-size",
+      "5000",
+      "--hot-count",
+      "8",
+      "--member-delay",
+      "0.15",
+      "--deb-delay",
+      "30",
+      "--max-wait",
+      "1800"
+    ],
+    "runs": [
+      {
+        "label": "v1.0.5",
+        "output": "/tmp/acu-105-main-20261115-121134/burst-v1.0.5",
+        "command": [
+          "bash",
+          "/tmp/acu-105-main-20261115-121134/source-main/e2e/freshness-lab/run.sh",
+          "/tmp/acu-105-main-20261115-121134/acu-v1.0.5",
+          "/tmp/acu-105-main-20261115-121134/burst-v1.0.5",
+          "--burst",
+          "--suites",
+          "6",
+          "--hosts",
+          "2",
+          "--catalog-size",
+          "5000",
+          "--hot-count",
+          "8",
+          "--member-delay",
+          "0.15",
+          "--deb-delay",
+          "30",
+          "--max-wait",
+          "1800"
+        ],
+        "started_at": "2026-11-15T19:12:23.095563+00:00",
+        "resources_before": {
+          "loadavg": [
+            4.7802734375,
+            6.59716796875,
+            6.892578125
+          ],
+          "cpu_count": 12,
+          "cpu_pressure": "some avg10=0.41 avg60=2.70 avg300=4.00 total=17210290863\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+          "io_pressure": "some avg10=0.29 avg60=4.51 avg300=8.49 total=36698637792\nfull avg10=0.22 avg60=3.53 avg300=6.31 total=31567061522",
+          "memory_pressure": "some avg10=0.00 avg60=0.16 avg300=0.22 total=1979451699\nfull avg10=0.00 avg60=0.15 avg300=0.17 total=1791183109"
+        },
+        "exit_code": 0,
+        "finished_at": "2026-11-15T19:27:40.590498+00:00",
+        "wall_seconds": 917.4946390488185,
+        "resources_after": {
+          "loadavg": [
+            2.7783203125,
+            5.0048828125,
+            6.640625
+          ],
+          "cpu_count": 12,
+          "cpu_pressure": "some avg10=0.00 avg60=0.10 avg300=2.58 total=17258931554\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+          "io_pressure": "some avg10=5.20 avg60=2.04 avg300=4.27 total=36764048769\nfull avg10=5.13 avg60=1.98 avg300=3.29 total=31613847189",
+          "memory_pressure": "some avg10=0.00 avg60=0.00 avg300=0.21 total=1985122010\nfull avg10=0.00 avg60=0.00 avg300=0.15 total=1795428883"
+        },
+        "summary": {
+          "scenario": "burst",
+          "options": {
+            "scenario": "baseline",
+            "cooldown": "60s",
+            "refresh": null,
+            "prefetch_budget": null,
+            "delay": 90,
+            "client_interval": 5,
+            "max_wait": 1800.0,
+            "burst": true,
+            "suites": 6,
+            "hosts": 2,
+            "catalog_size": 5000,
+            "hot_count": 8,
+            "member_delay": 0.15,
+            "deb_delay": 30.0,
+            "periodic_only": false
+          },
+          "suites": {
+            "trixie-security": {
+              "freshness_check_seconds": 47.753002,
+              "adoption_success_seconds": 302.926876
+            },
+            "suite-01": {
+              "freshness_check_seconds": 47.753198,
+              "adoption_success_seconds": 301.793126
+            },
+            "suite-03": {
+              "freshness_check_seconds": 47.753309,
+              "adoption_success_seconds": 546.021236
+            },
+            "suite-02": {
+              "freshness_check_seconds": 47.753473,
+              "adoption_success_seconds": 546.669768
+            },
+            "suite-04": {
+              "freshness_check_seconds": 47.75363,
+              "adoption_success_seconds": 788.641792
+            },
+            "suite-05": {
+              "freshness_check_seconds": 47.754854,
+              "adoption_success_seconds": 789.037044
+            }
+          },
+          "publication_to_client_seconds": 794.149482,
+          "slowest_publication_seconds": 789.037044,
+          "caveat": "Synthetic burst with larger catalogs, not a full Debian/Ubuntu mirror or an SLA."
+        }
+      },
+      {
+        "label": "main",
+        "output": "/tmp/acu-105-main-20261115-121134/burst-main",
+        "command": [
+          "bash",
+          "/tmp/acu-105-main-20261115-121134/source-main/e2e/freshness-lab/run.sh",
+          "/tmp/acu-105-main-20261115-121134/acu-main",
+          "/tmp/acu-105-main-20261115-121134/burst-main",
+          "--burst",
+          "--suites",
+          "6",
+          "--hosts",
+          "2",
+          "--catalog-size",
+          "5000",
+          "--hot-count",
+          "8",
+          "--member-delay",
+          "0.15",
+          "--deb-delay",
+          "30",
+          "--max-wait",
+          "1800"
+        ],
+        "started_at": "2026-11-15T19:27:40.593705+00:00",
+        "resources_before": {
+          "loadavg": [
+            2.7783203125,
+            5.0048828125,
+            6.640625
+          ],
+          "cpu_count": 12,
+          "cpu_pressure": "some avg10=0.00 avg60=0.10 avg300=2.58 total=17258931554\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+          "io_pressure": "some avg10=5.20 avg60=2.04 avg300=4.27 total=36764048797\nfull avg10=5.13 avg60=1.98 avg300=3.29 total=31613847217",
+          "memory_pressure": "some avg10=0.00 avg60=0.00 avg300=0.21 total=1985122010\nfull avg10=0.00 avg60=0.00 avg300=0.15 total=1795428883"
+        },
+        "exit_code": 0,
+        "finished_at": "2026-11-15T19:37:53.258007+00:00",
+        "wall_seconds": 612.6639935409185,
+        "resources_after": {
+          "loadavg": [
+            1.14990234375,
+            1.72216796875,
+            4.087890625
+          ],
+          "cpu_count": 12,
+          "cpu_pressure": "some avg10=0.00 avg60=0.00 avg300=0.31 total=17260261242\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+          "io_pressure": "some avg10=4.27 avg60=0.94 avg300=0.92 total=36768199642\nfull avg10=4.13 avg60=0.91 avg300=0.79 total=31617856692",
+          "memory_pressure": "some avg10=0.00 avg60=0.00 avg300=0.00 total=1985197730\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=1795503941"
+        },
+        "summary": {
+          "scenario": "burst",
+          "options": {
+            "scenario": "baseline",
+            "cooldown": "60s",
+            "refresh": null,
+            "prefetch_budget": null,
+            "delay": 90,
+            "client_interval": 5,
+            "max_wait": 1800.0,
+            "burst": true,
+            "suites": 6,
+            "hosts": 2,
+            "catalog_size": 5000,
+            "hot_count": 8,
+            "member_delay": 0.15,
+            "deb_delay": 30.0,
+            "periodic_only": false
+          },
+          "suites": {
+            "trixie-security": {
+              "freshness_check_seconds": 27.255695,
+              "adoption_started_seconds": 27.255763,
+              "adoption_success_seconds": 47.898649,
+              "attempts": [
+                {
+                  "seconds": 47.898779,
+                  "outcome": "success",
+                  "adoption_id": "HTG3COAQRAMV4NDI3G3EGXPCJ3"
+                }
+              ],
+              "adoption_finished_seconds": 47.898779,
+              "first_seen_seconds": 21,
+              "release_age_seconds": 48,
+              "hot": {
+                "hot_count": 8,
+                "hot_fetched": 0,
+                "hot_failed": 4,
+                "hot_unattempted": 4
+              },
+              "phases": {
+                "commit": 0.360165229,
+                "finalize": 8.3082e-05,
+                "flip_wait": 4.26861696,
+                "hot_prefetch": 15.00153603,
+                "members": 0.327225213,
+                "parse_indexes": 0.676933057,
+                "prepare": 0.007881087,
+                "prepare_commit": 0.000280747,
+                "verify": 0.000196608
+              },
+              "outcome": "success"
+            },
+            "suite-01": {
+              "freshness_check_seconds": 37.538184,
+              "adoption_started_seconds": 37.538312,
+              "adoption_success_seconds": 58.182868,
+              "attempts": [
+                {
+                  "seconds": 58.182992,
+                  "outcome": "success",
+                  "adoption_id": "7OWFMVSHJMRTGRBSO66X25TNLU"
+                }
+              ],
+              "adoption_finished_seconds": 58.182992,
+              "first_seen_seconds": 20,
+              "release_age_seconds": 58,
+              "hot": {
+                "hot_count": 8,
+                "hot_fetched": 0,
+                "hot_failed": 4,
+                "hot_unattempted": 4
+              },
+              "phases": {
+                "commit": 0.281716815,
+                "finalize": 7.1972e-05,
+                "flip_wait": 4.308148495,
+                "hot_prefetch": 15.001639758,
+                "members": 0.358691041,
+                "parse_indexes": 0.678444764,
+                "prepare": 0.015511841,
+                "prepare_commit": 0.000141709,
+                "verify": 0.000242282
+              },
+              "outcome": "success"
+            },
+            "suite-02": {
+              "freshness_check_seconds": 42.256746,
+              "adoption_started_seconds": 47.906556,
+              "adoption_success_seconds": 68.470632,
+              "attempts": [
+                {
+                  "seconds": 68.47107,
+                  "outcome": "success",
+                  "adoption_id": "HFYDTNDFYH2LPZPJV7G5U4HMVN"
+                }
+              ],
+              "adoption_finished_seconds": 68.47107,
+              "first_seen_seconds": 26,
+              "release_age_seconds": 68,
+              "hot": {
+                "hot_count": 8,
+                "hot_fetched": 0,
+                "hot_failed": 4,
+                "hot_unattempted": 4
+              },
+              "phases": {
+                "commit": 0.283658547,
+                "finalize": 0.000272712,
+                "flip_wait": 4.348752946,
+                "hot_prefetch": 15.003197904,
+                "members": 0.355268996,
+                "parse_indexes": 0.565939851,
+                "prepare": 0.005636307,
+                "prepare_commit": 0.000607767,
+                "verify": 0.000279111
+              },
+              "outcome": "success"
+            },
+            "suite-04": {
+              "freshness_check_seconds": 42.257985,
+              "adoption_started_seconds": 68.479396,
+              "adoption_success_seconds": 89.089431,
+              "attempts": [
+                {
+                  "seconds": 89.089548,
+                  "outcome": "success",
+                  "adoption_id": "O7DUC336JJAD7SAFJ4WZ5YGQHZ"
+                }
+              ],
+              "adoption_finished_seconds": 89.089548,
+              "first_seen_seconds": 47,
+              "release_age_seconds": 89,
+              "hot": {
+                "hot_count": 8,
+                "hot_fetched": 0,
+                "hot_failed": 4,
+                "hot_unattempted": 4
+              },
+              "phases": {
+                "commit": 0.284184645,
+                "finalize": 8.1039e-05,
+                "flip_wait": 4.301574138,
+                "hot_prefetch": 15.002074266,
+                "members": 0.346013487,
+                "parse_indexes": 0.670431369,
+                "prepare": 0.00518783,
+                "prepare_commit": 0.000226854,
+                "verify": 0.000185405
+              },
+              "outcome": "success"
+            },
+            "suite-03": {
+              "freshness_check_seconds": 52.904304,
+              "adoption_started_seconds": 58.194794,
+              "adoption_success_seconds": 78.803238,
+              "attempts": [
+                {
+                  "seconds": 78.803353,
+                  "outcome": "success",
+                  "adoption_id": "Q246BJTQXYZ5FY5KRWFRDSN7DL"
+                }
+              ],
+              "adoption_finished_seconds": 78.803353,
+              "first_seen_seconds": 26,
+              "release_age_seconds": 79,
+              "hot": {
+                "hot_count": 8,
+                "hot_fetched": 0,
+                "hot_failed": 4,
+                "hot_unattempted": 4
+              },
+              "phases": {
+                "commit": 0.270936045,
+                "finalize": 6.1916e-05,
+                "flip_wait": 4.307395558,
+                "hot_prefetch": 15.003710835,
+                "members": 0.339291316,
+                "parse_indexes": 0.679673738,
+                "prepare": 0.006510615,
+                "prepare_commit": 0.000625553,
+                "verify": 0.000207701
+              },
+              "outcome": "success"
+            },
+            "suite-05": {
+              "freshness_check_seconds": 52.906608,
+              "adoption_started_seconds": 78.812656,
+              "adoption_success_seconds": 163.38679,
+              "attempts": [
+                {
+                  "seconds": 163.387168,
+                  "outcome": "success",
+                  "adoption_id": "DU7AAQ4FOEKSM3IDP5225NWQHN"
+                }
+              ],
+              "adoption_finished_seconds": 163.387168,
+              "first_seen_seconds": 110,
+              "release_age_seconds": 163,
+              "hot": {
+                "hot_count": 8,
+                "hot_fetched": 0,
+                "hot_failed": 4,
+                "hot_unattempted": 4
+              },
+              "phases": {
+                "commit": 0.263913692,
+                "finalize": 0.000273717,
+                "flip_wait": 68.229769353,
+                "hot_prefetch": 15.001787636,
+                "members": 0.358997636,
+                "parse_indexes": 0.710998005,
+                "prepare": 0.0076266960000000005,
+                "prepare_commit": 0.000230649,
+                "verify": 0.000190294
+              },
+              "outcome": "success"
+            }
+          },
+          "publication_to_client_seconds": 163.69435099999998,
+          "slowest_publication_seconds": 163.38679,
+          "caveat": "Synthetic burst with larger catalogs, not a full Debian/Ubuntu mirror or an SLA."
+        }
+      }
+    ]
+  },
+  "runs": [
+    {
+      "label": "v1.0.5",
+      "source_commit": "563c5719b9db94b803dbed14e50ab5512ef95408",
+      "raw_output": "/tmp/acu-105-main-20261115-121134/burst-v1.0.5",
+      "environment": {
+        "t": 35.198112,
+        "unix": 1794769978.7740374,
+        "event": "environment",
+        "scenario": "baseline",
+        "binary_sha256": "29861063d69f973ea3de6fc7b861cc1cc7f12fb2129330acb7e7d5856959d09e",
+        "binary_version": "v1.0.5-freshness-lab",
+        "apt_version": "apt 3.0.4 (amd64)",
+        "options": {
+          "scenario": "baseline",
+          "cooldown": "60s",
+          "refresh": null,
+          "prefetch_budget": null,
+          "delay": 90,
+          "client_interval": 5,
+          "max_wait": 1800.0,
+          "burst": true,
+          "suites": 6,
+          "hosts": 2,
+          "catalog_size": 5000,
+          "hot_count": 8,
+          "member_delay": 0.15,
+          "deb_delay": 30.0,
+          "periodic_only": false
+        }
+      },
+      "publication_unix": 1794770056.255377,
+      "bootstrap": {
+        "publication_to_all_candidates_seconds": 64.284324,
+        "publication_t": 41.602428,
+        "all_candidates_t": 105.886752,
+        "description": "Setup transition from initial pass-through/partially adopted cache to adopted 1.1; no injected delays. Not the warmed 2.0 burst.",
+        "adoptions": []
+      },
+      "summary": {
+        "scenario": "burst",
+        "options": {
+          "scenario": "baseline",
+          "cooldown": "60s",
+          "refresh": null,
+          "prefetch_budget": null,
+          "delay": 90,
+          "client_interval": 5,
+          "max_wait": 1800.0,
+          "burst": true,
+          "suites": 6,
+          "hosts": 2,
+          "catalog_size": 5000,
+          "hot_count": 8,
+          "member_delay": 0.15,
+          "deb_delay": 30.0,
+          "periodic_only": false
+        },
+        "suites": {
+          "trixie-security": {
+            "freshness_check_seconds": 47.753002,
+            "adoption_success_seconds": 302.926876
+          },
+          "suite-01": {
+            "freshness_check_seconds": 47.753198,
+            "adoption_success_seconds": 301.793126
+          },
+          "suite-03": {
+            "freshness_check_seconds": 47.753309,
+            "adoption_success_seconds": 546.021236
+          },
+          "suite-02": {
+            "freshness_check_seconds": 47.753473,
+            "adoption_success_seconds": 546.669768
+          },
+          "suite-04": {
+            "freshness_check_seconds": 47.75363,
+            "adoption_success_seconds": 788.641792
+          },
+          "suite-05": {
+            "freshness_check_seconds": 47.754854,
+            "adoption_success_seconds": 789.037044
+          }
+        },
+        "publication_to_client_seconds": 794.149482,
+        "slowest_publication_seconds": 789.037044,
+        "caveat": "Synthetic burst with larger catalogs, not a full Debian/Ubuntu mirror or an SLA."
+      },
+      "suites": {
+        "trixie-security": {
+          "change_detected_seconds": 47.753002,
+          "hot_prefetch_started_seconds": 49.4306,
+          "hot_count": 8,
+          "hot_budget_seconds": 300,
+          "hot_complete_log_seconds": 302.926698,
+          "hot_result": {
+            "hot_count": 8,
+            "fetched": 8,
+            "failed": 0,
+            "mismatched": 0,
+            "unattempted": 0
+          },
+          "published_seconds": 302.926876,
+          "client_visible_seconds": 306.009065
+        },
+        "suite-01": {
+          "change_detected_seconds": 47.753198,
+          "hot_prefetch_started_seconds": 49.417693,
+          "hot_count": 8,
+          "hot_budget_seconds": 300,
+          "hot_complete_log_seconds": 301.792988,
+          "hot_result": {
+            "hot_count": 8,
+            "fetched": 8,
+            "failed": 0,
+            "mismatched": 0,
+            "unattempted": 0
+          },
+          "published_seconds": 301.793126,
+          "client_visible_seconds": 306.009065
+        },
+        "suite-03": {
+          "change_detected_seconds": 47.753309,
+          "hot_prefetch_started_seconds": 305.337489,
+          "hot_count": 8,
+          "hot_budget_seconds": 300,
+          "hot_complete_log_seconds": 546.021099,
+          "hot_result": {
+            "hot_count": 8,
+            "fetched": 8,
+            "failed": 0,
+            "mismatched": 0,
+            "unattempted": 0
+          },
+          "published_seconds": 546.021236,
+          "client_visible_seconds": 551.450095
+        },
+        "suite-02": {
+          "change_detected_seconds": 47.753473,
+          "hot_prefetch_started_seconds": 305.399002,
+          "hot_count": 8,
+          "hot_budget_seconds": 300,
+          "hot_complete_log_seconds": 546.66964,
+          "hot_result": {
+            "hot_count": 8,
+            "fetched": 8,
+            "failed": 0,
+            "mismatched": 0,
+            "unattempted": 0
+          },
+          "published_seconds": 546.669768,
+          "client_visible_seconds": 551.450095
+        },
+        "suite-04": {
+          "change_detected_seconds": 47.75363,
+          "hot_prefetch_started_seconds": 548.201101,
+          "hot_count": 8,
+          "hot_budget_seconds": 300,
+          "hot_complete_log_seconds": 788.641653,
+          "hot_result": {
+            "hot_count": 8,
+            "fetched": 8,
+            "failed": 0,
+            "mismatched": 0,
+            "unattempted": 0
+          },
+          "published_seconds": 788.641792,
+          "client_visible_seconds": 794.149482
+        },
+        "suite-05": {
+          "change_detected_seconds": 47.754854,
+          "hot_prefetch_started_seconds": 548.304122,
+          "hot_count": 8,
+          "hot_budget_seconds": 300,
+          "hot_complete_log_seconds": 789.036909,
+          "hot_result": {
+            "hot_count": 8,
+            "fetched": 8,
+            "failed": 0,
+            "mismatched": 0,
+            "unattempted": 0
+          },
+          "published_seconds": 789.037044,
+          "client_visible_seconds": 794.149482
+        }
+      },
+      "installations": [
+        {
+          "version": "1.0",
+          "count": 48,
+          "t": 41.354416
+        },
+        {
+          "version": "1.1",
+          "count": 48,
+          "t": 112.427131
+        },
+        {
+          "version": "2.0",
+          "count": 48,
+          "t": 913.305843
+        }
+      ],
+      "measured_client_observations": 148,
+      "first_suite_client_seconds": 306.009065,
+      "all_packages_client_seconds": 794.149482,
+      "last_snapshot_seconds": 789.037044,
+      "warnings_by_message": {},
+      "evidence_sha256": {
+        "summary.json": "6978e3adc296d77b24f576074ee38ba47dac1cac20847e49efa03fab5d17e422",
+        "timeline.jsonl": "06b355466338193895bf28f28803f710f5a73921440997e49fa477e9ef4fd337",
+        "acu.jsonl": "c5b996f5befc2b52ceba726c7b07ffbbf85650973dca6235e2543d1ed44ef162",
+        "config.toml": "1946819f051893ed4da21561e62f929e82d48341d2b1d841c4c0b3aebadf8627",
+        "install-1.0.log": "24e6043237a3fd996572e7a02d1532d185b6aece031d110ec5de3afe1783b784",
+        "install-1.1.log": "ad96a73fe8eb57db9bab66105174df848c4a3d431bb1adcc10cc83de843277fa",
+        "install-2.0.log": "f4d7f460f052af17d1d08c42e41a8324d6f1af46bdefe9799f3ecc308d2720ae"
+      }
+    },
+    {
+      "label": "main",
+      "source_commit": "5b65bd96e967f80061a7d6e562a8743e2608f3e6",
+      "raw_output": "/tmp/acu-105-main-20261115-121134/burst-main",
+      "environment": {
+        "t": 33.380601,
+        "unix": 1794770894.3187482,
+        "event": "environment",
+        "scenario": "baseline",
+        "binary_sha256": "c39755c511ea59fcc3b7cd357a917e55435db8a88ca5f456c58b14282caed0f8",
+        "binary_version": "main-freshness-lab",
+        "apt_version": "apt 3.0.4 (amd64)",
+        "options": {
+          "scenario": "baseline",
+          "cooldown": "60s",
+          "refresh": null,
+          "prefetch_budget": null,
+          "delay": 90,
+          "client_interval": 5,
+          "max_wait": 1800.0,
+          "burst": true,
+          "suites": 6,
+          "hosts": 2,
+          "catalog_size": 5000,
+          "hot_count": 8,
+          "member_delay": 0.15,
+          "deb_delay": 30.0,
+          "periodic_only": false
+        }
+      },
+      "publication_unix": 1794771302.4933975,
+      "bootstrap": {
+        "publication_to_all_candidates_seconds": 394.462036,
+        "publication_t": 40.591773,
+        "all_candidates_t": 435.053809,
+        "description": "Setup transition from initial pass-through/partially adopted cache to adopted 1.1; no injected delays. Not the warmed 2.0 burst.",
+        "adoptions": [
+          {
+            "seconds": 78.964178,
+            "suite_path": "/debian-security/dists/suite-02",
+            "previous_snapshot_id": 0,
+            "trigger_source": "queued",
+            "trigger_reason": "first_adoption",
+            "phase_seconds": {
+              "commit": 0.230274024,
+              "finalize": 0.000107008,
+              "flip_wait": 69.85451518,
+              "hot_prefetch": 0.000124402,
+              "members": 0.035536026,
+              "parse_indexes": 0.615855629,
+              "prepare": 0.007000966999999999,
+              "prepare_commit": 0.000123838,
+              "verify": 0.000141026
+            },
+            "hot_count": 0,
+            "outcome": "success"
+          },
+          {
+            "seconds": 120.916821,
+            "suite_path": "/debian-security/dists/trixie-security",
+            "previous_snapshot_id": 1,
+            "trigger_source": "periodic",
+            "trigger_reason": "changed",
+            "phase_seconds": {
+              "commit": 0.257300003,
+              "finalize": 7.185e-05,
+              "flip_wait": 66.782109511,
+              "hot_prefetch": 0.036807918,
+              "members": 0.038238143,
+              "parse_indexes": 0.569774856,
+              "prepare": 0.012861934,
+              "prepare_commit": 0.000151239,
+              "verify": 0.00018319
+            },
+            "hot_count": 8,
+            "outcome": "success"
+          },
+          {
+            "seconds": 189.124813,
+            "suite_path": "/debian-security/dists/suite-01",
+            "previous_snapshot_id": 0,
+            "trigger_source": "queued",
+            "trigger_reason": "first_adoption",
+            "phase_seconds": {
+              "commit": 0.201733757,
+              "finalize": 6.4473e-05,
+              "flip_wait": 67.351455777,
+              "hot_prefetch": 0.000125296,
+              "members": 0.035834921,
+              "parse_indexes": 0.608031436,
+              "prepare": 0.005216057,
+              "prepare_commit": 0.000122691,
+              "verify": 0.000167834
+            },
+            "hot_count": 0,
+            "outcome": "success"
+          },
+          {
+            "seconds": 257.351926,
+            "suite_path": "/debian-security/dists/suite-04",
+            "previous_snapshot_id": 0,
+            "trigger_source": "queued",
+            "trigger_reason": "first_adoption",
+            "phase_seconds": {
+              "commit": 0.264957457,
+              "finalize": 0.00032266,
+              "flip_wait": 67.320286756,
+              "hot_prefetch": 0.000146603,
+              "members": 0.039494644,
+              "parse_indexes": 0.585976165,
+              "prepare": 0.005260199,
+              "prepare_commit": 0.000138923,
+              "verify": 0.000162387
+            },
+            "hot_count": 0,
+            "outcome": "success"
+          },
+          {
+            "seconds": 325.936264,
+            "suite_path": "/debian-security/dists/suite-03",
+            "previous_snapshot_id": 0,
+            "trigger_source": "queued",
+            "trigger_reason": "first_adoption",
+            "phase_seconds": {
+              "commit": 0.242316522,
+              "finalize": 9.5537e-05,
+              "flip_wait": 67.593721651,
+              "hot_prefetch": 0.000142884,
+              "members": 0.035808665,
+              "parse_indexes": 0.697865147,
+              "prepare": 0.007618821,
+              "prepare_commit": 0.000151699,
+              "verify": 0.000268305
+            },
+            "hot_count": 0,
+            "outcome": "success"
+          },
+          {
+            "seconds": 394.197116,
+            "suite_path": "/debian-security/dists/suite-05",
+            "previous_snapshot_id": 0,
+            "trigger_source": "queued",
+            "trigger_reason": "first_adoption",
+            "phase_seconds": {
+              "commit": 0.231205855,
+              "finalize": 8.1747e-05,
+              "flip_wait": 67.29759553,
+              "hot_prefetch": 0.00013987,
+              "members": 0.040696282,
+              "parse_indexes": 0.679777414,
+              "prepare": 0.005361269,
+              "prepare_commit": 0.000145674,
+              "verify": 0.000188397
+            },
+            "hot_count": 0,
+            "outcome": "success"
+          }
+        ]
+      },
+      "summary": {
+        "scenario": "burst",
+        "options": {
+          "scenario": "baseline",
+          "cooldown": "60s",
+          "refresh": null,
+          "prefetch_budget": null,
+          "delay": 90,
+          "client_interval": 5,
+          "max_wait": 1800.0,
+          "burst": true,
+          "suites": 6,
+          "hosts": 2,
+          "catalog_size": 5000,
+          "hot_count": 8,
+          "member_delay": 0.15,
+          "deb_delay": 30.0,
+          "periodic_only": false
+        },
+        "suites": {
+          "trixie-security": {
+            "freshness_check_seconds": 27.255695,
+            "adoption_started_seconds": 27.255763,
+            "adoption_success_seconds": 47.898649,
+            "attempts": [
+              {
+                "seconds": 47.898779,
+                "outcome": "success",
+                "adoption_id": "HTG3COAQRAMV4NDI3G3EGXPCJ3"
+              }
+            ],
+            "adoption_finished_seconds": 47.898779,
+            "first_seen_seconds": 21,
+            "release_age_seconds": 48,
+            "hot": {
+              "hot_count": 8,
+              "hot_fetched": 0,
+              "hot_failed": 4,
+              "hot_unattempted": 4
+            },
+            "phases": {
+              "commit": 0.360165229,
+              "finalize": 8.3082e-05,
+              "flip_wait": 4.26861696,
+              "hot_prefetch": 15.00153603,
+              "members": 0.327225213,
+              "parse_indexes": 0.676933057,
+              "prepare": 0.007881087,
+              "prepare_commit": 0.000280747,
+              "verify": 0.000196608
+            },
+            "outcome": "success"
+          },
+          "suite-01": {
+            "freshness_check_seconds": 37.538184,
+            "adoption_started_seconds": 37.538312,
+            "adoption_success_seconds": 58.182868,
+            "attempts": [
+              {
+                "seconds": 58.182992,
+                "outcome": "success",
+                "adoption_id": "7OWFMVSHJMRTGRBSO66X25TNLU"
+              }
+            ],
+            "adoption_finished_seconds": 58.182992,
+            "first_seen_seconds": 20,
+            "release_age_seconds": 58,
+            "hot": {
+              "hot_count": 8,
+              "hot_fetched": 0,
+              "hot_failed": 4,
+              "hot_unattempted": 4
+            },
+            "phases": {
+              "commit": 0.281716815,
+              "finalize": 7.1972e-05,
+              "flip_wait": 4.308148495,
+              "hot_prefetch": 15.001639758,
+              "members": 0.358691041,
+              "parse_indexes": 0.678444764,
+              "prepare": 0.015511841,
+              "prepare_commit": 0.000141709,
+              "verify": 0.000242282
+            },
+            "outcome": "success"
+          },
+          "suite-02": {
+            "freshness_check_seconds": 42.256746,
+            "adoption_started_seconds": 47.906556,
+            "adoption_success_seconds": 68.470632,
+            "attempts": [
+              {
+                "seconds": 68.47107,
+                "outcome": "success",
+                "adoption_id": "HFYDTNDFYH2LPZPJV7G5U4HMVN"
+              }
+            ],
+            "adoption_finished_seconds": 68.47107,
+            "first_seen_seconds": 26,
+            "release_age_seconds": 68,
+            "hot": {
+              "hot_count": 8,
+              "hot_fetched": 0,
+              "hot_failed": 4,
+              "hot_unattempted": 4
+            },
+            "phases": {
+              "commit": 0.283658547,
+              "finalize": 0.000272712,
+              "flip_wait": 4.348752946,
+              "hot_prefetch": 15.003197904,
+              "members": 0.355268996,
+              "parse_indexes": 0.565939851,
+              "prepare": 0.005636307,
+              "prepare_commit": 0.000607767,
+              "verify": 0.000279111
+            },
+            "outcome": "success"
+          },
+          "suite-04": {
+            "freshness_check_seconds": 42.257985,
+            "adoption_started_seconds": 68.479396,
+            "adoption_success_seconds": 89.089431,
+            "attempts": [
+              {
+                "seconds": 89.089548,
+                "outcome": "success",
+                "adoption_id": "O7DUC336JJAD7SAFJ4WZ5YGQHZ"
+              }
+            ],
+            "adoption_finished_seconds": 89.089548,
+            "first_seen_seconds": 47,
+            "release_age_seconds": 89,
+            "hot": {
+              "hot_count": 8,
+              "hot_fetched": 0,
+              "hot_failed": 4,
+              "hot_unattempted": 4
+            },
+            "phases": {
+              "commit": 0.284184645,
+              "finalize": 8.1039e-05,
+              "flip_wait": 4.301574138,
+              "hot_prefetch": 15.002074266,
+              "members": 0.346013487,
+              "parse_indexes": 0.670431369,
+              "prepare": 0.00518783,
+              "prepare_commit": 0.000226854,
+              "verify": 0.000185405
+            },
+            "outcome": "success"
+          },
+          "suite-03": {
+            "freshness_check_seconds": 52.904304,
+            "adoption_started_seconds": 58.194794,
+            "adoption_success_seconds": 78.803238,
+            "attempts": [
+              {
+                "seconds": 78.803353,
+                "outcome": "success",
+                "adoption_id": "Q246BJTQXYZ5FY5KRWFRDSN7DL"
+              }
+            ],
+            "adoption_finished_seconds": 78.803353,
+            "first_seen_seconds": 26,
+            "release_age_seconds": 79,
+            "hot": {
+              "hot_count": 8,
+              "hot_fetched": 0,
+              "hot_failed": 4,
+              "hot_unattempted": 4
+            },
+            "phases": {
+              "commit": 0.270936045,
+              "finalize": 6.1916e-05,
+              "flip_wait": 4.307395558,
+              "hot_prefetch": 15.003710835,
+              "members": 0.339291316,
+              "parse_indexes": 0.679673738,
+              "prepare": 0.006510615,
+              "prepare_commit": 0.000625553,
+              "verify": 0.000207701
+            },
+            "outcome": "success"
+          },
+          "suite-05": {
+            "freshness_check_seconds": 52.906608,
+            "adoption_started_seconds": 78.812656,
+            "adoption_success_seconds": 163.38679,
+            "attempts": [
+              {
+                "seconds": 163.387168,
+                "outcome": "success",
+                "adoption_id": "DU7AAQ4FOEKSM3IDP5225NWQHN"
+              }
+            ],
+            "adoption_finished_seconds": 163.387168,
+            "first_seen_seconds": 110,
+            "release_age_seconds": 163,
+            "hot": {
+              "hot_count": 8,
+              "hot_fetched": 0,
+              "hot_failed": 4,
+              "hot_unattempted": 4
+            },
+            "phases": {
+              "commit": 0.263913692,
+              "finalize": 0.000273717,
+              "flip_wait": 68.229769353,
+              "hot_prefetch": 15.001787636,
+              "members": 0.358997636,
+              "parse_indexes": 0.710998005,
+              "prepare": 0.0076266960000000005,
+              "prepare_commit": 0.000230649,
+              "verify": 0.000190294
+            },
+            "outcome": "success"
+          }
+        },
+        "publication_to_client_seconds": 163.69435099999998,
+        "slowest_publication_seconds": 163.38679,
+        "caveat": "Synthetic burst with larger catalogs, not a full Debian/Ubuntu mirror or an SLA."
+      },
+      "suites": {
+        "trixie-security": {
+          "change_detected_seconds": 27.255695,
+          "hot_prefetch_started_seconds": 28.269902,
+          "hot_count": 8,
+          "hot_budget_seconds": 15,
+          "hot_complete_log_seconds": 43.26946,
+          "hot_result": {
+            "hot_count": 8,
+            "fetched": 0,
+            "failed": 4,
+            "mismatched": 0,
+            "unattempted": 4
+          },
+          "published_seconds": 47.898649,
+          "phase_seconds": {
+            "commit": 0.360165229,
+            "finalize": 8.3082e-05,
+            "flip_wait": 4.26861696,
+            "hot_prefetch": 15.00153603,
+            "members": 0.327225213,
+            "parse_indexes": 0.676933057,
+            "prepare": 0.007881087,
+            "prepare_commit": 0.000280747,
+            "verify": 0.000196608
+          },
+          "outcome": "success",
+          "client_visible_seconds": 53.155395
+        },
+        "suite-01": {
+          "change_detected_seconds": 37.538184,
+          "hot_prefetch_started_seconds": 38.592757,
+          "hot_count": 8,
+          "hot_budget_seconds": 15,
+          "hot_complete_log_seconds": 53.592674,
+          "hot_result": {
+            "hot_count": 8,
+            "fetched": 0,
+            "failed": 4,
+            "mismatched": 0,
+            "unattempted": 4
+          },
+          "published_seconds": 58.182868,
+          "phase_seconds": {
+            "commit": 0.281716815,
+            "finalize": 7.1972e-05,
+            "flip_wait": 4.308148495,
+            "hot_prefetch": 15.001639758,
+            "members": 0.358691041,
+            "parse_indexes": 0.678444764,
+            "prepare": 0.015511841,
+            "prepare_commit": 0.000141709,
+            "verify": 0.000242282
+          },
+          "outcome": "success",
+          "client_visible_seconds": 63.50985
+        },
+        "suite-02": {
+          "change_detected_seconds": 42.256746,
+          "hot_prefetch_started_seconds": 48.83545,
+          "hot_count": 8,
+          "hot_budget_seconds": 15,
+          "hot_complete_log_seconds": 63.837167,
+          "hot_result": {
+            "hot_count": 8,
+            "fetched": 0,
+            "failed": 4,
+            "mismatched": 0,
+            "unattempted": 4
+          },
+          "published_seconds": 68.470632,
+          "phase_seconds": {
+            "commit": 0.283658547,
+            "finalize": 0.000272712,
+            "flip_wait": 4.348752946,
+            "hot_prefetch": 15.003197904,
+            "members": 0.355268996,
+            "parse_indexes": 0.565939851,
+            "prepare": 0.005636307,
+            "prepare_commit": 0.000607767,
+            "verify": 0.000279111
+          },
+          "outcome": "success",
+          "client_visible_seconds": 73.751857
+        },
+        "suite-04": {
+          "change_detected_seconds": 42.257985,
+          "hot_prefetch_started_seconds": 69.503114,
+          "hot_count": 8,
+          "hot_budget_seconds": 15,
+          "hot_complete_log_seconds": 84.50328,
+          "hot_result": {
+            "hot_count": 8,
+            "fetched": 0,
+            "failed": 4,
+            "mismatched": 0,
+            "unattempted": 4
+          },
+          "published_seconds": 89.089431,
+          "phase_seconds": {
+            "commit": 0.284184645,
+            "finalize": 8.1039e-05,
+            "flip_wait": 4.301574138,
+            "hot_prefetch": 15.002074266,
+            "members": 0.346013487,
+            "parse_indexes": 0.670431369,
+            "prepare": 0.00518783,
+            "prepare_commit": 0.000226854,
+            "verify": 0.000185405
+          },
+          "outcome": "success",
+          "client_visible_seconds": 89.483928
+        },
+        "suite-03": {
+          "change_detected_seconds": 52.904304,
+          "hot_prefetch_started_seconds": 59.22224,
+          "hot_count": 8,
+          "hot_budget_seconds": 15,
+          "hot_complete_log_seconds": 74.224578,
+          "hot_result": {
+            "hot_count": 8,
+            "fetched": 0,
+            "failed": 4,
+            "mismatched": 0,
+            "unattempted": 4
+          },
+          "published_seconds": 78.803238,
+          "phase_seconds": {
+            "commit": 0.270936045,
+            "finalize": 6.1916e-05,
+            "flip_wait": 4.307395558,
+            "hot_prefetch": 15.003710835,
+            "members": 0.339291316,
+            "parse_indexes": 0.679673738,
+            "prepare": 0.006510615,
+            "prepare_commit": 0.000625553,
+            "verify": 0.000207701
+          },
+          "outcome": "success",
+          "client_visible_seconds": 84.107
+        },
+        "suite-05": {
+          "change_detected_seconds": 52.906608,
+          "hot_prefetch_started_seconds": 79.89247,
+          "hot_count": 8,
+          "hot_budget_seconds": 15,
+          "hot_complete_log_seconds": 94.892269,
+          "hot_result": {
+            "hot_count": 8,
+            "fetched": 0,
+            "failed": 4,
+            "mismatched": 0,
+            "unattempted": 4
+          },
+          "published_seconds": 163.38679,
+          "phase_seconds": {
+            "commit": 0.263913692,
+            "finalize": 0.000273717,
+            "flip_wait": 68.229769353,
+            "hot_prefetch": 15.001787636,
+            "members": 0.358997636,
+            "parse_indexes": 0.710998005,
+            "prepare": 0.0076266960000000005,
+            "prepare_commit": 0.000230649,
+            "verify": 0.000190294
+          },
+          "outcome": "success",
+          "client_visible_seconds": 163.694351
+        }
+      },
+      "installations": [
+        {
+          "version": "1.0",
+          "count": 48,
+          "t": 40.368494
+        },
+        {
+          "version": "1.1",
+          "count": 48,
+          "t": 441.299999
+        },
+        {
+          "version": "2.0",
+          "count": 48,
+          "t": 611.590533
+        }
+      ],
+      "measured_client_observations": 26,
+      "first_suite_client_seconds": 53.155395,
+      "all_packages_client_seconds": 163.69435099999998,
+      "last_snapshot_seconds": 163.38679,
+      "warnings_by_message": {},
+      "evidence_sha256": {
+        "summary.json": "5c865d8164e0ae695416baa73bd49824a8f694f97419a3395d4175ee5d606f80",
+        "timeline.jsonl": "88c6e839d17da07b5b89a0d14522d73dcf02d90b52f4c78e1f0207cfa3a4663d",
+        "acu.jsonl": "8dce17f09cf05b0bea9d04e6be9687222aadd41e07acaed812781bd418052a63",
+        "config.toml": "1946819f051893ed4da21561e62f929e82d48341d2b1d841c4c0b3aebadf8627",
+        "install-1.0.log": "1936c537fc58c881a5edbdcd9f5c4327c372166d8c550954707e447d67cd1458",
+        "install-1.1.log": "482c80351d04f97428a6a37d5afc08c8d6923685bcff62bb8043bf6db97a0c6f",
+        "install-2.0.log": "e1c968411e99ac1c34588bd763ad6d4a8f5fcbe6a2811ccc3253be760878a32a"
+      }
+    }
+  ],
+  "caveats": [
+    "One run per version on a shared development host; not performance percentiles or an availability SLA.",
+    "Synthetic signed repository: six suites, two hostnames served by one loopback origin, 5000 filler rows per index, 48 real packages, 12 index variants per suite with six unique blobs.",
+    "150 ms index delay and 30 s package delay apply only to the measured generation. Package delays are removed before the final installation, so this measures candidate visibility, not installation latency under a continuing outage.",
+    "The same client polls with apt-get update every five seconds after each update finishes; updates themselves may wait. The fixture uses canonical indexes, without Acquire-By-Hash.",
+    "Refresh and warming budget are omitted from configuration: each binary uses its own defaults. Cooldown is 60 seconds and max concurrent adoptions is two for both.",
+    "Client requests can trigger checks; this is not a measurement of the periodic scheduler in isolation.",
+    "Main has a canonical-index publication barrier that v1.0.5 lacks. The comparison measures the complete versions, not just one change.",
+    "Daemon event timestamps are taken by the harness when logs arrive. Per-suite client visibility is the first completed APT observation with all eight relevant packages at version 2.0."
+  ],
+  "comparison": {
+    "client_seconds_saved": 630.455131,
+    "client_percent_reduction": 79.38746360600157,
+    "client_speedup": 4.851416540330094
+  },
+  "analysis_script": {
+    "path": "/tmp/acu-105-main-20261115-121134/analyze.py",
+    "sha256": "2ab38f853bd8fc83aac09b423596bead316a64a959ae8dff030f4999a402c7ec"
+  }
+}
