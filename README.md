@@ -5,11 +5,9 @@ A robust apt repository cache focused on availability under upstream failure.
 Designed as a replacement for `apt-cacher-ng` that keeps cache hits
 available even when upstream Ubuntu/Debian/PPA mirrors are slow, broken,
 or under DDoS.  It snapshots repo updates, tracks "hot packages" across your
-fleet, and pre-downloads hot packages before making snapshot updates available
-for clients to request.  This provides the ability to reliably provide package
-sets to clients even if upstream servers become unavailable.  The limitation is
-that "cold" packages require upstream availability.  Typical usage should be
-available from the cache at all times.
+fleet, and warms those packages within a configurable budget before publishing
+verified snapshot updates. Cached packages remain available when upstream
+servers fail; cold packages and packages left unwarmed require upstream access.
 
 > **Contributing:** apt-cacher-ultra accepts AI-authored contributions only.
 > See [CONTRIBUTING.md](CONTRIBUTING.md) for more details.
@@ -21,10 +19,10 @@ available from the cache at all times.
 Stable 1.0 release.  I run it in my 4 environments with 200 machines, serving thousands
 of "apt update/upgrade" and "apt installs".
 
-The [1.1.0-rc1 release candidate](https://github.com/linsomniac/apt-cacher-ultra/releases/tag/1.1.0-rc1)
+The [1.1.0-rc2 release candidate](https://github.com/linsomniac/apt-cacher-ultra/releases/tag/1.1.0-rc2)
 is for users who want to test the upcoming 1.1 release and report problems.
-Stable users should stay on 1.0.4 for now; the apt repository continues to
-serve stable releases only. Read the [candidate's upgrade notes](docs/release-notes/1.1.0-rc1.md)
+Stable users should stay on 1.0.5 for now; the apt repository continues to
+serve stable releases only. Read the [candidate's upgrade notes](docs/release-notes/1.1.0-rc2.md)
 before installing its downloaded `.deb` or standalone binary.
 
 ## Features
@@ -35,8 +33,8 @@ client configs work unchanged.
 - Server HTTPS (optional) — admin and cache listeners support certificate file reload and automatic
   ACME HTTP-01 or DNS-01 issuance and renewal, using Lego's full automated DNS provider catalogue.
   See [server HTTPS setup](docs/server-tls.md).
-- Availability-first caching — cache hits never block on upstream; snapshot is served when upstream is down/slow
-  rather than failing.
+- Availability-first caching — the adopted snapshot remains available when upstream fails;
+  metadata requests can wait briefly for revalidation and coherent publication.
 - Atomic snapshot adoption — per-suite InRelease + all referenced Packages/by-hash blobs are staged, GPG-verified
   (signed repositories; see [Repositories](#repositories)), and flipped in a single SQLite transaction. The flip
   waits (bounded) until clients that received the old InRelease have had `adoption.flip_quiet_period` to fetch its

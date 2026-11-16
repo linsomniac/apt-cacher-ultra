@@ -4,13 +4,36 @@ A brief list of the changes in each release. Add an entry here with each
 change; the release notes for a release (in `docs/release-notes/`) give
 the detail an operator needs before upgrading.
 
+## 1.1.0-rc2
+
+Second opt-in candidate for 1.1.0; stable users remain on 1.0.5. See the
+[RC2 release and upgrade notes](docs/release-notes/1.1.0-rc2.md).
+
+- Faster release detection and publication: maintenance yields to updates,
+  downloads run concurrently, transient mirror failures retry sooner, and busy
+  suites no longer wait a full minute before the publication barrier holds.
+- Background refresh defaults to one minute and prepublication warming to
+  15 seconds. Existing explicit settings retain their values; edit them to
+  receive the shorter delays. Metadata requests can wait up to five seconds
+  for revalidation.
+- INFO logs identify delayed checks/adoptions, active phases, owners and waits,
+  and distinguish the last upstream check from pending unpublished metadata.
+- Hot-package history and verified-content reuse improve prefetch behavior.
+  **The database migrates to schema 10; rollback to RC1 or 1.0.x requires a
+  pre-upgrade backup.**
+- Recover misserved plain indexes from verified compressed siblings (#32),
+  ship optional firewalld definitions, and keep prerelease download names
+  consistent with checksums.
+- Record the post-merge adoption benchmarks and the observed slow-commit hold
+  expiry, including the successful repeat; see the manual freshness lab.
+
 ## Unreleased: 1.1.0
 
 Collects changes throughout the release candidates for the final 1.1.0 release.
 The detail, and what to do before upgrading
 from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 The freshness and publication changes marked "After 1.1.0-rc1" below are
-planned for the anticipated 1.1.0-rc2 and the final 1.1.0 release; they are
+included in 1.1.0-rc2 and planned for the final 1.1.0 release; they are
 not included in the published 1.1.0-rc1.
 
 ### Added

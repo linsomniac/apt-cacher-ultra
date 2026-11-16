@@ -545,3 +545,75 @@ These are two runs on a shared development host under other load. Whether
 a pause is found depends on how the five-second poll lines up with the
 ten-second quiet period, so single runs of this workload differ by tens of
 seconds; the comparison that matters is the 60 s per switch that is gone.
+
+## Comparison after merging the barrier fix (2026-11-15)
+
+After `fix/flip-barrier-busy-suite` reached local main at
+`fb92fe333474a300d02ba68f0155fa48ceed99ed`, the same benchmark was repeated
+against release 1.0.5 (`563c5719b9db94b803dbed14e50ab5512ef95408`). The control
+ran while the merge completed; main was built from a clean archive only after
+the branch's inclusion in main was verified and the control had finished.
+A second main run used the identical binary to investigate a hold expiry in
+the first run. All three runs were sequential, with a fresh cache each time.
+
+[post-merge-main-measurements.json](post-merge-main-measurements.json) preserves
+the merge verification, source and binary hashes, unchanged harness/image,
+options, resource samples, per-suite timings, barrier outcomes, request holds,
+installation verification and raw evidence hashes. The workload is unchanged:
+six suites, two hostnames, 5,000 catalog rows per index, 48 hot packages,
+150 ms member delays, 30 s package delays and five-second client polling.
+Each version uses its own refresh/warming defaults, with a 60 s cooldown and
+two adoption slots. Go 1.26.8 and `CGO_ENABLED=0` were used for both builds.
+
+| Client-visible result | 1.0.5, fresh run | Earlier main `5b65bd9` | Merged main, run 1 | Merged main, repeat |
+| --- | ---: | ---: | ---: | ---: |
+| Setup: all 1.1 candidates | 65.91 s | 394.46 s | 115.82 s | 117.83 s |
+| Burst: first 2.0 candidates | 286.53 s | 53.16 s | 46.18 s | 25.03 s |
+| Burst: all 48 2.0 candidates | **781.73 s (13m02s)** | **163.69 s (2m44s)** | **150.43 s (2m30s)** | **128.12 s (2m08s)** |
+
+The earlier-main column is the historical run above, not another run in this
+batch. The merged binary's observed burst delay was 80.8–83.6% lower than the
+fresh 1.0.5 control and 8.1–21.7% lower than the earlier main. Setup delay was
+70.1–70.6% lower than the earlier main. Setup remains slower than 1.0.5, which
+has no publication barrier. Both merged-main runs used about 15 s of warming
+per suite and published with the new packages unwarmed; 1.0.5 downloaded all
+eight packages per suite before publication.
+
+### Barrier behavior and the repeat
+
+All six setup switches completed within their holds in both main runs. The
+longest waits before holding were 16.18 s and 19.62 s, versus the earlier
+main's repeated 60 s waits. The longest such waits during the measured bursts
+were 25.19 s and 14.95 s. The busy-suite change therefore removed the repeated
+minute-long waits in these runs while preserving the barrier.
+
+The first main burst also exposed the existing slow-commit fallback. Its last
+suite spent **11.77 s in commit**, and the barrier logged **`hold_expired`**
+when its 20 s hold bound was reached. The request log recorded a 10.54 s hold;
+that request received the new snapshot. The longest measured `apt-get update`
+took 13.11 s. APT completed successfully without a reported consistency error,
+but this event is retained as a stress observation, not described as a normal
+within-hold switch. The code deliberately releases a hold at its bound without
+canceling an in-progress commit; this benchmark does not establish why that
+commit took longer or prove a new regression in the barrier change.
+
+The unchanged-binary repeat had **no expired holds**: all twelve setup/burst
+switches completed within their holds, measured commit phases stayed below
+0.41 s, and the longest individual request hold was 5.10 s across setup and
+burst. Its longest `apt-get update` was 10.64 s during setup and 5.40 s during
+the measured burst. The first run's slow-commit event did not recur in this
+repeat; that is not a guarantee it cannot recur under load.
+
+Every run installed all 48 packages at versions 1.0, 1.1 and 2.0 and verified
+the installed versions and version files. All three containers exited
+successfully. There were no measured WARN/ERROR daemon records; the hold expiry
+is an INFO event, illustrating why its structured outcome must also be checked.
+
+The host was busy: the first two runs started with one-minute load averages
+near 25 on 12 CPUs, much higher than the earlier comparison. Shared-host CPU
+and I/O load and polling/cooldown phase affect the timings. These few samples
+support the phase-level finding, not precise production speedup percentages
+or a five-minute guarantee. As before, the fixture uses canonical indexes
+without Acquire-By-Hash, client requests can trigger checks, and download
+delays are removed before the final installation. These results measure
+candidate availability, not installation latency during a continuing outage.
