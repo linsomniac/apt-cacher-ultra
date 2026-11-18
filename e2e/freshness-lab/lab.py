@@ -409,6 +409,10 @@ def main():
     parser.add_argument("--suites", type=int, default=6)
     parser.add_argument("--hosts", type=int, choices=(1, 2), default=2)
     parser.add_argument("--catalog-size", type=int, default=5000)
+    parser.add_argument("--catalog-churn", type=float, default=1.0,
+                        help="share of catalog entries that change version at each publication (burst only)")
+    parser.add_argument("--xz-preset", type=int, default=6,
+                        help="xz preset of the burst indexes; 1 shortens the setup of a large catalog")
     parser.add_argument("--hot-count", type=int, default=8)
     parser.add_argument("--member-delay", type=float, default=0.15)
     parser.add_argument("--deb-delay", type=float, default=8)

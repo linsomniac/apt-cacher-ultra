@@ -49,23 +49,31 @@ class BurstLab(Lab):
                 stanzas.append(control + f"Filename: {deb.relative_to(root)}\nSize: {len(body)}\nSHA256: {hashlib.sha256(body).hexdigest()}\n\n")
             # Catalog rows exercise parsing/storage; clients request only the real
             # hot fixtures above. These filler artifacts are deliberately not served.
+            # --catalog-churn: the share of catalog entries that take each new
+            # version; the rest stay at 1.0, as most of a real suite's packages do
+            # across one publication. 1.0 (the default) changes every entry.
+            churned = round(self.args.catalog_churn * 1000)
             for j in range(self.args.catalog_size):
                 name = f"catalog-{i:02d}-{j:06d}"
-                digest = hashlib.sha256(f"{name}/{version}".encode()).hexdigest()
-                stanzas.append(f"Package: {name}\nVersion: {version}\nArchitecture: amd64\n"
-                               f"Filename: pool/main/c/{name}/{name}_{version}_amd64.deb\nSize: 1024\nSHA256: {digest}\n"
+                entry_version = version if j % 1000 < churned else "1.0"
+                digest = hashlib.sha256(f"{name}/{entry_version}".encode()).hexdigest()
+                stanzas.append(f"Package: {name}\nVersion: {entry_version}\nArchitecture: amd64\n"
+                               f"Filename: pool/main/c/{name}/{name}_{entry_version}_amd64.deb\nSize: 1024\nSHA256: {digest}\n"
                                f"Description: catalog fixture {digest}\n\n")
             data = "".join(stanzas).encode()
             dists = root / "dists" / suite
             # Twelve indexes: two architectures and two components, three encodings.
-            for component in ("main", "contrib"):
-                for arch in ("amd64", "arm64"):
-                    index = data if arch == "amd64" else data.replace(b"amd64", b"arm64")
+            # Both components carry the same bytes, so each architecture's index is
+            # compressed once (a large catalog spends its setup time here).
+            for arch in ("amd64", "arm64"):
+                index = data if arch == "amd64" else data.replace(b"amd64", b"arm64")
+                encoded = {"Packages": index, "Packages.gz": gzip.compress(index, mtime=0),
+                           "Packages.xz": lzma.compress(index, preset=self.args.xz_preset)}
+                for component in ("main", "contrib"):
                     directory = dists / component / f"binary-{arch}"
                     directory.mkdir(parents=True)
-                    (directory / "Packages").write_bytes(index)
-                    (directory / "Packages.gz").write_bytes(gzip.compress(index, mtime=0))
-                    (directory / "Packages.xz").write_bytes(lzma.compress(index))
+                    for member, body in encoded.items():
+                        (directory / member).write_bytes(body)
         self.versions[version] = root
 
     def publish(self, version):
@@ -185,6 +193,10 @@ class BurstLab(Lab):
                 stats["release_age_seconds"] = rec.get("release_age_seconds")
                 stats["hot"] = {k: rec[k] for k in ("hot_count", "hot_fetched", "hot_failed", "hot_unattempted") if k in rec}
                 stats["phases"] = rec.get("phase_seconds")
+                # What the attempt's database writes waited behind (binaries that log it).
+                for key in ("writer_wait_seconds", "writer_ahead", "duration_seconds"):
+                    if key in rec:
+                        stats[key] = rec[key]
                 stats["outcome"] = rec.get("outcome")
         if len(suites) != len(self.suites) or any("adoption_success_seconds" not in s for s in suites.values()):
             raise RuntimeError(f"missing measured publication: {suites}")

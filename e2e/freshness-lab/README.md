@@ -617,3 +617,50 @@ or a five-minute guarantee. As before, the fixture uses canonical indexes
 without Acquire-By-Hash, client requests can trigger checks, and download
 delays are removed before the final installation. These results measure
 candidate availability, not installation latency during a continuing outage.
+
+## A real suite's size and a real publication's change (2026-11-18)
+
+Until now every publication of the burst changed every catalog entry, and
+the catalog was 5,000 entries. A real suite is the other way round: the
+maintainer's June production database held 45,000 to 67,000 package rows a
+suite, of which 0 to 241 differed between the snapshots it kept. Two
+options make the burst say something about that:
+
+- `--catalog-churn F`: the share of catalog entries that take each new
+  version; the rest stay at 1.0. The default, 1.0, is the old behaviour
+  and the old fixture bytes.
+- `--xz-preset N`: the xz preset of the indexes (default 6, the old
+  bytes); 1 shortens the setup of a large catalog.
+
+`--catalog-size 33000` gives about 66,000 package rows a suite (two
+architectures; both components carry the same paths).
+
+```sh
+ACU_FRESHNESS_LAB_SKIP_BUILD=1 bash e2e/freshness-lab/run.sh \
+  /path/to/acu-binary /tmp/acu-burst-real \
+  --burst --suites 6 --hosts 2 --catalog-size 33000 --catalog-churn 0.003 \
+  --hot-count 8 --member-delay 0.15 --deb-delay 8 --xz-preset 1 --max-wait 1800
+```
+
+Baseline, `main` 421f5ea, before the package-list-per-suite work
+(`docs/superpowers/specs/2026-11-18-package-list-per-suite-design.md`);
+one run each, one after the other, on a shared host with a load average
+of 7 to 9 (29 when the single-suite run began).
+[package-list-baseline-measurements.json](package-list-baseline-measurements.json)
+has every attempt's phases and every `database_write_waited` line.
+
+| | Publication to all candidates visible | Commit phase per suite | Longest wait of another write behind a commit |
+| --- | ---: | ---: | ---: |
+| One suite, the "PHP update" scenario | 59.5 s | 0.002 s | none |
+| Six suites of 66,000 rows, 0.3% changed | 189.8 s | 3.1 to 17.8 s (40.4 s in all) | 5.4 s (a client's `url_path_touch`) |
+| Six suites of 66,000 rows, all changed | 223.8 s | 5.1 to 22.9 s (76.3 s in all) | 25.8 s (an adoption behind two commits) |
+
+At a real suite's size the commit is seconds where the 5,000-entry catalog
+showed under 0.4 s, and it is seconds whether 0.3% or all of the rows
+changed: the whole list is written either way. The single-suite scenario's
+59.5 s is detection (39.3 s) and the publication barrier (20.1 s); its
+commit is 2 ms, so a cheaper commit cannot show there. In the bursts the
+other phases per suite were 5 to 9 s parsing indexes (6 to 22 s with every
+row changed), 15 to 24 s of warming (the injected 8 s package delay
+exhausts the 15 s budget) and 3 to 47 s in the barrier.
+

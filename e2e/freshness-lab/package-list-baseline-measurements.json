@@ -1,0 +1,2283 @@
+{
+ "what": "Baseline for the package-list-per-suite work: main before the change, freshness lab, three runs one after the other on a shared development host.",
+ "date": "2026-11-18",
+ "source_commit": "421f5ea (main)",
+ "binary_sha256": "952c98b0eedee1dadfb4f8ca24b8b4610edd189855088a52d3c2d2fa5200199c",
+ "build": "go build, CGO_ENABLED=0, from a git archive of the commit",
+ "load_average_at_start": {
+  "php": "29.40 15.39 9.51",
+  "burst-real": "7.09 11.60 8.98",
+  "burst-total": "7.88 8.06 8.03"
+ },
+ "runs": {
+  "php": {
+   "summary": {
+    "scenario": "baseline",
+    "publication_to_client_seconds": 59.531836,
+    "phases_seconds_after_publication": {
+     "InRelease changed at upstream": 39.327519,
+     "adoption_hot_prefetch_started": 39.345492,
+     "adoption_success": 59.448939
+    },
+    "old_client_observations": 10,
+    "faults": [],
+    "caveat": "Synthetic mechanism reproduction, not proof of the customer's root cause."
+   },
+   "adoption_finished": [
+    {
+     "suite_path": "/debian-security/dists/trixie-security",
+     "outcome": "success",
+     "duration_seconds": 0.028535731,
+     "phase_seconds": {
+      "commit": 0.001539265,
+      "finalize": 0.001734188,
+      "flip_wait": 0.000176497,
+      "hot_prefetch": 0.00124622,
+      "members": 0.017358344,
+      "parse_indexes": 0.000343471,
+      "prepare": 0.005288867,
+      "prepare_commit": 0.000593651,
+      "verify": 0.000249835
+     },
+     "writer_wait_seconds": 9.8552e-05,
+     "writer_ahead": {}
+    },
+    {
+     "suite_path": "/debian-security/dists/trixie-security",
+     "outcome": "success",
+     "duration_seconds": 20.155261732,
+     "phase_seconds": {
+      "commit": 0.002169161,
+      "finalize": 8.8207e-05,
+      "flip_wait": 20.128575605,
+      "hot_prefetch": 0.006359895,
+      "members": 0.010723518,
+      "parse_indexes": 0.001164287,
+      "prepare": 0.005824887,
+      "prepare_commit": 0.000168511,
+      "verify": 0.00018236
+     },
+     "writer_wait_seconds": 0.000103918,
+     "writer_ahead": {}
+    },
+    {
+     "suite_path": "/debian-security/dists/trixie-security",
+     "outcome": "success",
+     "duration_seconds": 20.121241585,
+     "phase_seconds": {
+      "commit": 0.002080942,
+      "finalize": 9.2538e-05,
+      "flip_wait": 20.093436475,
+      "hot_prefetch": 0.007712366,
+      "members": 0.010450508,
+      "parse_indexes": 0.000281581,
+      "prepare": 0.006869166,
+      "prepare_commit": 0.000160561,
+      "verify": 0.000153887
+     },
+     "writer_wait_seconds": 7.4402e-05,
+     "writer_ahead": {}
+    }
+   ],
+   "database_write_waited": [],
+   "database_files_bytes": {
+    "cache.db": 4096,
+    "cache.db-wal": 1532672,
+    "cache.db-shm": 32768
+   }
+  },
+  "burst-real": {
+   "summary": {
+    "scenario": "burst",
+    "options": {
+     "scenario": "baseline",
+     "cooldown": "60s",
+     "refresh": null,
+     "prefetch_budget": null,
+     "delay": 90,
+     "client_interval": 5,
+     "max_wait": 1800.0,
+     "burst": true,
+     "suites": 6,
+     "hosts": 2,
+     "catalog_size": 33000,
+     "catalog_churn": 0.003,
+     "xz_preset": 1,
+     "hot_count": 8,
+     "member_delay": 0.15,
+     "deb_delay": 8.0,
+     "periodic_only": false
+    },
+    "suites": {
+     "suite-05": {
+      "freshness_check_seconds": 19.046036,
+      "adoption_started_seconds": 19.046112,
+      "adoption_success_seconds": 82.158646,
+      "attempts": [
+       {
+        "seconds": 82.158873,
+        "outcome": "success",
+        "adoption_id": "MMRTAL6TDCMKVMMIS5PY7QEX2O"
+       }
+      ],
+      "adoption_finished_seconds": 82.158873,
+      "first_seen_seconds": 63,
+      "release_age_seconds": 84,
+      "hot": {
+       "hot_count": 8,
+       "hot_fetched": 4,
+       "hot_failed": 4,
+       "hot_unattempted": 0
+      },
+      "phases": {
+       "commit": 17.779149287,
+       "finalize": 0.000245721,
+       "flip_wait": 21.12261453,
+       "hot_prefetch": 15.00173125,
+       "members": 0.371196821,
+       "parse_indexes": 8.829499362,
+       "prepare": 0.007407217,
+       "prepare_commit": 0.00044228,
+       "verify": 0.000306465
+      },
+      "writer_wait_seconds": 3.092477832,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 6,
+        "seconds": 0.001186848
+       },
+       "adoption_commit": {
+        "count": 1,
+        "seconds": 3.089023809
+       },
+       "adoption_heartbeat": {
+        "count": 8,
+        "seconds": 0.000442006
+       },
+       "blob_put": {
+        "count": 4,
+        "seconds": 0.000451607
+       },
+       "representation_put": {
+        "count": 4,
+        "seconds": 0.000330193
+       },
+       "url_path_touch": {
+        "count": 2,
+        "seconds": 0.00010458
+       },
+       "usage_save": {
+        "count": 1,
+        "seconds": 8.6514e-05
+       }
+      },
+      "duration_seconds": 63.112598413,
+      "outcome": "success"
+     },
+     "suite-02": {
+      "freshness_check_seconds": 28.783033,
+      "adoption_started_seconds": 28.783151,
+      "adoption_success_seconds": 100.263916,
+      "attempts": [
+       {
+        "seconds": 100.26401,
+        "outcome": "success",
+        "adoption_id": "C6WLBO3WNJIGQMT2IJBAENAM47"
+       }
+      ],
+      "adoption_finished_seconds": 100.26401,
+      "first_seen_seconds": 71,
+      "release_age_seconds": 102,
+      "hot": {
+       "hot_count": 8,
+       "hot_fetched": 4,
+       "hot_failed": 4,
+       "hot_unattempted": 0
+      },
+      "phases": {
+       "commit": 3.099787099,
+       "finalize": 0.000148256,
+       "flip_wait": 47.122519396,
+       "hot_prefetch": 15.003345412,
+       "members": 0.487672741,
+       "parse_indexes": 5.7592202310000005,
+       "prepare": 0.007781372,
+       "prepare_commit": 0.000315444,
+       "verify": 0.000311481
+      },
+      "writer_wait_seconds": 0.018903207,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 5,
+        "seconds": 0.001120338
+       },
+       "adoption_heartbeat": {
+        "count": 7,
+        "seconds": 0.000318569
+       },
+       "blob_put": {
+        "count": 3,
+        "seconds": 0.016599473
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 0.0003948
+       }
+      },
+      "duration_seconds": 71.481104904,
+      "outcome": "success"
+     },
+     "suite-03": {
+      "freshness_check_seconds": 28.785831,
+      "adoption_started_seconds": 100.276815,
+      "adoption_success_seconds": 131.182035,
+      "attempts": [
+       {
+        "seconds": 131.182183,
+        "outcome": "success",
+        "adoption_id": "W25W2DRMWYWMXLCRAHQNQSYGDI"
+       }
+      ],
+      "adoption_finished_seconds": 131.182183,
+      "first_seen_seconds": 102,
+      "release_age_seconds": 133,
+      "hot": {
+       "hot_count": 8,
+       "hot_fetched": 4,
+       "hot_failed": 4,
+       "hot_unattempted": 0
+      },
+      "phases": {
+       "commit": 7.201971192,
+       "finalize": 0.000725481,
+       "flip_wait": 2.810652547,
+       "hot_prefetch": 15.001540187,
+       "members": 0.458715849,
+       "parse_indexes": 5.42190188,
+       "prepare": 0.007962644,
+       "prepare_commit": 0.000287523,
+       "verify": 0.000169793
+      },
+      "writer_wait_seconds": 0.006187805,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 8,
+        "seconds": 0.00145463
+       },
+       "adoption_heartbeat": {
+        "count": 8,
+        "seconds": 0.001001109
+       },
+       "blob_put": {
+        "count": 6,
+        "seconds": 0.000879931
+       },
+       "representation_put": {
+        "count": 6,
+        "seconds": 0.001266515
+       }
+      },
+      "duration_seconds": 30.90393202,
+      "outcome": "success"
+     },
+     "trixie-security": {
+      "freshness_check_seconds": 43.777755,
+      "adoption_started_seconds": 82.176269,
+      "adoption_success_seconds": 113.967123,
+      "attempts": [
+       {
+        "seconds": 113.967291,
+        "outcome": "success",
+        "adoption_id": "AAULFUACN3YKIR6E67JGFFPFJM"
+       }
+      ],
+      "adoption_finished_seconds": 113.967291,
+      "first_seen_seconds": 70,
+      "release_age_seconds": 116,
+      "hot": {
+       "hot_count": 8,
+       "hot_fetched": 4,
+       "hot_failed": 4,
+       "hot_unattempted": 0
+      },
+      "phases": {
+       "commit": 3.699993122,
+       "finalize": 0.000125299,
+       "flip_wait": 7.154536057,
+       "hot_prefetch": 15.001527733,
+       "members": 0.462022338,
+       "parse_indexes": 5.465413371,
+       "prepare": 0.006453621,
+       "prepare_commit": 0.000221423,
+       "verify": 0.000351058
+      },
+      "writer_wait_seconds": 0.014070655,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 8,
+        "seconds": 0.000657427
+       },
+       "adoption_heartbeat": {
+        "count": 9,
+        "seconds": 0.000290369
+       },
+       "blob_put": {
+        "count": 7,
+        "seconds": 0.010925878
+       },
+       "representation_put": {
+        "count": 6,
+        "seconds": 0.001961345
+       }
+      },
+      "duration_seconds": 31.790648889,
+      "outcome": "success"
+     },
+     "suite-04": {
+      "freshness_check_seconds": 58.78412,
+      "adoption_started_seconds": 113.984255,
+      "adoption_success_seconds": 158.929602,
+      "attempts": [
+       {
+        "seconds": 158.929735,
+        "outcome": "success",
+        "adoption_id": "FDBS2ICGTXKGWBZT777FVGRJNQ"
+       }
+      ],
+      "adoption_finished_seconds": 158.929735,
+      "first_seen_seconds": 100,
+      "release_age_seconds": 161,
+      "hot": {
+       "hot_count": 8,
+       "hot_fetched": 4,
+       "hot_failed": 4,
+       "hot_unattempted": 0
+      },
+      "phases": {
+       "commit": 3.102642003,
+       "finalize": 7.6157e-05,
+       "flip_wait": 19.537189632,
+       "hot_prefetch": 15.001763971,
+       "members": 0.666692576,
+       "parse_indexes": 6.624532833,
+       "prepare": 0.011826465000000001,
+       "prepare_commit": 0.00033177,
+       "verify": 0.00035023
+      },
+      "writer_wait_seconds": 1.137174441,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 6,
+        "seconds": 0.004491391
+       },
+       "adoption_commit": {
+        "count": 1,
+        "seconds": 1.1033006
+       },
+       "adoption_heartbeat": {
+        "count": 7,
+        "seconds": 0.000387931
+       },
+       "blob_put": {
+        "count": 6,
+        "seconds": 0.007680495
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 0.000339136
+       },
+       "suite_freshness_update": {
+        "count": 1,
+        "seconds": 0.000116367
+       },
+       "url_path_touch": {
+        "count": 7,
+        "seconds": 0.020202669
+       }
+      },
+      "duration_seconds": 44.945408609,
+      "outcome": "success"
+     },
+     "suite-01": {
+      "freshness_check_seconds": 58.785367,
+      "adoption_started_seconds": 133.778081,
+      "adoption_success_seconds": 187.354849,
+      "attempts": [
+       {
+        "seconds": 187.355329,
+        "outcome": "success",
+        "adoption_id": "INR2S7UQOMRMVOONO7TZ5KYJSM"
+       }
+      ],
+      "adoption_finished_seconds": 187.355329,
+      "first_seen_seconds": 128,
+      "release_age_seconds": 189,
+      "hot": {
+       "hot_count": 8,
+       "hot_fetched": 4,
+       "hot_failed": 4,
+       "hot_unattempted": 0
+      },
+      "phases": {
+       "commit": 5.5552067560000005,
+       "finalize": 0.000162414,
+       "flip_wait": 22.844219156,
+       "hot_prefetch": 17.657994966,
+       "members": 1.00321132,
+       "parse_indexes": 6.493539139,
+       "prepare": 0.010220198000000002,
+       "prepare_commit": 0.000384147,
+       "verify": 0.000270597
+      },
+      "writer_wait_seconds": 2.6643441,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 7,
+        "seconds": 0.00145768
+       },
+       "adoption_commit": {
+        "count": 1,
+        "seconds": 2.643937497
+       },
+       "adoption_heartbeat": {
+        "count": 6,
+        "seconds": 0.011978187
+       },
+       "blob_put": {
+        "count": 5,
+        "seconds": 0.005103038
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 0.00021973
+       },
+       "url_path_touch": {
+        "count": 3,
+        "seconds": 0.001017094
+       }
+      },
+      "duration_seconds": 53.565214139,
+      "outcome": "success"
+     }
+    },
+    "publication_to_client_seconds": 189.80078699999999,
+    "slowest_publication_seconds": 187.354849,
+    "caveat": "Synthetic burst with larger catalogs, not a full Debian/Ubuntu mirror or an SLA."
+   },
+   "adoption_finished": [
+    {
+     "suite_path": "/debian-security/dists/trixie-security",
+     "outcome": "success",
+     "duration_seconds": 9.314062453,
+     "phase_seconds": {
+      "commit": 2.202143202,
+      "finalize": 7.0985e-05,
+      "flip_wait": 0.000109365,
+      "hot_prefetch": 0.000226045,
+      "members": 1.8782125349999998,
+      "parse_indexes": 5.231561737,
+      "prepare": 0.001218706,
+      "prepare_commit": 0.000258588,
+      "verify": 0.000257481
+     },
+     "writer_wait_seconds": 0.002097629,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 3,
+       "seconds": 0.000280293
+      },
+      "adoption_heartbeat": {
+       "count": 3,
+       "seconds": 0.000114877
+      },
+      "blob_put": {
+       "count": 5,
+       "seconds": 0.000378691
+      },
+      "fetched_store": {
+       "count": 1,
+       "seconds": 0.000872032
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 0.000236159
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-01",
+     "outcome": "success",
+     "duration_seconds": 29.883527173,
+     "phase_seconds": {
+      "commit": 2.11337387,
+      "finalize": 0.000126651,
+      "flip_wait": 22.452121197,
+      "hot_prefetch": 0.000150956,
+      "members": 0.282066264,
+      "parse_indexes": 5.026679112,
+      "prepare": 0.008668494,
+      "prepare_commit": 0.000155726,
+      "verify": 0.000178807
+     },
+     "writer_wait_seconds": 0.0002611,
+     "writer_ahead": {}
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-02",
+     "outcome": "success",
+     "duration_seconds": 32.118622265,
+     "phase_seconds": {
+      "commit": 2.009064926,
+      "finalize": 7.6225e-05,
+      "flip_wait": 24.981815942,
+      "hot_prefetch": 0.000136089,
+      "members": 0.190623539,
+      "parse_indexes": 4.929913814,
+      "prepare": 0.006638619,
+      "prepare_commit": 0.000153038,
+      "verify": 0.000195836
+     },
+     "writer_wait_seconds": 0.000231137,
+     "writer_ahead": {}
+    },
+    {
+     "suite_path": "/debian-security/dists/trixie-security",
+     "outcome": "success",
+     "duration_seconds": 35.832630418,
+     "phase_seconds": {
+      "commit": 2.372136375,
+      "finalize": 0.00012091,
+      "flip_wait": 28.113771563,
+      "hot_prefetch": 0.054788539,
+      "members": 0.19295328,
+      "parse_indexes": 5.093451204,
+      "prepare": 0.004844113,
+      "prepare_commit": 0.000382659,
+      "verify": 0.000175866
+     },
+     "writer_wait_seconds": 0.001828912,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 3,
+       "seconds": 0.000586352
+      },
+      "adoption_heartbeat": {
+       "count": 3,
+       "seconds": 0.000101343
+      },
+      "blob_put": {
+       "count": 5,
+       "seconds": 0.00043726
+      },
+      "representation_put": {
+       "count": 5,
+       "seconds": 0.000335933
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-03",
+     "outcome": "success",
+     "duration_seconds": 29.650537607,
+     "phase_seconds": {
+      "commit": 1.926275896,
+      "finalize": 8.914e-05,
+      "flip_wait": 22.423888544,
+      "hot_prefetch": 0.000149339,
+      "members": 0.207653542,
+      "parse_indexes": 5.079782344,
+      "prepare": 0.012272149,
+      "prepare_commit": 0.000184264,
+      "verify": 0.000238836
+     },
+     "writer_wait_seconds": 0.000253236,
+     "writer_ahead": {}
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-04",
+     "outcome": "success",
+     "duration_seconds": 29.797742912,
+     "phase_seconds": {
+      "commit": 2.040338144,
+      "finalize": 9.4407e-05,
+      "flip_wait": 22.495725579,
+      "hot_prefetch": 0.000161388,
+      "members": 0.235512722,
+      "parse_indexes": 5.018199296,
+      "prepare": 0.007270673,
+      "prepare_commit": 0.000185504,
+      "verify": 0.000250855
+     },
+     "writer_wait_seconds": 0.000249207,
+     "writer_ahead": {}
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-05",
+     "outcome": "success",
+     "duration_seconds": 29.639913119,
+     "phase_seconds": {
+      "commit": 1.969377961,
+      "finalize": 0.000155746,
+      "flip_wait": 22.551503172,
+      "hot_prefetch": 0.000145746,
+      "members": 0.19905104,
+      "parse_indexes": 4.914417377,
+      "prepare": 0.004839766,
+      "prepare_commit": 0.000211827,
+      "verify": 0.000206026
+     },
+     "writer_wait_seconds": 0.000284653,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 1,
+       "seconds": 2.7178e-05
+      },
+      "adoption_heartbeat": {
+       "count": 1,
+       "seconds": 2.0225e-05
+      },
+      "blob_put": {
+       "count": 1,
+       "seconds": 2.3138e-05
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-05",
+     "outcome": "success",
+     "duration_seconds": 63.112598413,
+     "phase_seconds": {
+      "commit": 17.779149287,
+      "finalize": 0.000245721,
+      "flip_wait": 21.12261453,
+      "hot_prefetch": 15.00173125,
+      "members": 0.371196821,
+      "parse_indexes": 8.829499362,
+      "prepare": 0.007407217,
+      "prepare_commit": 0.00044228,
+      "verify": 0.000306465
+     },
+     "writer_wait_seconds": 3.092477832,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 6,
+       "seconds": 0.001186848
+      },
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 3.089023809
+      },
+      "adoption_heartbeat": {
+       "count": 8,
+       "seconds": 0.000442006
+      },
+      "blob_put": {
+       "count": 4,
+       "seconds": 0.000451607
+      },
+      "representation_put": {
+       "count": 4,
+       "seconds": 0.000330193
+      },
+      "url_path_touch": {
+       "count": 2,
+       "seconds": 0.00010458
+      },
+      "usage_save": {
+       "count": 1,
+       "seconds": 8.6514e-05
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-02",
+     "outcome": "success",
+     "duration_seconds": 71.481104904,
+     "phase_seconds": {
+      "commit": 3.099787099,
+      "finalize": 0.000148256,
+      "flip_wait": 47.122519396,
+      "hot_prefetch": 15.003345412,
+      "members": 0.487672741,
+      "parse_indexes": 5.7592202310000005,
+      "prepare": 0.007781372,
+      "prepare_commit": 0.000315444,
+      "verify": 0.000311481
+     },
+     "writer_wait_seconds": 0.018903207,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 5,
+       "seconds": 0.001120338
+      },
+      "adoption_heartbeat": {
+       "count": 7,
+       "seconds": 0.000318569
+      },
+      "blob_put": {
+       "count": 3,
+       "seconds": 0.016599473
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 0.0003948
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/trixie-security",
+     "outcome": "success",
+     "duration_seconds": 31.790648889,
+     "phase_seconds": {
+      "commit": 3.699993122,
+      "finalize": 0.000125299,
+      "flip_wait": 7.154536057,
+      "hot_prefetch": 15.001527733,
+      "members": 0.462022338,
+      "parse_indexes": 5.465413371,
+      "prepare": 0.006453621,
+      "prepare_commit": 0.000221423,
+      "verify": 0.000351058
+     },
+     "writer_wait_seconds": 0.014070655,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 8,
+       "seconds": 0.000657427
+      },
+      "adoption_heartbeat": {
+       "count": 9,
+       "seconds": 0.000290369
+      },
+      "blob_put": {
+       "count": 7,
+       "seconds": 0.010925878
+      },
+      "representation_put": {
+       "count": 6,
+       "seconds": 0.001961345
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-03",
+     "outcome": "success",
+     "duration_seconds": 30.90393202,
+     "phase_seconds": {
+      "commit": 7.201971192,
+      "finalize": 0.000725481,
+      "flip_wait": 2.810652547,
+      "hot_prefetch": 15.001540187,
+      "members": 0.458715849,
+      "parse_indexes": 5.42190188,
+      "prepare": 0.007962644,
+      "prepare_commit": 0.000287523,
+      "verify": 0.000169793
+     },
+     "writer_wait_seconds": 0.006187805,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 8,
+       "seconds": 0.00145463
+      },
+      "adoption_heartbeat": {
+       "count": 8,
+       "seconds": 0.001001109
+      },
+      "blob_put": {
+       "count": 6,
+       "seconds": 0.000879931
+      },
+      "representation_put": {
+       "count": 6,
+       "seconds": 0.001266515
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-04",
+     "outcome": "success",
+     "duration_seconds": 44.945408609,
+     "phase_seconds": {
+      "commit": 3.102642003,
+      "finalize": 7.6157e-05,
+      "flip_wait": 19.537189632,
+      "hot_prefetch": 15.001763971,
+      "members": 0.666692576,
+      "parse_indexes": 6.624532833,
+      "prepare": 0.011826465000000001,
+      "prepare_commit": 0.00033177,
+      "verify": 0.00035023
+     },
+     "writer_wait_seconds": 1.137174441,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 6,
+       "seconds": 0.004491391
+      },
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 1.1033006
+      },
+      "adoption_heartbeat": {
+       "count": 7,
+       "seconds": 0.000387931
+      },
+      "blob_put": {
+       "count": 6,
+       "seconds": 0.007680495
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 0.000339136
+      },
+      "suite_freshness_update": {
+       "count": 1,
+       "seconds": 0.000116367
+      },
+      "url_path_touch": {
+       "count": 7,
+       "seconds": 0.020202669
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-01",
+     "outcome": "success",
+     "duration_seconds": 53.565214139,
+     "phase_seconds": {
+      "commit": 5.5552067560000005,
+      "finalize": 0.000162414,
+      "flip_wait": 22.844219156,
+      "hot_prefetch": 17.657994966,
+      "members": 1.00321132,
+      "parse_indexes": 6.493539139,
+      "prepare": 0.010220198000000002,
+      "prepare_commit": 0.000384147,
+      "verify": 0.000270597
+     },
+     "writer_wait_seconds": 2.6643441,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 7,
+       "seconds": 0.00145768
+      },
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 2.643937497
+      },
+      "adoption_heartbeat": {
+       "count": 6,
+       "seconds": 0.011978187
+      },
+      "blob_put": {
+       "count": 5,
+       "seconds": 0.005103038
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 0.00021973
+      },
+      "url_path_touch": {
+       "count": 3,
+       "seconds": 0.001017094
+      }
+     }
+    }
+   ],
+   "database_write_waited": [
+    {
+     "op": "usage_save",
+     "waited_seconds": 5.000115834,
+     "started": false,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 5.000115834
+      }
+     },
+     "suppressed": 0
+    },
+    {
+     "op": "adoption_heartbeat",
+     "waited_seconds": 3.089218053,
+     "started": false,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 3.089023809
+      },
+      "url_path_touch": {
+       "count": 1,
+       "seconds": 0.000101323
+      },
+      "usage_save": {
+       "count": 1,
+       "seconds": 8.6514e-05
+      }
+     },
+     "suppressed": 0
+    },
+    {
+     "op": "url_path_touch",
+     "waited_seconds": 3.67107157,
+     "started": true,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 3.6709786490000003
+      },
+      "usage_save": {
+       "count": 1,
+       "seconds": 8.6514e-05
+      }
+     },
+     "suppressed": 0,
+     "ran_seconds": 0.010790664
+    },
+    {
+     "op": "url_path_touch",
+     "waited_seconds": 5.372725247,
+     "started": true,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 5.372576909
+      }
+     },
+     "suppressed": 0,
+     "ran_seconds": 0.010806651
+    },
+    {
+     "op": "suite_freshness_update",
+     "waited_seconds": 5.375071579,
+     "started": true,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 5.364112567
+      },
+      "url_path_touch": {
+       "count": 1,
+       "seconds": 0.010806651
+      }
+     },
+     "suppressed": 0,
+     "ran_seconds": 0.000116367
+    },
+    {
+     "op": "adoption_heartbeat",
+     "waited_seconds": 2.643942675,
+     "started": true,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 2.643937497
+      }
+     },
+     "suppressed": 0,
+     "ran_seconds": 0.011652108
+    }
+   ],
+   "database_files_bytes": {
+    "cache.db": 337715200,
+    "cache.db-wal": 42287712,
+    "cache.db-shm": 98304
+   }
+  },
+  "burst-total": {
+   "summary": {
+    "scenario": "burst",
+    "options": {
+     "scenario": "baseline",
+     "cooldown": "60s",
+     "refresh": null,
+     "prefetch_budget": null,
+     "delay": 90,
+     "client_interval": 5,
+     "max_wait": 1800.0,
+     "burst": true,
+     "suites": 6,
+     "hosts": 2,
+     "catalog_size": 33000,
+     "catalog_churn": 1.0,
+     "xz_preset": 1,
+     "hot_count": 8,
+     "member_delay": 0.15,
+     "deb_delay": 8.0,
+     "periodic_only": false
+    },
+    "suites": {
+     "suite-05": {
+      "freshness_check_seconds": 19.237993,
+      "adoption_started_seconds": 19.238082,
+      "adoption_success_seconds": 66.897675,
+      "attempts": [
+       {
+        "seconds": 66.897829,
+        "outcome": "success",
+        "adoption_id": "B5ANC7WFUSDOMN65PC52NFJGVB"
+       }
+      ],
+      "adoption_finished_seconds": 66.897829,
+      "first_seen_seconds": 48,
+      "release_age_seconds": 69,
+      "hot": {
+       "hot_count": 8,
+       "hot_fetched": 4,
+       "hot_failed": 4,
+       "hot_unattempted": 0
+      },
+      "phases": {
+       "commit": 6.014625441,
+       "finalize": 0.000112484,
+       "flip_wait": 20.105164791,
+       "hot_prefetch": 15.002823348,
+       "members": 0.380779796,
+       "parse_indexes": 6.144826347,
+       "prepare": 0.008723195,
+       "prepare_commit": 0.000219449,
+       "verify": 0.000259334
+      },
+      "writer_wait_seconds": 0.002277383,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 6,
+        "seconds": 0.000777358
+       },
+       "adoption_heartbeat": {
+        "count": 6,
+        "seconds": 0.000305089
+       },
+       "blob_put": {
+        "count": 5,
+        "seconds": 0.000438343
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 0.000393761
+       }
+      },
+      "duration_seconds": 47.657539193,
+      "outcome": "success"
+     },
+     "suite-03": {
+      "freshness_check_seconds": 24.951287,
+      "adoption_started_seconds": 66.914136,
+      "adoption_success_seconds": 118.942938,
+      "attempts": [
+       {
+        "seconds": 118.943181,
+        "outcome": "success",
+        "adoption_id": "2ZK2F2BPT4Z2C753B3BNPC74RJ"
+       }
+      ],
+      "adoption_finished_seconds": 118.943181,
+      "first_seen_seconds": 94,
+      "release_age_seconds": 121,
+      "hot": {
+       "hot_count": 8,
+       "hot_fetched": 4,
+       "hot_failed": 4,
+       "hot_unattempted": 0
+      },
+      "phases": {
+       "commit": 5.069810143,
+       "finalize": 0.004819004,
+       "flip_wait": 23.183467687,
+       "hot_prefetch": 15.001364346,
+       "members": 0.508456763,
+       "parse_indexes": 8.232908541,
+       "prepare": 0.026316506,
+       "prepare_commit": 0.000184868,
+       "verify": 0.000296926
+      },
+      "writer_wait_seconds": 0.013412533,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 6,
+        "seconds": 0.00131089
+       },
+       "adoption_heartbeat": {
+        "count": 4,
+        "seconds": 0.000195545
+       },
+       "blob_put": {
+        "count": 3,
+        "seconds": 0.008901438
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 0.002478819
+       }
+      },
+      "duration_seconds": 52.027633759,
+      "outcome": "success"
+     },
+     "trixie-security": {
+      "freshness_check_seconds": 24.952259,
+      "adoption_started_seconds": 24.952348,
+      "adoption_success_seconds": 89.892766,
+      "attempts": [
+       {
+        "seconds": 89.89297,
+        "outcome": "success",
+        "adoption_id": "EWVQJOOHM4NJTBKCA34RWX5TQN"
+       }
+      ],
+      "adoption_finished_seconds": 89.89297,
+      "first_seen_seconds": 65,
+      "release_age_seconds": 92,
+      "hot": {
+       "hot_count": 8,
+       "hot_fetched": 4,
+       "hot_failed": 4,
+       "hot_unattempted": 0
+      },
+      "phases": {
+       "commit": 5.217434738,
+       "finalize": 0.000172278,
+       "flip_wait": 38.274779144,
+       "hot_prefetch": 15.001925517,
+       "members": 0.425934094,
+       "parse_indexes": 6.013883739,
+       "prepare": 0.005945288,
+       "prepare_commit": 0.000282225,
+       "verify": 0.000194058
+      },
+      "writer_wait_seconds": 4.936823287,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 8,
+        "seconds": 0.000981831
+       },
+       "adoption_commit": {
+        "count": 1,
+        "seconds": 4.933490353
+       },
+       "adoption_heartbeat": {
+        "count": 9,
+        "seconds": 0.000295854
+       },
+       "blob_put": {
+        "count": 8,
+        "seconds": 0.00074818
+       },
+       "representation_put": {
+        "count": 8,
+        "seconds": 0.000886708
+       },
+       "suite_freshness_update": {
+        "count": 2,
+        "seconds": 0.000113753
+       }
+      },
+      "duration_seconds": 64.940554419,
+      "outcome": "success"
+     },
+     "suite-02": {
+      "freshness_check_seconds": 39.950962,
+      "adoption_started_seconds": 89.903638,
+      "adoption_success_seconds": 151.876119,
+      "attempts": [
+       {
+        "seconds": 151.880036,
+        "outcome": "success",
+        "adoption_id": "FQA2SDDFWREKFBHOFAAQ3OFTIU"
+       }
+      ],
+      "adoption_finished_seconds": 151.880036,
+      "first_seen_seconds": 112,
+      "release_age_seconds": 154,
+      "hot": {
+       "hot_count": 8,
+       "hot_fetched": 4,
+       "hot_failed": 4,
+       "hot_unattempted": 0
+      },
+      "phases": {
+       "commit": 22.935478469,
+       "finalize": 0.002570942,
+       "flip_wait": 15.105128043,
+       "hot_prefetch": 15.007410695,
+       "members": 0.429368637,
+       "parse_indexes": 8.482491102000001,
+       "prepare": 0.007998752,
+       "prepare_commit": 0.000863309,
+       "verify": 0.00019557
+      },
+      "writer_wait_seconds": 1.966796212,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 6,
+        "seconds": 0.001443726
+       },
+       "adoption_commit": {
+        "count": 1,
+        "seconds": 1.956171997
+       },
+       "adoption_heartbeat": {
+        "count": 6,
+        "seconds": 0.00030805
+       },
+       "blob_put": {
+        "count": 5,
+        "seconds": 0.001723802
+       },
+       "representation_put": {
+        "count": 6,
+        "seconds": 0.005612071
+       },
+       "suite_freshness_update": {
+        "count": 2,
+        "seconds": 0.001063829
+       }
+      },
+      "duration_seconds": 61.973683364,
+      "outcome": "success"
+     },
+     "suite-01": {
+      "freshness_check_seconds": 54.955373,
+      "adoption_started_seconds": 151.895554,
+      "adoption_success_seconds": 221.825832,
+      "attempts": [
+       {
+        "seconds": 221.826085,
+        "outcome": "success",
+        "adoption_id": "5OJFK6XFHTPBLC5R2ZOJ3UIBV7"
+       }
+      ],
+      "adoption_finished_seconds": 221.826085,
+      "first_seen_seconds": 167,
+      "release_age_seconds": 224,
+      "hot": {
+       "hot_count": 8,
+       "hot_fetched": 4,
+       "hot_failed": 4,
+       "hot_unattempted": 0
+      },
+      "phases": {
+       "commit": 18.913190309,
+       "finalize": 0.000209198,
+       "flip_wait": 10.663900816,
+       "hot_prefetch": 15.119382627,
+       "members": 2.9625835929999997,
+       "parse_indexes": 22.214372198,
+       "prepare": 0.013539513,
+       "prepare_commit": 0.000300324,
+       "verify": 0.042775501
+      },
+      "writer_wait_seconds": 25.820131074,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 9,
+        "seconds": 0.001573545
+       },
+       "adoption_commit": {
+        "count": 2,
+        "seconds": 25.751505934
+       },
+       "adoption_heartbeat": {
+        "count": 11,
+        "seconds": 0.002116059
+       },
+       "blob_put": {
+        "count": 8,
+        "seconds": 0.012820037
+       },
+       "representation_put": {
+        "count": 7,
+        "seconds": 0.019599651
+       },
+       "suite_freshness_update": {
+        "count": 2,
+        "seconds": 0.010624931
+       },
+       "url_path_touch": {
+        "count": 8,
+        "seconds": 0.018394769
+       },
+       "usage_save": {
+        "count": 1,
+        "seconds": 0.002889251
+       }
+      },
+      "duration_seconds": 69.9302609,
+      "outcome": "success"
+     },
+     "suite-04": {
+      "freshness_check_seconds": 54.955696,
+      "adoption_started_seconds": 118.951412,
+      "adoption_success_seconds": 177.094515,
+      "attempts": [
+       {
+        "seconds": 177.094712,
+        "outcome": "success",
+        "adoption_id": "IYFUXVXS5ERMVIQQZIQJF5YYR5"
+       }
+      ],
+      "adoption_finished_seconds": 177.094712,
+      "first_seen_seconds": 122,
+      "release_age_seconds": 179,
+      "hot": {
+       "hot_count": 8,
+       "hot_fetched": 0,
+       "hot_failed": 4,
+       "hot_unattempted": 4
+      },
+      "phases": {
+       "commit": 18.139603882,
+       "finalize": 0.000126189,
+       "flip_wait": 7.053969832,
+       "hot_prefetch": 24.118995042,
+       "members": 0.658385406,
+       "parse_indexes": 8.132895906,
+       "prepare": 0.022316502000000002,
+       "prepare_commit": 0.002590504,
+       "verify": 0.00993707
+      },
+      "writer_wait_seconds": 13.472892819,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 7,
+        "seconds": 0.001856334
+       },
+       "adoption_commit": {
+        "count": 2,
+        "seconds": 13.429877263
+       },
+       "adoption_heartbeat": {
+        "count": 9,
+        "seconds": 0.002593766
+       },
+       "blob_put": {
+        "count": 10,
+        "seconds": 0.014490281
+       },
+       "representation_put": {
+        "count": 4,
+        "seconds": 0.005636492
+       },
+       "suite_freshness_update": {
+        "count": 2,
+        "seconds": 0.013764452
+       },
+       "url_path_touch": {
+        "count": 5,
+        "seconds": 0.004266365
+       }
+      },
+      "duration_seconds": 58.138836374,
+      "outcome": "success"
+     }
+    },
+    "publication_to_client_seconds": 223.75413699999996,
+    "slowest_publication_seconds": 221.825832,
+    "caveat": "Synthetic burst with larger catalogs, not a full Debian/Ubuntu mirror or an SLA."
+   },
+   "adoption_finished": [
+    {
+     "suite_path": "/debian-security/dists/trixie-security",
+     "outcome": "success",
+     "duration_seconds": 9.364121899,
+     "phase_seconds": {
+      "commit": 3.258661422,
+      "finalize": 0.000233642,
+      "flip_wait": 0.000115207,
+      "hot_prefetch": 0.000261835,
+      "members": 0.317866213,
+      "parse_indexes": 5.785204968,
+      "prepare": 0.001213299,
+      "prepare_commit": 0.000270586,
+      "verify": 0.000288778
+     },
+     "writer_wait_seconds": 0.001095525,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 1,
+       "seconds": 7.6551e-05
+      },
+      "adoption_heartbeat": {
+       "count": 1,
+       "seconds": 1.389e-05
+      },
+      "blob_put": {
+       "count": 4,
+       "seconds": 0.000153231
+      },
+      "fetched_store": {
+       "count": 1,
+       "seconds": 0.000551337
+      },
+      "representation_put": {
+       "count": 2,
+       "seconds": 3.4757e-05
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-02",
+     "outcome": "success",
+     "duration_seconds": 52.08388746,
+     "phase_seconds": {
+      "commit": 36.649126796,
+      "finalize": 0.016715442,
+      "flip_wait": 0.000257815,
+      "hot_prefetch": 0.517383599,
+      "members": 5.625219898,
+      "parse_indexes": 9.245501484,
+      "prepare": 0.002814558,
+      "prepare_commit": 0.02433003,
+      "verify": 0.000292834
+     },
+     "writer_wait_seconds": 0.002473474,
+     "writer_ahead": {
+      "blob_put": {
+       "count": 3,
+       "seconds": 0.001839474
+      },
+      "representation_put": {
+       "count": 2,
+       "seconds": 0.000245061
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-01",
+     "outcome": "success",
+     "duration_seconds": 27.18925801,
+     "phase_seconds": {
+      "commit": 11.116759329,
+      "finalize": 0.000103431,
+      "flip_wait": 0.005712363,
+      "hot_prefetch": 0.026437049,
+      "members": 8.840595463,
+      "parse_indexes": 7.133531538,
+      "prepare": 0.026548642,
+      "prepare_commit": 0.003508808,
+      "verify": 0.036056358
+     },
+     "writer_wait_seconds": 0.796760998,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 3,
+       "seconds": 0.311862504
+      },
+      "adoption_heartbeat": {
+       "count": 2,
+       "seconds": 0.02499429
+      },
+      "blob_put": {
+       "count": 3,
+       "seconds": 0.450717508
+      },
+      "representation_put": {
+       "count": 2,
+       "seconds": 0.007413444
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-04",
+     "outcome": "success",
+     "duration_seconds": 10.224159712,
+     "phase_seconds": {
+      "commit": 3.524813778,
+      "finalize": 0.000105847,
+      "flip_wait": 0.000204256,
+      "hot_prefetch": 0.000149931,
+      "members": 0.414450988,
+      "parse_indexes": 6.259594789,
+      "prepare": 0.006927471,
+      "prepare_commit": 0.00023397,
+      "verify": 0.017673779
+     },
+     "writer_wait_seconds": 0.017417975,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 2,
+       "seconds": 0.004356885
+      },
+      "adoption_heartbeat": {
+       "count": 2,
+       "seconds": 1.2135e-05
+      },
+      "blob_put": {
+       "count": 2,
+       "seconds": 0.005641999
+      },
+      "representation_put": {
+       "count": 2,
+       "seconds": 0.0071539
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-03",
+     "outcome": "success",
+     "duration_seconds": 34.616641155,
+     "phase_seconds": {
+      "commit": 3.749977384,
+      "finalize": 0.0005128,
+      "flip_wait": 22.972451492,
+      "hot_prefetch": 0.000150914,
+      "members": 1.284365175,
+      "parse_indexes": 6.598503645,
+      "prepare": 0.010270488999999999,
+      "prepare_commit": 0.000186449,
+      "verify": 0.000216654
+     },
+     "writer_wait_seconds": 0.001836773,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 4,
+       "seconds": 0.000356683
+      },
+      "adoption_heartbeat": {
+       "count": 4,
+       "seconds": 0.000143202
+      },
+      "blob_put": {
+       "count": 6,
+       "seconds": 0.000663619
+      },
+      "representation_put": {
+       "count": 6,
+       "seconds": 0.00043519
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-02",
+     "outcome": "success",
+     "duration_seconds": 40.654443067,
+     "phase_seconds": {
+      "commit": 7.197042164,
+      "finalize": 0.001095261,
+      "flip_wait": 24.143645829,
+      "hot_prefetch": 0.114363707,
+      "members": 0.437815421,
+      "parse_indexes": 8.742993178,
+      "prepare": 0.016557229,
+      "prepare_commit": 0.000680528,
+      "verify": 0.000244503
+     },
+     "writer_wait_seconds": 0.000812726,
+     "writer_ahead": {
+      "adoption_heartbeat": {
+       "count": 1,
+       "seconds": 2.8308e-05
+      },
+      "blob_put": {
+       "count": 1,
+       "seconds": 0.000112218
+      },
+      "representation_put": {
+       "count": 1,
+       "seconds": 5.9471e-05
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-01",
+     "outcome": "success",
+     "duration_seconds": 55.162148869,
+     "phase_seconds": {
+      "commit": 5.40124376,
+      "finalize": 0.000112576,
+      "flip_wait": 40.490021319,
+      "hot_prefetch": 0.08958154,
+      "members": 0.433078785,
+      "parse_indexes": 8.727650323,
+      "prepare": 0.019849883,
+      "prepare_commit": 0.00029672,
+      "verify": 0.000308129
+     },
+     "writer_wait_seconds": 0.014769471,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 1,
+       "seconds": 6.2261e-05
+      },
+      "adoption_heartbeat": {
+       "count": 1,
+       "seconds": 0.001909382
+      },
+      "blob_put": {
+       "count": 2,
+       "seconds": 0.00404025
+      },
+      "representation_put": {
+       "count": 4,
+       "seconds": 0.006523671
+      },
+      "url_path_touch": {
+       "count": 1,
+       "seconds": 0.001725438
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/trixie-security",
+     "outcome": "success",
+     "duration_seconds": 37.173451539,
+     "phase_seconds": {
+      "commit": 4.118147114,
+      "finalize": 0.000112164,
+      "flip_wait": 23.672187042,
+      "hot_prefetch": 0.079098217,
+      "members": 0.499533799,
+      "parse_indexes": 8.789325996,
+      "prepare": 0.014449795999999999,
+      "prepare_commit": 0.000322254,
+      "verify": 0.000269271
+     },
+     "writer_wait_seconds": 0.00187583,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 1,
+       "seconds": 1.3878e-05
+      },
+      "adoption_heartbeat": {
+       "count": 3,
+       "seconds": 0.000138629
+      },
+      "blob_put": {
+       "count": 6,
+       "seconds": 0.000675584
+      },
+      "representation_put": {
+       "count": 4,
+       "seconds": 0.000224411
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-04",
+     "outcome": "success",
+     "duration_seconds": 34.796115313,
+     "phase_seconds": {
+      "commit": 3.646392455,
+      "finalize": 0.004141457,
+      "flip_wait": 22.146843496,
+      "hot_prefetch": 0.071512819,
+      "members": 0.360062207,
+      "parse_indexes": 8.555798487,
+      "prepare": 0.010745587,
+      "prepare_commit": 0.000340466,
+      "verify": 0.000270682
+     },
+     "writer_wait_seconds": 0.002419445,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 4,
+       "seconds": 0.000581492
+      },
+      "adoption_heartbeat": {
+       "count": 4,
+       "seconds": 0.000154294
+      },
+      "blob_put": {
+       "count": 5,
+       "seconds": 0.000576219
+      },
+      "representation_put": {
+       "count": 6,
+       "seconds": 0.000564812
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-05",
+     "outcome": "success",
+     "duration_seconds": 25.923757787,
+     "phase_seconds": {
+      "commit": 2.429846488,
+      "finalize": 0.000117325,
+      "flip_wait": 16.861026073,
+      "hot_prefetch": 0.000162038,
+      "members": 0.394768193,
+      "parse_indexes": 6.199849583,
+      "prepare": 0.024148173,
+      "prepare_commit": 0.000381301,
+      "verify": 0.013454337
+     },
+     "writer_wait_seconds": 0.000694901,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 1,
+       "seconds": 0.000175148
+      },
+      "adoption_heartbeat": {
+       "count": 1,
+       "seconds": 1.168e-06
+      },
+      "blob_put": {
+       "count": 1,
+       "seconds": 0.000137016
+      },
+      "representation_put": {
+       "count": 2,
+       "seconds": 0.000102964
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-05",
+     "outcome": "success",
+     "duration_seconds": 47.657539193,
+     "phase_seconds": {
+      "commit": 6.014625441,
+      "finalize": 0.000112484,
+      "flip_wait": 20.105164791,
+      "hot_prefetch": 15.002823348,
+      "members": 0.380779796,
+      "parse_indexes": 6.144826347,
+      "prepare": 0.008723195,
+      "prepare_commit": 0.000219449,
+      "verify": 0.000259334
+     },
+     "writer_wait_seconds": 0.002277383,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 6,
+       "seconds": 0.000777358
+      },
+      "adoption_heartbeat": {
+       "count": 6,
+       "seconds": 0.000305089
+      },
+      "blob_put": {
+       "count": 5,
+       "seconds": 0.000438343
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 0.000393761
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/trixie-security",
+     "outcome": "success",
+     "duration_seconds": 64.940554419,
+     "phase_seconds": {
+      "commit": 5.217434738,
+      "finalize": 0.000172278,
+      "flip_wait": 38.274779144,
+      "hot_prefetch": 15.001925517,
+      "members": 0.425934094,
+      "parse_indexes": 6.013883739,
+      "prepare": 0.005945288,
+      "prepare_commit": 0.000282225,
+      "verify": 0.000194058
+     },
+     "writer_wait_seconds": 4.936823287,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 8,
+       "seconds": 0.000981831
+      },
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 4.933490353
+      },
+      "adoption_heartbeat": {
+       "count": 9,
+       "seconds": 0.000295854
+      },
+      "blob_put": {
+       "count": 8,
+       "seconds": 0.00074818
+      },
+      "representation_put": {
+       "count": 8,
+       "seconds": 0.000886708
+      },
+      "suite_freshness_update": {
+       "count": 2,
+       "seconds": 0.000113753
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-03",
+     "outcome": "success",
+     "duration_seconds": 52.027633759,
+     "phase_seconds": {
+      "commit": 5.069810143,
+      "finalize": 0.004819004,
+      "flip_wait": 23.183467687,
+      "hot_prefetch": 15.001364346,
+      "members": 0.508456763,
+      "parse_indexes": 8.232908541,
+      "prepare": 0.026316506,
+      "prepare_commit": 0.000184868,
+      "verify": 0.000296926
+     },
+     "writer_wait_seconds": 0.013412533,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 6,
+       "seconds": 0.00131089
+      },
+      "adoption_heartbeat": {
+       "count": 4,
+       "seconds": 0.000195545
+      },
+      "blob_put": {
+       "count": 3,
+       "seconds": 0.008901438
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 0.002478819
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-02",
+     "outcome": "success",
+     "duration_seconds": 61.973683364,
+     "phase_seconds": {
+      "commit": 22.935478469,
+      "finalize": 0.002570942,
+      "flip_wait": 15.105128043,
+      "hot_prefetch": 15.007410695,
+      "members": 0.429368637,
+      "parse_indexes": 8.482491102000001,
+      "prepare": 0.007998752,
+      "prepare_commit": 0.000863309,
+      "verify": 0.00019557
+     },
+     "writer_wait_seconds": 1.966796212,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 6,
+       "seconds": 0.001443726
+      },
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 1.956171997
+      },
+      "adoption_heartbeat": {
+       "count": 6,
+       "seconds": 0.00030805
+      },
+      "blob_put": {
+       "count": 5,
+       "seconds": 0.001723802
+      },
+      "representation_put": {
+       "count": 6,
+       "seconds": 0.005612071
+      },
+      "suite_freshness_update": {
+       "count": 2,
+       "seconds": 0.001063829
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-04",
+     "outcome": "success",
+     "duration_seconds": 58.138836374,
+     "phase_seconds": {
+      "commit": 18.139603882,
+      "finalize": 0.000126189,
+      "flip_wait": 7.053969832,
+      "hot_prefetch": 24.118995042,
+      "members": 0.658385406,
+      "parse_indexes": 8.132895906,
+      "prepare": 0.022316502000000002,
+      "prepare_commit": 0.002590504,
+      "verify": 0.00993707
+     },
+     "writer_wait_seconds": 13.472892819,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 7,
+       "seconds": 0.001856334
+      },
+      "adoption_commit": {
+       "count": 2,
+       "seconds": 13.429877263
+      },
+      "adoption_heartbeat": {
+       "count": 9,
+       "seconds": 0.002593766
+      },
+      "blob_put": {
+       "count": 10,
+       "seconds": 0.014490281
+      },
+      "representation_put": {
+       "count": 4,
+       "seconds": 0.005636492
+      },
+      "suite_freshness_update": {
+       "count": 2,
+       "seconds": 0.013764452
+      },
+      "url_path_touch": {
+       "count": 5,
+       "seconds": 0.004266365
+      }
+     }
+    },
+    {
+     "suite_path": "/debian-security/dists/suite-01",
+     "outcome": "success",
+     "duration_seconds": 69.9302609,
+     "phase_seconds": {
+      "commit": 18.913190309,
+      "finalize": 0.000209198,
+      "flip_wait": 10.663900816,
+      "hot_prefetch": 15.119382627,
+      "members": 2.9625835929999997,
+      "parse_indexes": 22.214372198,
+      "prepare": 0.013539513,
+      "prepare_commit": 0.000300324,
+      "verify": 0.042775501
+     },
+     "writer_wait_seconds": 25.820131074,
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 9,
+       "seconds": 0.001573545
+      },
+      "adoption_commit": {
+       "count": 2,
+       "seconds": 25.751505934
+      },
+      "adoption_heartbeat": {
+       "count": 11,
+       "seconds": 0.002116059
+      },
+      "blob_put": {
+       "count": 8,
+       "seconds": 0.012820037
+      },
+      "representation_put": {
+       "count": 7,
+       "seconds": 0.019599651
+      },
+      "suite_freshness_update": {
+       "count": 2,
+       "seconds": 0.010624931
+      },
+      "url_path_touch": {
+       "count": 8,
+       "seconds": 0.018394769
+      },
+      "usage_save": {
+       "count": 1,
+       "seconds": 0.002889251
+      }
+     }
+    }
+   ],
+   "database_write_waited": [
+    {
+     "op": "signed_seen_mark",
+     "waited_seconds": 3.964877401,
+     "started": true,
+     "ahead": {
+      "signed_seen_mark": {
+       "count": 1,
+       "seconds": 3.96486594
+      }
+     },
+     "suppressed": 0,
+     "ran_seconds": 0.000192099
+    },
+    {
+     "op": "usage_save",
+     "waited_seconds": 5.02096142,
+     "started": false,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 5.02096142
+      }
+     },
+     "suppressed": 0
+    },
+    {
+     "op": "url_path_touch",
+     "waited_seconds": 3.536217089,
+     "started": true,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 3.5362080970000003
+      }
+     },
+     "suppressed": 0,
+     "ran_seconds": 0.025055377
+    },
+    {
+     "op": "suite_freshness_update",
+     "waited_seconds": 3.727801195,
+     "started": true,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 3.727797154
+      }
+     },
+     "suppressed": 0,
+     "ran_seconds": 0.018360296
+    },
+    {
+     "op": "usage_save",
+     "waited_seconds": 3.1299915560000002,
+     "started": true,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 3.129986349
+      }
+     },
+     "suppressed": 0,
+     "ran_seconds": 0.015421875
+    },
+    {
+     "op": "adoption_heartbeat",
+     "waited_seconds": 4.933608213,
+     "started": false,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 4.933490353
+      },
+      "suite_freshness_update": {
+       "count": 1,
+       "seconds": 0.000111076
+      }
+     },
+     "suppressed": 0
+    },
+    {
+     "op": "suite_freshness_update",
+     "waited_seconds": 4.938211116,
+     "started": true,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 4.938204332
+      }
+     },
+     "suppressed": 0,
+     "ran_seconds": 0.008480433
+    },
+    {
+     "op": "usage_save",
+     "waited_seconds": 4.265022082,
+     "started": true,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 4.265018281
+      }
+     },
+     "suppressed": 0,
+     "ran_seconds": 0.015225211
+    },
+    {
+     "op": "blob_put",
+     "waited_seconds": 4.3674853670000005,
+     "started": false,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 4.3674853670000005
+      }
+     },
+     "suppressed": 0
+    },
+    {
+     "op": "url_path_touch",
+     "waited_seconds": 10.000616431,
+     "started": false,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 10.000616431
+      }
+     },
+     "suppressed": 0
+    },
+    {
+     "op": "usage_save",
+     "waited_seconds": 5.000583103,
+     "started": false,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 5.000583103
+      }
+     },
+     "suppressed": 0
+    },
+    {
+     "op": "suite_freshness_update",
+     "waited_seconds": 21.9196275,
+     "started": true,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 21.919614999
+      }
+     },
+     "suppressed": 0,
+     "ran_seconds": 0.013038575
+    },
+    {
+     "op": "adoption_heartbeat",
+     "waited_seconds": 9.078317583,
+     "started": true,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 9.062380686
+      },
+      "blob_put": {
+       "count": 4,
+       "seconds": 0.000184244
+      },
+      "suite_freshness_update": {
+       "count": 1,
+       "seconds": 0.013038575
+      },
+      "url_path_touch": {
+       "count": 2,
+       "seconds": 0.00268966
+      }
+     },
+     "suppressed": 0,
+     "ran_seconds": 0.00016594
+    },
+    {
+     "op": "suite_freshness_update",
+     "waited_seconds": 17.136945769,
+     "started": true,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 17.136933715
+      }
+     },
+     "suppressed": 1,
+     "ran_seconds": 0.010095423
+    },
+    {
+     "op": "adoption_heartbeat",
+     "waited_seconds": 15.888687993,
+     "started": true,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 15.878577705
+      },
+      "suite_freshness_update": {
+       "count": 1,
+       "seconds": 0.010095423
+      }
+     },
+     "suppressed": 3,
+     "ran_seconds": 0.001743877
+    },
+    {
+     "op": "url_path_touch",
+     "waited_seconds": 9.63654484,
+     "started": true,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 9.623365743
+      },
+      "adoption_heartbeat": {
+       "count": 1,
+       "seconds": 0.001743877
+      },
+      "suite_freshness_update": {
+       "count": 2,
+       "seconds": 0.011414466
+      }
+     },
+     "suppressed": 4,
+     "ran_seconds": 0.004279526
+    },
+    {
+     "op": "usage_save",
+     "waited_seconds": 2.448294877,
+     "started": true,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 2.418346006
+      },
+      "adoption_heartbeat": {
+       "count": 1,
+       "seconds": 0.001743877
+      },
+      "suite_freshness_update": {
+       "count": 2,
+       "seconds": 0.011414466
+      },
+      "url_path_touch": {
+       "count": 4,
+       "seconds": 0.016679448
+      }
+     },
+     "suppressed": 0,
+     "ran_seconds": 0.002889251
+    },
+    {
+     "op": "usage_save",
+     "waited_seconds": 5.003986463,
+     "started": false,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 5.003986463
+      }
+     },
+     "suppressed": 0
+    },
+    {
+     "op": "url_path_touch",
+     "waited_seconds": 10.000031051,
+     "started": false,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 10.000031051
+      }
+     },
+     "suppressed": 3
+    },
+    {
+     "op": "adoption_heartbeat",
+     "waited_seconds": 9.873116986,
+     "started": false,
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 9.872928229
+      },
+      "url_path_touch": {
+       "count": 1,
+       "seconds": 0.00018032
+      }
+     },
+     "suppressed": 0
+    }
+   ],
+   "database_files_bytes": {
+    "cache.db": 416227328
+   }
+  }
+ }
+}
