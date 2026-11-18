@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 )
 
@@ -20,14 +21,18 @@ type backgroundWork struct {
 	started              time.Time
 	phase                atomic.Pointer[phaseMark]
 	waits                observability.Waits
-	logger               *slog.Logger
-	timer                *time.Timer
-	timerMu              sync.Mutex
-	stopped              bool
-	once                 sync.Once
-	busyMu               sync.Mutex
-	lastBusy             time.Time
-	busySuppressed       int
+	// writer collects how long the work's database writes were queued
+	// behind the cache's one writer goroutine, and what that goroutine ran
+	// meanwhile (cache.WriterWait).
+	writer         cache.WriterWait
+	logger         *slog.Logger
+	timer          *time.Timer
+	timerMu        sync.Mutex
+	stopped        bool
+	once           sync.Once
+	busyMu         sync.Mutex
+	lastBusy       time.Time
+	busySuppressed int
 }
 
 type workKey struct{}
@@ -80,7 +85,8 @@ func (w *backgroundWork) setPhase(phase string) {
 }
 
 func (w *backgroundWork) context(ctx context.Context) context.Context {
-	return observability.WithWaits(context.WithValue(ctx, workKey{}, w), &w.waits)
+	ctx = cache.WithWriterWait(context.WithValue(ctx, workKey{}, w), &w.writer)
+	return observability.WithWaits(ctx, &w.waits)
 }
 
 func workPhase(ctx context.Context, phase string) {
@@ -89,7 +95,15 @@ func workPhase(ctx context.Context, phase string) {
 	}
 }
 
+// attrs describes the work as it is now. While one of its database writes
+// is queued it also says for how long, what the writer is running, and
+// what the writer has finished since (writerWaiting).
 func (w *backgroundWork) attrs() []any {
+	return append(w.identity(), w.writerWaiting()...)
+}
+
+// identity is the work's own fields, without its wait for the writer.
+func (w *backgroundWork) identity() []any {
 	p := w.phase.Load()
 	a := []any{"work_id", w.id, "work_kind", w.kind, "canonical_scheme", w.suite.CanonicalScheme,
 		"canonical_host", w.suite.CanonicalHost, "suite_path", w.suite.SuitePath,
@@ -99,6 +113,33 @@ func (w *backgroundWork) attrs() []any {
 		a = append(a, "adoption_id", w.adoptionID)
 	}
 	return a
+}
+
+// writerWaiting is the fields of a wait for the database writer that is
+// still in progress; nil when none of the work's writes is queued.
+//
+// AIDEV-NOTE: this reads the cache's in-memory account of its writer, never
+// the database: the watchdog's lines must keep coming while the writer is
+// blocked (backgroundWork's own comment), and this is the line that then
+// says what blocks it.
+func (w *backgroundWork) writerWaiting() []any {
+	now, waiting := w.writer.Waiting()
+	if !waiting {
+		return nil
+	}
+	a := []any{"writer_waiting_seconds", now.Seconds}
+	if now.Running != "" {
+		a = append(a, "writer_running", now.Running, "writer_running_seconds", now.RunningSeconds)
+	}
+	return append(a, "writer_ahead", now.Ahead)
+}
+
+// writerTotal is the fields of the work's finished waits for the database
+// writer: for how long it had a write queued, and what the writer ran in
+// that time.
+func (w *backgroundWork) writerTotal() []any {
+	seconds, ahead := w.writer.Total()
+	return []any{"writer_wait_seconds", seconds, "writer_ahead", ahead}
 }
 
 func (w *backgroundWork) finish() {
@@ -112,7 +153,9 @@ func (w *backgroundWork) finish() {
 		// Short checks already have freshness_check; do not log every cooldown
 		// hit. Repairs have a lifecycle even when they finish without a member.
 		if w.kind == "adoption" || w.kind == "repair" || w.kind == "reconcile" || time.Since(w.started) >= time.Minute {
-			unloggedPanic(func() { w.logger.Info("background_work_finished", w.attrs()...) })
+			unloggedPanic(func() {
+				w.logger.Info("background_work_finished", append(w.identity(), w.writerTotal()...)...)
+			})
 		}
 	})
 }

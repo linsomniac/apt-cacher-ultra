@@ -877,7 +877,7 @@ func TestDeleteSuiteTx_IsACompareAndDelete(t *testing.T) {
 	del := func(k SuiteKey, want *int64, cutoff int64) deleteOutcome {
 		t.Helper()
 		var out deleteOutcome
-		if err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		if err := c.submitWrite(ctx, writeTest, func(ctx context.Context, conn *sql.Conn) error {
 			tx, err := conn.BeginTx(ctx, nil)
 			if err != nil {
 				return err

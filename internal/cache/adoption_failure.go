@@ -100,7 +100,7 @@ UPDATE suite_freshness
        adoption_fail_etag     = ?,
        adoption_fail_lastmod  = ?
  WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeAdoptionFailureRecord, func(ctx context.Context, conn *sql.Conn) error {
 		if _, err := conn.ExecContext(ctx, q,
 			f.Hash, f.Reason, f.Count, f.FirstAt, f.LastAt, f.NextRetryAt, f.ETag, f.LastMod,
 			scheme, host, suitePath); err != nil {
@@ -116,7 +116,7 @@ UPDATE suite_freshness
 func (c *Cache) ClearAdoptionFailure(ctx context.Context, scheme, host, suitePath string) error {
 	q := `UPDATE suite_freshness SET ` + clearAdoptionFailureSet + `
  WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeAdoptionFailureClear, func(ctx context.Context, conn *sql.Conn) error {
 		if _, err := conn.ExecContext(ctx, q, scheme, host, suitePath); err != nil {
 			return fmt.Errorf("ClearAdoptionFailure: %w", err)
 		}
@@ -133,7 +133,7 @@ func (c *Cache) SetAdoptionNextRetry(ctx context.Context, scheme, host, suitePat
 UPDATE suite_freshness SET adoption_next_retry_at = ?
  WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?
    AND adoption_fail_count > 0`
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeAdoptionRetrySet, func(ctx context.Context, conn *sql.Conn) error {
 		if _, err := conn.ExecContext(ctx, q, next, scheme, host, suitePath); err != nil {
 			return fmt.Errorf("SetAdoptionNextRetry: %w", err)
 		}
@@ -160,7 +160,7 @@ func (c *Cache) RescheduleFailingAdoptions(ctx context.Context, now int64, offse
 	const upd = `UPDATE suite_freshness SET adoption_next_retry_at = ?
  WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`
 	n := 0
-	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	err := c.submitWrite(ctx, writeAdoptionRetryReschedule, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("RescheduleFailingAdoptions: begin: %w", err)

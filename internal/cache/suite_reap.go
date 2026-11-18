@@ -276,7 +276,7 @@ SELECT blob_hash FROM url_path WHERE canonical_scheme = ? AND canonical_host = ?
 // deleted.
 func (c *Cache) deleteURLPathRows(ctx context.Context, scheme, host string, paths []string) (int, error) {
 	n := 0
-	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	err := c.submitWrite(ctx, writeSuiteReapURLPaths, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("delete url_path rows: begin: %w", err)
@@ -362,7 +362,7 @@ func (c *Cache) DeleteSuiteMetadata(ctx context.Context, key SuiteKey) (int, err
 // that committed (the Task 3 review's minor 4).
 func (c *Cache) ReapIdleSuite(ctx context.Context, key SuiteKey, wantCurrent *int64, cutoff int64) (deleted, gone bool, err error) {
 	var out deleteOutcome
-	err = c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	err = c.submitWrite(ctx, writeSuiteReap, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("ReapIdleSuite: begin: %w", err)
@@ -434,7 +434,7 @@ type ForgetResult struct {
 // blob's pin.
 func (c *Cache) ForgetSuite(ctx context.Context, key SuiteKey, wantCurrent *int64) (ForgetResult, error) {
 	var got ForgetResult
-	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	err := c.submitWrite(ctx, writeSuiteForget, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("ForgetSuite: begin: %w", err)

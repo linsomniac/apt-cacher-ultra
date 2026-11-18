@@ -141,7 +141,7 @@ func (c *Cache) deleteOrphanMarkers(ctx context.Context, keys []SignedSeenMark, 
 DELETE FROM suite_signed_seen
  WHERE canonical_scheme = ? AND canonical_host = ? AND base = ? AND last_seen_at < ?
    AND NOT EXISTS (` + fmt.Sprintf(orphanSuiteRowSQL, "?", "?", "?") + `)`
-	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	err := c.submitWrite(ctx, writeMarkerSweep, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("SweepOrphanMarkers: begin: %w", err)

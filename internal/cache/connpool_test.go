@@ -16,7 +16,7 @@ import (
 // of the connections just handed back.
 func holdConns(t *testing.T, c *Cache, n int) {
 	t.Helper()
-	if err := c.submitWrite(context.Background(), func(context.Context, *sql.Conn) error { return nil }); err != nil {
+	if err := c.submitWrite(context.Background(), writeTest, func(context.Context, *sql.Conn) error { return nil }); err != nil {
 		t.Fatalf("pin the writer: %v", err)
 	}
 	conns := make([]*sql.Conn, 0, n)

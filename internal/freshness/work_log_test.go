@@ -317,3 +317,105 @@ func TestMaintenanceProbeStampDoesNotOverwriteSnapshotOrPendingChange(t *testing
 		t.Fatalf("older probe overwrote newer check: %v %v", ok, err)
 	}
 }
+
+// What a write waited behind (2026-11-18). The cache's writer runs every
+// write on one goroutine; these pin that an adoption's own log lines say
+// what that goroutine was doing while the adoption's writes queued.
+
+// While an adoption's write is queued, its progress line names what the
+// writer is running, and for how long the adoption has waited.
+func TestAdoptionInProgress_NamesWhatTheWriterIsRunning(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adopt()
+	logs := adoptionLogs(r)
+	r.adopter.progressInterval = 20 * time.Millisecond
+	release, err := r.cache.HoldWriterForTest(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- r.adopter.Run(ctx, SuiteRef{"http", rigHost, rigSuite}, r.release("next", 0), "", "") }()
+	defer func() { release(); cancel(); <-done }()
+
+	rec := waitWorkRecord(t, logs, "adoption_in_progress", func(rec map[string]any) bool { return rec["writer_running"] != nil })
+	// The hold is a test's own write, which the vocabulary names "test".
+	if rec["writer_running"] != "test" {
+		t.Errorf("writer_running = %v, want test (the held write)", rec["writer_running"])
+	}
+	for _, field := range []string{"writer_waiting_seconds", "writer_running_seconds"} {
+		if s, ok := rec[field].(float64); !ok || s <= 0 {
+			t.Errorf("%s = %v, want a positive number of seconds", field, rec[field])
+		}
+	}
+	if ahead, ok := rec["writer_ahead"].(map[string]any); !ok || len(ahead) != 0 {
+		t.Errorf("writer_ahead = %v, want an empty object: the held write has not finished", rec["writer_ahead"])
+	}
+}
+
+// An adoption whose first write waited behind another says so when it
+// ends: for how long its writes were queued, and behind what. Its
+// background_work_finished line says the same.
+func TestAdoptionFinished_SaysWhatItsWritesWaitedBehind(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adopt()
+	logs := adoptionLogs(r)
+	r.adopter.progressInterval = 20 * time.Millisecond
+	release, err := r.cache.HoldWriterForTest(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	done := make(chan error, 1)
+	go func() {
+		done <- r.adopter.Run(t.Context(), SuiteRef{"http", rigHost, rigSuite}, r.release("next", 0), "", "")
+	}()
+	waitWorkRecord(t, logs, "adoption_in_progress", func(rec map[string]any) bool { return rec["writer_running"] != nil })
+	release()
+	if err := <-done; err != nil {
+		t.Fatalf("adoption: %v", err)
+	}
+
+	for _, event := range []string{"adoption_finished", "background_work_finished"} {
+		recs := logRecords(t, logs, event)
+		if len(recs) != 1 {
+			t.Fatalf("%s records = %v, want one", event, recs)
+		}
+		rec := recs[0]
+		if s, ok := rec["writer_wait_seconds"].(float64); !ok || s <= 0 {
+			t.Errorf("%s: writer_wait_seconds = %v, want a positive number of seconds", event, rec["writer_wait_seconds"])
+		}
+		ahead, _ := rec["writer_ahead"].(map[string]any)
+		held, _ := ahead["test"].(map[string]any)
+		if held["count"] != float64(1) {
+			t.Errorf("%s: writer_ahead = %v, want the one held write (test) among it", event, rec["writer_ahead"])
+		}
+		if s, ok := held["seconds"].(float64); !ok || s <= 0 {
+			t.Errorf("%s: writer_ahead.test.seconds = %v, want a positive number", event, held["seconds"])
+		}
+		// A finished record describes a wait that is over.
+		for _, live := range []string{"writer_waiting_seconds", "writer_running", "writer_running_seconds"} {
+			if _, has := rec[live]; has {
+				t.Errorf("%s has %s, a field of a wait still in progress", event, live)
+			}
+		}
+	}
+}
+
+// An adoption that waited for nothing still carries both fields, so that
+// the record has one shape.
+func TestAdoptionFinished_AlwaysCarriesTheWriterFields(t *testing.T) {
+	r := newRetryRig(t, 0)
+	logs := adoptionLogs(r)
+	r.adopt()
+	recs := logRecords(t, logs, "adoption_finished")
+	if len(recs) != 1 {
+		t.Fatalf("adoption_finished records = %v, want one", recs)
+	}
+	if _, ok := recs[0]["writer_wait_seconds"].(float64); !ok {
+		t.Errorf("writer_wait_seconds = %v, want a number", recs[0]["writer_wait_seconds"])
+	}
+	if _, ok := recs[0]["writer_ahead"].(map[string]any); !ok {
+		t.Errorf("writer_ahead = %v, want an object", recs[0]["writer_ahead"])
+	}
+}

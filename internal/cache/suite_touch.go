@@ -56,7 +56,7 @@ func (c *Cache) TouchSuite(ctx context.Context, key SuiteKey) error {
 	}
 	now := nowUnix()
 	found := false
-	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	err := c.submitWrite(ctx, writeSuiteTouch, func(ctx context.Context, conn *sql.Conn) error {
 		res, err := conn.ExecContext(ctx, `
 UPDATE suite_freshness SET last_requested_at = ?
  WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,

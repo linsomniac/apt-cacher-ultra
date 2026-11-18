@@ -92,7 +92,7 @@ SELECT hash FROM blob
  LIMIT ?`
 
 	var reaped []ReapedBlob
-	werr := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	werr := c.submitWrite(ctx, writeGCBlobs, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("RunBlobGCBatch: begin: %w", err)
@@ -324,7 +324,7 @@ SELECT snapshot_id, reap_class FROM (
 LIMIT ?`
 
 	var result SnapshotGCBatchResult
-	werr := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	werr := c.submitWrite(ctx, writeGCSnapshots, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("RunSnapshotGCBatch: begin: %w", err)
@@ -503,7 +503,7 @@ func (c *Cache) RunRetiredSnapshotGCChunk(ctx context.Context, maxRows int) (rea
 	// InsertCandidateSnapshot).
 	var gotReaped int
 	var gotMore bool
-	werr := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	werr := c.submitWrite(ctx, writeGCRetiredSnapshots, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("RunRetiredSnapshotGCChunk: begin: %w", err)
@@ -646,7 +646,7 @@ func (c *Cache) RunDisplacedPackageHashChunk(ctx context.Context, maxRows int) (
 	// path submitWrite returns before the op ends (see InsertCandidateSnapshot).
 	var gotRows int
 	var gotMore bool
-	werr := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	werr := c.submitWrite(ctx, writeGCDisplacedPackages, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("RunDisplacedPackageHashChunk: begin: %w", err)
@@ -763,7 +763,7 @@ func (c *Cache) HeartbeatBlobs(ctx context.Context, hashes []string) error {
 		args = append(args, h)
 	}
 	q := `UPDATE blob SET refcount_zeroed_at = ? WHERE refcount <= 0 AND hash IN (` + string(ph) + `)`
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeAdoptionBlobHeartbeat, func(ctx context.Context, conn *sql.Conn) error {
 		if _, err := conn.ExecContext(ctx, q, args...); err != nil {
 			return fmt.Errorf("HeartbeatBlobs: %w", err)
 		}

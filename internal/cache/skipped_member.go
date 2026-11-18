@@ -94,7 +94,7 @@ SELECT snapshot_id, path, declared_sha256, size, reason,
 // Members' BlobHash values must reference existing pool blobs (FK
 // fails closed otherwise).
 func (c *Cache) RepairSkippedMember(ctx context.Context, snapshotID int64, skippedPath string, members []SnapshotMember) error {
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeRepairMember, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("RepairSkippedMember: begin: %w", err)
@@ -223,7 +223,7 @@ SELECT blob_hash, declared_sha256 FROM snapshot_member
 // repaired or reaped) is benign — the bookkeeping exists only for
 // operator visibility into how long a member has been failing.
 func (c *Cache) BumpSkippedMemberRetry(ctx context.Context, snapshotID int64, path string) error {
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeRepairRetryBump, func(ctx context.Context, conn *sql.Conn) error {
 		if _, err := conn.ExecContext(ctx, `
 UPDATE snapshot_skipped_member SET retry_count = retry_count + 1
  WHERE snapshot_id = ? AND path = ?`, snapshotID, path); err != nil {

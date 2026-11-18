@@ -71,10 +71,14 @@ type Cache struct {
 	db     *sql.DB
 	logger *slog.Logger
 
-	writes  chan writeReq
-	closeCh chan struct{}
-	closed  atomic.Bool
-	wg      sync.WaitGroup
+	writes chan writeReq
+	// wr is the writer's account of what it has run, and waitedLog the
+	// rate limit of database_write_waited (writer_wait.go).
+	wr        writerState
+	waitedLog writeWaitedLog
+	closeCh   chan struct{}
+	closed    atomic.Bool
+	wg        sync.WaitGroup
 
 	// SQLite data_version values are comparable only on one connection.
 	// This lazy observer stays pinned between polls, without holding a
@@ -168,6 +172,7 @@ func OpenWithDBDir(ctx context.Context, dir, dbDir string, logger *slog.Logger) 
 		writes:  make(chan writeReq, writeBufferSize),
 		closeCh: make(chan struct{}),
 	}
+	c.wr.now = time.Now
 	var flat bool
 	if err := db.QueryRowContext(ctx, flatRowsExistSQL).Scan(&flat); err != nil {
 		_ = db.Close()
@@ -283,6 +288,8 @@ type writeReq struct {
 	// a pointer because writeReq travels through c.writes by value and
 	// both sides must CAS the same word.
 	state *atomic.Int32
+	// wait is the request's wait for the writer (writer_wait.go).
+	wait *writeWait
 }
 
 // start claims req for running: true unless its submitter abandoned it.
@@ -341,17 +348,27 @@ func (req *writeReq) abandon() bool {
 // request with no start deadline is untouched: nil state, no timer (a nil
 // channel in the selects), and the writer still calls its op after a
 // cancel, exactly as before issue #14.
-func (c *Cache) submitWrite(ctx context.Context, op writeOp) error {
+//
+// AIDEV-NOTE: every return after c.wr.queued must end the request's wait:
+// writeReturned once the result is in, writeGaveUp on every path that
+// leaves without it (writer_wait.go, added 2026-11-18). A path that
+// returned without either would leave the work the write belongs to
+// reporting a queued write for good (WriterWait.Waiting), and every later
+// wait of that work would be added to one that never closed. kind names
+// the write in the logs; a new call site takes a kind of its own.
+func (c *Cache) submitWrite(ctx context.Context, kind writeKind, op writeOp) error {
 	defer observability.TrackWait(ctx, "database_write")()
 	if c.closed.Load() {
 		return ErrClosed
 	}
-	req := writeReq{ctx: ctx, op: op, res: make(chan error, 1)}
+	waiting := c.wr.queued(ctx, kind)
+	req := writeReq{ctx: ctx, op: op, res: make(chan error, 1), wait: waiting}
 	var deadlineC <-chan time.Time // nil (never ready) without a start deadline
 	if deadline, ok := writeStartDeadline(ctx); ok {
 		wait := time.Until(deadline)
 		if wait <= 0 {
 			// Not enqueued. A shutdown reads as a shutdown (ctx.Err()).
+			c.writeGaveUp(ctx, waiting, true)
 			return notStartedErr(ctx)
 		}
 		timer := time.NewTimer(wait)
@@ -362,30 +379,37 @@ func (c *Cache) submitWrite(ctx context.Context, op writeOp) error {
 	select {
 	case c.writes <- req:
 	case <-c.closeCh:
+		c.writeGaveUp(ctx, waiting, false)
 		return ErrClosed
 	case <-ctx.Done():
+		c.writeGaveUp(ctx, waiting, true)
 		return ctx.Err()
 	case <-deadlineC:
 		// Not enqueued, so the writer can never see it. A ctx cancelled
 		// too (both ready, the select chose the deadline) is ctx.Err().
+		c.writeGaveUp(ctx, waiting, true)
 		return notStartedErr(ctx)
 	}
 	for {
 		select {
 		case err := <-req.res:
+			c.writeReturned(ctx, waiting)
 			return err
 		case <-c.closeCh:
+			c.writeGaveUp(ctx, waiting, false)
 			return ErrClosed
 		case <-ctx.Done():
 			// The writer will still dequeue the request and write to
 			// req.res; res is buffered (cap 1) so no goroutine blocks.
 			// With a start deadline, a still-pending op is skipped.
 			req.abandon()
+			c.writeGaveUp(ctx, waiting, true)
 			return ctx.Err()
 		case <-deadlineC:
 			if req.abandon() {
 				// Never runs. A ctx cancelled too (both ready, the
 				// select chose the deadline) is ctx.Err().
+				c.writeGaveUp(ctx, waiting, true)
 				return notStartedErr(ctx)
 			}
 			// The writer started the op first: it runs to completion.
@@ -439,7 +463,10 @@ func (c *Cache) writer() {
 			// (or was cancelled while it was still pending) is skipped,
 			// never started. See submitWrite's AIDEV-NOTE.
 			if req.start() {
-				req.res <- req.op(req.ctx, conn)
+				c.wr.started(req.wait)
+				err := req.op(req.ctx, conn)
+				c.wr.finished(req.wait)
+				req.res <- err
 			} else {
 				req.res <- ErrWriteNotStarted
 			}

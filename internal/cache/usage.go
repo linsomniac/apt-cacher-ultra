@@ -27,7 +27,7 @@ func (c *Cache) SaveUsage(ctx context.Context, t usage.Totals) error {
 	if err := t.Validate(); err != nil {
 		return err
 	}
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeUsageSave, func(ctx context.Context, conn *sql.Conn) error {
 		_, err := conn.ExecContext(ctx, `INSERT INTO usage_totals
 (id, since_unixtime, fetched_bytes, served_bytes, cache_hit_bytes, requests,
  cache_hit_requests, fetch_nanoseconds, serve_nanoseconds)

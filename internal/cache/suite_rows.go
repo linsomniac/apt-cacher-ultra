@@ -180,7 +180,7 @@ type SuiteGuard interface {
 // operation is submitted — the writer goroutine never runs foreign code.
 func (c *Cache) CreateSuite(ctx context.Context, seed SuiteSeed, caps SuiteCaps, guard SuiteGuard) (CreateResult, error) {
 	attempt := func() (CreateResult, error) {
-		r, err := c.creationAttempt(ctx, "CreateSuite", &seed, caps, guard,
+		r, err := c.creationAttempt(ctx, "CreateSuite", writeSuiteCreate, &seed, caps, guard,
 			func(ctx context.Context, tx *sql.Tx, held *heldSuite) (FetchedResult, error) {
 				cr, err := createSuiteTx(ctx, tx, seed, caps, held, nowUnix())
 				return FetchedResult{Create: cr}, err
@@ -217,7 +217,7 @@ func (c *Cache) CreateSuite(ctx context.Context, seed SuiteSeed, caps SuiteCaps,
 // afterCreate's read error) and continues. Never read got after an
 // error: on a ctx/close path the op may still be running (see
 // InsertCandidateSnapshot).
-func (c *Cache) creationAttempt(ctx context.Context, op string, create *SuiteSeed, caps SuiteCaps, guard SuiteGuard,
+func (c *Cache) creationAttempt(ctx context.Context, op string, kind writeKind, create *SuiteSeed, caps SuiteCaps, guard SuiteGuard,
 	body func(ctx context.Context, tx *sql.Tx, held *heldSuite) (FetchedResult, error)) (FetchedResult, error) {
 	var held *heldSuite
 	busy := false
@@ -237,7 +237,7 @@ func (c *Cache) creationAttempt(ctx context.Context, op string, create *SuiteSee
 		}
 	}
 	var got FetchedResult
-	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	err := c.submitWrite(ctx, kind, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("%s: begin: %w", op, err)
@@ -549,7 +549,7 @@ SELECT canonical_host, COUNT(*) AS n FROM suite_freshness
 // last_check_at. The adoption failure record (adoption_fail_*) is never
 // written here (spec C7). (Carried over from PutSuiteFreshness.)
 func (c *Cache) UpdateSuiteFreshness(ctx context.Context, s SuiteFreshness) error {
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeSuiteFreshnessUpdate, func(ctx context.Context, conn *sql.Conn) error {
 		if err := updateSuiteFreshness(ctx, conn, s); err != nil {
 			return fmt.Errorf("UpdateSuiteFreshness: %w", err)
 		}

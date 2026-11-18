@@ -151,6 +151,12 @@ func (l *adoptionLog) finish(logger *slog.Logger, ctx context.Context, suite Sui
 	// behind upstream, whatever the cache's own logs cover. Each only when
 	// known (a direct adopter call has no first sighting; a Release may
 	// carry no Date).
+	// What the attempt's database writes waited behind: every write in the
+	// daemon runs on one goroutine, and phase_seconds alone cannot tell a
+	// slow transaction of the attempt's own from a queue.
+	if l.work != nil {
+		attrs = append(attrs, l.work.writerTotal()...)
+	}
 	if l.trigger.changeSeenAt > 0 {
 		attrs = append(attrs, "first_seen_seconds", max(now.Unix()-l.trigger.changeSeenAt, 0))
 	}

@@ -28,7 +28,7 @@ func holdWriter(t *testing.T, c *Cache) (release func()) {
 // queued before it has been run or skipped once it returns.
 func flushWriter(t *testing.T, c *Cache) {
 	t.Helper()
-	if err := c.submitWrite(context.Background(), func(context.Context, *sql.Conn) error { return nil }); err != nil {
+	if err := c.submitWrite(context.Background(), writeTest, func(context.Context, *sql.Conn) error { return nil }); err != nil {
 		t.Fatalf("flush the writer: %v", err)
 	}
 }
@@ -42,7 +42,7 @@ func TestSubmitWrite_AQueuedOpAbandonedAtItsStartDeadlineNeverRuns(t *testing.T)
 	var ran atomic.Bool
 	start := time.Now()
 	ctx := WithWriteStartDeadline(context.Background(), start.Add(50*time.Millisecond))
-	err := c.submitWrite(ctx, func(context.Context, *sql.Conn) error {
+	err := c.submitWrite(ctx, writeTest, func(context.Context, *sql.Conn) error {
 		ran.Store(true)
 		return nil
 	})
@@ -75,7 +75,7 @@ func TestSubmitWrite_AnOpStartedBeforeItsDeadlineRunsToCompletion(t *testing.T) 
 	var startedAt atomic.Int64 // ns after start
 	start := time.Now()
 	ctx := WithWriteStartDeadline(context.Background(), start.Add(startDeadline))
-	err := c.submitWrite(ctx, func(opCtx context.Context, _ *sql.Conn) error {
+	err := c.submitWrite(ctx, writeTest, func(opCtx context.Context, _ *sql.Conn) error {
 		startedAt.Store(int64(time.Since(start)))
 		timer := time.NewTimer(work)
 		defer timer.Stop()
@@ -117,7 +117,7 @@ func TestSubmitWrite_StartDeadlineRaceRunsAtMostOnceAndReportsTruthfully(t *test
 		holdStarted := make(chan struct{})
 		holdDone := make(chan error, 1)
 		go func() {
-			holdDone <- c.submitWrite(context.Background(), func(context.Context, *sql.Conn) error {
+			holdDone <- c.submitWrite(context.Background(), writeTest, func(context.Context, *sql.Conn) error {
 				close(holdStarted)
 				time.Sleep(hold)
 				return nil
@@ -127,7 +127,7 @@ func TestSubmitWrite_StartDeadlineRaceRunsAtMostOnceAndReportsTruthfully(t *test
 
 		var runs atomic.Int32
 		deadline := time.Now().Add(time.Duration(rng.IntN(2001)) * time.Microsecond)
-		err := c.submitWrite(WithWriteStartDeadline(context.Background(), deadline), func(context.Context, *sql.Conn) error {
+		err := c.submitWrite(WithWriteStartDeadline(context.Background(), deadline), writeTest, func(context.Context, *sql.Conn) error {
 			runs.Add(1)
 			return nil
 		})
@@ -168,7 +168,7 @@ func TestSubmitWrite_NoStartDeadlineBehavesAsBefore(t *testing.T) {
 	defer cancel()
 	time.AfterFunc(50*time.Millisecond, cancel)
 	var called atomic.Bool
-	err := c.submitWrite(ctx, func(context.Context, *sql.Conn) error {
+	err := c.submitWrite(ctx, writeTest, func(context.Context, *sql.Conn) error {
 		called.Store(true)
 		return nil
 	})
@@ -196,7 +196,7 @@ func TestSubmitWrite_ShutdownWhileWaitingForTheStartDeadlineIsCtxErr(t *testing.
 	time.AfterFunc(50*time.Millisecond, cancel)
 	var ran atomic.Bool
 	start := time.Now()
-	err := c.submitWrite(WithWriteStartDeadline(ctx, start.Add(time.Second)), func(context.Context, *sql.Conn) error {
+	err := c.submitWrite(WithWriteStartDeadline(ctx, start.Add(time.Second)), writeTest, func(context.Context, *sql.Conn) error {
 		ran.Store(true)
 		return nil
 	})
@@ -218,7 +218,7 @@ func TestSubmitWrite_ShutdownWhileWaitingForTheStartDeadlineIsCtxErr(t *testing.
 func TestSubmitWrite_AStartDeadlineAlreadyPastIsNotStarted(t *testing.T) {
 	c := openCache(t)
 	var ran atomic.Bool
-	err := c.submitWrite(WithWriteStartDeadline(context.Background(), time.Now().Add(-time.Second)), func(context.Context, *sql.Conn) error {
+	err := c.submitWrite(WithWriteStartDeadline(context.Background(), time.Now().Add(-time.Second)), writeTest, func(context.Context, *sql.Conn) error {
 		ran.Store(true)
 		return nil
 	})
@@ -239,7 +239,7 @@ func TestHoldWriterForTest_HoldsUntilRelease(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- c.submitWrite(context.Background(), func(context.Context, *sql.Conn) error { return nil })
+		done <- c.submitWrite(context.Background(), writeTest, func(context.Context, *sql.Conn) error { return nil })
 	}()
 	select {
 	case err := <-done:
@@ -267,7 +267,7 @@ func TestSubmitWrite_ACancelledCtxAndAPastDeadlineOnEntryIsCtxErr(t *testing.T) 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var ran atomic.Bool
-	err := c.submitWrite(WithWriteStartDeadline(ctx, time.Now().Add(-time.Second)), func(context.Context, *sql.Conn) error {
+	err := c.submitWrite(WithWriteStartDeadline(ctx, time.Now().Add(-time.Second)), writeTest, func(context.Context, *sql.Conn) error {
 		ran.Store(true)
 		return nil
 	})
@@ -310,7 +310,7 @@ func TestSubmitWrite_ACancelAndAStartDeadlineReadyTogetherIsCtxErr(t *testing.T)
 	for i := range iterations {
 		deadline := time.Now().Add(2 * time.Millisecond)
 		ctx := WithWriteStartDeadline(lateDoneCtx{Context: parent, deadline: deadline}, deadline)
-		err := c.submitWrite(ctx, func(context.Context, *sql.Conn) error {
+		err := c.submitWrite(ctx, writeTest, func(context.Context, *sql.Conn) error {
 			runs.Add(1)
 			return nil
 		})

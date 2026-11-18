@@ -84,7 +84,7 @@ func isUniqueViolation(err error) bool {
 func (c *Cache) HeartbeatSnapshot(ctx context.Context, snapshotID int64) error {
 	const q = `UPDATE suite_snapshot SET heartbeat_at = ? WHERE snapshot_id = ?`
 	now := nowUnix()
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeAdoptionHeartbeat, func(ctx context.Context, conn *sql.Conn) error {
 		_, err := conn.ExecContext(ctx, q, now, snapshotID)
 		if err != nil {
 			return fmt.Errorf("HeartbeatSnapshot: %w", err)
@@ -202,7 +202,7 @@ SELECT snapshot_id, adopted_at FROM suite_snapshot
 		gotID     int64
 		gotReused bool
 	)
-	werr := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	werr := c.submitWrite(ctx, writeAdoptionCandidate, func(ctx context.Context, conn *sql.Conn) error {
 		res, execErr := conn.ExecContext(ctx, insertQ,
 			sc.CanonicalScheme, sc.CanonicalHost, sc.SuitePath,
 			sc.InReleaseHash, sc.InReleaseETag, sc.InReleaseLastMod,
@@ -370,7 +370,7 @@ func (c *Cache) CommitAdoption(ctx context.Context, snapshotID int64,
 	members []SnapshotMember, skipped []SkippedMember, packageHashes []PackageHash,
 	prefetchedURLPaths []PrefetchedURLPath, coverageComplete bool) error {
 	c.noteFlatRows(packageHashes) // ruling PG-31: before the transaction can commit
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeAdoptionCommit, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("CommitAdoption: begin: %w", err)
@@ -1255,7 +1255,7 @@ SELECT blob_hash, declared_sha256, snapshot_id, source FROM (
 // asks for. If a future phase tightens GC to an `= 0` predicate, this
 // helper and PutURLPath will need to be adjusted in lockstep.
 func (c *Cache) EvictURLPath(ctx context.Context, scheme, host, path string) error {
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeURLPathEvict, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("EvictURLPath: begin: %w", err)

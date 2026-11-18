@@ -64,7 +64,7 @@ func (c *Cache) MarkSignedSeenBatch(ctx context.Context, marks []SignedSeenMark)
 		n := min(len(marks), 500)
 		chunk := marks[:n]
 		marks = marks[n:]
-		if err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		if err := c.submitWrite(ctx, writeSignedSeenMark, func(ctx context.Context, conn *sql.Conn) error {
 			tx, err := conn.BeginTx(ctx, nil)
 			if err != nil {
 				return fmt.Errorf("MarkSignedSeenBatch: begin: %w", err)

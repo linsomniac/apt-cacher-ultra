@@ -10,7 +10,7 @@ import (
 // identity remain untouched. A completed adoption makes the update a no-op.
 func (c *Cache) ConfirmSnapshotUnchanged(ctx context.Context, key SuiteKey, snapshotID, now int64) (bool, error) {
 	updated := false
-	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	err := c.submitWrite(ctx, writeCheckUnchanged, func(ctx context.Context, conn *sql.Conn) error {
 		res, err := conn.ExecContext(ctx, `UPDATE suite_freshness
 SET last_check_at = ?, last_success_at = ?, check_fail_count = 0
 WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ? AND current_snapshot_id = ?

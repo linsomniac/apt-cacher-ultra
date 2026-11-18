@@ -26,7 +26,7 @@ func (c *Cache) DeleteSnapshotMembersForTest(ctx context.Context, snapshotID int
 	if len(paths) == 0 {
 		return nil
 	}
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeTest, func(ctx context.Context, conn *sql.Conn) error {
 		// Build "?,?,..." placeholders for the IN clause.
 		placeholders := strings.Repeat("?,", len(paths))
 		placeholders = placeholders[:len(placeholders)-1] // trim trailing comma
@@ -56,7 +56,7 @@ func (c *Cache) DeleteSnapshotMembersForTest(ctx context.Context, snapshotID int
 // a test must prove that reconcile builds package_hash rows from scratch, not
 // just that they survive from the initial adoption.
 func (c *Cache) DeletePackageHashForTest(ctx context.Context, scheme, host, debPath string, snapshotID int64) error {
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeTest, func(ctx context.Context, conn *sql.Conn) error {
 		if _, err := conn.ExecContext(ctx,
 			`DELETE FROM package_hash WHERE canonical_scheme = ? AND canonical_host = ? AND path = ? AND snapshot_id = ?`,
 			scheme, host, debPath, snapshotID); err != nil {
@@ -69,7 +69,7 @@ func (c *Cache) DeletePackageHashForTest(ctx context.Context, scheme, host, debP
 // ClearSignedSeenForTest deletes every marker. Tests that build a
 // "pre-v7" state with v7 code use it to undo CommitAdoption's marks.
 func (c *Cache) ClearSignedSeenForTest(ctx context.Context) error {
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeTest, func(ctx context.Context, conn *sql.Conn) error {
 		_, err := conn.ExecContext(ctx, `DELETE FROM suite_signed_seen`)
 		return err
 	})
@@ -96,7 +96,7 @@ func (c *Cache) SetCommittedHookForTest(fn func()) {
 // (TestOnlyTheHandlerCreatesSuiteRows fails on such a call). TEST-ONLY.
 func (c *Cache) SeedSuiteForTest(ctx context.Context, s SuiteFreshness) error {
 	key := SuiteKey{CanonicalScheme: s.CanonicalScheme, CanonicalHost: s.CanonicalHost, SuitePath: s.SuitePath}
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeTest, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("SeedSuiteForTest: begin: %w", err)
@@ -174,7 +174,7 @@ func (c *Cache) HoldWriterForTest(ctx context.Context) (release func(), err erro
 	gate := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		done <- c.submitWrite(ctx, func(opCtx context.Context, _ *sql.Conn) error {
+		done <- c.submitWrite(ctx, writeTest, func(opCtx context.Context, _ *sql.Conn) error {
 			close(started)
 			select {
 			case <-gate:

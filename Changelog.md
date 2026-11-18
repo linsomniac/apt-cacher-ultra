@@ -38,6 +38,15 @@ not included in the published 1.1.0-rc1.
 
 ### Added
 
+- After 1.1.0-rc2: logs say what a database write waited behind. Every write
+  in the daemon runs on one goroutine, in arrival order, so an adoption's
+  commit queues with GC batches and client requests. `adoption_finished` and
+  `background_work_finished` now carry `writer_wait_seconds` and
+  `writer_ahead` (what the writer ran while the work's writes were queued, by
+  kind of write); the progress lines name what the writer is running while a
+  write is still queued; and `database_write_waited` reports any write, a
+  client request's included, that waited two seconds or more. See
+  [waiting for the database writer](docs/log-fields.md#waiting-for-the-database-writer).
 - After 1.1.0-rc1: independent background-work diagnostics identify busy
   suite locks, active phases, elapsed time and database/upstream/host/content-lock
   waits at INFO, including before candidate creation and during failure recording.

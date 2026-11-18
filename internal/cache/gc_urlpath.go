@@ -84,7 +84,7 @@ func (c *Cache) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds
 		droppedAt          sql.NullInt64
 	}
 
-	werr := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	werr := c.submitWrite(ctx, writeGCURLPaths, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("RunURLPathGCBatch: begin: %w", err)

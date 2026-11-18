@@ -89,7 +89,7 @@ func (c *Cache) StoreFetched(ctx context.Context, m FetchedRow, caps SuiteCaps, 
 		return FetchedResult{}, errFetchedSuiteMismatch
 	}
 	attempt := func() (FetchedResult, error) {
-		return c.creationAttempt(ctx, "StoreFetched", m.Create, caps, guard,
+		return c.creationAttempt(ctx, "StoreFetched", writeFetchedStore, m.Create, caps, guard,
 			func(ctx context.Context, tx *sql.Tx, held *heldSuite) (FetchedResult, error) {
 				return storeFetchedTx(ctx, tx, m, caps, held)
 			})

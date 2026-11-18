@@ -115,7 +115,7 @@ func (c *Cache) RefreshURLPathBlob(ctx context.Context, scheme, host, path, old,
 	}
 	now := nowUnix()
 	updated := false
-	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	err := c.submitWrite(ctx, writeURLPathRefresh, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -175,7 +175,7 @@ UPDATE url_path
 // fetch just stored.
 func (c *Cache) DeleteURLPathRows(ctx context.Context, rows []URLPath) (int, error) {
 	n := 0
-	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	err := c.submitWrite(ctx, writeURLPathDelete, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("DeleteURLPathRows: begin: %w", err)

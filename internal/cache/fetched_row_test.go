@@ -185,7 +185,7 @@ func TestStoreFetched_MarkerPrecedesALaterWriterOperation(t *testing.T) {
 	row := fetchedRow(t, c, key, "/InRelease") // its blob is written before the writer is blocked
 	block, blocked := make(chan struct{}), make(chan struct{})
 	go func() {
-		_ = c.submitWrite(ctx, func(context.Context, *sql.Conn) error {
+		_ = c.submitWrite(ctx, writeTest, func(context.Context, *sql.Conn) error {
 			close(blocked)
 			<-block
 			return nil
@@ -213,7 +213,7 @@ func TestStoreFetched_MarkerPrecedesALaterWriterOperation(t *testing.T) {
 	var sawMarker bool
 	later := make(chan error, 1)
 	go func() {
-		later <- c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+		later <- c.submitWrite(ctx, writeTest, func(ctx context.Context, conn *sql.Conn) error {
 			var n int
 			err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM suite_signed_seen
  WHERE canonical_scheme = 'http' AND canonical_host = 'h' AND base = '/r/dists/x'`).Scan(&n)

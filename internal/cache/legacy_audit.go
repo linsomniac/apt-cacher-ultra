@@ -163,7 +163,7 @@ SELECT hash
 // retried, and the rows would serve the corrupt bytes for good.
 func (c *Cache) ApplyLegacyAuditDecisions(ctx context.Context, decisions []LegacyAuditDecision) (map[int64]LegacyAuditEffect, error) {
 	effects := make(map[int64]LegacyAuditEffect)
-	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	err := c.submitWrite(ctx, writeLegacyAuditApply, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("ApplyLegacyAuditDecisions: begin: %w", err)
@@ -323,7 +323,7 @@ SELECT s.canonical_scheme, s.canonical_host, s.suite_path, COALESCE(s.adopted_at
 // migration enqueues every adopted pre-v7 snapshot itself; this exists for tests
 // and for operator tooling that wants a snapshot re-audited.
 func (c *Cache) EnqueueLegacyTrustAudit(ctx context.Context, ids ...int64) error {
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeLegacyAuditEnqueue, func(ctx context.Context, conn *sql.Conn) error {
 		for _, id := range ids {
 			if _, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO legacy_trust_audit (snapshot_id) VALUES (?)`, id); err != nil {
 				return fmt.Errorf("EnqueueLegacyTrustAudit: %w", err)

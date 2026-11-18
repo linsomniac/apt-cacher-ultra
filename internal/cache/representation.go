@@ -35,7 +35,7 @@ func (c *Cache) PutRepresentation(ctx context.Context, scheme, host, path, hash,
 		return ErrInvalidHash
 	}
 	date := HTTPDate(lastmod)
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeRepresentationPut, func(ctx context.Context, conn *sql.Conn) error {
 		_, err := conn.ExecContext(ctx, putRepresentationSQL, scheme, host, path, hash, date, nowUnix())
 		return err
 	})
@@ -79,7 +79,7 @@ func (c *Cache) PruneRepresentationMetadata(ctx context.Context, limit int) (int
 		return 0, fmt.Errorf("PruneRepresentationMetadata: limit must be >= 1, got %d", limit)
 	}
 	var pruned int
-	err := c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	err := c.submitWrite(ctx, writeRepresentationPrune, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("PruneRepresentationMetadata: begin: %w", err)

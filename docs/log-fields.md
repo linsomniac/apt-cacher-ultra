@@ -529,6 +529,12 @@ The finish record adds:
 - `hot_count`, `hot_fetched`, `hot_reused`, `hot_failed`, `hot_mismatched`,
   `hot_unattempted`: hot-package prefetch progress. Zero if prefetch was not
   reached; use `phase_seconds` to distinguish that from an empty hot set.
+- `writer_wait_seconds`, `writer_ahead`: for how long the attempt had a
+  database write queued, and what the database writer ran in that time
+  (see [Waiting for the database writer](#waiting-for-the-database-writer)).
+  A long `commit` or `prepare` phase with a small `writer_wait_seconds` is
+  the attempt's own transaction; with a large one it is a queue, and
+  `writer_ahead` says of what.
 - `first_seen_seconds`: how long the cache had known of this upstream change
   when the attempt ended — from the first check that saw it, across any
   checks that found no adoption slot or were deferred by a failure record.
@@ -563,6 +569,103 @@ Older versions counted every successful warm as `fetched` and had no `reused`.
 Reuse preserves stored upstream dates and client request timestamps. Corruption
 found during reuse emits `pool_corruption_during_adoption` before a repair fetch;
 an invalid replacement is discarded and cannot become a successful prefetch.
+
+### Waiting for the database writer
+
+Every database write in the daemon runs on one goroutine, in arrival
+order: a client's cache miss, an adoption's commit and a GC batch stand in
+the same queue. These fields say, for a write that waited there, what ran
+ahead of it.
+
+On `adoption_finished` and `background_work_finished`:
+
+- `writer_wait_seconds`: for how long the work had at least one write
+  queued. Two of its writes queued at the same moment count that time
+  once, so the value never exceeds the work's duration. It is queue time
+  only: the work's own transactions are not in it.
+- `writer_ahead`: what the writer ran during that time, by kind of write,
+  for example
+  `{"gc_retired_snapshots": {"count": 14, "seconds": 9.8}, "adoption_commit": {"count": 1, "seconds": 6.1}}`.
+  `count` is operations and `seconds` their run time inside the wait: an
+  operation already running when the work's write queued counts once, with
+  only the part that came after. A write of the work's own that ran while
+  another of its writes still waited is listed too (an adoption's
+  `adoption_heartbeat` ahead of its commit). Empty when nothing was ahead.
+
+While a write is still queued, the activity fields of
+`adoption_in_progress`, `background_work_in_progress`,
+`freshness_check_busy` and `repair_yield_timeout` carry:
+
+- `writer_waiting_seconds`: for how long the work has had a write queued.
+- `writer_running`, `writer_running_seconds`: the kind of write the writer
+  is running at that moment, and for how long that operation has run —
+  which can be longer than the wait. Absent in the instant between two
+  operations.
+- `writer_ahead`: what the writer has finished since the write queued, as
+  above. The operation still running is in `writer_running`, not here.
+
+All four are absent when none of the work's writes is queued.
+
+`database_write_waited` is logged for any write, a client request's
+included, that waited two seconds or more:
+
+- `op`: its kind (the table below).
+- `waited_seconds`: how long it was queued.
+- `started`: `true` when the writer then ran it; `false` when its caller
+  stopped waiting first — the request ended, or a GC batch reached its
+  pass deadline — and the write was never started for that caller.
+- `ran_seconds`: how long its own operation ran. Only with `started` true.
+- `ahead`: what the writer ran while it waited, as `writer_ahead`. For a
+  write that was not started, the operation still on the writer is counted.
+- `suppressed`: at most one line is logged per kind of write in ten
+  seconds; this counts the waits of that kind left out since its previous
+  line. A stalled writer has many client writes behind it; the work they
+  belong to, if any, still reports them in its own `writer_ahead`.
+- `work_id`, `work_kind`, `adoption_id`: when the write belongs to an
+  adoption, repair, reconcile or check.
+
+A write whose caller stopped waiting only after the writer had started it
+is not logged.
+
+The kinds of write:
+
+| Kind | The write |
+| --- | --- |
+| `adoption_candidate` | An adoption records the release it is about to fetch (its candidate snapshot). |
+| `adoption_heartbeat` | A running adoption marks its candidate snapshot as alive. |
+| `adoption_blob_heartbeat` | A running adoption marks the files it has fetched as in use, so GC keeps them. |
+| `adoption_commit` | An adoption publishes its snapshot: one transaction with every member and package row of the release. |
+| `adoption_failure_record` | A failed or refused adoption is recorded for the retry schedule. |
+| `adoption_failure_clear` | A failure record is cleared: upstream serves the current snapshot's content again. |
+| `adoption_retry_set` | The next retry time of a failure record is moved. |
+| `adoption_retry_reschedule` | At start, every failing suite is given one prompt retry. |
+| `reconcile_members` | A reconcile adds recovered index files and their package rows to the current snapshot. |
+| `repair_member` | A repair adds a file the adoption had skipped to the current snapshot. |
+| `repair_retry_bump` | A repair counts one more failed attempt at a skipped file. |
+| `check_unchanged` | A check beside a running repair records that upstream is unchanged. |
+| `suite_create` | A suite is tracked for the first time. |
+| `suite_freshness_update` | A freshness check records its result. |
+| `suite_touch` | A suite's last-requested time is updated. |
+| `suite_reap`, `suite_reap_url_paths` | An idle suite is removed; its cached paths are removed in batches. |
+| `suite_forget` | `POST /forget` removes a suite. |
+| `fetched_store` | A client request's cache miss stores the file it fetched, before the body is served. |
+| `url_path_put` | A cached path's row is stored or replaced. |
+| `url_path_touch` | A cache hit updates the path's last-requested time and count. |
+| `url_path_refresh` | A refresh of a suite without an adopted snapshot updates a cached path: its file, or only its validators. |
+| `url_path_evict` | A cached path whose file differs from what the current snapshot declares is dropped. |
+| `url_path_delete` | Cached paths that upstream no longer serves are removed. |
+| `blob_put` | A stored file is recorded. |
+| `representation_put`, `representation_prune` | A stored file's upstream date is recorded; GC removes dates no longer needed. |
+| `signed_seen_mark` | Suites are marked as having been served signed. |
+| `marker_sweep` | Signed-seen markers of suites that are gone are removed. |
+| `gc_blobs` | GC deletes a batch of unreferenced files' rows. |
+| `gc_snapshots` | GC removes abandoned candidates and retires displaced snapshots. |
+| `gc_retired_snapshots` | GC deletes a retired snapshot's rows, a chunk at a time. |
+| `gc_displaced_packages` | GC deletes the package rows of displaced snapshots, a chunk at a time. |
+| `gc_url_paths` | GC scans and removes a batch of cached paths. |
+| `legacy_audit_enqueue`, `legacy_audit_apply` | The audit of snapshots adopted by an earlier version queues its work and applies its decisions. |
+| `legacy_metadata_invalidate` | With adoption disabled, a changed release drops the suite's cached metadata. |
+| `usage_save` | Usage statistics are saved. |
 
 ### Other operational events
 
@@ -618,12 +721,13 @@ file events and the daemon's `main`).
 | `maintenance_probe_stamp_failed` | WARN | `canonical_host`, `suite_path`, `err` | Upstream confirmed the current anchor during maintenance, but recording the check failed. The repair keeps running; the next due probe retries. |
 | `adoption_hot_set_budget_elapsed` | INFO | `canonical_host`, `suite_path`, `snapshot_id`, `adoption_id` | Hot-set computation exhausted the warming budget. Publication proceeds without prefetch. |
 | `background_work_started` | INFO | `work_id`, `work_kind`, `canonical_scheme`, `canonical_host`, `suite_path`, `phase`, `phase_seconds`, `elapsed_seconds`, `waits` | A repair or manual reconcile starts. |
-| `background_work_in_progress` | INFO | Same activity fields | Once per minute while a check, repair, reconcile or suite maintenance holds its suite lock, or a maintenance probe is running beside that owner. `waits` counts outstanding `database_write`, `host_slot`, `maintenance_probe_slot`, `content_lock`, `upstream_probe` and `upstream_fetch` operations (parallel operations can overlap). Runs independently of database heartbeats. |
-| `background_work_finished` | INFO | Same activity fields, `adoption_id` for adoption work | A maintenance/adoption lock owner ends, or a check taking at least a minute ends. Includes adoption failure-record work after `adoption_finished`. |
+| `background_work_in_progress` | INFO | Same activity fields | Once per minute while a check, repair, reconcile or suite maintenance holds its suite lock, or a maintenance probe is running beside that owner. `waits` counts outstanding `database_write`, `host_slot`, `maintenance_probe_slot`, `content_lock`, `upstream_probe` and `upstream_fetch` operations (parallel operations can overlap). Runs independently of database heartbeats. While one of the work's database writes is queued, the activity fields also carry `writer_waiting_seconds`, `writer_running`, `writer_running_seconds` and `writer_ahead` ([Waiting for the database writer](#waiting-for-the-database-writer)). |
+| `background_work_finished` | INFO | Same activity fields, `adoption_id` for adoption work, `writer_wait_seconds`, `writer_ahead` | A maintenance/adoption lock owner ends, or a check taking at least a minute ends. Includes adoption failure-record work after `adoption_finished`. `writer_wait_seconds` and `writer_ahead` are the work's finished waits for the database writer, as on `adoption_finished`. |
+| `database_write_waited` | INFO | `op`, `waited_seconds`, `started`, `ran_seconds` (with `started` true), `ahead`, `suppressed`; `work_id`, `work_kind` and `adoption_id` for a write of tracked work | A database write waited two seconds or more for the writer: whose it was, and what ran ahead of it. See [Waiting for the database writer](#waiting-for-the-database-writer). |
 | `freshness_check_busy` | INFO | Activity fields, `reason`, `suppressed` | A check cannot take the suite lock. Names its holder and current phase, once per minute per holder; `suppressed` counts additional busy checks since that holder's previous line. All busy checks count in `acu_freshness_skipped_total{reason,host}`. A transient unregistered owner counts as `suite_lock`; cooldown skips count as `cooldown` without a log per request. |
 | `repair_yield_timeout` | WARN | `canonical_host`, `to`, `wait_seconds`; activity fields for a check of the same suite | Cancellation was requested but maintenance had not released its lock/slot after five seconds. This is visible even if the repair never reaches `repair_yielded`. |
 | `repair_yielded` | INFO | `canonical_scheme`, `canonical_host`, `suite_path`, `snapshot_id`, `to` (`adoption`: an adoption needed the repair's adoption slots — one of another suite on the same host, or any when the pool was full; `check`: a due probe of the repair's own suite found a changed or inconclusive anchor), `ran_seconds` | A repair or reconcile stopped before it was done so that a new release could be noticed or adopted: it holds its suite's lock and adoption slots while it runs, and a repair heals a snapshot that is already serving. Nothing is recorded against the members it had not finished (being stopped is no evidence about upstream), the ones it had finished stay, and the next unchanged check starts it again. Counted in `acu_repair_yielded_total{to}`. An unchanged anchor probe leaves maintenance running, even across several refresh intervals. A changed or inconclusive probe yields to the ordinary check; competing real adoptions still take priority. |
-| `adoption_in_progress` | INFO | `adoption_id`, `canonical_scheme`, `canonical_host`, `suite_path`, `phase` (as `adoption_finished`'s `phase_seconds` keys), `phase_seconds`, `elapsed_seconds` | An adoption attempt has been running for a minute, and for every minute after: where it is. Also includes `work_id`, `work_kind`, and `waits` as above. The watchdog starts before verification and runs independently of database liveness heartbeats. An attempt that ends sooner logs none. `adoption_finished` gives the complete picture; this line is for the attempt that has not finished — a slow upstream, a long flip barrier, a deep write queue. |
+| `adoption_in_progress` | INFO | `adoption_id`, `canonical_scheme`, `canonical_host`, `suite_path`, `phase` (as `adoption_finished`'s `phase_seconds` keys), `phase_seconds`, `elapsed_seconds` | An adoption attempt has been running for a minute, and for every minute after: where it is. Also includes `work_id`, `work_kind`, and `waits` as above. The watchdog starts before verification and runs independently of database liveness heartbeats. An attempt that ends sooner logs none. `adoption_finished` gives the complete picture; this line is for the attempt that has not finished — a slow upstream, a long flip barrier, a deep write queue. For the last of these it names what the writer is running (`writer_running` and the other [writer fields](#waiting-for-the-database-writer)). |
 | `adoption_read_prior_members_failed` | WARN | `canonical_host`, `suite_path`, `snapshot_id`, `err` | The adoption could not read the suite's current snapshot — its member rows, or the `Release` it was adopted from — which together tell it which declared files upstream did not serve last time. It goes on and asks for every member by hash first, then by path, as a first adoption does: slower, never less complete. |
 | `adoption_member_retry` | INFO | `canonical_host`, `suite_path`, `path`, `attempt`, `max_retries`, `delay`, `waiting_members`, `err` | A member's fetch failed in a way a mirror mid-sync explains (it did not come, or its size or hash differed) and will be tried again after `delay` (`adoption.member_retry_delay`). The members that failed in a round wait together: one line per member, one delay for all `waiting_members` of them. |
 | `adoption_repair_list_failed` | WARN | `canonical_host`, `suite_path`, `snapshot_id`, `err` | The repair decision could not list the snapshot's repairable skipped members; no repair runs this check, the next unchanged check asks again. |

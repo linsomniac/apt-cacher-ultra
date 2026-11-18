@@ -61,7 +61,7 @@ func (c *Cache) PutURLPath(ctx context.Context, u URLPath) error {
 	if u.IsMetadata {
 		isMD = 1
 	}
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeURLPathPut, func(ctx context.Context, conn *sql.Conn) error {
 		_, err := conn.ExecContext(ctx, putURLPathSQL,
 			u.CanonicalScheme, u.CanonicalHost, u.Path, u.BlobHash, u.UpstreamURL,
 			isMD, u.LastRequestedAt, u.RequestCount, u.LastFetchedAt,
@@ -111,7 +111,7 @@ SET request_count = request_count + 1,
     dropped_at = NULL
 WHERE canonical_scheme = ? AND canonical_host = ? AND path = ?`
 	now := nowUnix()
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeURLPathTouch, func(ctx context.Context, conn *sql.Conn) error {
 		_, err := conn.ExecContext(ctx, q, now, scheme, host, path)
 		if err != nil {
 			return fmt.Errorf("TouchURLPath: %w", err)
@@ -195,7 +195,7 @@ ON CONFLICT(hash) DO UPDATE
    SET refcount_zeroed_at = excluded.refcount_zeroed_at
  WHERE blob.refcount <= 0`
 	now := nowUnix()
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeBlobPut, func(ctx context.Context, conn *sql.Conn) error {
 		_, err := conn.ExecContext(ctx, q, hash, size, now, now)
 		if err != nil {
 			return fmt.Errorf("PutBlob: %w", err)

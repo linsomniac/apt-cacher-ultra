@@ -51,7 +51,7 @@ func (c *Cache) InvalidateLegacyMetadata(ctx context.Context, key SuiteKey, anch
 	if !aptpath.IsCanonicalSuitePath(key.SuitePath) || (anchorPath != key.SuitePath+"/InRelease" && anchorPath != key.SuitePath+"/Release") || !validBlobHash(oldHash) {
 		return fmt.Errorf("invalidate metadata: invalid suite or anchor")
 	}
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeLegacyMetadataInvalidate, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return err

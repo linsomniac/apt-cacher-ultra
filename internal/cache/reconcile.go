@@ -136,7 +136,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 //     substitute a different blob than what already serves — that is corruption.
 func (c *Cache) InsertReconciledMembers(ctx context.Context, snapshotID int64, members []SnapshotMember, packageHashes []PackageHash) error {
 	c.noteFlatRows(packageHashes) // ruling PG-31: before the transaction can commit
-	return c.submitWrite(ctx, func(ctx context.Context, conn *sql.Conn) error {
+	return c.submitWrite(ctx, writeReconcileMembers, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("InsertReconciledMembers: begin: %w", err)
