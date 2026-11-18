@@ -2889,12 +2889,24 @@ func (a *Adopter) buildPackageHashes(ctx context.Context, suite SuiteRef, snapsh
 	// vouch nothing and make coverage incomplete below (no_sha256).
 	dedup := make(map[string]debPathDecl)
 	noSHA256 := make(map[string]bool)
+	var emptyPlainPackages map[string]bool
 	for _, m := range fetchedMembers {
 		if !packagesIndex(m.Path, isPackagesMember) {
 			continue
 		}
 		body, err := a.readPackagesBlob(m.Path, m.SHA256)
 		if err != nil {
+			// Cloudsmith publishes some empty components as zero bytes at
+			// both Packages and Packages.gz. Only the verified plain sibling
+			// can establish coverage. Keep the original bytes for both URLs.
+			if errors.Is(err, io.EOF) && path.Base(m.Path) == "Packages.gz" && isVerifiedEmptyMember(m) {
+				if emptyPlainPackages == nil {
+					emptyPlainPackages = verifiedEmptyPackagesPaths(fetchedMembers)
+				}
+				if emptyPlainPackages[strings.TrimSuffix(m.Path, ".gz")] {
+					continue
+				}
+			}
 			return packageHashBuildResult{}, fmt.Errorf("%w: read %q: %w", ErrAdoptionParseFailed, m.Path, err)
 		}
 		refs, gaps, err := parsePackages(body)

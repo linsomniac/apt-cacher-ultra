@@ -254,6 +254,10 @@ not included in the published 1.1.0-rc1.
 
 ### Fixed
 
+- After 1.1.0-rc2, ACU can adopt the Caddy repository on Cloudsmith.
+  Empty components previously caused adoption to report `parse_failed`. ACU
+  accepts a zero-byte `Packages.gz` only when it also verifies a zero-byte
+  `Packages` in the same directory of the same release.
 - After 1.1.0-rc1: release checks can run beside automatic repair or manual
   reconciliation instead of waiting for maintenance to finish. Unchanged
   metadata lets a slow repair continue across refresh intervals; changed or
