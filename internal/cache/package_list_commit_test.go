@@ -605,3 +605,68 @@ func TestCommitDiff_ADifferenceThatDoesNotFitItsListIsRewritten(t *testing.T) {
 		})
 	}
 }
+
+// A difference belongs to the rows it was computed for. Handed to a commit
+// of other rows — another publication of the same size, or the same slice
+// changed since — it is not applied: the commit writes the list whole and
+// reports the defect, and the list is exactly the rows the commit was given.
+func TestCommitDiff_ADifferenceForOtherRowsIsNotApplied(t *testing.T) {
+	for _, how := range []string{"other rows of the same count", "the same slice, changed since"} {
+		t.Run(how, func(t *testing.T) {
+			c := openCache(t)
+			ctx := context.Background()
+			key := sk("h", "/ubuntu/dists/jammy")
+			seedRow(t, c, key, 1)
+			rows := numbered(100, 'a')
+			publish(t, c, key, rows)
+
+			forDiff := slices.Clone(rows)
+			forDiff[3].DeclaredSHA256 = hashOf('b')
+			id, members := signedCandidate(t, c, key)
+			diff, err := c.DiffPackageList(ctx, key, forDiff)
+			if err != nil || diff.Size() != 1 {
+				t.Fatalf("DiffPackageList = %+v, %v", diff, err)
+			}
+			committed := forDiff
+			if how == "other rows of the same count" {
+				committed = slices.Clone(rows)
+				committed[40].DeclaredSHA256, committed[41].Version = hashOf('c'), "7"
+			} else {
+				committed[60].DeclaredSHA256 = hashOf('d')
+			}
+			w, err := c.CommitAdoptionDiff(ctx, id, members, nil, committed, nil, true, diff)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if w.Mode != PackageListRewrite || w.Reason != "mismatch" || w.Added != 100 || w.Detail == "" {
+				t.Fatalf("the write = %+v, want a rewrite (mismatch) of 100 rows with a detail", w)
+			}
+			requireLive(t, c, key, committed)
+		})
+	}
+}
+
+// The binding is to the rows, not to their order: the same rows in another
+// order are the same publication, and its difference is applied.
+func TestCommitDiff_TheSameRowsInAnotherOrderAreTheSameRows(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	key := sk("h", "/ubuntu/dists/jammy")
+	seedRow(t, c, key, 1)
+	rows := numbered(100, 'a')
+	publish(t, c, key, rows)
+	next := slices.Clone(rows)
+	next[3].DeclaredSHA256 = hashOf('b')
+	id, members := signedCandidate(t, c, key)
+	diff, err := c.DiffPackageList(ctx, key, next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reordered := slices.Clone(next)
+	slices.Reverse(reordered)
+	w, err := c.CommitAdoptionDiff(ctx, id, members, nil, reordered, nil, true, diff)
+	if err != nil || w.Mode != PackageListDifference || w.Changed != 1 {
+		t.Fatalf("the write = %+v, %v; want the difference applied", w, err)
+	}
+	requireLive(t, c, key, next)
+}

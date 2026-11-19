@@ -381,15 +381,23 @@ func (c *Cache) CommitAdoption(ctx context.Context, snapshotID int64,
 // CommitAdoptionDiff is CommitAdoption given what turns the suite's live
 // package list into packageHashes (DiffPackageList's result, read before
 // the commit), and it reports how the list was written. With a difference
-// that still fits the list, Step 3 writes only the rows that changed, in
-// place; with none (nil), or one that no longer fits, it writes the whole
-// list as CommitAdoption does. Either way the list the suite names after
-// the commit holds exactly packageHashes (commitPackageListTx).
+// that still fits — computed for these very rows, against the list and
+// generation the suite still has — Step 3 writes only the rows that
+// changed, in place; with none (nil), or one that does not fit, it writes
+// the whole list as CommitAdoption does. Either way the list the suite
+// names after the commit holds exactly packageHashes (commitPackageListTx:
+// each of those conditions is checked there, none is the caller's word).
 func (c *Cache) CommitAdoptionDiff(ctx context.Context, snapshotID int64,
 	members []SnapshotMember, skipped []SkippedMember, packageHashes []PackageHash,
 	prefetchedURLPaths []PrefetchedURLPath, coverageComplete bool,
 	diff *PackageListDiff) (PackageListWrite, error) {
 	c.noteFlatRows(packageHashes) // ruling PG-31: before the transaction can commit
+	// What the difference must have been computed for (commitPackageListTx):
+	// digested here, on the caller's goroutine, not on the writer's.
+	var rowsDigest packageRowsDigest
+	if diff != nil {
+		rowsDigest = digestPackageRows(packageHashes)
+	}
 	// The op writes got, never a named result: on a ctx/close path
 	// submitWrite returns before the op ends (see InsertCandidateSnapshot).
 	var got PackageListWrite
@@ -535,7 +543,7 @@ SELECT package_list_id, package_list_generation FROM suite_freshness
 		var newList sql.NullInt64 // the list Step 6 points the suite at; NULL for an unsigned candidate
 		written := PackageListWrite{Mode: PackageListNone}
 		if AnchorForm(form) != FormUnsigned {
-			id, w, err := commitPackageListTx(ctx, tx, suiteKey, liveList, generation, packageHashes, diff)
+			id, w, err := commitPackageListTx(ctx, tx, suiteKey, liveList, generation, packageHashes, rowsDigest, diff)
 			if err != nil {
 				return fmt.Errorf("CommitAdoption: %w", err)
 			}
@@ -1230,6 +1238,17 @@ type IntegrityCandidate struct {
 // excludes blob.refcount-0 rows transitively via the suite_freshness
 // join: only blobs reachable from a current snapshot show up. Phase 4
 // GC will reap orphans separately; the scanner does not race it.
+//
+// integrityPackageRowsSQL is its second arm: the entries of the lists
+// suites name.
+const integrityPackageRowsSQL = `
+  SELECT e.declared_sha256      AS blob_hash,
+         e.declared_sha256      AS declared_sha256,
+         sf.current_snapshot_id AS snapshot_id,
+         'package_hash'         AS source
+    FROM package_list_entry e
+    JOIN suite_freshness sf ON sf.package_list_id = e.package_list_id`
+
 func (c *Cache) ListIntegrityCandidates(ctx context.Context) ([]IntegrityCandidate, error) {
 	const q = `
 SELECT blob_hash, declared_sha256, snapshot_id, source FROM (
@@ -1239,13 +1258,7 @@ SELECT blob_hash, declared_sha256, snapshot_id, source FROM (
          'snapshot_member'  AS source
     FROM snapshot_member sm
     JOIN suite_freshness sf ON sf.current_snapshot_id = sm.snapshot_id
-  UNION ALL
-  SELECT e.declared_sha256      AS blob_hash,
-         e.declared_sha256      AS declared_sha256,
-         sf.current_snapshot_id AS snapshot_id,
-         'package_hash'         AS source
-    FROM package_list_entry e
-    JOIN suite_freshness sf ON sf.package_list_id = e.package_list_id
+  UNION ALL` + integrityPackageRowsSQL + `
 )`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {

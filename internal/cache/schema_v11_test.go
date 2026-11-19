@@ -392,6 +392,25 @@ func TestMigrationV11_OddRows(t *testing.T) {
 	f.row(foreignCur, mv11Row("other.test", "/ubuntu/pool/x.deb", "9", "x", "amd64", "1", "")) // not its suite's host
 	// A suite whose pointer names another suite's snapshot.
 	f.exec(`UPDATE suite_freshness SET current_snapshot_id = ? WHERE canonical_host = 'b.test'`, foreignCur)
+	// A suite whose pointer names no snapshot at all: the foreign key
+	// forbids it, but only on a connection that enforces foreign keys (the
+	// sqlite3 shell does not by default).
+	dangling := SuiteKey{CanonicalScheme: "http", CanonicalHost: "a.test", SuitePath: "/dangling/dists/s"}
+	f.suite(dangling)
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{`PRAGMA foreign_keys = OFF`,
+		`UPDATE suite_freshness SET current_snapshot_id = 987654 WHERE suite_path = '/dangling/dists/s'`,
+		`PRAGMA foreign_keys = ON`} {
+		if _, err := conn.ExecContext(context.Background(), q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	c := migrateV11(t, db, dir)
 	ctx := context.Background()
@@ -403,6 +422,9 @@ func TestMigrationV11_OddRows(t *testing.T) {
 	}
 	if got := listIDOf(t, c, stray); got.Valid {
 		t.Fatalf("a suite pointing at another suite's snapshot names list %d, want none", got.Int64)
+	}
+	if got := listIDOf(t, c, dangling); got.Valid {
+		t.Fatalf("a suite pointing at no snapshot names list %d, want none", got.Int64)
 	}
 	rows, err := c.PackageRowsOfSnapshotForTest(ctx, foreignCur)
 	if err != nil || len(rows) != 1 || rows[0].CanonicalHost != "a.test" {

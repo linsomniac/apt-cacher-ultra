@@ -150,12 +150,6 @@ func (l *adoptionLog) finish(logger *slog.Logger, ctx context.Context, suite Sui
 		"hot_count", l.hot.hotCount, "hot_fetched", l.hot.fetched, "hot_reused", l.hot.reused,
 		"hot_failed", l.hot.failed, "hot_mismatched", l.hot.mismatched, "hot_unattempted", l.hot.unattempted,
 	)
-	// How late: how long the cache had known of this upstream change when
-	// the attempt ended, and how old the release itself — by its signed
-	// Date — was then. For a success the second is the publication's lag
-	// behind upstream, whatever the cache's own logs cover. Each only when
-	// known (a direct adopter call has no first sighting; a Release may
-	// carry no Date).
 	// How the commit wrote the suite's package list: the rows that changed
 	// (difference), the whole list (rewrite, with why), or none (an
 	// unsigned snapshot). Only an attempt that committed has one.
@@ -173,6 +167,12 @@ func (l *adoptionLog) finish(logger *slog.Logger, ctx context.Context, suite Sui
 	if l.work != nil {
 		attrs = append(attrs, l.work.writerTotal()...)
 	}
+	// How late: how long the cache had known of this upstream change when
+	// the attempt ended, and how old the release itself — by its signed
+	// Date — was then. For a success the second is the publication's lag
+	// behind upstream, whatever the cache's own logs cover. Each only when
+	// known (a direct adopter call has no first sighting; a Release may
+	// carry no Date).
 	if l.trigger.changeSeenAt > 0 {
 		attrs = append(attrs, "first_seen_seconds", max(now.Unix()-l.trigger.changeSeenAt, 0))
 	}

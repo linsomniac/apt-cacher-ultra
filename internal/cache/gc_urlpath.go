@@ -306,12 +306,7 @@ SELECT
 	//
 	// Schema 11: the current snapshots' rows are the entries of the lists
 	// suites name, so the join to the suite by its list is that scope.
-	mrows, err := tx.QueryContext(ctx, `
-SELECT sf.suite_path, ph.package_name, ph.architecture, ph.version
-  FROM package_list_entry ph
-  JOIN suite_freshness sf ON sf.package_list_id = ph.package_list_id
- WHERE ph.canonical_scheme = ? AND ph.canonical_host = ? AND ph.path = ? AND ph.declared_sha256 = ?`,
-		scheme, host, path, blobHash.String)
+	mrows, err := tx.QueryContext(ctx, mirrorMatchSQL, scheme, host, path, blobHash.String)
 	if err != nil {
 		return false, fmt.Errorf("urlPathRetainedTx: mirror match: %w", err)
 	}
@@ -369,6 +364,15 @@ SELECT sf.suite_path, ph.package_name, ph.architecture, ph.version
 	}
 	return false, nil
 }
+
+// mirrorMatchSQL is the mirror rule's match (urlPathRetainedTx): the
+// entries, in the lists suites name, that declare path with the hash the
+// cached file has, with their suite.
+const mirrorMatchSQL = `
+SELECT sf.suite_path, ph.package_name, ph.architecture, ph.version
+  FROM package_list_entry ph
+  JOIN suite_freshness sf ON sf.package_list_id = ph.package_list_id
+ WHERE ph.canonical_scheme = ? AND ph.canonical_host = ? AND ph.path = ? AND ph.declared_sha256 = ?`
 
 // topNVersionsSQL lists the distinct versions the suite's live package
 // list holds for one (package_name, architecture).

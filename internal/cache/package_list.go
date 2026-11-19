@@ -94,6 +94,53 @@ type PackageListDiff struct {
 	Changed    []PackageHash // new rows whose path the live list has with another column different
 	Added      []PackageHash // new rows whose path the live list does not have
 	TooLarge   bool          // more rows differ than the limit: the three slices are nil
+
+	// rows identifies the new rows the difference was computed for
+	// (digestPackageRows): a commit applies it only to those rows.
+	rows packageRowsDigest
+}
+
+// packageRowsDigest identifies a set of package rows whatever their order:
+// how many there are, and the sum of a hash of each.
+type packageRowsDigest struct {
+	count int
+	sum   uint64
+}
+
+// digestPackageRows digests rows: every stored column of every row
+// (SnapshotID is not stored), independent of the rows' order.
+//
+// AIDEV-NOTE: this binds a difference to the rows it was computed for
+// (the final review's I-1). A PackageListDiff says how to turn one list
+// into one particular set of rows; the commit's other checks (the list,
+// its generation, the row count afterwards) do not notice a difference
+// handed over with other rows of the same number. It is a tripwire
+// against a caller's mistake — a retry loop, a later phase that stages
+// rows — not a security boundary: FNV-1a per row, summed, so no sort and
+// no allocation (about 15 ms for 67,000 rows, on the adopter's goroutine,
+// before the commit is queued). A column added to PackageHash that is
+// stored must be added here.
+func digestPackageRows(rows []PackageHash) packageRowsDigest {
+	const (
+		offset = 14695981039346656037
+		prime  = 1099511628211
+	)
+	d := packageRowsDigest{count: len(rows)}
+	for i := range rows {
+		r := &rows[i]
+		h := uint64(offset)
+		for _, s := range [...]string{r.CanonicalScheme, r.CanonicalHost, r.Path, r.DeclaredSHA256,
+			r.PackageName, r.Architecture, r.Version, r.FlatFilename} {
+			for j := 0; j < len(s); j++ {
+				h ^= uint64(s[j])
+				h *= prime
+			}
+			h ^= 0xff // a field's end: "ab","c" is not "a","bc"
+			h *= prime
+		}
+		d.sum += h
+	}
+	return d
 }
 
 // Size is the number of rows the difference writes.
@@ -144,7 +191,7 @@ func diffPackageRows(next func() (row PackageHash, ok bool, err error), rows []P
 	}
 
 	var (
-		d        PackageListDiff
+		d        = PackageListDiff{rows: digestPackageRows(rows)}
 		old      PackageHash
 		haveOld  bool
 		lastPath string
@@ -174,7 +221,7 @@ func diffPackageRows(next func() (row PackageHash, ok bool, err error), rows []P
 		case haveOld && (i == len(order) || old.Path < rows[order[i]].Path):
 			d.Removed = append(d.Removed, old.Path)
 			if tooLarge() {
-				return PackageListDiff{TooLarge: true}, nil
+				return PackageListDiff{TooLarge: true, rows: d.rows}, nil
 			}
 			if err := advance(); err != nil {
 				return PackageListDiff{}, err
@@ -182,14 +229,14 @@ func diffPackageRows(next func() (row PackageHash, ok bool, err error), rows []P
 		case !haveOld || rows[order[i]].Path < old.Path:
 			d.Added = append(d.Added, rows[order[i]])
 			if tooLarge() {
-				return PackageListDiff{TooLarge: true}, nil
+				return PackageListDiff{TooLarge: true, rows: d.rows}, nil
 			}
 			i++
 		default: // the same path in both
 			if !samePackageRow(old, rows[order[i]]) {
 				d.Changed = append(d.Changed, rows[order[i]])
 				if tooLarge() {
-					return PackageListDiff{TooLarge: true}, nil
+					return PackageListDiff{TooLarge: true, rows: d.rows}, nil
 				}
 			}
 			i++
@@ -293,10 +340,11 @@ SELECT canonical_scheme, canonical_host, path, declared_sha256,
 // package_list_generation, read in this transaction.
 //
 // The difference path: diff is applied to the live list in place, when it
-// was computed against this list at this generation and is at most half
-// of rows. The rewrite path, otherwise and whenever the difference turns
-// out wrong: a new list holding rows; the live one is left unnamed, for
-// GC.
+// was computed for these rows (rowsDigest is digestPackageRows(rows),
+// taken by the caller before the commit was queued), against this list at
+// this generation, and is at most half of rows. The rewrite path,
+// otherwise and whenever the difference turns out wrong: a new list
+// holding rows; the live one is left unnamed, for GC.
 //
 // AIDEV-NOTE: this is the guard the package-list design rests on ("The
 // switch", step 1). A difference says how to turn one particular state of
@@ -311,12 +359,18 @@ SELECT canonical_scheme, canonical_host, path, declared_sha256,
 // the generation breaks it silently; TestPackageLists_AModelOfTheSwitch
 // is where that would show.
 func commitPackageListTx(ctx context.Context, tx *sql.Tx, key SuiteKey, live sql.NullInt64, generation int64,
-	rows []PackageHash, diff *PackageListDiff) (listID int64, w PackageListWrite, err error) {
+	rows []PackageHash, rowsDigest packageRowsDigest, diff *PackageListDiff) (listID int64, w PackageListWrite, err error) {
 	switch {
 	case !live.Valid:
 		w.Reason = "first"
 	case diff == nil:
 		w.Reason = "no_difference"
+	case diff.rows != rowsDigest:
+		// The difference was computed for other rows than these (or these
+		// were changed since): a caller's defect. Nothing of it is applied.
+		w.Reason, w.Expected = "mismatch", len(rows)
+		w.Detail = fmt.Sprintf("the difference was computed for other rows than the commit was given (%d rows then, %d now, or their contents changed)",
+			diff.rows.count, rowsDigest.count)
 	case diff.TooLarge || diff.Size() > len(rows)/2:
 		w.Reason = "large"
 	case diff.ListID != live.Int64 || diff.Generation != generation:

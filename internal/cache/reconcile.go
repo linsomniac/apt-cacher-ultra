@@ -21,8 +21,11 @@ import (
 // (package_name/architecture/version) DISAGREES is a real cross-index
 // conflict and fails loud (SPEC6_5 §11 H7). It is NOT a silent ON CONFLICT
 // DO NOTHING. If the package_list_entry column set ever changes, update
-// insertPackageListEntrySQL and the probe and heal below; both writers
-// call noteFlatRows before they submit (Cache.flatRows, ruling PG-31).
+// insertPackageListEntrySQL, the probe and heal below, and in
+// package_list.go the difference's UPDATE (runPackageListDiffTx),
+// DiffPackageList's SELECT and digestPackageRows (samePackageRow follows
+// the struct by itself); both writers call noteFlatRows before they
+// submit (Cache.flatRows, ruling PG-31).
 // flat_filename (phase G) is inserted but neither probed nor healed here,
 // on purpose: it follows from the row's path and its suite (DotClean of
 // the Filename relative to FlatBase), so a same-path row of the suite's
