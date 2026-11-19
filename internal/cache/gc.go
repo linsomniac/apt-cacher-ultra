@@ -616,9 +616,14 @@ SELECT pl.package_list_id FROM package_list pl
 // suite with a list, plus the garbage — and probes
 // idx_suite_freshness_package_list once per row, so a call costs at most
 // one probe per live list before it finds garbage or reports none. The
-// chunk's DELETE is keyed by the entries' primary key (package_list_id,
-// path), so one transaction holds the writer for one chunk of one list,
-// as sub-job C's does (measurement at retiredChunkRows).
+// chunk's DELETE is sub-job C's shape (rowid IN (… LIMIT ?), the rowids
+// read from the primary key's index), so one transaction holds the writer
+// for one chunk of one list, as C's does. Keyed by path instead
+// (package_list_id = ? AND path IN (…)), the first version held the
+// writer about three times as long a chunk on a production database copy
+// (0.46 to 0.76 s for the longest of a 67,000-row list, against main's
+// 0.16 to 0.29 s for a displaced snapshot's rows): the measurement at
+// retiredChunkRows is of this shape.
 func (c *Cache) RunPackageListGCChunk(ctx context.Context, maxRows int) (rows int, more bool, err error) {
 	maxRows = effectiveChunkRows(maxRows)
 	// The op writes gotRows/gotMore, never the named results: on a ctx/close
@@ -640,8 +645,8 @@ func (c *Cache) RunPackageListGCChunk(ctx context.Context, maxRows int) (rows in
 			return fmt.Errorf("RunPackageListGCChunk: select: %w", err)
 		}
 		res, err := tx.ExecContext(ctx, `
-DELETE FROM package_list_entry WHERE package_list_id = ?1 AND path IN
- (SELECT path FROM package_list_entry WHERE package_list_id = ?1 LIMIT ?2)`, id, maxRows)
+DELETE FROM package_list_entry WHERE rowid IN
+ (SELECT rowid FROM package_list_entry WHERE package_list_id = ? LIMIT ?)`, id, maxRows)
 		if err != nil {
 			return fmt.Errorf("RunPackageListGCChunk: delete entries of list %d: %w", id, err)
 		}
