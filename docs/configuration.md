@@ -1158,16 +1158,23 @@ at startup. The unit is `Type=simple`, so systemctl reports only a restart job
 that fails, not a daemon that exits once started, and `Restart=always` starts
 it again every 5 seconds.
 
-On its first start after an upgrade, the daemon audits every metadata snapshot
-adopted by earlier versions before it serves anything (a large cache can take
-a little while; progress is logged per 100 snapshots). Application ports remain
-closed during this work; clients connecting directly may see connection refusal
-until startup finishes. The first start's garbage collection then runs in the
-background once the ports are open: it deletes the package lists that earlier
-versions kept for every displaced snapshot, which on a large, old cache can take
-several minutes (up to `gc.max_tick_duration`, then hourly runs). Requests are
-served meanwhile, some more slowly, since GC and the cache share one database
-writer. A snapshot whose stored `InRelease` is not a signed, clean
+On its first start after an upgrade, the daemon migrates its database and
+then audits every metadata snapshot adopted by earlier versions, before it
+serves anything. The migration moves each suite's current package rows into
+one list per suite and drops the table that held a copy per snapshot, and
+with it the package lists earlier versions kept for every displaced
+snapshot: 5 to 10 seconds for a database of 1.16 million package rows in
+our measurement, longer on a larger database or a slower disk. While it
+runs, the write-ahead log beside the database grows (about 170 MiB for
+290,000 current rows) and SQLite may sort in its temporary directory. The
+audit can take a little while on a large cache; its progress is logged per
+100 snapshots. Application ports remain closed during this work; clients
+connecting directly may see connection refusal until startup finishes. Do
+not restart the daemon to hurry it: an interrupted migration starts again
+from the beginning. The first start's garbage collection then runs in the
+background once the ports are open (up to `gc.max_tick_duration`, then
+hourly runs). Requests are served meanwhile, some more slowly, since GC and
+the cache share one database writer. A snapshot whose stored `InRelease` is not a signed, clean
 clearsigned message — a plain-text file adopted with `require_signature =
 false`, or one carrying declarations outside its signature — or whose pool
 file is missing or corrupt, is quarantined: it stops serving and vouching,
@@ -1217,7 +1224,7 @@ Keep `ca/`: unless `tls_mitm.ca_storage_dir` is set, it holds the MITM CA the ca
 for every client that trusts the old one. The rest of `cache.dir`,
 `tmp/` and `staging/`, is scratch space that may go too. The audit then
 changes nothing, but the migration before it has:
-the database is at schema 10, which older binaries refuse, so going back to 1.0.x
+the database is at schema 11, which older binaries refuse, so going back to 1.0.x
 means restoring the `cache.db` copied before the upgrade: stop the
 daemon first (a refused start runs again every 5 seconds and would
 migrate the copy again, and a copy put back under a running daemon can be
@@ -2052,8 +2059,9 @@ upstream modification dates. Missing, invalid and future dates are omitted.
 Dates already saved with URL rows and snapshot anchors survive the schema 8
 upgrade; objects whose upstream dates were never recorded have no date until
 fetched again. Schema 9 adds persistent usage totals; schema 10 adds persistent
-hot-package identities. The migrations are forward-only; binaries supporting
-only schema 9 or earlier cannot open schema 10.
+hot-package identities; schema 11 keeps a suite's package rows as one list
+instead of a copy per snapshot. The migrations are forward-only; binaries
+supporting only schema 10 or earlier cannot open schema 11.
 
 Responses carry a strong content-based ETag. Clients using `If-None-Match` can
 receive 304 responses. Date-only conditional requests receive the full body:

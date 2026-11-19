@@ -193,8 +193,11 @@ class BurstLab(Lab):
                 stats["release_age_seconds"] = rec.get("release_age_seconds")
                 stats["hot"] = {k: rec[k] for k in ("hot_count", "hot_fetched", "hot_failed", "hot_unattempted") if k in rec}
                 stats["phases"] = rec.get("phase_seconds")
-                # What the attempt's database writes waited behind (binaries that log it).
-                for key in ("writer_wait_seconds", "writer_ahead", "duration_seconds"):
+                # What the attempt's database writes waited behind, and how its
+                # commit wrote the suite's package list (binaries that log them).
+                for key in ("writer_wait_seconds", "writer_ahead", "duration_seconds",
+                            "package_list_write", "package_list_rewrite_reason",
+                            "package_rows_added", "package_rows_changed", "package_rows_removed"):
                     if key in rec:
                         stats[key] = rec[key]
                 stats["outcome"] = rec.get("outcome")

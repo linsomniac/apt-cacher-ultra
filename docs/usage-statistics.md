@@ -68,10 +68,11 @@ when retrying after an ambiguous database commit result. Loading invalid or
 unreadable saved statistics stops startup rather than silently resetting them.
 
 Usage statistics were introduced in **schema 9**; current builds also migrate
-to **schema 10** for persistent hot-package identities. Upgrades from
+to **schema 10** for persistent hot-package identities and to **schema 11**
+for one package list per suite. Upgrades from
 schema 7 first apply the existing schema-8 representation-metadata migration,
 then add usage totals. Existing origin dates and refresh generations are preserved.
-Binaries supporting only schema 9 or earlier refuse schema 10. Before
+Binaries supporting only schema 10 or earlier refuse schema 11. Before
 upgrading, stop the daemon and retain a backup of the database and any adjacent
 WAL file if rollback is needed; see
 [upgrading an existing cache](configuration.md#upgrading-an-existing-cache).

@@ -2,7 +2,8 @@
 
 Date: 2026-11-18. Branch: `perf/package-rows-per-suite` (off `main`
 421f5ea, which has the writer-wait logging). Status: approved by the
-maintainer 2026-11-19 as written. Plan:
+maintainer 2026-11-19 as written; built and measured the same day (phase
+1; "Result" at the end). Plan:
 `docs/superpowers/plans/2026-11-19-package-list-per-suite.md`.
 
 ## Why
@@ -400,6 +401,57 @@ and 20.1 s of barrier); the last row should stay about where it is
 are untouched by it: 5 to 9 s of index parsing per suite, the warming
 budget, the barrier.
 
+### Result (2026-11-19)
+
+Branch 602de26 against `main` 421f5ea. The detail, the conditions and
+the evidence files are in `e2e/freshness-lab/README.md`, "One package
+list per suite: the result".
+
+1 and 2, the lab, branch and main alternating on a quiet machine (the
+baseline table above was taken under load; `main` is re-measured here):
+
+| | `main` | Branch |
+|---|---|---|
+| One suite, "PHP update": publication to client-visible | 59.6 s, 61.1 s | 59.8 s, 59.7 s |
+| Six suites of 66,016 rows, 0.3% changed: to all visible | 160.5 s | 136.5 s |
+| commit phase per suite (in all) | 2.33 to 2.74 s (14.9 s) | 0.05 to 0.09 s (0.41 s) |
+| Six suites, all changed: to all visible | 163.0 s | 153.6 s |
+| commit phase per suite (in all) | 2.29 to 2.58 s (14.4 s) | 1.75 to 1.89 s (10.8 s) |
+
+3 to 5, on the June database copy (two runs a side; the schema-11 step
+four):
+
+| | `main` | Branch |
+|---|---|---|
+| Commit of jammy-updates' next list, 241 of 66,928 rows changed | 2.0 to 2.5 s, 64 to 66 MiB of WAL | 0.05 s, 1.8 to 2.2 MiB (plus 0.25 s reading the live list beforehand, off the writer) |
+| Commit that writes the whole list | the same | 1.8 to 2.3 s, 67 MiB |
+| Package rows GC deletes after one adoption | 66,930 | none (after a whole-list commit: the old list) |
+| The schema-11 migration: 1,159,431 rows before, 292,712 after | | 5.3 to 10.2 s |
+
+Against the goals: a typical publication commits in 50 ms and writes
+2 MiB (the goal said milliseconds and on the order of 1 MiB); no case
+measured is slower than before, the whole-list commit included; the table
+holds current rows only. Against the expectations above: the middle
+row's commit seconds went, the single-suite row did not move, the last
+row stayed about where it was.
+
+What the measurements do not show, and what they showed that was not
+asked:
+
+- The bursts are one run a side (the single suite two). The 24 s on the
+  middle row's publication time rests on that.
+- Under heavy load from other work on the machine, one branch run still
+  had commits of 12 to 16 s that wrote 428 rows each. A quiet rerun did
+  not, and evicting the database file from the page cache does not
+  reproduce it. Unexplained.
+- GC's chunk delete was first keyed by path and held the writer about
+  three times as long a chunk as `main`'s; it is keyed by rowid since,
+  and is back at `main`'s level (0.30 s for the longest chunk).
+- The host summary's row count (admin) is no longer answered from a
+  covering index: 336 ms against 155 ms in `BenchmarkAdminCacheSummaries`.
+- The largest database measured is 1.16M package rows. The migration's
+  time and temporary space on a much larger one are not measured.
+
 ## Left to the builder
 
 - Whether `package_list_entry` is a rowid table or `WITHOUT ROWID` (the
@@ -425,3 +477,24 @@ budget, the barrier.
 4. **Phase 2 waits for phase 1's numbers.**
 5. **Which release this lands in is not decided here.** It is a schema
    bump (10 to 11) either way.
+
+Added while building (the plan's "Calls made" and the executor's
+rulings; the final review weighed them):
+
+6. `CommitAdoption` keeps its signature and always writes the whole
+   list; `CommitAdoptionDiff` takes the difference.
+7. A difference is applied behind more than the row count: every delete
+   and update must hit exactly one row, no insert may fail, and the
+   difference must have been computed for the very rows the commit is
+   given (a digest). Any of them failing writes the whole list and
+   reports `package_list_mismatch`.
+8. Reconcile records hot-package interest for the rows it adds: no later
+   commit visits an unchanged row.
+9. The migration copies a current snapshot's rows whose scheme and host
+   are its suite's own, and gives a list only to the suite a snapshot
+   belongs to, so it cannot fail on the new keys. Every release's writers
+   took both from the suite.
+10. The admin aggregates keep their scheme and host terms (an existing
+    test pins them), written so SQLite does not choose an index by them.
+11. `package_list_entry` is a rowid table; the rewrite path is taken past
+    half the new list (both by measurement, in the plan).

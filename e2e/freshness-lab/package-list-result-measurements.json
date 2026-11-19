@@ -1,0 +1,3610 @@
+{
+ "binary_sha256": {
+  "branch": "ba484eecf5c10dfcbe0a58dcdf899e10143eefc82b49e46e343319dc2a202250",
+  "main": "952c98b0eedee1dadfb4f8ca24b8b4610edd189855088a52d3c2d2fa5200199c"
+ },
+ "branch_commit": "602de26",
+ "build": "go build, CGO_ENABLED=0, from a git archive of each commit",
+ "date": "2026-11-19",
+ "first_pass_not_quiet": {
+  "headlines": {
+   "burst-real": {
+    "commit_phase_max": 16.432933183,
+    "commit_phase_min": 0.073089745,
+    "commit_phase_sum": 42.302895005,
+    "publication_to_client_seconds": 226.10231100000004
+   },
+   "burst-real-2": {
+    "commit_phase_max": 0.056277978,
+    "commit_phase_min": 0.017806127,
+    "commit_phase_sum": 0.180748336,
+    "publication_to_client_seconds": 135.54679500000003
+   },
+   "burst-total": {
+    "commit_phase_max": 2.230520589,
+    "commit_phase_min": 1.686751232,
+    "commit_phase_sum": 11.688862782000001,
+    "publication_to_client_seconds": 159.76237499999996
+   },
+   "main-burst-real": {
+    "commit_phase_max": 30.604134399,
+    "commit_phase_min": 2.389577029,
+    "commit_phase_sum": 61.611576795,
+    "publication_to_client_seconds": 211.342312
+   },
+   "php": {
+    "publication_to_client_seconds": 74.830639
+   }
+  },
+  "note": "Earlier the same day, branch commit 4aa542c (before the review's fixes, which do not touch what is measured). A reviewer's experiments and compiles ran on the machine during the first three runs; kept as headlines only, to show what load does to these numbers.",
+  "runs_in_order": {
+   "burst-real": {
+    "ended": "2026-11-19T05:37:21-07:00",
+    "exit": 0,
+    "load_average_at_end": "27.57 21.78 15.42",
+    "load_average_at_start": "12.00 7.76 7.19",
+    "started": "2026-11-19T05:24:07-07:00"
+   },
+   "burst-real-2": {
+    "ended": "2026-11-19T05:58:58-07:00",
+    "exit": 0,
+    "load_average_at_end": "2.42 4.46 8.62",
+    "load_average_at_start": "3.23 9.39 11.64",
+    "started": "2026-11-19T05:52:52-07:00"
+   },
+   "burst-total": {
+    "ended": "2026-11-19T05:52:52-07:00",
+    "exit": 0,
+    "load_average_at_end": "3.23 9.39 11.64",
+    "load_average_at_start": "12.03 12.41 12.92",
+    "started": "2026-11-19T05:45:35-07:00"
+   },
+   "main-burst-real": {
+    "ended": "2026-11-19T05:45:35-07:00",
+    "exit": 0,
+    "load_average_at_end": "12.03 12.41 12.92",
+    "load_average_at_start": "27.57 21.78 15.42",
+    "started": "2026-11-19T05:37:21-07:00"
+   },
+   "php": {
+    "ended": "2026-11-19T05:24:07-07:00",
+    "exit": 0,
+    "load_average_at_end": "12.00 7.76 7.19",
+    "load_average_at_start": "2.48 6.23 6.80",
+    "started": "2026-11-19T05:21:20-07:00"
+   }
+  }
+ },
+ "main_commit": "421f5ea",
+ "runs": {
+  "burst-real-branch": {
+   "adoption_finished": [
+    {
+     "duration_seconds": 6.578450201,
+     "outcome": "success",
+     "package_list_rewrite_reason": "first",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.363325095,
+      "finalize": 7.0451e-05,
+      "flip_wait": 6.4934e-05,
+      "hot_prefetch": 0.000153966,
+      "members": 0.184578158,
+      "parse_indexes": 5.028417161,
+      "prepare": 0.0013254929999999999,
+      "prepare_commit": 0.000276333,
+      "verify": 0.000234494
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {
+      "blob_put": {
+       "count": 2,
+       "seconds": 8.1551e-05
+      },
+      "fetched_store": {
+       "count": 1,
+       "seconds": 0.000431306
+      }
+     },
+     "writer_wait_seconds": 0.000730701
+    },
+    {
+     "duration_seconds": 29.274896402,
+     "outcome": "success",
+     "package_list_rewrite_reason": "first",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.5997546150000002,
+      "finalize": 0.000247612,
+      "flip_wait": 22.394303298,
+      "hot_prefetch": 0.000152839,
+      "members": 0.236152263,
+      "parse_indexes": 5.026119181,
+      "prepare": 0.017732803,
+      "prepare_commit": 0.000232217,
+      "verify": 0.000191296
+     },
+     "suite_path": "/debian-security/dists/suite-02",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000250756
+    },
+    {
+     "duration_seconds": 24.161162983,
+     "outcome": "success",
+     "package_list_rewrite_reason": "first",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.381312491,
+      "finalize": 0.000118371,
+      "flip_wait": 17.82794379,
+      "hot_prefetch": 0.000168745,
+      "members": 0.180736444,
+      "parse_indexes": 4.765014261,
+      "prepare": 0.005306330999999999,
+      "prepare_commit": 0.000389282,
+      "verify": 0.000168024
+     },
+     "suite_path": "/debian-security/dists/suite-01",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000209998
+    },
+    {
+     "duration_seconds": 31.318350358,
+     "outcome": "success",
+     "package_list_write": "difference",
+     "package_rows_added": 214,
+     "package_rows_changed": 0,
+     "package_rows_removed": 214,
+     "phase_seconds": {
+      "commit": 0.076756162,
+      "finalize": 7.1493e-05,
+      "flip_wait": 25.858697869,
+      "hot_prefetch": 0.042242845,
+      "members": 0.179791102,
+      "parse_indexes": 4.859318442,
+      "prepare": 0.018204642,
+      "prepare_commit": 0.283068702,
+      "verify": 0.000196148
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 3,
+       "seconds": 0.000412089
+      },
+      "adoption_heartbeat": {
+       "count": 3,
+       "seconds": 0.000121206
+      },
+      "blob_put": {
+       "count": 5,
+       "seconds": 0.000266351
+      },
+      "representation_put": {
+       "count": 4,
+       "seconds": 0.000254439
+      }
+     },
+     "writer_wait_seconds": 0.001386467
+    },
+    {
+     "duration_seconds": 29.266489154,
+     "outcome": "success",
+     "package_list_rewrite_reason": "first",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.539723151,
+      "finalize": 0.00036121,
+      "flip_wait": 22.663241951,
+      "hot_prefetch": 0.000162471,
+      "members": 0.213119463,
+      "parse_indexes": 4.836951993,
+      "prepare": 0.012468762,
+      "prepare_commit": 0.000192179,
+      "verify": 0.000251497
+     },
+     "suite_path": "/debian-security/dists/suite-03",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.00024861
+    },
+    {
+     "duration_seconds": 22.816970627,
+     "outcome": "success",
+     "package_list_rewrite_reason": "first",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.387701288,
+      "finalize": 8.1149e-05,
+      "flip_wait": 16.629386461,
+      "hot_prefetch": 0.000152606,
+      "members": 0.202735674,
+      "parse_indexes": 4.591310282,
+      "prepare": 0.0051873119999999995,
+      "prepare_commit": 0.00023032,
+      "verify": 0.000181385
+     },
+     "suite_path": "/debian-security/dists/suite-05",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000337272
+    },
+    {
+     "duration_seconds": 24.136933646,
+     "outcome": "success",
+     "package_list_rewrite_reason": "first",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.386058794,
+      "finalize": 9.6309e-05,
+      "flip_wait": 17.96646256,
+      "hot_prefetch": 0.000160083,
+      "members": 0.13725387,
+      "parse_indexes": 4.641367747,
+      "prepare": 0.005121719,
+      "prepare_commit": 0.000236035,
+      "verify": 0.000171823
+     },
+     "suite_path": "/debian-security/dists/suite-04",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.00024075
+    },
+    {
+     "duration_seconds": 40.28374448,
+     "outcome": "success",
+     "package_list_write": "difference",
+     "package_rows_added": 214,
+     "package_rows_changed": 0,
+     "package_rows_removed": 214,
+     "phase_seconds": {
+      "commit": 0.074186571,
+      "finalize": 6.3594e-05,
+      "flip_wait": 19.948764113,
+      "hot_prefetch": 15.01326308,
+      "members": 0.376900479,
+      "parse_indexes": 4.560476458,
+      "prepare": 0.016163524,
+      "prepare_commit": 0.293737083,
+      "verify": 0.000185619
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 15,
+       "seconds": 0.002422824
+      },
+      "adoption_heartbeat": {
+       "count": 15,
+       "seconds": 0.005299618
+      },
+      "blob_put": {
+       "count": 10,
+       "seconds": 0.000877736
+      },
+      "representation_put": {
+       "count": 10,
+       "seconds": 0.000658913
+      }
+     },
+     "writer_wait_seconds": 0.009537882
+    },
+    {
+     "duration_seconds": 55.343902905,
+     "outcome": "success",
+     "package_list_write": "difference",
+     "package_rows_added": 214,
+     "package_rows_changed": 0,
+     "package_rows_removed": 214,
+     "phase_seconds": {
+      "commit": 0.05600332,
+      "finalize": 6.7238e-05,
+      "flip_wait": 35.022409172,
+      "hot_prefetch": 15.012667209,
+      "members": 0.377528865,
+      "parse_indexes": 4.56549391,
+      "prepare": 0.016440709999999997,
+      "prepare_commit": 0.293100915,
+      "verify": 0.000187616
+     },
+     "suite_path": "/debian-security/dists/suite-05",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 12,
+       "seconds": 0.007670146
+      },
+      "adoption_candidate": {
+       "count": 1,
+       "seconds": 0.000199027
+      },
+      "adoption_heartbeat": {
+       "count": 11,
+       "seconds": 0.004819542
+      },
+      "blob_put": {
+       "count": 9,
+       "seconds": 0.000694356
+      },
+      "representation_put": {
+       "count": 9,
+       "seconds": 0.000653305
+      }
+     },
+     "writer_wait_seconds": 0.014247264
+    },
+    {
+     "duration_seconds": 37.92024853,
+     "outcome": "success",
+     "package_list_write": "difference",
+     "package_rows_added": 214,
+     "package_rows_changed": 0,
+     "package_rows_removed": 214,
+     "phase_seconds": {
+      "commit": 0.064822666,
+      "finalize": 7.7269e-05,
+      "flip_wait": 17.248447141,
+      "hot_prefetch": 15.00164588,
+      "members": 0.433696338,
+      "parse_indexes": 4.890477386,
+      "prepare": 0.011627906,
+      "prepare_commit": 0.269275402,
+      "verify": 0.000174427
+     },
+     "suite_path": "/debian-security/dists/suite-02",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 6,
+       "seconds": 0.000637411
+      },
+      "adoption_heartbeat": {
+       "count": 5,
+       "seconds": 0.000232692
+      },
+      "blob_put": {
+       "count": 2,
+       "seconds": 0.000211349
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 0.000228483
+      }
+     },
+     "writer_wait_seconds": 0.001616144
+    },
+    {
+     "duration_seconds": 32.941601366,
+     "outcome": "success",
+     "package_list_write": "difference",
+     "package_rows_added": 214,
+     "package_rows_changed": 0,
+     "package_rows_removed": 214,
+     "phase_seconds": {
+      "commit": 0.077671589,
+      "finalize": 7.1983e-05,
+      "flip_wait": 12.325204164,
+      "hot_prefetch": 15.004083224,
+      "members": 0.421213885,
+      "parse_indexes": 4.816594431,
+      "prepare": 0.005589402,
+      "prepare_commit": 0.290966229,
+      "verify": 0.000202557
+     },
+     "suite_path": "/debian-security/dists/suite-01",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 6,
+       "seconds": 0.001839256
+      },
+      "adoption_heartbeat": {
+       "count": 7,
+       "seconds": 0.000891722
+      },
+      "blob_put": {
+       "count": 5,
+       "seconds": 0.000463966
+      },
+      "representation_put": {
+       "count": 4,
+       "seconds": 0.000257257
+      }
+     },
+     "writer_wait_seconds": 0.003777092
+    },
+    {
+     "duration_seconds": 37.800922922,
+     "outcome": "success",
+     "package_list_write": "difference",
+     "package_rows_added": 214,
+     "package_rows_changed": 0,
+     "package_rows_removed": 214,
+     "phase_seconds": {
+      "commit": 0.049532332,
+      "finalize": 6.9382e-05,
+      "flip_wait": 17.2304623,
+      "hot_prefetch": 15.005511835,
+      "members": 0.434779043,
+      "parse_indexes": 4.78250168,
+      "prepare": 0.009219939,
+      "prepare_commit": 0.288677197,
+      "verify": 0.000165339
+     },
+     "suite_path": "/debian-security/dists/suite-04",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 6,
+       "seconds": 0.004624257
+      },
+      "adoption_heartbeat": {
+       "count": 8,
+       "seconds": 0.000258012
+      },
+      "blob_put": {
+       "count": 5,
+       "seconds": 0.000335083
+      },
+      "representation_put": {
+       "count": 5,
+       "seconds": 0.025652778
+      }
+     },
+     "writer_wait_seconds": 0.031173759
+    },
+    {
+     "duration_seconds": 44.355411301,
+     "outcome": "success",
+     "package_list_write": "difference",
+     "package_rows_added": 214,
+     "package_rows_changed": 0,
+     "package_rows_removed": 214,
+     "phase_seconds": {
+      "commit": 0.089946283,
+      "finalize": 7.7533e-05,
+      "flip_wait": 23.958648674,
+      "hot_prefetch": 15.004431311,
+      "members": 0.388212552,
+      "parse_indexes": 4.621397119,
+      "prepare": 0.013418526,
+      "prepare_commit": 0.279091651,
+      "verify": 0.000179551
+     },
+     "suite_path": "/debian-security/dists/suite-03",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 5,
+       "seconds": 0.00154046
+      },
+      "adoption_heartbeat": {
+       "count": 7,
+       "seconds": 0.000670572
+      },
+      "blob_put": {
+       "count": 3,
+       "seconds": 0.000298632
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 0.00022215
+      }
+     },
+     "writer_wait_seconds": 0.003068562
+    }
+   ],
+   "database_files_bytes": {
+    "cache.db": 184426496,
+    "cache.db-shm": 65536,
+    "cache.db-wal": 32745792
+   },
+   "database_write_waited": [],
+   "summary": {
+    "caveat": "Synthetic burst with larger catalogs, not a full Debian/Ubuntu mirror or an SLA.",
+    "options": {
+     "burst": true,
+     "catalog_churn": 0.003,
+     "catalog_size": 33000,
+     "client_interval": 5,
+     "cooldown": "60s",
+     "deb_delay": 8.0,
+     "delay": 90,
+     "hosts": 2,
+     "hot_count": 8,
+     "max_wait": 1800.0,
+     "member_delay": 0.15,
+     "periodic_only": false,
+     "prefetch_budget": null,
+     "refresh": null,
+     "scenario": "baseline",
+     "suites": 6,
+     "xz_preset": 1
+    },
+    "publication_to_client_seconds": 136.48137000000003,
+    "scenario": "burst",
+    "slowest_publication_seconds": 135.015831,
+    "suites": {
+     "suite-01": {
+      "adoption_finished_seconds": 90.659101,
+      "adoption_started_seconds": 57.717472,
+      "adoption_success_seconds": 90.658996,
+      "attempts": [
+       {
+        "adoption_id": "AEWX7KSKNTHK5H5KIMFUC2RQBP",
+        "outcome": "success",
+        "seconds": 90.659101
+       }
+      ],
+      "duration_seconds": 32.941601366,
+      "first_seen_seconds": 43,
+      "freshness_check_seconds": 47.368651,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "package_list_write": "difference",
+      "package_rows_added": 214,
+      "package_rows_changed": 0,
+      "package_rows_removed": 214,
+      "phases": {
+       "commit": 0.077671589,
+       "finalize": 7.1983e-05,
+       "flip_wait": 12.325204164,
+       "hot_prefetch": 15.004083224,
+       "members": 0.421213885,
+       "parse_indexes": 4.816594431,
+       "prepare": 0.005589402,
+       "prepare_commit": 0.290966229,
+       "verify": 0.000202557
+      },
+      "release_age_seconds": 92,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 6,
+        "seconds": 0.001839256
+       },
+       "adoption_heartbeat": {
+        "count": 7,
+        "seconds": 0.000891722
+       },
+       "blob_put": {
+        "count": 5,
+        "seconds": 0.000463966
+       },
+       "representation_put": {
+        "count": 4,
+        "seconds": 0.000257257
+       }
+      },
+      "writer_wait_seconds": 0.003777092
+     },
+     "suite-02": {
+      "adoption_finished_seconds": 80.577865,
+      "adoption_started_seconds": 42.657443,
+      "adoption_success_seconds": 80.577734,
+      "attempts": [
+       {
+        "adoption_id": "KCKGTKY5VR47KEZ2ZOYROOTMIS",
+        "outcome": "success",
+        "seconds": 80.577865
+       }
+      ],
+      "duration_seconds": 37.92024853,
+      "first_seen_seconds": 63,
+      "freshness_check_seconds": 17.371753,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "package_list_write": "difference",
+      "package_rows_added": 214,
+      "package_rows_changed": 0,
+      "package_rows_removed": 214,
+      "phases": {
+       "commit": 0.064822666,
+       "finalize": 7.7269e-05,
+       "flip_wait": 17.248447141,
+       "hot_prefetch": 15.00164588,
+       "members": 0.433696338,
+       "parse_indexes": 4.890477386,
+       "prepare": 0.011627906,
+       "prepare_commit": 0.269275402,
+       "verify": 0.000174427
+      },
+      "release_age_seconds": 82,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 6,
+        "seconds": 0.000637411
+       },
+       "adoption_heartbeat": {
+        "count": 5,
+        "seconds": 0.000232692
+       },
+       "blob_put": {
+        "count": 2,
+        "seconds": 0.000211349
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 0.000228483
+       }
+      },
+      "writer_wait_seconds": 0.001616144
+     },
+     "suite-03": {
+      "adoption_finished_seconds": 135.015945,
+      "adoption_started_seconds": 90.660386,
+      "adoption_success_seconds": 135.015831,
+      "attempts": [
+       {
+        "adoption_id": "JYVYUVH25TEQSJODH6CQ4HTBCU",
+        "outcome": "success",
+        "seconds": 135.015945
+       }
+      ],
+      "duration_seconds": 44.355411301,
+      "first_seen_seconds": 87,
+      "freshness_check_seconds": 47.369635,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "package_list_write": "difference",
+      "package_rows_added": 214,
+      "package_rows_changed": 0,
+      "package_rows_removed": 214,
+      "phases": {
+       "commit": 0.089946283,
+       "finalize": 7.7533e-05,
+       "flip_wait": 23.958648674,
+       "hot_prefetch": 15.004431311,
+       "members": 0.388212552,
+       "parse_indexes": 4.621397119,
+       "prepare": 0.013418526,
+       "prepare_commit": 0.279091651,
+       "verify": 0.000179551
+      },
+      "release_age_seconds": 136,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 5,
+        "seconds": 0.00154046
+       },
+       "adoption_heartbeat": {
+        "count": 7,
+        "seconds": 0.000670572
+       },
+       "blob_put": {
+        "count": 3,
+        "seconds": 0.000298632
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 0.00022215
+       }
+      },
+      "writer_wait_seconds": 0.003068562
+     },
+     "suite-04": {
+      "adoption_finished_seconds": 118.380524,
+      "adoption_started_seconds": 80.579382,
+      "adoption_success_seconds": 118.380413,
+      "attempts": [
+       {
+        "adoption_id": "5JEKECQF634SZ2VH2P2CXNUBRN",
+        "outcome": "success",
+        "seconds": 118.380524
+       }
+      ],
+      "duration_seconds": 37.800922922,
+      "first_seen_seconds": 93,
+      "freshness_check_seconds": 26.237569,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "package_list_write": "difference",
+      "package_rows_added": 214,
+      "package_rows_changed": 0,
+      "package_rows_removed": 214,
+      "phases": {
+       "commit": 0.049532332,
+       "finalize": 6.9382e-05,
+       "flip_wait": 17.2304623,
+       "hot_prefetch": 15.005511835,
+       "members": 0.434779043,
+       "parse_indexes": 4.78250168,
+       "prepare": 0.009219939,
+       "prepare_commit": 0.288677197,
+       "verify": 0.000165339
+      },
+      "release_age_seconds": 120,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 6,
+        "seconds": 0.004624257
+       },
+       "adoption_heartbeat": {
+        "count": 8,
+        "seconds": 0.000258012
+       },
+       "blob_put": {
+        "count": 5,
+        "seconds": 0.000335083
+       },
+       "representation_put": {
+        "count": 5,
+        "seconds": 0.025652778
+       }
+      },
+      "writer_wait_seconds": 0.031173759
+     },
+     "suite-05": {
+      "adoption_finished_seconds": 57.716071,
+      "adoption_started_seconds": 2.372334,
+      "adoption_success_seconds": 57.715951,
+      "attempts": [
+       {
+        "adoption_id": "C6LG2ZQCOOSWBSAC5SACHHEYH7",
+        "outcome": "success",
+        "seconds": 57.716071
+       }
+      ],
+      "duration_seconds": 55.343902905,
+      "first_seen_seconds": 55,
+      "freshness_check_seconds": 2.372251,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "package_list_write": "difference",
+      "package_rows_added": 214,
+      "package_rows_changed": 0,
+      "package_rows_removed": 214,
+      "phases": {
+       "commit": 0.05600332,
+       "finalize": 6.7238e-05,
+       "flip_wait": 35.022409172,
+       "hot_prefetch": 15.012667209,
+       "members": 0.377528865,
+       "parse_indexes": 4.56549391,
+       "prepare": 0.016440709999999997,
+       "prepare_commit": 0.293100915,
+       "verify": 0.000187616
+      },
+      "release_age_seconds": 59,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 12,
+        "seconds": 0.007670146
+       },
+       "adoption_candidate": {
+        "count": 1,
+        "seconds": 0.000199027
+       },
+       "adoption_heartbeat": {
+        "count": 11,
+        "seconds": 0.004819542
+       },
+       "blob_put": {
+        "count": 9,
+        "seconds": 0.000694356
+       },
+       "representation_put": {
+        "count": 9,
+        "seconds": 0.000653305
+       }
+      },
+      "writer_wait_seconds": 0.014247264
+     },
+     "trixie-security": {
+      "adoption_finished_seconds": 42.656165,
+      "adoption_started_seconds": 2.372702,
+      "adoption_success_seconds": 42.656058,
+      "attempts": [
+       {
+        "adoption_id": "YNOF2IPPVNAITUTJZVKMDT5OT4",
+        "outcome": "success",
+        "seconds": 42.656165
+       }
+      ],
+      "duration_seconds": 40.28374448,
+      "first_seen_seconds": 40,
+      "freshness_check_seconds": 2.372591,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "package_list_write": "difference",
+      "package_rows_added": 214,
+      "package_rows_changed": 0,
+      "package_rows_removed": 214,
+      "phases": {
+       "commit": 0.074186571,
+       "finalize": 6.3594e-05,
+       "flip_wait": 19.948764113,
+       "hot_prefetch": 15.01326308,
+       "members": 0.376900479,
+       "parse_indexes": 4.560476458,
+       "prepare": 0.016163524,
+       "prepare_commit": 0.293737083,
+       "verify": 0.000185619
+      },
+      "release_age_seconds": 44,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 15,
+        "seconds": 0.002422824
+       },
+       "adoption_heartbeat": {
+        "count": 15,
+        "seconds": 0.005299618
+       },
+       "blob_put": {
+        "count": 10,
+        "seconds": 0.000877736
+       },
+       "representation_put": {
+        "count": 10,
+        "seconds": 0.000658913
+       }
+      },
+      "writer_wait_seconds": 0.009537882
+     }
+    }
+   }
+  },
+  "burst-real-main": {
+   "adoption_finished": [
+    {
+     "duration_seconds": 8.188510951,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.265747375,
+      "finalize": 7.1395e-05,
+      "flip_wait": 0.000112841,
+      "hot_prefetch": 0.000182467,
+      "members": 0.217477599,
+      "parse_indexes": 5.702738525,
+      "prepare": 0.001720308,
+      "prepare_commit": 0.00024075,
+      "verify": 0.000215775
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {
+      "blob_put": {
+       "count": 2,
+       "seconds": 5.6258e-05
+      },
+      "fetched_store": {
+       "count": 1,
+       "seconds": 0.000728752
+      }
+     },
+     "writer_wait_seconds": 0.001060335
+    },
+    {
+     "duration_seconds": 29.929572064,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.262108861,
+      "finalize": 8.4159e-05,
+      "flip_wait": 21.822595677,
+      "hot_prefetch": 0.000196606,
+      "members": 0.21418385,
+      "parse_indexes": 5.6251824280000005,
+      "prepare": 0.004772028,
+      "prepare_commit": 0.000194652,
+      "verify": 0.000250267
+     },
+     "suite_path": "/debian-security/dists/suite-01",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000431377
+    },
+    {
+     "duration_seconds": 32.286709806,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.222479897,
+      "finalize": 9.6378e-05,
+      "flip_wait": 24.436781717,
+      "hot_prefetch": 0.00015762,
+      "members": 0.156821277,
+      "parse_indexes": 5.464767969,
+      "prepare": 0.00521965,
+      "prepare_commit": 0.000187532,
+      "verify": 0.000191421
+     },
+     "suite_path": "/debian-security/dists/suite-02",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000236318
+    },
+    {
+     "duration_seconds": 36.407877356,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.622493884,
+      "finalize": 8.7773e-05,
+      "flip_wait": 28.089068634,
+      "hot_prefetch": 0.063809349,
+      "members": 0.237428353,
+      "parse_indexes": 5.381495434,
+      "prepare": 0.012970347,
+      "prepare_commit": 0.00032338,
+      "verify": 0.000195799
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 4,
+       "seconds": 0.000826777
+      },
+      "adoption_heartbeat": {
+       "count": 5,
+       "seconds": 0.000133557
+      },
+      "blob_put": {
+       "count": 6,
+       "seconds": 0.000696128
+      },
+      "representation_put": {
+       "count": 7,
+       "seconds": 0.000601864
+      }
+     },
+     "writer_wait_seconds": 0.002613908
+    },
+    {
+     "duration_seconds": 30.037045749,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.204141722,
+      "finalize": 0.000110565,
+      "flip_wait": 22.401091627,
+      "hot_prefetch": 0.000153764,
+      "members": 0.172642283,
+      "parse_indexes": 5.25116788,
+      "prepare": 0.0073024660000000005,
+      "prepare_commit": 0.000168542,
+      "verify": 0.000262637
+     },
+     "suite_path": "/debian-security/dists/suite-03",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000250784
+    },
+    {
+     "duration_seconds": 29.874898142,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.034016544,
+      "finalize": 8.4058e-05,
+      "flip_wait": 22.368675313,
+      "hot_prefetch": 0.000183461,
+      "members": 0.167627117,
+      "parse_indexes": 5.298711922,
+      "prepare": 0.00517991,
+      "prepare_commit": 0.000245417,
+      "verify": 0.000170349
+     },
+     "suite_path": "/debian-security/dists/suite-04",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 1,
+       "seconds": 6.263e-06
+      }
+     },
+     "writer_wait_seconds": 0.000255913
+    },
+    {
+     "duration_seconds": 29.975973146,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.246209481,
+      "finalize": 8.5413e-05,
+      "flip_wait": 22.361408002,
+      "hot_prefetch": 0.000158558,
+      "members": 0.136300203,
+      "parse_indexes": 5.226225687,
+      "prepare": 0.0051771280000000005,
+      "prepare_commit": 0.000162795,
+      "verify": 0.000241311
+     },
+     "suite_path": "/debian-security/dists/suite-05",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000258092
+    },
+    {
+     "duration_seconds": 45.41636717,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.340334698,
+      "finalize": 0.000109222,
+      "flip_wait": 22.486039346,
+      "hot_prefetch": 15.001569818,
+      "members": 0.376055402,
+      "parse_indexes": 5.203243313,
+      "prepare": 0.00857341,
+      "prepare_commit": 0.000270253,
+      "verify": 0.000167588
+     },
+     "suite_path": "/debian-security/dists/suite-05",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 5,
+       "seconds": 0.000910128
+      },
+      "adoption_heartbeat": {
+       "count": 7,
+       "seconds": 0.000326785
+      },
+      "blob_put": {
+       "count": 3,
+       "seconds": 0.000317663
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 0.000243904
+      }
+     },
+     "writer_wait_seconds": 0.002082162
+    },
+    {
+     "duration_seconds": 55.170634664,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.456856171,
+      "finalize": 8.4454e-05,
+      "flip_wait": 32.034715568,
+      "hot_prefetch": 15.003129211,
+      "members": 0.36175959,
+      "parse_indexes": 5.298456753,
+      "prepare": 0.015131286999999998,
+      "prepare_commit": 0.000243675,
+      "verify": 0.000254371
+     },
+     "suite_path": "/debian-security/dists/suite-02",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 6,
+       "seconds": 0.010091578
+      },
+      "adoption_heartbeat": {
+       "count": 6,
+       "seconds": 0.00021743
+      },
+      "blob_put": {
+       "count": 3,
+       "seconds": 0.004644445
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 0.000149344
+      }
+     },
+     "writer_wait_seconds": 0.015372767
+    },
+    {
+     "duration_seconds": 31.509595679,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.507951554,
+      "finalize": 7.9456e-05,
+      "flip_wait": 8.323261177,
+      "hot_prefetch": 15.001534899,
+      "members": 0.361141721,
+      "parse_indexes": 5.308234886,
+      "prepare": 0.006992244000000001,
+      "prepare_commit": 0.000206568,
+      "verify": 0.000190157
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 5,
+       "seconds": 0.000659621
+      },
+      "adoption_heartbeat": {
+       "count": 6,
+       "seconds": 0.000262678
+      },
+      "blob_put": {
+       "count": 3,
+       "seconds": 0.000242766
+      },
+      "representation_put": {
+       "count": 2,
+       "seconds": 0.000120866
+      }
+     },
+     "writer_wait_seconds": 0.001598881
+    },
+    {
+     "duration_seconds": 24.845164517,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.333595336,
+      "finalize": 8.7414e-05,
+      "flip_wait": 1.8630426020000002,
+      "hot_prefetch": 15.001165151,
+      "members": 0.375750635,
+      "parse_indexes": 5.266246382,
+      "prepare": 0.00489796,
+      "prepare_commit": 0.000202235,
+      "verify": 0.000171406
+     },
+     "suite_path": "/debian-security/dists/suite-03",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 5,
+       "seconds": 0.000650892
+      },
+      "adoption_heartbeat": {
+       "count": 5,
+       "seconds": 0.000239447
+      },
+      "blob_put": {
+       "count": 3,
+       "seconds": 0.00028105
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 0.000256324
+      }
+     },
+     "writer_wait_seconds": 0.001716289
+    },
+    {
+     "duration_seconds": 44.13393164,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.741803903,
+      "finalize": 0.00010215,
+      "flip_wait": 20.816874592,
+      "hot_prefetch": 15.002772866,
+      "members": 0.362264505,
+      "parse_indexes": 5.204667151,
+      "prepare": 0.005029560000000001,
+      "prepare_commit": 0.000224174,
+      "verify": 0.000188566
+     },
+     "suite_path": "/debian-security/dists/suite-04",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 5,
+       "seconds": 0.000779372
+      },
+      "adoption_heartbeat": {
+       "count": 6,
+       "seconds": 0.000262623
+      },
+      "blob_put": {
+       "count": 3,
+       "seconds": 0.000331227
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 0.000218787
+      }
+     },
+     "writer_wait_seconds": 0.001888889
+    },
+    {
+     "duration_seconds": 50.957855027,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.489393573,
+      "finalize": 6.9058e-05,
+      "flip_wait": 27.862753193,
+      "hot_prefetch": 15.001438791,
+      "members": 0.369705574,
+      "parse_indexes": 5.228748539,
+      "prepare": 0.005209576,
+      "prepare_commit": 0.000244518,
+      "verify": 0.000288909
+     },
+     "suite_path": "/debian-security/dists/suite-01",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 5,
+       "seconds": 0.000800909
+      },
+      "adoption_heartbeat": {
+       "count": 6,
+       "seconds": 0.000192624
+      },
+      "blob_put": {
+       "count": 3,
+       "seconds": 0.000512794
+      },
+      "representation_put": {
+       "count": 4,
+       "seconds": 0.000286907
+      }
+     },
+     "writer_wait_seconds": 0.002094864
+    }
+   ],
+   "database_files_bytes": {
+    "cache.db": 337895424,
+    "cache.db-shm": 98304,
+    "cache.db-wal": 42361872
+   },
+   "database_write_waited": [],
+   "summary": {
+    "caveat": "Synthetic burst with larger catalogs, not a full Debian/Ubuntu mirror or an SLA.",
+    "options": {
+     "burst": true,
+     "catalog_churn": 0.003,
+     "catalog_size": 33000,
+     "client_interval": 5,
+     "cooldown": "60s",
+     "deb_delay": 8.0,
+     "delay": 90,
+     "hosts": 2,
+     "hot_count": 8,
+     "max_wait": 1800.0,
+     "member_delay": 0.15,
+     "periodic_only": false,
+     "prefetch_budget": null,
+     "refresh": null,
+     "scenario": "baseline",
+     "suites": 6,
+     "xz_preset": 1
+    },
+    "publication_to_client_seconds": 160.53054500000002,
+    "scenario": "burst",
+    "slowest_publication_seconds": 159.105809,
+    "suites": {
+     "suite-01": {
+      "adoption_finished_seconds": 159.105917,
+      "adoption_started_seconds": 108.148004,
+      "adoption_success_seconds": 159.105809,
+      "attempts": [
+       {
+        "adoption_id": "WDTBKPEZ2VC5QB24U6LD436OYA",
+        "outcome": "success",
+        "seconds": 159.105917
+       }
+      ],
+      "duration_seconds": 50.957855027,
+      "first_seen_seconds": 101,
+      "freshness_check_seconds": 58.120485,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "phases": {
+       "commit": 2.489393573,
+       "finalize": 6.9058e-05,
+       "flip_wait": 27.862753193,
+       "hot_prefetch": 15.001438791,
+       "members": 0.369705574,
+       "parse_indexes": 5.228748539,
+       "prepare": 0.005209576,
+       "prepare_commit": 0.000244518,
+       "verify": 0.000288909
+      },
+      "release_age_seconds": 160,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 5,
+        "seconds": 0.000800909
+       },
+       "adoption_heartbeat": {
+        "count": 6,
+        "seconds": 0.000192624
+       },
+       "blob_put": {
+        "count": 3,
+        "seconds": 0.000512794
+       },
+       "representation_put": {
+        "count": 4,
+        "seconds": 0.000286907
+       }
+      },
+      "writer_wait_seconds": 0.002094864
+     },
+     "suite-02": {
+      "adoption_finished_seconds": 83.292536,
+      "adoption_started_seconds": 28.12195,
+      "adoption_success_seconds": 83.29239,
+      "attempts": [
+       {
+        "adoption_id": "26HD5BVZ5TPGDKCYP56WZGNTJQ",
+        "outcome": "success",
+        "seconds": 83.292536
+       }
+      ],
+      "duration_seconds": 55.170634664,
+      "first_seen_seconds": 55,
+      "freshness_check_seconds": 28.121833,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "phases": {
+       "commit": 2.456856171,
+       "finalize": 8.4454e-05,
+       "flip_wait": 32.034715568,
+       "hot_prefetch": 15.003129211,
+       "members": 0.36175959,
+       "parse_indexes": 5.298456753,
+       "prepare": 0.015131286999999998,
+       "prepare_commit": 0.000243675,
+       "verify": 0.000254371
+      },
+      "release_age_seconds": 84,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 6,
+        "seconds": 0.010091578
+       },
+       "adoption_heartbeat": {
+        "count": 6,
+        "seconds": 0.00021743
+       },
+       "blob_put": {
+        "count": 3,
+        "seconds": 0.004644445
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 0.000149344
+       }
+      },
+      "writer_wait_seconds": 0.015372767
+     },
+     "suite-03": {
+      "adoption_finished_seconds": 108.142511,
+      "adoption_started_seconds": 83.297067,
+      "adoption_success_seconds": 108.142355,
+      "attempts": [
+       {
+        "adoption_id": "RBWY7QVOVHTMIYM6FP3ZF56MSC",
+        "outcome": "success",
+        "seconds": 108.142511
+       }
+      ],
+      "duration_seconds": 24.845164517,
+      "first_seen_seconds": 80,
+      "freshness_check_seconds": 28.121893,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "phases": {
+       "commit": 2.333595336,
+       "finalize": 8.7414e-05,
+       "flip_wait": 1.8630426020000002,
+       "hot_prefetch": 15.001165151,
+       "members": 0.375750635,
+       "parse_indexes": 5.266246382,
+       "prepare": 0.00489796,
+       "prepare_commit": 0.000202235,
+       "verify": 0.000171406
+      },
+      "release_age_seconds": 109,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 5,
+        "seconds": 0.000650892
+       },
+       "adoption_heartbeat": {
+        "count": 5,
+        "seconds": 0.000239447
+       },
+       "blob_put": {
+        "count": 3,
+        "seconds": 0.00028105
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 0.000256324
+       }
+      },
+      "writer_wait_seconds": 0.001716289
+     },
+     "suite-04": {
+      "adoption_finished_seconds": 139.943455,
+      "adoption_started_seconds": 95.809229,
+      "adoption_success_seconds": 139.943327,
+      "attempts": [
+       {
+        "adoption_id": "2OQSXTU2DPA4CEB6A6KCOWB4UX",
+        "outcome": "success",
+        "seconds": 139.943455
+       }
+      ],
+      "duration_seconds": 44.13393164,
+      "first_seen_seconds": 82,
+      "freshness_check_seconds": 58.120677,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "phases": {
+       "commit": 2.741803903,
+       "finalize": 0.00010215,
+       "flip_wait": 20.816874592,
+       "hot_prefetch": 15.002772866,
+       "members": 0.362264505,
+       "parse_indexes": 5.204667151,
+       "prepare": 0.005029560000000001,
+       "prepare_commit": 0.000224174,
+       "verify": 0.000188566
+      },
+      "release_age_seconds": 141,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 5,
+        "seconds": 0.000779372
+       },
+       "adoption_heartbeat": {
+        "count": 6,
+        "seconds": 0.000262623
+       },
+       "blob_put": {
+        "count": 3,
+        "seconds": 0.000331227
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 0.000218787
+       }
+      },
+      "writer_wait_seconds": 0.001888889
+     },
+     "suite-05": {
+      "adoption_finished_seconds": 64.28838,
+      "adoption_started_seconds": 18.87184,
+      "adoption_success_seconds": 64.288256,
+      "attempts": [
+       {
+        "adoption_id": "GY42AR4IVAMJYV4KMPZXSQKVER",
+        "outcome": "success",
+        "seconds": 64.28838
+       }
+      ],
+      "duration_seconds": 45.41636717,
+      "first_seen_seconds": 45,
+      "freshness_check_seconds": 18.871772,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "phases": {
+       "commit": 2.340334698,
+       "finalize": 0.000109222,
+       "flip_wait": 22.486039346,
+       "hot_prefetch": 15.001569818,
+       "members": 0.376055402,
+       "parse_indexes": 5.203243313,
+       "prepare": 0.00857341,
+       "prepare_commit": 0.000270253,
+       "verify": 0.000167588
+      },
+      "release_age_seconds": 65,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 5,
+        "seconds": 0.000910128
+       },
+       "adoption_heartbeat": {
+        "count": 7,
+        "seconds": 0.000326785
+       },
+       "blob_put": {
+        "count": 3,
+        "seconds": 0.000317663
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 0.000243904
+       }
+      },
+      "writer_wait_seconds": 0.002082162
+     },
+     "trixie-security": {
+      "adoption_finished_seconds": 95.804515,
+      "adoption_started_seconds": 64.294723,
+      "adoption_success_seconds": 95.804403,
+      "attempts": [
+       {
+        "adoption_id": "43VCDZFEPWTIRKIEMSNBUNBLNC",
+        "outcome": "success",
+        "seconds": 95.804515
+       }
+      ],
+      "duration_seconds": 31.509595679,
+      "first_seen_seconds": 53,
+      "freshness_check_seconds": 43.119417,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "phases": {
+       "commit": 2.507951554,
+       "finalize": 7.9456e-05,
+       "flip_wait": 8.323261177,
+       "hot_prefetch": 15.001534899,
+       "members": 0.361141721,
+       "parse_indexes": 5.308234886,
+       "prepare": 0.006992244000000001,
+       "prepare_commit": 0.000206568,
+       "verify": 0.000190157
+      },
+      "release_age_seconds": 97,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 5,
+        "seconds": 0.000659621
+       },
+       "adoption_heartbeat": {
+        "count": 6,
+        "seconds": 0.000262678
+       },
+       "blob_put": {
+        "count": 3,
+        "seconds": 0.000242766
+       },
+       "representation_put": {
+        "count": 2,
+        "seconds": 0.000120866
+       }
+      },
+      "writer_wait_seconds": 0.001598881
+     }
+    }
+   }
+  },
+  "burst-total-branch": {
+   "adoption_finished": [
+    {
+     "duration_seconds": 6.481484541,
+     "outcome": "success",
+     "package_list_rewrite_reason": "first",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.2862737229999999,
+      "finalize": 9.3598e-05,
+      "flip_wait": 6.6872e-05,
+      "hot_prefetch": 0.000164591,
+      "members": 0.188411754,
+      "parse_indexes": 5.004656969,
+      "prepare": 0.00137394,
+      "prepare_commit": 0.000276439,
+      "verify": 0.000161487
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {
+      "blob_put": {
+       "count": 2,
+       "seconds": 0.000164014
+      },
+      "fetched_store": {
+       "count": 1,
+       "seconds": 0.000612611
+      }
+     },
+     "writer_wait_seconds": 0.000971532
+    },
+    {
+     "duration_seconds": 29.255737665,
+     "outcome": "success",
+     "package_list_rewrite_reason": "first",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.59572452,
+      "finalize": 0.000126834,
+      "flip_wait": 22.624292476,
+      "hot_prefetch": 0.000221435,
+      "members": 0.179433744,
+      "parse_indexes": 4.841910362,
+      "prepare": 0.013406665,
+      "prepare_commit": 0.000337976,
+      "verify": 0.000277732
+     },
+     "suite_path": "/debian-security/dists/suite-02",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000230833
+    },
+    {
+     "duration_seconds": 24.160663246,
+     "outcome": "success",
+     "package_list_rewrite_reason": "first",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.389358055,
+      "finalize": 0.000116228,
+      "flip_wait": 17.549552139,
+      "hot_prefetch": 0.000177126,
+      "members": 0.200774756,
+      "parse_indexes": 5.0149487,
+      "prepare": 0.00532531,
+      "prepare_commit": 0.000231686,
+      "verify": 0.000169277
+     },
+     "suite_path": "/debian-security/dists/suite-01",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 1,
+       "seconds": 6.1384e-05
+      },
+      "adoption_heartbeat": {
+       "count": 1,
+       "seconds": 5.6253e-05
+      },
+      "blob_put": {
+       "count": 1,
+       "seconds": 6.9988e-05
+      },
+      "representation_put": {
+       "count": 1,
+       "seconds": 3.171e-06
+      }
+     },
+     "writer_wait_seconds": 0.000433239
+    },
+    {
+     "duration_seconds": 32.986307732,
+     "outcome": "success",
+     "package_list_rewrite_reason": "large",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.7727418080000001,
+      "finalize": 0.000271991,
+      "flip_wait": 26.172900391,
+      "hot_prefetch": 0.050851874,
+      "members": 0.190227925,
+      "parse_indexes": 4.653294951,
+      "prepare": 0.0051517360000000005,
+      "prepare_commit": 0.140687637,
+      "verify": 0.000169174
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 3,
+       "seconds": 0.000462841
+      },
+      "adoption_heartbeat": {
+       "count": 2,
+       "seconds": 8.7731e-05
+      },
+      "blob_put": {
+       "count": 4,
+       "seconds": 0.000214137
+      },
+      "representation_put": {
+       "count": 5,
+       "seconds": 0.000319442
+      }
+     },
+     "writer_wait_seconds": 0.001438991
+    },
+    {
+     "duration_seconds": 23.005813633,
+     "outcome": "success",
+     "package_list_rewrite_reason": "first",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.65023795,
+      "finalize": 0.000287417,
+      "flip_wait": 16.465587736,
+      "hot_prefetch": 0.000153185,
+      "members": 0.178595783,
+      "parse_indexes": 4.704324578,
+      "prepare": 0.0058195700000000005,
+      "prepare_commit": 0.000251817,
+      "verify": 0.000542572
+     },
+     "suite_path": "/debian-security/dists/suite-03",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000227272
+    },
+    {
+     "duration_seconds": 23.024510481,
+     "outcome": "success",
+     "package_list_rewrite_reason": "first",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.598792547,
+      "finalize": 0.000125761,
+      "flip_wait": 16.55337001,
+      "hot_prefetch": 0.000242554,
+      "members": 0.169522866,
+      "parse_indexes": 4.696517565,
+      "prepare": 0.005506309,
+      "prepare_commit": 0.000252899,
+      "verify": 0.000174457
+     },
+     "suite_path": "/debian-security/dists/suite-04",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000251536
+    },
+    {
+     "duration_seconds": 23.012660183,
+     "outcome": "success",
+     "package_list_rewrite_reason": "first",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.5495439979999999,
+      "finalize": 0.000240808,
+      "flip_wait": 16.624648456,
+      "hot_prefetch": 0.000151607,
+      "members": 0.154143672,
+      "parse_indexes": 4.676240588,
+      "prepare": 0.007274679,
+      "prepare_commit": 0.000237716,
+      "verify": 0.000167681
+     },
+     "suite_path": "/debian-security/dists/suite-05",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000288
+    },
+    {
+     "duration_seconds": 43.135020021,
+     "outcome": "success",
+     "package_list_rewrite_reason": "large",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.777974157,
+      "finalize": 0.000284792,
+      "flip_wait": 21.103114888,
+      "hot_prefetch": 15.004092201,
+      "members": 0.396917173,
+      "parse_indexes": 4.720273366,
+      "prepare": 0.008978591999999999,
+      "prepare_commit": 0.12321373,
+      "verify": 0.000159979
+     },
+     "suite_path": "/debian-security/dists/suite-04",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 5,
+       "seconds": 0.000987878
+      },
+      "adoption_heartbeat": {
+       "count": 6,
+       "seconds": 0.000517237
+      },
+      "blob_put": {
+       "count": 4,
+       "seconds": 0.000504747
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 7.7502e-05
+      }
+     },
+     "writer_wait_seconds": 0.002381016
+    },
+    {
+     "duration_seconds": 34.830721954,
+     "outcome": "success",
+     "package_list_rewrite_reason": "large",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.82384213,
+      "finalize": 7.4223e-05,
+      "flip_wait": 12.686709412999999,
+      "hot_prefetch": 15.005728911,
+      "members": 0.382715144,
+      "parse_indexes": 4.8008280150000004,
+      "prepare": 0.012988427,
+      "prepare_commit": 0.117663667,
+      "verify": 0.000167898
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 5,
+       "seconds": 0.00250855
+      },
+      "adoption_heartbeat": {
+       "count": 5,
+       "seconds": 0.00088291
+      },
+      "blob_put": {
+       "count": 4,
+       "seconds": 0.000448393
+      },
+      "representation_put": {
+       "count": 4,
+       "seconds": 0.000182285
+      }
+     },
+     "writer_wait_seconds": 0.004384018
+    },
+    {
+     "duration_seconds": 41.412901057,
+     "outcome": "success",
+     "package_list_rewrite_reason": "large",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.885506042,
+      "finalize": 0.000305046,
+      "flip_wait": 19.274689253,
+      "hot_prefetch": 15.004328254,
+      "members": 0.472778948,
+      "parse_indexes": 4.642367354,
+      "prepare": 0.006879215,
+      "prepare_commit": 0.125871397,
+      "verify": 0.000163401
+     },
+     "suite_path": "/debian-security/dists/suite-05",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 6,
+       "seconds": 0.002092132
+      },
+      "adoption_heartbeat": {
+       "count": 8,
+       "seconds": 0.000636481
+      },
+      "blob_put": {
+       "count": 4,
+       "seconds": 0.000397034
+      },
+      "representation_put": {
+       "count": 4,
+       "seconds": 0.00028688
+      }
+     },
+     "writer_wait_seconds": 0.003766824
+    },
+    {
+     "duration_seconds": 47.804635239,
+     "outcome": "success",
+     "package_list_rewrite_reason": "large",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.7480143030000002,
+      "finalize": 0.000261196,
+      "flip_wait": 25.991434274,
+      "hot_prefetch": 15.004735658,
+      "members": 0.394399816,
+      "parse_indexes": 4.538083847,
+      "prepare": 0.005627326,
+      "prepare_commit": 0.121819749,
+      "verify": 0.000246351
+     },
+     "suite_path": "/debian-security/dists/suite-02",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 5,
+       "seconds": 0.001827688
+      },
+      "adoption_heartbeat": {
+       "count": 6,
+       "seconds": 0.000786695
+      },
+      "blob_put": {
+       "count": 3,
+       "seconds": 0.000414636
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 0.00034499
+      }
+     },
+     "writer_wait_seconds": 0.003708359
+    },
+    {
+     "duration_seconds": 43.042823977,
+     "outcome": "success",
+     "package_list_rewrite_reason": "large",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.810155256,
+      "finalize": 0.00029408,
+      "flip_wait": 21.087043937,
+      "hot_prefetch": 15.004377155,
+      "members": 0.377522853,
+      "parse_indexes": 4.634056483,
+      "prepare": 0.005731384999999999,
+      "prepare_commit": 0.123369516,
+      "verify": 0.000260507
+     },
+     "suite_path": "/debian-security/dists/suite-01",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 5,
+       "seconds": 0.002126877
+      },
+      "adoption_heartbeat": {
+       "count": 7,
+       "seconds": 0.00067909
+      },
+      "blob_put": {
+       "count": 3,
+       "seconds": 0.000295282
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 0.00034901
+      }
+     },
+     "writer_wait_seconds": 0.003762095
+    },
+    {
+     "duration_seconds": 41.234726142,
+     "outcome": "success",
+     "package_list_rewrite_reason": "large",
+     "package_list_write": "rewrite",
+     "package_rows_added": 66016,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 1.787802476,
+      "finalize": 0.000231583,
+      "flip_wait": 19.274052576,
+      "hot_prefetch": 15.004472914,
+      "members": 0.416535265,
+      "parse_indexes": 4.616593676,
+      "prepare": 0.012709294,
+      "prepare_commit": 0.122135334,
+      "verify": 0.00018381
+     },
+     "suite_path": "/debian-security/dists/suite-03",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 5,
+       "seconds": 0.001636869
+      },
+      "adoption_heartbeat": {
+       "count": 5,
+       "seconds": 0.000690287
+      },
+      "blob_put": {
+       "count": 4,
+       "seconds": 0.000300189
+      },
+      "representation_put": {
+       "count": 4,
+       "seconds": 0.000198235
+      }
+     },
+     "writer_wait_seconds": 0.003206139
+    }
+   ],
+   "database_files_bytes": {
+    "cache.db": 398422016,
+    "cache.db-shm": 98304,
+    "cache.db-wal": 46827952
+   },
+   "database_write_waited": [],
+   "summary": {
+    "caveat": "Synthetic burst with larger catalogs, not a full Debian/Ubuntu mirror or an SLA.",
+    "options": {
+     "burst": true,
+     "catalog_churn": 1.0,
+     "catalog_size": 33000,
+     "client_interval": 5,
+     "cooldown": "60s",
+     "deb_delay": 8.0,
+     "delay": 90,
+     "hosts": 2,
+     "hot_count": 8,
+     "max_wait": 1800.0,
+     "member_delay": 0.15,
+     "periodic_only": false,
+     "prefetch_budget": null,
+     "refresh": null,
+     "scenario": "baseline",
+     "suites": 6,
+     "xz_preset": 1
+    },
+    "publication_to_client_seconds": 153.554665,
+    "scenario": "burst",
+    "slowest_publication_seconds": 152.110414,
+    "suites": {
+     "suite-01": {
+      "adoption_finished_seconds": 133.895072,
+      "adoption_started_seconds": 90.851515,
+      "adoption_success_seconds": 133.894647,
+      "attempts": [
+       {
+        "adoption_id": "CGIUDHQJZC44LETQ5C3ZSTWNKR",
+        "outcome": "success",
+        "seconds": 133.895072
+       }
+      ],
+      "duration_seconds": 43.042823977,
+      "first_seen_seconds": 81,
+      "freshness_check_seconds": 52.943246,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "package_list_rewrite_reason": "large",
+      "package_list_write": "rewrite",
+      "package_rows_added": 66016,
+      "package_rows_changed": 0,
+      "package_rows_removed": 0,
+      "phases": {
+       "commit": 1.810155256,
+       "finalize": 0.00029408,
+       "flip_wait": 21.087043937,
+       "hot_prefetch": 15.004377155,
+       "members": 0.377522853,
+       "parse_indexes": 4.634056483,
+       "prepare": 0.005731384999999999,
+       "prepare_commit": 0.123369516,
+       "verify": 0.000260507
+      },
+      "release_age_seconds": 135,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 5,
+        "seconds": 0.002126877
+       },
+       "adoption_heartbeat": {
+        "count": 7,
+        "seconds": 0.00067909
+       },
+       "blob_put": {
+        "count": 3,
+        "seconds": 0.000295282
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 0.00034901
+       }
+      },
+      "writer_wait_seconds": 0.003762095
+     },
+     "suite-02": {
+      "adoption_finished_seconds": 109.063015,
+      "adoption_started_seconds": 61.257616,
+      "adoption_success_seconds": 109.062624,
+      "attempts": [
+       {
+        "adoption_id": "42HBWGJYBHQBXUYVGYZGBE75XY",
+        "outcome": "success",
+        "seconds": 109.063015
+       }
+      ],
+      "duration_seconds": 47.804635239,
+      "first_seen_seconds": 86,
+      "freshness_check_seconds": 22.948749,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "package_list_rewrite_reason": "large",
+      "package_list_write": "rewrite",
+      "package_rows_added": 66016,
+      "package_rows_changed": 0,
+      "package_rows_removed": 0,
+      "phases": {
+       "commit": 1.7480143030000002,
+       "finalize": 0.000261196,
+       "flip_wait": 25.991434274,
+       "hot_prefetch": 15.004735658,
+       "members": 0.394399816,
+       "parse_indexes": 4.538083847,
+       "prepare": 0.005627326,
+       "prepare_commit": 0.121819749,
+       "verify": 0.000246351
+      },
+      "release_age_seconds": 110,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 5,
+        "seconds": 0.001827688
+       },
+       "adoption_heartbeat": {
+        "count": 6,
+        "seconds": 0.000786695
+       },
+       "blob_put": {
+        "count": 3,
+        "seconds": 0.000414636
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 0.00034499
+       }
+      },
+      "writer_wait_seconds": 0.003708359
+     },
+     "suite-03": {
+      "adoption_finished_seconds": 152.110813,
+      "adoption_started_seconds": 110.875356,
+      "adoption_success_seconds": 152.110414,
+      "attempts": [
+       {
+        "adoption_id": "VSN3E3PIQF6VAGCRDJLRXP5WHV",
+        "outcome": "success",
+        "seconds": 152.110813
+       }
+      ],
+      "duration_seconds": 41.234726142,
+      "first_seen_seconds": 99,
+      "freshness_check_seconds": 52.944359,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "package_list_rewrite_reason": "large",
+      "package_list_write": "rewrite",
+      "package_rows_added": 66016,
+      "package_rows_changed": 0,
+      "package_rows_removed": 0,
+      "phases": {
+       "commit": 1.787802476,
+       "finalize": 0.000231583,
+       "flip_wait": 19.274052576,
+       "hot_prefetch": 15.004472914,
+       "members": 0.416535265,
+       "parse_indexes": 4.616593676,
+       "prepare": 0.012709294,
+       "prepare_commit": 0.122135334,
+       "verify": 0.00018381
+      },
+      "release_age_seconds": 153,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 5,
+        "seconds": 0.001636869
+       },
+       "adoption_heartbeat": {
+        "count": 5,
+        "seconds": 0.000690287
+       },
+       "blob_put": {
+        "count": 4,
+        "seconds": 0.000300189
+       },
+       "representation_put": {
+        "count": 4,
+        "seconds": 0.000198235
+       }
+      },
+      "writer_wait_seconds": 0.003206139
+     },
+     "suite-04": {
+      "adoption_finished_seconds": 49.425157,
+      "adoption_started_seconds": 6.289286,
+      "adoption_success_seconds": 49.424623,
+      "attempts": [
+       {
+        "adoption_id": "IWOEGW5FQCVQNC5Z3BTDWW36KA",
+        "outcome": "success",
+        "seconds": 49.425157
+       }
+      ],
+      "duration_seconds": 43.135020021,
+      "first_seen_seconds": 43,
+      "freshness_check_seconds": 6.28922,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "package_list_rewrite_reason": "large",
+      "package_list_write": "rewrite",
+      "package_rows_added": 66016,
+      "package_rows_changed": 0,
+      "package_rows_removed": 0,
+      "phases": {
+       "commit": 1.777974157,
+       "finalize": 0.000284792,
+       "flip_wait": 21.103114888,
+       "hot_prefetch": 15.004092201,
+       "members": 0.396917173,
+       "parse_indexes": 4.720273366,
+       "prepare": 0.008978591999999999,
+       "prepare_commit": 0.12321373,
+       "verify": 0.000159979
+      },
+      "release_age_seconds": 51,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 5,
+        "seconds": 0.000987878
+       },
+       "adoption_heartbeat": {
+        "count": 6,
+        "seconds": 0.000517237
+       },
+       "blob_put": {
+        "count": 4,
+        "seconds": 0.000504747
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 7.7502e-05
+       }
+      },
+      "writer_wait_seconds": 0.002381016
+     },
+     "suite-05": {
+      "adoption_finished_seconds": 90.845579,
+      "adoption_started_seconds": 49.43179,
+      "adoption_success_seconds": 90.845127,
+      "attempts": [
+       {
+        "adoption_id": "YULZUDO7S65QFAEW4WT67MZCEA",
+        "outcome": "success",
+        "seconds": 90.845579
+       }
+      ],
+      "duration_seconds": 41.412901057,
+      "first_seen_seconds": 59,
+      "freshness_check_seconds": 31.427194,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "package_list_rewrite_reason": "large",
+      "package_list_write": "rewrite",
+      "package_rows_added": 66016,
+      "package_rows_changed": 0,
+      "package_rows_removed": 0,
+      "phases": {
+       "commit": 1.885506042,
+       "finalize": 0.000305046,
+       "flip_wait": 19.274689253,
+       "hot_prefetch": 15.004328254,
+       "members": 0.472778948,
+       "parse_indexes": 4.642367354,
+       "prepare": 0.006879215,
+       "prepare_commit": 0.125871397,
+       "verify": 0.000163401
+      },
+      "release_age_seconds": 92,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 6,
+        "seconds": 0.002092132
+       },
+       "adoption_heartbeat": {
+        "count": 8,
+        "seconds": 0.000636481
+       },
+       "blob_put": {
+        "count": 4,
+        "seconds": 0.000397034
+       },
+       "representation_put": {
+        "count": 4,
+        "seconds": 0.00028688
+       }
+      },
+      "writer_wait_seconds": 0.003766824
+     },
+     "trixie-security": {
+      "adoption_finished_seconds": 61.252186,
+      "adoption_started_seconds": 26.421309,
+      "adoption_success_seconds": 61.252057,
+      "attempts": [
+       {
+        "adoption_id": "PX347ADUQQTWXGKRINIBR4CRBN",
+        "outcome": "success",
+        "seconds": 61.252186
+       }
+      ],
+      "duration_seconds": 34.830721954,
+      "first_seen_seconds": 54,
+      "freshness_check_seconds": 7.944068,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "package_list_rewrite_reason": "large",
+      "package_list_write": "rewrite",
+      "package_rows_added": 66016,
+      "package_rows_changed": 0,
+      "package_rows_removed": 0,
+      "phases": {
+       "commit": 1.82384213,
+       "finalize": 7.4223e-05,
+       "flip_wait": 12.686709412999999,
+       "hot_prefetch": 15.005728911,
+       "members": 0.382715144,
+       "parse_indexes": 4.8008280150000004,
+       "prepare": 0.012988427,
+       "prepare_commit": 0.117663667,
+       "verify": 0.000167898
+      },
+      "release_age_seconds": 63,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 5,
+        "seconds": 0.00250855
+       },
+       "adoption_heartbeat": {
+        "count": 5,
+        "seconds": 0.00088291
+       },
+       "blob_put": {
+        "count": 4,
+        "seconds": 0.000448393
+       },
+       "representation_put": {
+        "count": 4,
+        "seconds": 0.000182285
+       }
+      },
+      "writer_wait_seconds": 0.004384018
+     }
+    }
+   }
+  },
+  "burst-total-main": {
+   "adoption_finished": [
+    {
+     "duration_seconds": 6.916041056,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 1.857399548,
+      "finalize": 8.712e-05,
+      "flip_wait": 7.8134e-05,
+      "hot_prefetch": 0.000140154,
+      "members": 0.205935277,
+      "parse_indexes": 4.850599831,
+      "prepare": 0.001421467,
+      "prepare_commit": 0.000178407,
+      "verify": 0.000196889
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {
+      "blob_put": {
+       "count": 1,
+       "seconds": 1.7736e-05
+      },
+      "fetched_store": {
+       "count": 1,
+       "seconds": 0.000710127
+      }
+     },
+     "writer_wait_seconds": 0.000934124
+    },
+    {
+     "duration_seconds": 23.780129997,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 1.944633519,
+      "finalize": 0.000239763,
+      "flip_wait": 16.946427855,
+      "hot_prefetch": 0.000159722,
+      "members": 0.268782863,
+      "parse_indexes": 4.60941172,
+      "prepare": 0.010037224,
+      "prepare_commit": 0.000242187,
+      "verify": 0.000181254
+     },
+     "suite_path": "/debian-security/dists/suite-01",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 1,
+       "seconds": 0.000138569
+      },
+      "blob_put": {
+       "count": 2,
+       "seconds": 0.000121772
+      }
+     },
+     "writer_wait_seconds": 0.000495725
+    },
+    {
+     "duration_seconds": 23.458974564,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.105078358,
+      "finalize": 0.000277931,
+      "flip_wait": 16.479458292,
+      "hot_prefetch": 0.000214394,
+      "members": 0.181554766,
+      "parse_indexes": 4.687017632,
+      "prepare": 0.0050165439999999995,
+      "prepare_commit": 0.00015224,
+      "verify": 0.000193122
+     },
+     "suite_path": "/debian-security/dists/suite-02",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000207536
+    },
+    {
+     "duration_seconds": 27.167275725,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.2037856319999998,
+      "finalize": 0.000309637,
+      "flip_wait": 17.99149181,
+      "hot_prefetch": 0.055078577,
+      "members": 2.279944771,
+      "parse_indexes": 4.629696246,
+      "prepare": 0.006558902,
+      "prepare_commit": 0.000210546,
+      "verify": 0.000189106
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 6,
+       "seconds": 0.000682176
+      },
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 2.022779273
+      },
+      "adoption_heartbeat": {
+       "count": 7,
+       "seconds": 0.000247052
+      },
+      "blob_put": {
+       "count": 8,
+       "seconds": 0.008908365
+      },
+      "representation_put": {
+       "count": 8,
+       "seconds": 0.000604872
+      },
+      "url_path_touch": {
+       "count": 5,
+       "seconds": 0.001102686
+      }
+     },
+     "writer_wait_seconds": 2.034646729
+    },
+    {
+     "duration_seconds": 23.300043989,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 1.948529396,
+      "finalize": 0.000243273,
+      "flip_wait": 16.680489068,
+      "hot_prefetch": 0.000158141,
+      "members": 0.149892382,
+      "parse_indexes": 4.515705652,
+      "prepare": 0.00465711,
+      "prepare_commit": 0.000165569,
+      "verify": 0.000193074
+     },
+     "suite_path": "/debian-security/dists/suite-03",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000241441
+    },
+    {
+     "duration_seconds": 23.486889979,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.023681939,
+      "finalize": 0.00025825,
+      "flip_wait": 16.721081666,
+      "hot_prefetch": 0.000171022,
+      "members": 0.144056952,
+      "parse_indexes": 4.592368084,
+      "prepare": 0.0048651530000000005,
+      "prepare_commit": 0.000178449,
+      "verify": 0.000216791
+     },
+     "suite_path": "/debian-security/dists/suite-04",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000252481
+    },
+    {
+     "duration_seconds": 23.446993549,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 1.993804523,
+      "finalize": 0.000102,
+      "flip_wait": 16.622301857,
+      "hot_prefetch": 0.00016354,
+      "members": 0.161191667,
+      "parse_indexes": 4.663098608,
+      "prepare": 0.005509738,
+      "prepare_commit": 0.000184831,
+      "verify": 0.000632472
+     },
+     "suite_path": "/debian-security/dists/suite-05",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000218825
+    },
+    {
+     "duration_seconds": 43.515725508,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.306041057,
+      "finalize": 0.000110762,
+      "flip_wait": 21.227934543,
+      "hot_prefetch": 15.005953304,
+      "members": 0.380125155,
+      "parse_indexes": 4.587593863,
+      "prepare": 0.0069077900000000005,
+      "prepare_commit": 0.000832667,
+      "verify": 0.000221408
+     },
+     "suite_path": "/debian-security/dists/suite-04",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 5,
+       "seconds": 0.002176355
+      },
+      "adoption_heartbeat": {
+       "count": 7,
+       "seconds": 0.000680878
+      },
+      "blob_put": {
+       "count": 3,
+       "seconds": 0.000409493
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 0.000377133
+      }
+     },
+     "writer_wait_seconds": 0.004077636
+    },
+    {
+     "duration_seconds": 48.929416967,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.581173255,
+      "finalize": 9.4538e-05,
+      "flip_wait": 26.227421752,
+      "hot_prefetch": 15.00295638,
+      "members": 0.434029516,
+      "parse_indexes": 4.669754466,
+      "prepare": 0.013511376,
+      "prepare_commit": 0.000271867,
+      "verify": 0.000199285
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 8,
+       "seconds": 0.001147346
+      },
+      "adoption_heartbeat": {
+       "count": 11,
+       "seconds": 0.000440067
+      },
+      "blob_put": {
+       "count": 7,
+       "seconds": 0.023091054
+      },
+      "representation_put": {
+       "count": 7,
+       "seconds": 0.000550066
+      }
+     },
+     "writer_wait_seconds": 0.025468713
+    },
+    {
+     "duration_seconds": 37.744004243,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.34863049,
+      "finalize": 0.000176017,
+      "flip_wait": 15.351302685,
+      "hot_prefetch": 15.004224738,
+      "members": 0.369864775,
+      "parse_indexes": 4.663527631,
+      "prepare": 0.005149667,
+      "prepare_commit": 0.000821967,
+      "verify": 0.000296093
+     },
+     "suite_path": "/debian-security/dists/suite-01",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 5,
+       "seconds": 0.001771879
+      },
+      "adoption_heartbeat": {
+       "count": 6,
+       "seconds": 0.000672009
+      },
+      "blob_put": {
+       "count": 4,
+       "seconds": 0.000323523
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 7.6346e-05
+      }
+     },
+     "writer_wait_seconds": 0.003207098
+    },
+    {
+     "duration_seconds": 42.33403875,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.289966766,
+      "finalize": 0.000261743,
+      "flip_wait": 20.057289813,
+      "hot_prefetch": 15.004269377,
+      "members": 0.39254118,
+      "parse_indexes": 4.584116235,
+      "prepare": 0.005092019999999999,
+      "prepare_commit": 0.000219135,
+      "verify": 0.000270083
+     },
+     "suite_path": "/debian-security/dists/suite-05",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 5,
+       "seconds": 0.001591384
+      },
+      "adoption_heartbeat": {
+       "count": 6,
+       "seconds": 0.00063575
+      },
+      "blob_put": {
+       "count": 3,
+       "seconds": 0.000385041
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 0.000330789
+      }
+     },
+     "writer_wait_seconds": 0.00325572
+    },
+    {
+     "duration_seconds": 48.931658489,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.516130359,
+      "finalize": 0.00011557,
+      "flip_wait": 26.34465016,
+      "hot_prefetch": 15.003544635,
+      "members": 0.429158638,
+      "parse_indexes": 4.631159022,
+      "prepare": 0.006405859,
+      "prepare_commit": 0.000255683,
+      "verify": 0.000232879
+     },
+     "suite_path": "/debian-security/dists/suite-02",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 5,
+       "seconds": 0.000967454
+      },
+      "adoption_heartbeat": {
+       "count": 6,
+       "seconds": 0.000780088
+      },
+      "blob_put": {
+       "count": 3,
+       "seconds": 0.000385854
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 0.000320701
+      }
+     },
+     "writer_wait_seconds": 0.002786182
+    },
+    {
+     "duration_seconds": 44.033508239,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 2.348484536,
+      "finalize": 0.000209123,
+      "flip_wait": 21.757512224,
+      "hot_prefetch": 15.001980397,
+      "members": 0.35770068,
+      "parse_indexes": 4.561669622,
+      "prepare": 0.005390799,
+      "prepare_commit": 0.000363005,
+      "verify": 0.000191243
+     },
+     "suite_path": "/debian-security/dists/suite-03",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 5,
+       "seconds": 0.000816208
+      },
+      "adoption_heartbeat": {
+       "count": 7,
+       "seconds": 0.000357562
+      },
+      "blob_put": {
+       "count": 3,
+       "seconds": 0.000273897
+      },
+      "representation_put": {
+       "count": 3,
+       "seconds": 0.000227889
+      }
+     },
+     "writer_wait_seconds": 0.001947962
+    }
+   ],
+   "database_files_bytes": {
+    "cache.db": 337924096,
+    "cache.db-shm": 98304,
+    "cache.db-wal": 42547272
+   },
+   "database_write_waited": [
+    {
+     "ahead": {
+      "adoption_commit": {
+       "count": 1,
+       "seconds": 2.022779273
+      }
+     },
+     "op": "blob_put",
+     "ran_seconds": 0.008356057,
+     "started": true,
+     "suppressed": 0,
+     "waited_seconds": 2.022790759
+    }
+   ],
+   "summary": {
+    "caveat": "Synthetic burst with larger catalogs, not a full Debian/Ubuntu mirror or an SLA.",
+    "options": {
+     "burst": true,
+     "catalog_churn": 1.0,
+     "catalog_size": 33000,
+     "client_interval": 5,
+     "cooldown": "60s",
+     "deb_delay": 8.0,
+     "delay": 90,
+     "hosts": 2,
+     "hot_count": 8,
+     "max_wait": 1800.0,
+     "member_delay": 0.15,
+     "periodic_only": false,
+     "prefetch_budget": null,
+     "refresh": null,
+     "scenario": "baseline",
+     "suites": 6,
+     "xz_preset": 1
+    },
+    "publication_to_client_seconds": 163.00442699999996,
+    "scenario": "burst",
+    "slowest_publication_seconds": 161.581046,
+    "suites": {
+     "suite-01": {
+      "adoption_finished_seconds": 87.555006,
+      "adoption_started_seconds": 49.810063,
+      "adoption_success_seconds": 87.554569,
+      "attempts": [
+       {
+        "adoption_id": "TBTI6ABFA4R4NBF76AMMFPKCKW",
+        "outcome": "success",
+        "seconds": 87.555006
+       }
+      ],
+      "duration_seconds": 37.744004243,
+      "first_seen_seconds": 60,
+      "freshness_check_seconds": 27.245437,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "phases": {
+       "commit": 2.34863049,
+       "finalize": 0.000176017,
+       "flip_wait": 15.351302685,
+       "hot_prefetch": 15.004224738,
+       "members": 0.369864775,
+       "parse_indexes": 4.663527631,
+       "prepare": 0.005149667,
+       "prepare_commit": 0.000821967,
+       "verify": 0.000296093
+      },
+      "release_age_seconds": 88,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 5,
+        "seconds": 0.001771879
+       },
+       "adoption_heartbeat": {
+        "count": 6,
+        "seconds": 0.000672009
+       },
+       "blob_put": {
+        "count": 4,
+        "seconds": 0.000323523
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 7.6346e-05
+       }
+      },
+      "writer_wait_seconds": 0.003207098
+     },
+     "suite-02": {
+      "adoption_finished_seconds": 136.491364,
+      "adoption_started_seconds": 87.559479,
+      "adoption_success_seconds": 136.491175,
+      "attempts": [
+       {
+        "adoption_id": "UJOJE3AALDTQYP5PMGUDLNJRU5",
+        "outcome": "success",
+        "seconds": 136.491364
+       }
+      ],
+      "duration_seconds": 48.931658489,
+      "first_seen_seconds": 79,
+      "freshness_check_seconds": 57.24519,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "phases": {
+       "commit": 2.516130359,
+       "finalize": 0.00011557,
+       "flip_wait": 26.34465016,
+       "hot_prefetch": 15.003544635,
+       "members": 0.429158638,
+       "parse_indexes": 4.631159022,
+       "prepare": 0.006405859,
+       "prepare_commit": 0.000255683,
+       "verify": 0.000232879
+      },
+      "release_age_seconds": 137,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 5,
+        "seconds": 0.000967454
+       },
+       "adoption_heartbeat": {
+        "count": 6,
+        "seconds": 0.000780088
+       },
+       "blob_put": {
+        "count": 3,
+        "seconds": 0.000385854
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 0.000320701
+       }
+      },
+      "writer_wait_seconds": 0.002786182
+     },
+     "suite-03": {
+      "adoption_finished_seconds": 161.581345,
+      "adoption_started_seconds": 117.547314,
+      "adoption_success_seconds": 161.581046,
+      "attempts": [
+       {
+        "adoption_id": "VVSQRVAQSBRSUPV7ONE5N7SHFT",
+        "outcome": "success",
+        "seconds": 161.581345
+       }
+      ],
+      "duration_seconds": 44.033508239,
+      "first_seen_seconds": 119,
+      "freshness_check_seconds": 42.25043,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "phases": {
+       "commit": 2.348484536,
+       "finalize": 0.000209123,
+       "flip_wait": 21.757512224,
+       "hot_prefetch": 15.001980397,
+       "members": 0.35770068,
+       "parse_indexes": 4.561669622,
+       "prepare": 0.005390799,
+       "prepare_commit": 0.000363005,
+       "verify": 0.000191243
+      },
+      "release_age_seconds": 162,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 5,
+        "seconds": 0.000816208
+       },
+       "adoption_heartbeat": {
+        "count": 7,
+        "seconds": 0.000357562
+       },
+       "blob_put": {
+        "count": 3,
+        "seconds": 0.000273897
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 0.000227889
+       }
+      },
+      "writer_wait_seconds": 0.001947962
+     },
+     "suite-04": {
+      "adoption_finished_seconds": 49.804471,
+      "adoption_started_seconds": 6.28846,
+      "adoption_success_seconds": 49.804247,
+      "attempts": [
+       {
+        "adoption_id": "DUH5H7XB536ZBEDABVC3EYLM2I",
+        "outcome": "success",
+        "seconds": 49.804471
+       }
+      ],
+      "duration_seconds": 43.515725508,
+      "first_seen_seconds": 44,
+      "freshness_check_seconds": 6.288379,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "phases": {
+       "commit": 2.306041057,
+       "finalize": 0.000110762,
+       "flip_wait": 21.227934543,
+       "hot_prefetch": 15.005953304,
+       "members": 0.380125155,
+       "parse_indexes": 4.587593863,
+       "prepare": 0.0069077900000000005,
+       "prepare_commit": 0.000832667,
+       "verify": 0.000221408
+      },
+      "release_age_seconds": 51,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 5,
+        "seconds": 0.002176355
+       },
+       "adoption_heartbeat": {
+        "count": 7,
+        "seconds": 0.000680878
+       },
+       "blob_put": {
+        "count": 3,
+        "seconds": 0.000409493
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 0.000377133
+       }
+      },
+      "writer_wait_seconds": 0.004077636
+     },
+     "suite-05": {
+      "adoption_finished_seconds": 117.540882,
+      "adoption_started_seconds": 75.206103,
+      "adoption_success_seconds": 117.540492,
+      "attempts": [
+       {
+        "adoption_id": "BTYOHOCL6QIMZLQDITVAMDW5MZ",
+        "outcome": "success",
+        "seconds": 117.540882
+       }
+      ],
+      "duration_seconds": 42.33403875,
+      "first_seen_seconds": 90,
+      "freshness_check_seconds": 27.246699,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "phases": {
+       "commit": 2.289966766,
+       "finalize": 0.000261743,
+       "flip_wait": 20.057289813,
+       "hot_prefetch": 15.004269377,
+       "members": 0.39254118,
+       "parse_indexes": 4.584116235,
+       "prepare": 0.005092019999999999,
+       "prepare_commit": 0.000219135,
+       "verify": 0.000270083
+      },
+      "release_age_seconds": 118,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 5,
+        "seconds": 0.001591384
+       },
+       "adoption_heartbeat": {
+        "count": 6,
+        "seconds": 0.00063575
+       },
+       "blob_put": {
+        "count": 3,
+        "seconds": 0.000385041
+       },
+       "representation_put": {
+        "count": 3,
+        "seconds": 0.000330789
+       }
+      },
+      "writer_wait_seconds": 0.00325572
+     },
+     "trixie-security": {
+      "adoption_finished_seconds": 75.201322,
+      "adoption_started_seconds": 26.271624,
+      "adoption_success_seconds": 75.201086,
+      "attempts": [
+       {
+        "adoption_id": "25KRTY5GEQMLEUH2W2ZMTXOWOM",
+        "outcome": "success",
+        "seconds": 75.201322
+       }
+      ],
+      "duration_seconds": 48.929416967,
+      "first_seen_seconds": 63,
+      "freshness_check_seconds": 12.245653,
+      "hot": {
+       "hot_count": 8,
+       "hot_failed": 4,
+       "hot_fetched": 4,
+       "hot_unattempted": 0
+      },
+      "outcome": "success",
+      "phases": {
+       "commit": 2.581173255,
+       "finalize": 9.4538e-05,
+       "flip_wait": 26.227421752,
+       "hot_prefetch": 15.00295638,
+       "members": 0.434029516,
+       "parse_indexes": 4.669754466,
+       "prepare": 0.013511376,
+       "prepare_commit": 0.000271867,
+       "verify": 0.000199285
+      },
+      "release_age_seconds": 76,
+      "writer_ahead": {
+       "adoption_blob_heartbeat": {
+        "count": 8,
+        "seconds": 0.001147346
+       },
+       "adoption_heartbeat": {
+        "count": 11,
+        "seconds": 0.000440067
+       },
+       "blob_put": {
+        "count": 7,
+        "seconds": 0.023091054
+       },
+       "representation_put": {
+        "count": 7,
+        "seconds": 0.000550066
+       }
+      },
+      "writer_wait_seconds": 0.025468713
+     }
+    }
+   }
+  },
+  "php-branch-1": {
+   "adoption_finished": [
+    {
+     "duration_seconds": 0.011260762,
+     "outcome": "success",
+     "package_list_rewrite_reason": "first",
+     "package_list_write": "rewrite",
+     "package_rows_added": 1,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 0.001224346,
+      "finalize": 4.3611e-05,
+      "flip_wait": 6.1258e-05,
+      "hot_prefetch": 0.000134332,
+      "members": 0.006254624,
+      "parse_indexes": 0.000234792,
+      "prepare": 0.002886682,
+      "prepare_commit": 0.000201384,
+      "verify": 0.000216577
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 1,
+       "seconds": 7.6275e-05
+      },
+      "blob_put": {
+       "count": 2,
+       "seconds": 0.000142848
+      },
+      "representation_put": {
+       "count": 2,
+       "seconds": 1.872e-05
+      }
+     },
+     "writer_wait_seconds": 0.000288416
+    },
+    {
+     "duration_seconds": 20.164683161,
+     "outcome": "success",
+     "package_list_rewrite_reason": "large",
+     "package_list_write": "rewrite",
+     "package_rows_added": 1,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 0.003475624,
+      "finalize": 7.0347e-05,
+      "flip_wait": 20.122366267,
+      "hot_prefetch": 0.005606823,
+      "members": 0.017606178,
+      "parse_indexes": 0.000647227,
+      "prepare": 0.014051850999999999,
+      "prepare_commit": 0.000292846,
+      "verify": 0.00056287
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {},
+     "writer_wait_seconds": 9.8691e-05
+    },
+    {
+     "duration_seconds": 20.238920653,
+     "outcome": "success",
+     "package_list_rewrite_reason": "large",
+     "package_list_write": "rewrite",
+     "package_rows_added": 1,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 0.00390045,
+      "finalize": 9.1213e-05,
+      "flip_wait": 20.194931457,
+      "hot_prefetch": 0.00687468,
+      "members": 0.016395361,
+      "parse_indexes": 0.000306857,
+      "prepare": 0.015491331,
+      "prepare_commit": 0.000291693,
+      "verify": 0.000632201
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000101797
+    }
+   ],
+   "database_files_bytes": {
+    "cache.db": 4096,
+    "cache.db-shm": 32768,
+    "cache.db-wal": 1648032
+   },
+   "database_write_waited": [],
+   "summary": {
+    "caveat": "Synthetic mechanism reproduction, not proof of the customer's root cause.",
+    "faults": [],
+    "old_client_observations": 10,
+    "phases_seconds_after_publication": {
+     "InRelease changed at upstream": 39.401135,
+     "adoption_hot_prefetch_started": 39.434116,
+     "adoption_success": 59.640188
+    },
+    "publication_to_client_seconds": 59.753437,
+    "scenario": "baseline"
+   }
+  },
+  "php-branch-2": {
+   "adoption_finished": [
+    {
+     "duration_seconds": 0.015875004,
+     "outcome": "success",
+     "package_list_rewrite_reason": "first",
+     "package_list_write": "rewrite",
+     "package_rows_added": 1,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 0.001261062,
+      "finalize": 5.3583e-05,
+      "flip_wait": 6.5472e-05,
+      "hot_prefetch": 0.000134352,
+      "members": 0.010693173,
+      "parse_indexes": 0.002262235,
+      "prepare": 0.000935663,
+      "prepare_commit": 0.000307845,
+      "verify": 0.000157536
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000151896
+    },
+    {
+     "duration_seconds": 20.245506766,
+     "outcome": "success",
+     "package_list_rewrite_reason": "large",
+     "package_list_write": "rewrite",
+     "package_rows_added": 1,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 0.001736287,
+      "finalize": 6.8634e-05,
+      "flip_wait": 20.203671813,
+      "hot_prefetch": 0.006302845,
+      "members": 0.016841122,
+      "parse_indexes": 0.000567356,
+      "prepare": 0.01545719,
+      "prepare_commit": 0.000304834,
+      "verify": 0.000553475
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000165195
+    },
+    {
+     "duration_seconds": 20.26979129,
+     "outcome": "success",
+     "package_list_rewrite_reason": "large",
+     "package_list_write": "rewrite",
+     "package_rows_added": 1,
+     "package_rows_changed": 0,
+     "package_rows_removed": 0,
+     "phase_seconds": {
+      "commit": 0.002457244,
+      "finalize": 0.000109347,
+      "flip_wait": 20.230795385,
+      "hot_prefetch": 0.00625185,
+      "members": 0.012792882,
+      "parse_indexes": 0.001364891,
+      "prepare": 0.015136245,
+      "prepare_commit": 0.000307149,
+      "verify": 0.000570856
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {},
+     "writer_wait_seconds": 0.000102901
+    }
+   ],
+   "database_files_bytes": {
+    "cache.db": 4096,
+    "cache.db-shm": 32768,
+    "cache.db-wal": 1689232
+   },
+   "database_write_waited": [],
+   "summary": {
+    "caveat": "Synthetic mechanism reproduction, not proof of the customer's root cause.",
+    "faults": [],
+    "old_client_observations": 10,
+    "phases_seconds_after_publication": {
+     "InRelease changed at upstream": 39.301803,
+     "adoption_hot_prefetch_started": 39.331941,
+     "adoption_success": 59.571666
+    },
+    "publication_to_client_seconds": 59.692897,
+    "scenario": "baseline"
+   }
+  },
+  "php-main-1": {
+   "adoption_finished": [
+    {
+     "duration_seconds": 0.013392081,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 0.001125452,
+      "finalize": 3.7724e-05,
+      "flip_wait": 7.1891e-05,
+      "hot_prefetch": 0.00013965,
+      "members": 0.009863807,
+      "parse_indexes": 0.000675513,
+      "prepare": 0.001165814,
+      "prepare_commit": 0.00013974,
+      "verify": 0.000169306
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {},
+     "writer_wait_seconds": 5.8336e-05
+    },
+    {
+     "duration_seconds": 20.251412287,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 0.001872084,
+      "finalize": 6.5626e-05,
+      "flip_wait": 20.212353914,
+      "hot_prefetch": 0.007449359,
+      "members": 0.01500158,
+      "parse_indexes": 0.000622264,
+      "prepare": 0.013220872,
+      "prepare_commit": 0.000175213,
+      "verify": 0.000646818
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {},
+     "writer_wait_seconds": 8.8657e-05
+    },
+    {
+     "duration_seconds": 20.211978844,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 0.003304774,
+      "finalize": 6.9107e-05,
+      "flip_wait": 20.172823875,
+      "hot_prefetch": 0.005838537,
+      "members": 0.013263342,
+      "parse_indexes": 0.000324063,
+      "prepare": 0.015454823,
+      "prepare_commit": 0.000174681,
+      "verify": 0.000722693
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {},
+     "writer_wait_seconds": 9.9698e-05
+    }
+   ],
+   "database_files_bytes": {
+    "cache.db": 4096,
+    "cache.db-shm": 32768,
+    "cache.db-wal": 1573872
+   },
+   "database_write_waited": [],
+   "summary": {
+    "caveat": "Synthetic mechanism reproduction, not proof of the customer's root cause.",
+    "faults": [],
+    "old_client_observations": 10,
+    "phases_seconds_after_publication": {
+     "InRelease changed at upstream": 39.265144,
+     "adoption_hot_prefetch_started": 39.294924,
+     "adoption_success": 59.477074
+    },
+    "publication_to_client_seconds": 59.594618,
+    "scenario": "baseline"
+   }
+  },
+  "php-main-2": {
+   "adoption_finished": [
+    {
+     "duration_seconds": 0.012045089,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 0.001483737,
+      "finalize": 5.1868e-05,
+      "flip_wait": 0.000142116,
+      "hot_prefetch": 0.000186948,
+      "members": 0.006194862,
+      "parse_indexes": 0.002577019,
+      "prepare": 0.000938761,
+      "prepare_commit": 0.000210704,
+      "verify": 0.000255132
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {
+      "adoption_blob_heartbeat": {
+       "count": 1,
+       "seconds": 8.2005e-05
+      },
+      "adoption_heartbeat": {
+       "count": 2,
+       "seconds": 8.2949e-05
+      },
+      "blob_put": {
+       "count": 2,
+       "seconds": 0.000154251
+      },
+      "representation_put": {
+       "count": 1,
+       "seconds": 1.9689e-05
+      }
+     },
+     "writer_wait_seconds": 0.000398254
+    },
+    {
+     "duration_seconds": 4.946749296,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 0.002186814,
+      "finalize": 8.8712e-05,
+      "flip_wait": 4.909178496,
+      "hot_prefetch": 0.005569619,
+      "members": 0.013971712,
+      "parse_indexes": 0.001908015,
+      "prepare": 0.013410569,
+      "prepare_commit": 0.000150394,
+      "verify": 0.000279816
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {},
+     "writer_wait_seconds": 7.3823e-05
+    },
+    {
+     "duration_seconds": 4.98094237,
+     "outcome": "success",
+     "phase_seconds": {
+      "commit": 0.006812824,
+      "finalize": 0.000206044,
+      "flip_wait": 4.945415628,
+      "hot_prefetch": 0.006102292,
+      "members": 0.011739428,
+      "parse_indexes": 0.002208852,
+      "prepare": 0.008098774999999999,
+      "prepare_commit": 0.000150072,
+      "verify": 0.000190698
+     },
+     "suite_path": "/debian-security/dists/trixie-security",
+     "writer_ahead": {},
+     "writer_wait_seconds": 9.6793e-05
+    }
+   ],
+   "database_files_bytes": {
+    "cache.db": 4096,
+    "cache.db-shm": 32768,
+    "cache.db-wal": 1516192
+   },
+   "database_write_waited": [],
+   "summary": {
+    "caveat": "Synthetic mechanism reproduction, not proof of the customer's root cause.",
+    "faults": [],
+    "old_client_observations": 11,
+    "phases_seconds_after_publication": {
+     "InRelease changed at upstream": 56.02197,
+     "adoption_hot_prefetch_started": 56.044704,
+     "adoption_success": 61.003457
+    },
+    "publication_to_client_seconds": 61.115253,
+    "scenario": "baseline"
+   }
+  }
+ },
+ "runs_in_order": {
+  "burst-real-branch": {
+   "ended": "2026-11-19T06:24:41-07:00",
+   "exit": 0,
+   "load_average_at_end": "1.14 1.06 2.59",
+   "load_average_at_start": "0.42 0.76 3.29",
+   "started": "2026-11-19T06:18:34-07:00"
+  },
+  "burst-real-main": {
+   "ended": "2026-11-19T06:31:33-07:00",
+   "exit": 0,
+   "load_average_at_end": "2.45 2.20 2.64",
+   "load_average_at_start": "1.14 1.06 2.59",
+   "started": "2026-11-19T06:24:41-07:00"
+  },
+  "burst-total-branch": {
+   "ended": "2026-11-19T06:37:55-07:00",
+   "exit": 0,
+   "load_average_at_end": "1.25 1.50 2.18",
+   "load_average_at_start": "2.45 2.20 2.64",
+   "started": "2026-11-19T06:31:33-07:00"
+  },
+  "burst-total-main": {
+   "ended": "2026-11-19T06:44:16-07:00",
+   "exit": 0,
+   "load_average_at_end": "0.96 1.15 1.80",
+   "load_average_at_start": "1.25 1.50 2.18",
+   "started": "2026-11-19T06:37:55-07:00"
+  },
+  "php-branch-1": {
+   "ended": "2026-11-19T06:11:38-07:00",
+   "exit": 0,
+   "load_average_at_end": "0.57 1.63 4.88",
+   "load_average_at_start": "0.83 2.35 5.63",
+   "started": "2026-11-19T06:09:15-07:00"
+  },
+  "php-branch-2": {
+   "ended": "2026-11-19T06:16:23-07:00",
+   "exit": 0,
+   "load_average_at_end": "0.43 0.95 3.72",
+   "load_average_at_start": "0.48 1.19 4.26",
+   "started": "2026-11-19T06:14:01-07:00"
+  },
+  "php-main-1": {
+   "ended": "2026-11-19T06:14:01-07:00",
+   "exit": 0,
+   "load_average_at_end": "0.48 1.19 4.26",
+   "load_average_at_start": "0.57 1.63 4.88",
+   "started": "2026-11-19T06:11:38-07:00"
+  },
+  "php-main-2": {
+   "ended": "2026-11-19T06:18:34-07:00",
+   "exit": 0,
+   "load_average_at_end": "0.42 0.76 3.29",
+   "load_average_at_start": "0.43 0.95 3.72",
+   "started": "2026-11-19T06:16:23-07:00"
+  }
+ },
+ "what": "One package list per suite, written by difference (branch perf/package-rows-per-suite) against main, in the freshness lab: the single-suite 'PHP update' scenario twice per binary, and the six-suite burst at a real suite's size (66,016 package rows a suite) with 0.3% and with all of the catalog changing per publication. Branch and main alternate in one sitting, with nothing else of the measurer's running."
+}

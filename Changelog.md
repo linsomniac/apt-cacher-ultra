@@ -142,15 +142,17 @@ not included in the published 1.1.0-rc1.
   `adoption.flip_quiet_period`, `adoption.max_duration`,
   `freshness.max_suites` (with a per-host cap) and `gc.suite_idle_ttl`.
 - New status-page and JSON fields, log events and metrics.
-- The counter `acu_gc_displaced_package_rows_deleted_total` and the
-  `displaced_package_rows_deleted` field of `gc_run_complete` and
-  `gc_retired_run_complete`: displaced snapshots' package-list rows GC
-  deleted (issue #14).
+- The counter `acu_gc_package_list_rows_deleted_total` and the
+  `package_list_rows_deleted` field of `gc_run_complete` and
+  `gc_retired_run_complete`: the package rows GC deleted, of package lists
+  no suite names any more (issue #14; in the release candidates they were
+  `acu_gc_displaced_package_rows_deleted_total` and
+  `displaced_package_rows_deleted`, and counted displaced snapshots' rows).
 - GC failures and work are visible (issue #14): the counters
   `acu_gc_pass_failures_total{pass}` and
   `acu_gc_representation_rows_pruned_total`, `gc_run_complete`'s
   `representation_rows_pruned` and `representation_prune_ms`, and the status
-  JSON's `gc.last_run_failed_passes`, `gc.last_run_displaced_package_rows_deleted`
+  JSON's `gc.last_run_failed_passes`, `gc.last_run_package_list_rows_deleted`
   and `gc.last_run_representation_rows_pruned` (GC panel rows); a failed pass
   turns the GC vital crit (DEGRADED). Alert:
   `increase(acu_gc_pass_failures_total[1d]) > 0`.
@@ -164,6 +166,33 @@ not included in the published 1.1.0-rc1.
 
 ### Changed
 
+- After 1.1.0-rc2: an adoption writes the package rows a publication
+  changed, not the suite's whole package list. **The database migrates to
+  schema 11; rollback to RC2, RC1 or 1.0.x requires a pre-upgrade backup.**
+  A suite's package rows (the hashes its packages are vouched by) are one
+  list per suite, updated in place, instead of a copy per snapshot.
+  Committing a typical update of a 67,000-package suite took 0.05 s and
+  2 MiB of write-ahead log where it took 2.0 to 2.5 s and 64 MiB (a copy
+  of a production database, 241 rows changed), so client requests and
+  other suites' adoptions no longer queue behind it, and garbage
+  collection has no package rows to delete afterwards. A suite's first
+  adoption, and a publication that changes more than half of its
+  packages, still write the whole list (about 2 s). In the freshness lab
+  six such suites updating at once were all visible in 136.5 s against
+  160.5 s (one run each); a single suite's update is unchanged, since its
+  minute is detection and the publication barrier. The migration runs at
+  the first start, before the ports open: it copies the current package
+  rows into the new tables and drops the old one, with the package lists
+  earlier versions kept for displaced snapshots; 5 to 10 s for a database
+  of 1.16 million package rows in our measurement. `adoption_finished`
+  says how each commit wrote the list (`package_list_write`, and the rows
+  added, changed and removed), `acu_adoption_package_list_writes_total`
+  counts them, and two new events report a list that could not be read
+  beforehand (WARN `package_list_diff_failed`: the whole list is written
+  instead) and a difference that did not produce the publication's rows
+  (ERROR `package_list_mismatch`: a defect to report; the list is written
+  whole and is exact). See
+  [the result](e2e/freshness-lab/README.md#one-package-list-per-suite-the-result-2026-11-19).
 - After 1.1.0-rc1: a suite that clients keep asking for no longer waits a
   minute before it switches to a new snapshot. The flip barrier waited up to
   60 s for a pause of `adoption.flip_quiet_period` (10 s) in the suite's
@@ -212,7 +241,7 @@ not included in the published 1.1.0-rc1.
 - The systemd service allows six minutes for shutdown and signals the daemon
   before its DNS worker, allowing bounded record cleanup after listeners stop.
 - The package upgrade restarts a running daemon.
-- The database migrates one way, from 1.0.x's schema 6 to schema 10, and a
+- The database migrates one way, from 1.0.x's schema 6 to schema 11, and a
   trust audit checks the snapshots 1.0.x adopted at the first start.
 - `POST /reconcile` requires the header `X-ACU-Admin: 1` and a local `Host`
   (or `admin.htpasswd_file`), and answers 400 for bad input.
@@ -232,25 +261,24 @@ not included in the published 1.1.0-rc1.
 - A reconcile decision that fails on a snapshot (a stored anchor apt's
   text layer refuses, say) warns once, not at every check;
   `acu_adoption_reconcile_failed_total{stage}` counts every failure.
-- GC deletes displaced snapshots' package lists (their `package_hash`
-  rows), 10,000 rows a transaction, at its next run that reaches them (a
-  start, the periodic run every `gc.interval`, or the hourly retired run),
-  instead of keeping `gc.keep_displaced` snapshots' worth per suite;
-  within the hour a suite that adopts several times an hour still holds
-  those it displaced since the last run. `gc.keep_displaced` now keeps
-  displaced snapshots' headers and index files, not their package lists.
-  The database file keeps its size (SQLite reuses the pages); an offline
-  `VACUUM` is optional. A failing GC sub-job no longer stops the ones after
-  it (issue #14).
+- Displaced snapshots keep no package lists: `gc.keep_displaced` keeps
+  their headers and index files. A suite has one package list (the first
+  entry of this section); when an adoption replaces it whole, or the suite
+  is removed, GC deletes the old list, 10,000 rows a transaction, at its
+  next run (a start, the periodic run every `gc.interval`, or the hourly
+  retired run). The database file keeps its size (SQLite reuses the
+  pages); an offline `VACUUM` is optional. A failing GC sub-job no longer
+  stops the ones after it (issue #14).
 - The startup GC pass no longer holds the listeners closed: the daemon
   serves as soon as the pool orphan scan (and, at the first 1.1.0 start,
   the migration and trust audit) is done, and runs the GC pass in the
-  background. A start with a GC backlog, such as the first 1.1.0 start,
-  which deletes the package lists earlier versions kept for displaced
-  snapshots, no longer waits up to `gc.max_tick_duration` before serving
-  (a 102-second wait on a test cache).
+  background. A start with a GC backlog no longer waits up to
+  `gc.max_tick_duration` before serving (a 102-second wait on a test cache
+  whose first start deleted the package lists earlier versions kept for
+  displaced snapshots; the schema-11 migration now drops those with the
+  old table).
 - When `gc.interval` is longer than an hour, the retired run (which
-  deletes retired snapshots and strips displaced snapshots' package lists)
+  deletes retired snapshots and the package lists no suite names any more)
   now runs every hour, not only while it has a backlog, so a cache whose
   upstreams update several times a day sheds those rows within the hour
   instead of at the next daily run. On a quiet cache a run finds nothing

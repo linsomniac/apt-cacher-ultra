@@ -664,3 +664,95 @@ other phases per suite were 5 to 9 s parsing indexes (6 to 22 s with every
 row changed), 15 to 24 s of warming (the injected 8 s package delay
 exhausts the 15 s budget) and 3 to 47 s in the barrier.
 
+
+## One package list per suite: the result (2026-11-19)
+
+The change the baseline above was taken for: a suite's package rows are
+one list, and an adoption writes the rows a publication changed instead
+of the whole list
+(`docs/superpowers/specs/2026-11-18-package-list-per-suite-design.md`).
+Branch `perf/package-rows-per-suite` at 602de26 against `main` 421f5ea,
+the same three scenarios, branch and main alternating in one sitting on a
+machine doing nothing else of the measurer's (load average 0.4 to 2.5 at
+each run's start); one run each of the bursts, two each of the single
+suite.
+[package-list-result-measurements.json](package-list-result-measurements.json)
+has every attempt's phases, how each commit wrote its list, and every
+`database_write_waited` line.
+
+| | `main` | Branch |
+| --- | ---: | ---: |
+| **One suite, the "PHP update" scenario:** publication to client-visible | 59.6 s, 61.1 s | 59.8 s, 59.7 s |
+| **Six suites of 66,016 rows, 0.3% changed:** publication to all candidates visible | 160.5 s | 136.5 s |
+| commit phase per suite (in all) | 2.33 to 2.74 s (14.9 s) | 0.05 to 0.09 s (0.41 s) |
+| package rows written per commit | 66,016 | 428 (214 in, 214 out) |
+| database file after the run | 322 MiB | 176 MiB |
+| **Six suites of 66,016 rows, all changed:** publication to all candidates visible | 163.0 s | 153.6 s |
+| commit phase per suite (in all) | 2.29 to 2.58 s (14.4 s) | 1.75 to 1.89 s (10.8 s) |
+| writes that waited 2 s or more behind a commit | 1 (a `blob_put`, 2.0 s) | none |
+
+What it says:
+
+- **A typical publication's commit is no longer seconds.** With 0.3% of
+  the rows changed (the June data's shape) each commit wrote 428 rows
+  where it wrote 66,016, and took 0.05 to 0.09 s where it took 2.3 to
+  2.7 s. Publication to all six suites visible was 136.5 s against
+  160.5 s, one run each (a second branch run, at 4aa542c, gave 135.5 s;
+  `main` has the one quiet run). That is more than the 14.5 s of commit
+  time saved; the likely reason is that the two adoption slots are held
+  through the commit, so a commit's seconds are also seconds the queued
+  suites wait, but one run a side does not establish the size.
+- **The single-suite scenario did not move,** as expected: its minute is
+  detection (39 s) and the publication barrier (20 s), and its commit was
+  2 to 4 ms before and after. (Its one-package list is written whole on
+  the branch: one changed row of one is more than half.)
+- **A publication that changes everything costs about what it did,** a
+  little less in these runs: the whole list is written as a new one
+  (1.8 s a commit against 2.4 s).
+- **The other phases are where the rest of the time is,** unchanged by
+  this: 4.6 to 5.3 s parsing indexes per suite, the 15 s warming budget
+  (the injected 8 s package delay exhausts it), and 12 to 35 s in the
+  barrier.
+
+Read with the baseline above: that table's 3 to 23 s commits were taken
+on a host with a load average of 7 to 9. On a quiet machine `main`'s
+commits are 2.3 to 2.7 s; the gain in this lab is from there. Load
+stretches both. In a first pass the same day, while a reviewer's
+experiments and compiles ran on the machine (load 12 to 27), `main`'s
+commits took 2.4 to 30.6 s (61.6 s in all, 211.3 s to all visible) and
+the branch's 0.07 to 16.4 s (42.3 s in all, 226.1 s to all visible):
+three of its six commits took 12 to 16 s although each wrote 428 rows,
+and client `url_path_touch` writes took 0.6 to 1.5 s each. A second
+branch run minutes later at a load of 3 gave 0.02 to 0.06 s per commit
+and 135.5 s. So on a machine whose disk is busy with something else, a
+small commit can still stall for seconds; what in it stalls was not
+found (evicting the database file from the page cache before a commit
+does not reproduce it: below). The file's `first_pass_not_quiet` has
+those headlines.
+
+### The same commit on a real database
+
+`TestMeasure_CommitOnARealDatabase` (`internal/cache`, skipped unless
+`ACU_MEASURE_DB` names a `cache.db` copy) runs the real migration and the
+real `CommitAdoption` on a copy of the maintainer's June production
+database (schema 4 then; 1,159,431 package rows, 292,712 of them of
+current snapshots, 24 suites with a current snapshot), for
+`jammy-updates` (66,928 rows) with 241 rows changed per publication, the
+most that database showed between two kept snapshots. Two runs on each
+side, load average about 1; `main` 421f5ea ran the same steps with its
+own reads and its plain commit.
+
+| | `main` | Branch |
+| --- | ---: | ---: |
+| Commit, 241 of 66,928 rows changed | 2.0 to 2.5 s, 64 to 66 MiB of WAL (2.2 to 3.3 s and 140 to 144 MiB while the upgrade's displaced rows are still in the table) | 0.05 s, 1.8 to 2.2 MiB |
+| the read of the live list before it (a reader connection, before the barrier) | none | 0.25 s |
+| the same with the database file evicted from the page cache first | 3.5 s | 0.08 to 0.09 s (the read: 0.9 s) |
+| Commit that writes the whole list (a first adoption; more than half changed) | 2.0 to 2.5 s, 64 to 66 MiB | 1.8 to 2.3 s, 67 MiB |
+| Package rows left for GC by one adoption | 66,930 (1.0 to 1.5 s in 8 writer transactions, longest 0.16 to 0.29 s, 9 MiB) | none. A whole-list commit leaves the old list: two of them (133,863 rows) took 3.4 to 3.7 s in 15 transactions, longest 0.30 to 0.31 s, 12 MiB |
+| The upgrade's backlog of displaced snapshots' rows (1,000,576) | GC's first runs: 35 to 51 s in 147 writer transactions, longest 1.0 to 1.3 s | gone with the old table, in the migration |
+| First open of the schema-4 copy, every migration | 3.5 s | 8.9 to 13.8 s; the schema-11 step alone 5.3 to 10.2 s (four runs: 5.3, 5.3, 6.2, 10.2 s) |
+| Package rows in the database afterwards | 1,159,431 | 292,712 in 24 lists |
+
+The branch's GC figures are with the chunk delete keyed by rowid (the
+commit after 602de26). Keyed by path, as at 602de26, the longest chunk
+was 0.46 to 0.76 s; the lab runs above do not reach GC.

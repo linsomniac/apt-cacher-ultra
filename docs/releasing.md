@@ -26,13 +26,21 @@ until its README's procedure says what to do.
    adoption or vouching (and before 1.1.0): the live-upstream smoke against
    five real vendors ([e2e/live/README.md](../e2e/live/README.md)). Add its
    row to that file's *Results*.
-5. **The vendor anchors.** `go test ./internal/gpg` (step 1) verifies the
+5. **The package-list model, long form,** for a release that changes
+   anything that writes, names or deletes a suite's package list (the
+   adoption commit, reconcile, the quarantine, suite removal, GC's sub-job
+   D, a migration of those tables):
+   `ACU_MODEL_SEEDS=40 ACU_MODEL_STEPS=300 go test ./internal/cache/ -run TestPackageLists_AModelOfTheSwitch -count=1`
+   (about 75 seconds). The suite runs it at 12 seeds of 150 steps; this is
+   the plan's full run, kept out of every `go test` for its time under
+   `-race`. A failure names its seed: `ACU_MODEL_SEED=<n>` repeats it.
+6. **The vendor anchors.** `go test ./internal/gpg` (step 1) verifies the
    committed vendor fixtures (`internal/gpg/testdata/vendors`) and pins each
    one's strong signer. The wider vendor survey the GC and upstream
    hardening plan re-ran at every verifier change uses anchors kept outside
    the tree, so it is not a release step; re-survey real vendors after a
    go-crypto upgrade or a verifier change, as that plan did.
-6. **The release notes** (`docs/release-notes/<version>.md`), brought up to
+7. **The release notes** (`docs/release-notes/<version>.md`), brought up to
    date with [Changelog.md](../Changelog.md) and committed before the tag.
    Their links name the tag being released (`/blob/1.1.0-rc1/` for that
    candidate): never `main`, which moves, and never
@@ -46,7 +54,7 @@ until its README's procedure says what to do.
    as records of those releases. Before the final tag, roll up the full
    cycle, mark the changelog section released, and update the final notes'
    tag links to `/blob/1.1.0/`.
-7. **Tag** the commit (`MAJOR.MINOR.PATCH`, or `-rcN`; no `v` prefix) and
+8. **Tag** the commit (`MAJOR.MINOR.PATCH`, or `-rcN`; no `v` prefix) and
    check the release workflow's `Verify no e2e test seam` step on the tag.
    The workflow creates the GitHub release with the matching version's
    notes file, when present, followed by generated notes. A prerelease
@@ -54,7 +62,7 @@ until its README's procedure says what to do.
    release. Its `.deb` uses `~rcN` internally, so the final version sorts
    newer; the download filename uses `-rcN` because GitHub rewrites `~`
    in asset names. `SHA256SUMS` must name the files as downloaded.
-8. **Verify the published release:** the intended notes, binary, `.deb`,
+9. **Verify the published release:** the intended notes, binary, `.deb`,
    source archive and checksums are present; the binary reports the tag;
    and the package has the expected version. For a candidate, confirm
    the previous stable release remains latest and `Publish apt repo`'s

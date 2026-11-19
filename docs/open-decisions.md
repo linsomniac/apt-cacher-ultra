@@ -892,6 +892,47 @@ the cache trusts or serves.
 
 ## Decided
 
+- **One package list per suite, written by difference** (the maintainer,
+  2026-11-18: chosen among four approaches; 2026-11-19: the design
+  approved as written). A suite's package rows are one list
+  (`package_list`, `package_list_entry`, named by
+  `suite_freshness.package_list_id`; schema 11) instead of a copy per
+  snapshot in `package_hash`, and an adoption's commit writes the rows a
+  publication changed. Why: the commit re-inserted 45,000 to 420,000 rows
+  per adoption in the one writer transaction every other write queues
+  behind, while 0 to 241 of them differed between kept snapshots.
+  Decided with it:
+  - The migration drops `package_hash` (no way back but the pre-upgrade
+    backup), so a reader that was missed fails instead of answering wrong.
+  - A difference is applied only to the list and generation it was read
+    at, only for the rows it was computed for, and behind tripwires (each
+    delete and update hits one row, no insert fails, the row count comes
+    out). Otherwise the commit writes the whole list in the same
+    transaction; a tripped wire also logs ERROR `package_list_mismatch`.
+    The adoption never fails for it.
+  - Past half the list changed, the whole list is written (at half the
+    two cost the same); `package_list_entry` is a rowid table (the two
+    shapes measured equal; lookups a little faster). Both by measurement
+    on a production database copy.
+  - The `hot_package` triggers see live lists only; reconcile records
+    interest for the rows it adds.
+  - Names that reach operators keep `package_hash` (the admin JSON, the
+    gauge, the log events); only sub-job D's are renamed
+    (`acu_gc_package_list_rows_deleted_total`, `package_list_rows_deleted`,
+    `gc.last_run_package_list_rows_deleted`), their old names having
+    shipped in release candidates only.
+  - The package-list model test runs 12 seeds of 150 steps in the suite
+    and 40 of 300 before a release that changes a writer of the lists
+    ([docs/releasing.md](releasing.md), step 5).
+  Evidence: `docs/superpowers/specs/2026-11-18-package-list-per-suite-design.md`
+  (the design, its result and the calls made while building), the plan
+  beside it, `e2e/freshness-lab/README.md` ("One package list per suite:
+  the result"), `TestPackageLists_AModelOfTheSwitch`,
+  `TestMigrationV11_EveryReaderAnswersAsSchema10DidOnRandomDatabases`,
+  `TestMeasure_CommitOnARealDatabase`. Not decided: the release it lands
+  in; whether the admin host summary keeps its scheme and host terms (it
+  is no longer answered from a covering index: 336 ms against 155 ms in
+  the benchmark); phase 2, writing a whole list in chunks before the flip.
 - **1.1.0-rc1 release preparation** (2026-11-11 local / 2026-11-12 UTC).
   The candidate is opt-in testing; 1.0.4 remains the recommended stable
   release. Its release notes are `docs/release-notes/1.1.0-rc1.md`, with
