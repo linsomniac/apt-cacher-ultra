@@ -267,12 +267,16 @@ func dropAnchorBlobRowsTx(ctx context.Context, tx *sql.Tx, snapshotID, now int64
 }
 
 // quarantineSnapshotTx removes all trust from a snapshot: if it is a
-// suite's current snapshot, the pointer and that suite's validators are
-// cleared and its pins released; it is retired.
+// suite's current snapshot, the pointer, the suite's package list and its
+// validators are cleared and its pins released; it is retired. The list
+// the suite named is left unnamed, for GC (RunPackageListGCChunk): its
+// rows were that snapshot's and stop vouching in this transaction.
 func quarantineSnapshotTx(ctx context.Context, tx *sql.Tx, snapshotID, now int64) (wasCurrent bool, err error) {
 	res, err := tx.ExecContext(ctx, `
 UPDATE suite_freshness
-   SET current_snapshot_id = NULL, inrelease_etag = NULL,
+   SET current_snapshot_id = NULL, package_list_id = NULL,
+       package_list_generation = package_list_generation + 1,
+       inrelease_etag = NULL,
        inrelease_lastmod = NULL, inrelease_change_seen_at = NULL
  WHERE current_snapshot_id = ?`, snapshotID)
 	if err != nil {

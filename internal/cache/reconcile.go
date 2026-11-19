@@ -7,38 +7,38 @@ import (
 	"fmt"
 )
 
-// insertPackageHashTx inserts a single package_hash row inside an open
-// transaction, for the InsertReconciledMembers path only.
+// insertPackageHashTx adds one package row to list listID inside an open
+// transaction, for the InsertReconciledMembers path only, and reports
+// whether it wrote (an insert or a heal).
 //
-// AIDEV-NOTE: CommitAdoption keeps its OWN inline copy of this INSERT
-// (adoption.go Step 3); this is an independent copy that matches its column
-// set + hash validation today, not a shared dependency. They are deliberately
-// not refactored into one: CommitAdoption uses a plain INSERT (candidate
-// snapshots are never partially committed, so a conflict there is a bug),
-// while reconcile probes the PK (canonical_scheme, canonical_host, path,
-// snapshot_id) first and is retry-safe: a byte-identical existing row is an
-// idempotent no-op, an existing row with EMPTY identity columns (pre-v3/pre-v6,
-// un-backfilled) is HEALED in place, and a same-path row whose declared_sha256
-// OR a non-empty identity field (package_name/architecture/version) DISAGREES
-// is a real cross-index conflict and fails loud (SPEC6_5 §11 H7). It is NOT a
-// silent ON CONFLICT DO NOTHING. If the package_hash column set ever changes,
-// update BOTH copies (and the heal UPDATE below); both writers call
-// noteFlatRows before they submit (Cache.flatRows, ruling PG-31).
-// flat_filename (phase G) is in both INSERTs but neither probed nor healed
-// here, on purpose: it follows
-// from the row's path and its snapshot's suite (DotClean of the Filename
-// relative to FlatBase), so a same-PK row always agrees, and no released
-// binary wrote a flat row with another value (v6 flat suites took
-// non_dists_layout and wrote none).
-func insertPackageHashTx(ctx context.Context, tx *sql.Tx, ph PackageHash) error {
+// AIDEV-NOTE: the commit writes its rows with a plain INSERT
+// (writePackageListTx: a new list holds nothing, so a conflict there is a
+// bug), while reconcile probes the list's primary key (package_list_id,
+// path) first and is retry-safe: a byte-identical existing row is an
+// idempotent no-op, an existing row with EMPTY identity columns
+// (pre-v3/pre-v6, un-backfilled) is HEALED in place, and a same-path row
+// whose declared_sha256 OR a non-empty identity field
+// (package_name/architecture/version) DISAGREES is a real cross-index
+// conflict and fails loud (SPEC6_5 §11 H7). It is NOT a silent ON CONFLICT
+// DO NOTHING. If the package_list_entry column set ever changes, update
+// insertPackageListEntrySQL and the probe and heal below; both writers
+// call noteFlatRows before they submit (Cache.flatRows, ruling PG-31).
+// flat_filename (phase G) is inserted but neither probed nor healed here,
+// on purpose: it follows from the row's path and its suite (DotClean of
+// the Filename relative to FlatBase), so a same-path row of the suite's
+// list always agrees, and no released binary wrote a flat row with another
+// value (v6 flat suites took non_dists_layout and wrote none). The row's
+// scheme and host are the suite's for the same reason and are not probed.
+// ph.SnapshotID is not stored (schema 11) and is ignored.
+func insertPackageHashTx(ctx context.Context, tx *sql.Tx, listID int64, ph PackageHash) (wrote bool, err error) {
 	if !validBlobHash(ph.DeclaredSHA256) {
-		return fmt.Errorf("insertPackageHashTx: %q declared_sha256 %w", ph.Path, ErrInvalidHash)
+		return false, fmt.Errorf("insertPackageHashTx: %q declared_sha256 %w", ph.Path, ErrInvalidHash)
 	}
 	// Idempotent on retry, loud on disagreement — mirroring the snapshot_member
 	// path below and adoption's own same-path/different-hash rule (which fails
 	// with ErrAdoptionParseFailed, SPEC6_5 §11 H7). A byte-identical existing
 	// row is a no-op; a DIFFERENT declared_sha256 for the same .deb path in
-	// this snapshot is a real cross-index disagreement (an already-present
+	// this suite's list is a real cross-index disagreement (an already-present
 	// index vs the healed one) and must NOT silently keep the stale row — that
 	// would fail-closed every strict-mode fetch of that .deb via the healed
 	// index. (The previous ON CONFLICT DO NOTHING silently kept the stale row.)
@@ -49,13 +49,12 @@ func insertPackageHashTx(ctx context.Context, tx *sql.Tx, ph PackageHash) error 
 		version string
 	}
 	switch err := tx.QueryRowContext(ctx, `
-SELECT declared_sha256, package_name, architecture, version FROM package_hash
- WHERE canonical_scheme = ? AND canonical_host = ? AND path = ? AND snapshot_id = ?`,
-		ph.CanonicalScheme, ph.CanonicalHost, ph.Path, ph.SnapshotID).
+SELECT declared_sha256, package_name, architecture, version FROM package_list_entry
+ WHERE package_list_id = ? AND path = ?`, listID, ph.Path).
 		Scan(&existing.sha256, &existing.name, &existing.arch, &existing.version); {
 	case err == nil:
 		if existing.sha256 != ph.DeclaredSHA256 {
-			return fmt.Errorf("insertPackageHashTx: %q already declares %s, reconcile has %s",
+			return false, fmt.Errorf("insertPackageHashTx: %q already declares %s, reconcile has %s",
 				ph.Path, existing.sha256, ph.DeclaredSHA256)
 		}
 		// Identity columns (package_name, architecture, version): an existing
@@ -73,7 +72,7 @@ SELECT declared_sha256, package_name, architecture, version FROM package_hash
 			{"version", existing.version, ph.Version},
 		} {
 			if f.have != "" && f.want != "" && f.have != f.want {
-				return fmt.Errorf("insertPackageHashTx: %q already declares %s %q, reconcile has %q",
+				return false, fmt.Errorf("insertPackageHashTx: %q already declares %s %q, reconcile has %q",
 					ph.Path, f.what, f.have, f.want)
 			}
 		}
@@ -82,38 +81,32 @@ SELECT declared_sha256, package_name, architecture, version FROM package_hash
 			(existing.version == "" && ph.Version != "")
 		if needHeal {
 			if _, err := tx.ExecContext(ctx, `
-UPDATE package_hash
+UPDATE package_list_entry
    SET package_name = CASE WHEN package_name = '' THEN ? ELSE package_name END,
        architecture = CASE WHEN architecture = '' THEN ? ELSE architecture END,
        version      = CASE WHEN version      = '' THEN ? ELSE version      END
- WHERE canonical_scheme = ? AND canonical_host = ? AND path = ? AND snapshot_id = ?`,
-				ph.PackageName, ph.Architecture, ph.Version,
-				ph.CanonicalScheme, ph.CanonicalHost, ph.Path, ph.SnapshotID); err != nil {
-				return fmt.Errorf("insertPackageHashTx: heal identity %q: %w", ph.Path, err)
+ WHERE package_list_id = ? AND path = ?`,
+				ph.PackageName, ph.Architecture, ph.Version, listID, ph.Path); err != nil {
+				return false, fmt.Errorf("insertPackageHashTx: heal identity %q: %w", ph.Path, err)
 			}
 		}
-		return nil // identical, or healed — idempotent
+		return needHeal, nil // identical, or healed — idempotent
 	case errors.Is(err, sql.ErrNoRows):
 		// not present — insert below
 	default:
-		return fmt.Errorf("insertPackageHashTx: probe %q: %w", ph.Path, err)
+		return false, fmt.Errorf("insertPackageHashTx: probe %q: %w", ph.Path, err)
 	}
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO package_hash (canonical_scheme, canonical_host, path,
-                          declared_sha256, snapshot_id,
-                          package_name, architecture, version, flat_filename)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ph.CanonicalScheme, ph.CanonicalHost, ph.Path,
-		ph.DeclaredSHA256, ph.SnapshotID,
-		ph.PackageName, ph.Architecture, ph.Version, ph.FlatFilename); err != nil {
-		return fmt.Errorf("insertPackageHashTx: insert %q: %w", ph.Path, err)
+	if _, err := tx.ExecContext(ctx, insertPackageListEntrySQL,
+		listID, ph.CanonicalScheme, ph.CanonicalHost, ph.Path,
+		ph.DeclaredSHA256, ph.PackageName, ph.Architecture, ph.Version, ph.FlatFilename); err != nil {
+		return false, fmt.Errorf("insertPackageHashTx: insert %q: %w", ph.Path, err)
 	}
-	return nil
+	return true, nil
 }
 
-// InsertReconciledMembers inserts snapshot_member (+ by-hash alias) and
-// package_hash rows into an EXISTING current snapshot — the SPEC6_8 in-place
-// reconcile path. Unlike RepairSkippedMember it consumes no
+// InsertReconciledMembers inserts snapshot_member (+ by-hash alias) rows
+// into an EXISTING current snapshot and package rows into its suite's live
+// package list — the SPEC6_8 in-place reconcile path. Unlike RepairSkippedMember it consumes no
 // snapshot_skipped_member row; the caller (Adopter.ReconcileSnapshot) has
 // already validated each member's bytes against the re-parsed, GPG-verified
 // Release declaration. The transaction re-checks the snapshot is still the
@@ -134,6 +127,15 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 //     conflicting package_hash declared_sha256) on the same path is an explicit
 //     error, not a silent no-op, because it would mean the caller is trying to
 //     substitute a different blob than what already serves — that is corruption.
+//
+// AIDEV-NOTE: the package rows go into the list the suite names (schema
+// 11), under three rules. A suite that names none — its current snapshot
+// is unsigned — is refused its rows: an unsigned snapshot never vouches.
+// A reconcile that wrote a row bumps package_list_generation, so an
+// adoption commit holding a difference computed before it rewrites the
+// list instead of applying a stale difference. And it records hot-package
+// interest for the rows it wrote (recordListHotPackages): a later commit
+// visits only rows that changed.
 func (c *Cache) InsertReconciledMembers(ctx context.Context, snapshotID int64, members []SnapshotMember, packageHashes []PackageHash) error {
 	c.noteFlatRows(packageHashes) // ruling PG-31: before the transaction can commit
 	return c.submitWrite(ctx, writeReconcileMembers, func(ctx context.Context, conn *sql.Conn) error {
@@ -149,13 +151,21 @@ func (c *Cache) InsertReconciledMembers(ctx context.Context, snapshotID int64, m
 		// Step 8) already ran, so any blob refcount bumps here would leak.
 		// ErrSnapshotNotCurrent is the sentinel callers check to distinguish
 		// "lost the race" (benign) from a real error.
-		var one int
-		switch err := tx.QueryRowContext(ctx,
-			`SELECT 1 FROM suite_freshness WHERE current_snapshot_id = ?`, snapshotID).Scan(&one); {
+		var (
+			key    SuiteKey
+			listID sql.NullInt64
+		)
+		switch err := tx.QueryRowContext(ctx, `
+SELECT canonical_scheme, canonical_host, suite_path, package_list_id
+  FROM suite_freshness WHERE current_snapshot_id = ?`, snapshotID).
+			Scan(&key.CanonicalScheme, &key.CanonicalHost, &key.SuitePath, &listID); {
 		case errors.Is(err, sql.ErrNoRows):
 			return fmt.Errorf("%w: snapshot_id=%d", ErrSnapshotNotCurrent, snapshotID)
 		case err != nil:
 			return fmt.Errorf("InsertReconciledMembers: current guard: %w", err)
+		}
+		if len(packageHashes) > 0 && !listID.Valid {
+			return fmt.Errorf("InsertReconciledMembers: snapshot %d's suite has no package list (an unsigned snapshot holds no package rows)", snapshotID)
 		}
 
 		for _, m := range members {
@@ -225,12 +235,28 @@ UPDATE blob
 			}
 		}
 
-		// package_hash upserts — the shared helper is retry-safe via a
-		// probe-then-insert/heal that fails loud on a real conflict (see
-		// insertPackageHashTx), not a silent ON CONFLICT DO NOTHING.
+		// Package rows — retry-safe via a probe-then-insert/heal that fails
+		// loud on a real conflict (see insertPackageHashTx), not a silent ON
+		// CONFLICT DO NOTHING.
+		var written []string
 		for _, ph := range packageHashes {
-			if err := insertPackageHashTx(ctx, tx, ph); err != nil {
+			wrote, err := insertPackageHashTx(ctx, tx, listID.Int64, ph)
+			if err != nil {
 				return fmt.Errorf("InsertReconciledMembers: package_hash %q: %w", ph.Path, err)
+			}
+			if wrote {
+				written = append(written, ph.Path)
+			}
+		}
+		if len(written) > 0 {
+			if _, err := tx.ExecContext(ctx, `
+UPDATE suite_freshness SET package_list_generation = package_list_generation + 1
+ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,
+				key.CanonicalScheme, key.CanonicalHost, key.SuitePath); err != nil {
+				return fmt.Errorf("InsertReconciledMembers: bump the list's generation: %w", err)
+			}
+			if err := recordListHotPackages(ctx, tx, listID.Int64, key, written); err != nil {
+				return fmt.Errorf("InsertReconciledMembers: %w", err)
 			}
 		}
 		return tx.Commit()

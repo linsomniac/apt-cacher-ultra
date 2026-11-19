@@ -301,7 +301,9 @@ func TestRunURLPathGCBatch_MirrorOnCurrentSnapshotProtects(t *testing.T) {
 // scoped to CURRENT snapshots (the live published index), so a .deb present
 // only in a displaced/forensic snapshot is NOT vouched and is reapable —
 // matching the pre-version guard (a). Just-superseded versions get the
-// hold-grace window, not indefinite displaced-snapshot retention.
+// hold-grace window, not indefinite displaced-snapshot retention. Since
+// schema 11 a displaced snapshot's package rows are a list no suite names
+// (until GC deletes it), which is what the fixture builds.
 func TestRunURLPathGCBatch_DisplacedSnapshotDoesNotProtect(t *testing.T) {
 	c := openCache(t)
 	const now = int64(2_000_000_000)
@@ -326,8 +328,13 @@ func TestRunURLPathGCBatch_DisplacedSnapshotDoesNotProtect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed suite_snapshot: %v", err)
 	}
-	snapID, _ := res.LastInsertId()
-	seedPackageHash(t, c, scheme, host, path, h, snapID, "y", "amd64", "1.0")
+	if _, err := res.LastInsertId(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.InsertUnnamedPackageListForTest(context.Background(), []PackageHash{{CanonicalScheme: scheme, CanonicalHost: host,
+		Path: path, DeclaredSHA256: h, PackageName: "y", Architecture: "amd64", Version: "1.0"}}); err != nil {
+		t.Fatal(err)
+	}
 
 	agg := drainURLPathGC(t, c, 100, 7*86400, 0, testMaxVersions)
 	if agg.Deleted != 1 {

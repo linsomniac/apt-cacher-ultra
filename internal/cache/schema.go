@@ -15,7 +15,7 @@ import (
 // expects. Forward-only: a database tagged with a higher version is treated
 // as written by a newer binary and the cache refuses to open it. SPEC §4.3,
 // SPEC2 §4.3, SPEC3 §4.3, SPEC4 §4.3, flat-repositories design §6.
-const CurrentSchemaVersion = 10
+const CurrentSchemaVersion = 11
 
 // migrations is indexed such that migrations[N] migrates the database from
 // schema version N to N+1. migrations[0] (v0 → v1) creates the entire
@@ -471,6 +471,126 @@ SELECT ph.canonical_scheme, ph.canonical_host, s.suite_path,
  ON CONFLICT(canonical_scheme, canonical_host, suite_path, package_name, architecture)
  DO UPDATE SET last_requested_at = MAX(hot_package.last_requested_at, excluded.last_requested_at);
  END;
+`,
+	// v10 → v11: one package list per suite (the package-list design,
+	// docs/superpowers/specs/2026-11-18-package-list-per-suite-design.md).
+	//   - package_list: a list's identity, never reused, not tied to a
+	//     snapshot. suite_freshness.package_list_id names a suite's live
+	//     list (NULL: none, as for a suite with no current snapshot or an
+	//     unsigned one); a list no suite names is garbage for GC.
+	//   - package_list_entry: package_hash's columns with the list in place
+	//     of the snapshot. Only the current signed snapshots' rows are
+	//     copied: no reader could see any other.
+	//   - suite_freshness.package_list_generation: bumped by every writer
+	//     of the suite's list, in its own transaction; the adoption commit
+	//     applies a difference only to the list and generation it was
+	//     computed against.
+	//   - the hot_package triggers read the lists; package_hash is dropped,
+	//     so a reader that was missed fails instead of answering wrong.
+	//
+	// AIDEV-NOTE: a migrated list takes its suite's current snapshot id as
+	// its id (unique per suite; AUTOINCREMENT continues above the highest).
+	// The joins on the suite's own key do two jobs. A list is given only to
+	// the suite the snapshot belongs to, as declaredExactSQL always read it
+	// (design review M-2), so the unique index below cannot fail. And only
+	// rows whose scheme and host are the suite's are copied, so the new
+	// primary key (list, path) cannot fail: every writer has always taken
+	// both from the suite (buildPackageHashes, buildSourceHashes,
+	// buildPdiffHashes). TestMigrationV11_OddRows pins both. The copy runs
+	// before the index builds: measured on a 1.16M-row production database,
+	// 292,712 rows copied, 8 to 11 s in all with the drop
+	// (the plan, "Measured before planning").
+	`
+CREATE TABLE package_list (
+  package_list_id INTEGER PRIMARY KEY AUTOINCREMENT
+);
+CREATE TABLE package_list_entry (
+  package_list_id  INTEGER NOT NULL REFERENCES package_list(package_list_id),
+  canonical_scheme TEXT NOT NULL,
+  canonical_host   TEXT NOT NULL,
+  path             TEXT NOT NULL,
+  declared_sha256  TEXT NOT NULL
+                     CHECK (length(declared_sha256) = 64
+                            AND declared_sha256 NOT GLOB '*[^0-9a-f]*'),
+  package_name     TEXT NOT NULL DEFAULT '',
+  architecture     TEXT NOT NULL DEFAULT '',
+  version          TEXT NOT NULL DEFAULT '',
+  flat_filename    TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (package_list_id, path)
+);
+ALTER TABLE suite_freshness ADD COLUMN package_list_id INTEGER
+  REFERENCES package_list(package_list_id);
+ALTER TABLE suite_freshness ADD COLUMN package_list_generation INTEGER NOT NULL DEFAULT 0;
+INSERT INTO package_list (package_list_id)
+SELECT sf.current_snapshot_id
+  FROM suite_freshness sf
+  JOIN suite_snapshot ss ON ss.snapshot_id      = sf.current_snapshot_id
+                        AND ss.canonical_scheme = sf.canonical_scheme
+                        AND ss.canonical_host   = sf.canonical_host
+                        AND ss.suite_path       = sf.suite_path
+ WHERE ss.anchor_form <> 'unsigned';
+UPDATE suite_freshness SET package_list_id = current_snapshot_id
+ WHERE EXISTS (SELECT 1 FROM suite_snapshot ss
+                WHERE ss.snapshot_id      = suite_freshness.current_snapshot_id
+                  AND ss.canonical_scheme = suite_freshness.canonical_scheme
+                  AND ss.canonical_host   = suite_freshness.canonical_host
+                  AND ss.suite_path       = suite_freshness.suite_path
+                  AND ss.anchor_form     <> 'unsigned');
+CREATE UNIQUE INDEX idx_suite_freshness_package_list
+  ON suite_freshness(package_list_id) WHERE package_list_id IS NOT NULL;
+INSERT INTO package_list_entry
+  (package_list_id, canonical_scheme, canonical_host, path, declared_sha256,
+   package_name, architecture, version, flat_filename)
+SELECT sf.package_list_id, p.canonical_scheme, p.canonical_host, p.path, p.declared_sha256,
+       p.package_name, p.architecture, p.version, p.flat_filename
+  FROM suite_freshness sf
+ CROSS JOIN package_hash p
+    ON p.canonical_scheme = sf.canonical_scheme
+   AND p.canonical_host   = sf.canonical_host
+   AND p.snapshot_id      = sf.package_list_id
+ ORDER BY sf.package_list_id, p.path;
+CREATE INDEX idx_package_list_entry_path
+  ON package_list_entry(canonical_scheme, canonical_host, path);
+CREATE INDEX idx_package_list_entry_pkg
+  ON package_list_entry(package_list_id, package_name, architecture);
+CREATE INDEX idx_package_list_entry_flat
+  ON package_list_entry(canonical_scheme, canonical_host, flat_filename)
+  WHERE flat_filename <> '';
+DROP TRIGGER hot_package_insert;
+DROP TRIGGER hot_package_touch;
+CREATE TRIGGER hot_package_insert AFTER INSERT ON url_path
+ WHEN NEW.last_requested_at IS NOT NULL
+ BEGIN
+INSERT INTO hot_package (canonical_scheme, canonical_host, suite_path, package_name, architecture, last_requested_at)
+SELECT sf.canonical_scheme, sf.canonical_host, sf.suite_path,
+       e.package_name, e.architecture, MAX(u.last_requested_at)
+  FROM url_path u JOIN package_list_entry e
+    ON e.canonical_scheme = u.canonical_scheme AND e.canonical_host = u.canonical_host
+   AND e.path = u.path AND e.declared_sha256 = u.blob_hash
+  JOIN suite_freshness sf ON sf.package_list_id = e.package_list_id
+ WHERE u.last_requested_at IS NOT NULL AND e.package_name <> '' AND e.architecture <> ''
+   AND u.canonical_scheme = NEW.canonical_scheme AND u.canonical_host = NEW.canonical_host AND u.path = NEW.path
+ GROUP BY sf.canonical_scheme, sf.canonical_host, sf.suite_path, e.package_name, e.architecture
+ ON CONFLICT(canonical_scheme, canonical_host, suite_path, package_name, architecture)
+ DO UPDATE SET last_requested_at = MAX(hot_package.last_requested_at, excluded.last_requested_at);
+ END;
+CREATE TRIGGER hot_package_touch AFTER UPDATE OF last_requested_at ON url_path
+ WHEN NEW.last_requested_at IS NOT NULL
+ BEGIN
+INSERT INTO hot_package (canonical_scheme, canonical_host, suite_path, package_name, architecture, last_requested_at)
+SELECT sf.canonical_scheme, sf.canonical_host, sf.suite_path,
+       e.package_name, e.architecture, MAX(u.last_requested_at)
+  FROM url_path u JOIN package_list_entry e
+    ON e.canonical_scheme = u.canonical_scheme AND e.canonical_host = u.canonical_host
+   AND e.path = u.path AND e.declared_sha256 = u.blob_hash
+  JOIN suite_freshness sf ON sf.package_list_id = e.package_list_id
+ WHERE u.last_requested_at IS NOT NULL AND e.package_name <> '' AND e.architecture <> ''
+   AND u.canonical_scheme = NEW.canonical_scheme AND u.canonical_host = NEW.canonical_host AND u.path = NEW.path
+ GROUP BY sf.canonical_scheme, sf.canonical_host, sf.suite_path, e.package_name, e.architecture
+ ON CONFLICT(canonical_scheme, canonical_host, suite_path, package_name, architecture)
+ DO UPDATE SET last_requested_at = MAX(hot_package.last_requested_at, excluded.last_requested_at);
+ END;
+DROP TABLE package_hash;
 `,
 }
 

@@ -2,16 +2,18 @@ package cache
 
 import "testing"
 
-// TestSchemaV6_AddsVersionAndDroppedAt verifies the v6 migration adds the
-// version-aware-retention columns: package_hash.version (the Debian version
-// the mirror rule ranks on) and url_path.dropped_at (the hold-grace clock).
+// TestSchemaV6_AddsVersionAndDroppedAt verifies the version-aware-retention
+// columns the v6 migration added are there at the current schema: the
+// package rows' version (the Debian version the mirror rule ranks on; on
+// package_hash then, carried to package_list_entry by schema 11) and
+// url_path.dropped_at (the hold-grace clock).
 func TestSchemaV6_AddsVersionAndDroppedAt(t *testing.T) {
 	if CurrentSchemaVersion < 6 {
 		t.Fatalf("CurrentSchemaVersion = %d, want >= 6", CurrentSchemaVersion)
 	}
 	c := openCache(t)
 	for _, q := range []string{
-		`SELECT version FROM package_hash LIMIT 0`,
+		`SELECT version FROM package_list_entry LIMIT 0`,
 		`SELECT dropped_at FROM url_path LIMIT 0`,
 	} {
 		if _, err := c.db.Exec(q); err != nil {

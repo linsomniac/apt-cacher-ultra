@@ -661,7 +661,7 @@ The kinds of write:
 | `gc_blobs` | GC deletes a batch of unreferenced files' rows. |
 | `gc_snapshots` | GC removes abandoned candidates and retires displaced snapshots. |
 | `gc_retired_snapshots` | GC deletes a retired snapshot's rows, a chunk at a time. |
-| `gc_displaced_packages` | GC deletes the package rows of displaced snapshots, a chunk at a time. |
+| `gc_package_lists` | GC deletes a package list no suite names any more (a list an adoption rewrote, a removed or quarantined suite's), a chunk at a time. |
 | `gc_url_paths` | GC scans and removes a batch of cached paths. |
 | `legacy_audit_enqueue`, `legacy_audit_apply` | The audit of snapshots adopted by an earlier version queues its work and applies its decisions. |
 | `legacy_metadata_invalidate` | With adoption disabled, a changed release drops the suite's cached metadata. |

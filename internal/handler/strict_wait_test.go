@@ -311,12 +311,12 @@ func TestServeHTTP_StrictMissDecidesAfterAFailedPrefetchRead(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = db.Close() }()
-			if _, err := db.Exec(`ALTER TABLE package_hash RENAME TO package_hash_unreadable`); err != nil {
+			if _, err := db.Exec(`ALTER TABLE package_list_entry RENAME TO package_list_entry_unreadable`); err != nil {
 				t.Fatal(err)
 			}
 			h.fetch = &firstFetchHook{Fetcher: h.fetch, before: func() {
-				if _, err := db.Exec(`ALTER TABLE package_hash_unreadable RENAME TO package_hash`); err != nil {
-					t.Errorf("restore package_hash: %v", err)
+				if _, err := db.Exec(`ALTER TABLE package_list_entry_unreadable RENAME TO package_list_entry`); err != nil {
+					t.Errorf("restore package_list_entry: %v", err)
 				}
 			}}
 			rec := httptest.NewRecorder()
@@ -489,7 +489,7 @@ func TestServeHTTP_StrictMissDecidesWhenVouchingEndsDuringTheDownload(t *testing
 // Retry-After 60, logged once) on both paths, and nothing is downloaded.
 func TestServeHTTP_StrictRecheckReadFaultKeepsTheRefusal(t *testing.T) {
 	faults := map[string]string{
-		"package_hash read": `ALTER TABLE package_hash RENAME TO package_hash_unreadable`,
+		"package_hash read": `ALTER TABLE package_list_entry RENAME TO package_list_entry_unreadable`,
 		"coverage read":     `ALTER TABLE suite_snapshot RENAME COLUMN package_coverage_complete TO package_coverage_unreadable`,
 	}
 	warnings := map[string]string{"hit": "package_hash lookup failed", "miss": "package_hash_prefetch_lookup_failed"}
@@ -573,8 +573,8 @@ func TestServeHTTP_StrictRecheckReadFaultKeepsTheRefusal(t *testing.T) {
 // snapshots that disagree on the .deb's hash (they committed between the
 // two looks), it refuses the conflict before the download, as the first
 // look does. Deciding it after the download let a fault of the read there
-// serve the file unchecked: here the package_hash table becomes
-// unreadable as the upstream is asked.
+// serve the file unchecked: here the package rows' table
+// (package_list_entry) becomes unreadable as the upstream is asked.
 func TestServeHTTP_StrictMissSecondLookRefusesAConflictBeforeTheDownload(t *testing.T) {
 	a := &fakeAdoptions{}
 	h, logs, srvURL, scheme, canon := strictWaitRig(t, a)
@@ -593,7 +593,7 @@ func TestServeHTTP_StrictMissSecondLookRefusesAConflictBeforeTheDownload(t *test
 	var downloaded atomic.Bool
 	h.fetch = &firstFetchHook{Fetcher: h.fetch, before: func() {
 		downloaded.Store(true)
-		if _, err := db.Exec(`ALTER TABLE package_hash RENAME TO package_hash_unreadable`); err != nil {
+		if _, err := db.Exec(`ALTER TABLE package_list_entry RENAME TO package_list_entry_unreadable`); err != nil {
 			t.Errorf("inject the post-download read fault: %v", err)
 		}
 	}}

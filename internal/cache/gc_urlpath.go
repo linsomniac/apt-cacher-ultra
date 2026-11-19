@@ -48,7 +48,8 @@ type URLPathGCBatchResult struct {
 // maxVersions is retention.max_versions_per_package (clamped to >= 1).
 //
 // Mirror rule (rule 2) detail: for the row's blob, find the CURRENT-snapshot
-// package_hash rows whose (path, declared_sha256) match the url_path's
+// package rows (the entries of the lists suites name) whose (path,
+// declared_sha256) match the url_path's
 // (path, blob_hash). A matching architecture="source" row with empty version
 // is a source artifact and keeps the legacy snapshot-reference guard
 // (retained); a version-less BINARY match is NOT (it falls through and is
@@ -103,7 +104,7 @@ func (c *Cache) RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds
 		// rows are NOT excluded by this prefilter, so each is re-evaluated
 		// every pass. This is a deliberate, bounded cost that buys correct hold
 		// semantics: the heavy part (newest-N ranking) is memoized per batch
-		// and runs an index-backed query (idx_package_hash_pkg_arch via
+		// and runs an index-backed query (idx_package_list_entry_pkg via
 		// topNVersionSetTx), and the cursor + per-tick deadline cap the work
 		// per tick and resume next tick. Two speedups that skipped this
 		// re-evaluation were tried and removed because both broke the hold
@@ -145,7 +146,7 @@ SELECT canonical_scheme, canonical_host, path, blob_hash, last_requested_at, dro
 		// could be made stale by a concurrent mid-pass adoption and, combined
 		// with the in-grace fast-path skipping re-evaluation, spuriously stamp
 		// a just-warmed current version and truncate its hold grace. The
-		// ranking query itself is index-backed (idx_package_hash_pkg_arch via
+		// ranking query itself is index-backed (idx_package_list_entry_pkg via
 		// topNVersionSetTx), so re-ranking a group across batches is cheap.
 		topNCache := make(map[topNKey]map[string]struct{})
 
@@ -165,7 +166,7 @@ SELECT canonical_scheme, canonical_host, path, blob_hash, last_requested_at, dro
 			// stale stamp on mirror re-qualification, reaping a still-current
 			// version early and breaking the hold guarantee (round-8 finding).
 			// The re-evaluation is cheap: the ranking query is index-backed
-			// (idx_package_hash_pkg_arch) and the recency prefilter already
+			// (idx_package_list_entry_pkg) and the recency prefilter already
 			// excludes recency-fresh un-stamped rows.
 			retained, err := c.urlPathRetainedTx(ctx, tx, r.scheme, r.host, r.path, r.blobHash, r.lastReq, ttlCutoff, maxVersions, topNCache)
 			if err != nil {
@@ -233,7 +234,7 @@ type topNKey struct {
 //  3. empty-version fallback (any current-snapshot match lacks a rankable
 //     Debian version — source artifacts, pdiff patch files, Contents, OR a
 //     pre-v6/malformed binary stanza) keeps the legacy snapshot-reference
-//     guard (a). Gated on package_hash.version, NOT the path suffix: the
+//     guard (a). Gated on the package row's version, NOT the path suffix: the
 //     pre-migration 25 GB is reclaimed operationally (design §6), never by GC
 //     reaping a still-published version-less binary;
 //  4. mirror: newest-N distinct versions per (suite,name,arch) in the CURRENT
@@ -289,7 +290,7 @@ SELECT
 	}
 
 	// Rule 2: mirror. Needs a cached blob (path+hash match). A NULL/empty
-	// blob_hash (failed fetch) cannot match any package_hash row, so it is
+	// blob_hash (failed fetch) cannot match any package row, so it is
 	// not mirror-retained.
 	if !blobHash.Valid || blobHash.String == "" {
 		return false, nil
@@ -302,12 +303,14 @@ SELECT
 	// otherwise reap a still-published version, or keep a withdrawn one.
 	// Just-superseded versions that leave the current index are covered by
 	// the hold-grace window, not by displaced-snapshot membership.
+	//
+	// Schema 11: the current snapshots' rows are the entries of the lists
+	// suites name, so the join to the suite by its list is that scope.
 	mrows, err := tx.QueryContext(ctx, `
-SELECT ss.suite_path, ph.package_name, ph.architecture, ph.version
-  FROM package_hash ph
-  JOIN suite_snapshot ss ON ss.snapshot_id = ph.snapshot_id
- WHERE ph.canonical_scheme = ? AND ph.canonical_host = ? AND ph.path = ? AND ph.declared_sha256 = ?
-   AND ph.snapshot_id IN (SELECT current_snapshot_id FROM suite_freshness WHERE current_snapshot_id IS NOT NULL)`,
+SELECT sf.suite_path, ph.package_name, ph.architecture, ph.version
+  FROM package_list_entry ph
+  JOIN suite_freshness sf ON sf.package_list_id = ph.package_list_id
+ WHERE ph.canonical_scheme = ? AND ph.canonical_host = ? AND ph.path = ? AND ph.declared_sha256 = ?`,
 		scheme, host, path, blobHash.String)
 	if err != nil {
 		return false, fmt.Errorf("urlPathRetainedTx: mirror match: %w", err)
@@ -367,6 +370,22 @@ SELECT ss.suite_path, ph.package_name, ph.architecture, ph.version
 	return false, nil
 }
 
+// topNVersionsSQL lists the distinct versions the suite's live package
+// list holds for one (package_name, architecture).
+//
+// AIDEV-NOTE: the suite is found by its primary key and its list's entries
+// by idx_package_list_entry_pkg (package_list_id, package_name,
+// architecture): one O(log N) probe per ranked group, never a scan of the
+// list — the heavy cost on the fat-index caches version-aware retention
+// targets (it was idx_package_hash_pkg_arch's job before schema 11).
+// TestPackageListReaders_QueryPlans pins the plan.
+const topNVersionsSQL = `
+SELECT DISTINCT e.version
+  FROM suite_freshness sf
+  JOIN package_list_entry e ON e.package_list_id = sf.package_list_id
+ WHERE sf.canonical_scheme = ? AND sf.canonical_host = ? AND sf.suite_path = ?
+   AND e.package_name = ? AND e.architecture = ? AND e.version <> ''`
+
 // topNVersionSetTx returns the set of raw version strings in the newest
 // maxVersions Debian-version equivalence classes of (scheme, host, suite,
 // name, arch) within the CURRENT snapshots, memoized per batch via topNCache.
@@ -379,23 +398,7 @@ func (c *Cache) topNVersionSetTx(ctx context.Context, tx *sql.Tx,
 	if set, ok := topNCache[k]; ok {
 		return set, nil
 	}
-	// ph.canonical_scheme/host are constrained explicitly (not just via the
-	// suite_snapshot JOIN) so SQLite can use idx_package_hash_pkg_arch
-	// (canonical_scheme, canonical_host, snapshot_id, package_name,
-	// architecture) for an O(log N) probe instead of full-scanning every
-	// package_hash row of the current snapshot per ranked group — the heavy
-	// cost on the fat-index caches this feature targets. Equivalent: a snapshot
-	// belongs to exactly one (scheme, host), so the ph predicate matches the
-	// JOIN. Mirrors the sibling mirror-match query above, which already does it.
-	vrows, err := tx.QueryContext(ctx, `
-SELECT DISTINCT ph.version
-  FROM package_hash ph
-  JOIN suite_snapshot ss ON ss.snapshot_id = ph.snapshot_id
- WHERE ss.canonical_scheme = ? AND ss.canonical_host = ? AND ss.suite_path = ?
-   AND ph.canonical_scheme = ? AND ph.canonical_host = ?
-   AND ph.package_name = ? AND ph.architecture = ? AND ph.version <> ''
-   AND ph.snapshot_id IN (SELECT current_snapshot_id FROM suite_freshness WHERE current_snapshot_id IS NOT NULL)`,
-		scheme, host, suite, scheme, host, name, arch)
+	vrows, err := tx.QueryContext(ctx, topNVersionsSQL, scheme, host, suite, name, arch)
 	if err != nil {
 		return nil, fmt.Errorf("topNVersionSetTx: %w", err)
 	}

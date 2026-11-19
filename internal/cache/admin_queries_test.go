@@ -51,9 +51,13 @@ func TestAdminAggregatesCurrentSnapshots(t *testing.T) {
 		exec(`INSERT INTO suite_snapshot(snapshot_id, canonical_scheme, canonical_host,
 suite_path, inrelease_hash, anchor_form, created_at, adopted_at) VALUES (?, ?, ?, ?, ?, 'inline', 1, ?)`,
 			id, s.scheme, s.host, s.suite, hash(id), adoptedAt)
+		// Each snapshot's package rows are a list with the snapshot's id: a
+		// current snapshot's is the one its suite names, the old catalog's
+		// and the candidate's are lists no suite names.
+		exec(`INSERT INTO package_list(package_list_id) VALUES (?)`, id)
 		if s.current {
 			exec(`INSERT INTO suite_freshness(canonical_scheme, canonical_host, suite_path,
-current_snapshot_id) VALUES (?, ?, ?, ?)`, s.scheme, s.host, s.suite, id)
+current_snapshot_id, package_list_id) VALUES (?, ?, ?, ?, ?)`, s.scheme, s.host, s.suite, id, id)
 		}
 	}
 	for _, p := range []struct {
@@ -80,17 +84,17 @@ current_snapshot_id) VALUES (?, ?, ?, ?)`, s.scheme, s.host, s.suite, id)
 		{8, "/dists/pdiff-only/main/binary-ppc64el/Packages.diff/patch.gz", "ppc64el"},
 	} {
 		s := snapshots[p.snapshot-1]
-		exec(`INSERT INTO package_hash(canonical_scheme, canonical_host, path,
-declared_sha256, snapshot_id, architecture) VALUES (?, ?, ?, ?, ?, ?)`,
+		exec(`INSERT INTO package_list_entry(canonical_scheme, canonical_host, path,
+declared_sha256, package_list_id, architecture) VALUES (?, ?, ?, ?, ?, ?)`,
 			s.scheme, s.host, p.path, hash(100), p.snapshot, p.arch)
 	}
-	// Keep the scheme/host predicates: a snapshot ID alone does not prove
-	// that a package row belongs to the current suite's canonical origin.
-	exec(`INSERT INTO package_hash(canonical_scheme, canonical_host, path,
-declared_sha256, snapshot_id, architecture) VALUES ('http', 'mirror.example',
+	// Keep the scheme/host predicates: a list alone does not prove that a
+	// package row belongs to the suite's canonical origin.
+	exec(`INSERT INTO package_list_entry(canonical_scheme, canonical_host, path,
+declared_sha256, package_list_id, architecture) VALUES ('http', 'mirror.example',
 '/pool/wrong-scheme.deb', ?, 1, 'wrong-scheme')`, hash(100))
-	exec(`INSERT INTO package_hash(canonical_scheme, canonical_host, path,
-declared_sha256, snapshot_id, architecture) VALUES ('https', 'wrong.example',
+	exec(`INSERT INTO package_list_entry(canonical_scheme, canonical_host, path,
+declared_sha256, package_list_id, architecture) VALUES ('https', 'wrong.example',
 '/pool/wrong-host.deb', ?, 1, 'wrong-host')`, hash(100))
 	for _, m := range []struct {
 		snapshot int
@@ -101,7 +105,7 @@ declared_sha256, snapshot_id, architecture) VALUES ('https', 'wrong.example',
 		{2, "main/binary-amd64/packages.diff/Index"}, // case-sensitive classifier
 		{3, "main/source/Sources.diff/Index"},
 		{5, "main/binary-amd64/Packages.diff/Index"}, // old snapshot excluded
-		{6, "main/binary-amd64/Packages.diff/Index"}, // no package_hash rows
+		{6, "main/binary-amd64/Packages.diff/Index"}, // no package rows
 	} {
 		exec(`INSERT INTO snapshot_member(snapshot_id, path, blob_hash, declared_sha256)
 VALUES (?, ?, ?, ?)`, m.snapshot, m.path, hash(100), hash(100))

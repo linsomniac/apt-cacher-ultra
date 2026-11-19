@@ -16,15 +16,15 @@ func retire(t *testing.T, c *Cache, id int64) {
 	}
 }
 
-// childRows counts snapshot id's snapshot_member, snapshot_skipped_member
-// and package_hash rows.
+// childRows counts snapshot id's snapshot_member and
+// snapshot_skipped_member rows: every row a snapshot owns (its package
+// rows are its suite's list's since schema 11).
 func childRows(t *testing.T, c *Cache, id int64) int {
 	t.Helper()
 	var n int
 	if err := c.db.QueryRow(`SELECT
   (SELECT COUNT(*) FROM snapshot_member WHERE snapshot_id = ?) +
-  (SELECT COUNT(*) FROM snapshot_skipped_member WHERE snapshot_id = ?) +
-  (SELECT COUNT(*) FROM package_hash WHERE snapshot_id = ?)`, id, id, id).Scan(&n); err != nil {
+  (SELECT COUNT(*) FROM snapshot_skipped_member WHERE snapshot_id = ?)`, id, id).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	return n
@@ -60,9 +60,11 @@ func TestRunSnapshotGCBatch_RetiredSnapshotsTakeNoKeepDisplacedSlot(t *testing.T
 	}
 }
 
-// Spec C9 sub-job C: retired snapshots are deleted with their members,
-// skipped members and package_hash rows in bounded chunks, then the header
-// row; a displaced snapshot that is not retired (keep_displaced's to keep)
+// Spec C9 sub-job C: retired snapshots are deleted with their members and
+// skipped members in bounded chunks, then the header row (the package rows
+// a retired snapshot declared are its suite's list's, which sub-job D
+// deletes: C leaves them); a displaced snapshot that is not retired
+// (keep_displaced's to keep)
 // and the current one are untouched by every chunk, and the sub-job says
 // when nothing retired is left. The displaced one sits between the
 // retired and the current snapshot, so a chunk that ignored retired_at
@@ -73,7 +75,7 @@ func TestRunRetiredSnapshotGCChunk_DeletesRetiredSnapshotsInChunks(t *testing.T)
 	key := sk("h", "/r/dists/x")
 	seedRow(t, c, key, 1)
 	members := map[string]string{"InRelease": "old anchor"}
-	for i := range 12 {
+	for i := range 21 {
 		members[fmt.Sprintf("main/i%02d", i)] = fmt.Sprintf("index %d", i)
 	}
 	old, hashes := adoptWith(t, c, key, members)
@@ -87,8 +89,14 @@ VALUES (?, 'main/skipped', ?, 1, '4xx', 1)`, old, hashes["main/i01"]); err != ni
 	mid, _ := adoptWith(t, c, key, map[string]string{"InRelease": "mid anchor", "main/m": "mid member"})
 	cur, _ := adoptWith(t, c, key, map[string]string{"InRelease": "new anchor"})
 	retire(t, c, old)
-	if n := childRows(t, c, old); n != 13+9+1 {
+	if n := childRows(t, c, old); n != 22+1 {
 		t.Fatalf("premise: %d child rows, want 23", n)
+	}
+	// The list the retired snapshot's package rows are in: unnamed since
+	// the next adoption, and none of sub-job C's business.
+	lists := unnamedLists(t, c)
+	if len(lists) != 2 || entryCount(t, c, lists[0]) != 9 {
+		t.Fatalf("premise: unnamed lists %v; want the old snapshot's (9 rows) and the displaced one's (empty)", lists)
 	}
 	untouched := func(when string) {
 		t.Helper()
@@ -113,6 +121,9 @@ VALUES (?, 'main/skipped', ?, 1, '4xx', 1)`, old, hashes["main/i01"]); err != ni
 		t.Fatalf("with nothing retired left: reaped %d, more %v, err %v; want 0, false", reaped, more, err)
 	}
 	untouched("after the last call")
+	if entryCount(t, c, lists[0]) != 9 {
+		t.Fatalf("sub-job C deleted package rows: %d of the old list's 9 left", entryCount(t, c, lists[0]))
+	}
 }
 
 // Spec C9 sub-job C, defensively: a retired snapshot that is still some
@@ -158,7 +169,9 @@ func TestRunRetiredSnapshotGCChunk_AHeaderDeleteThatDeletesNothingFails(t *testi
 }
 
 // Spec C9 / §6.1: sub-job C deletes the snapshots the legacy trust audit
-// quarantined (retired), members and package_hash rows included.
+// quarantined (retired), members included; the package rows such a
+// snapshot declared are left in a list its suite no longer names, which
+// sub-job D deletes.
 func TestRunRetiredSnapshotGCChunk_DeletesAuditRetiredSnapshots(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
@@ -183,6 +196,10 @@ func TestRunRetiredSnapshotGCChunk_DeletesAuditRetiredSnapshots(t *testing.T) {
 	}
 	if snapshotExists(t, c, id) || childRows(t, c, id) != 0 {
 		t.Fatalf("the quarantined snapshot: header %v, %d child rows; want both gone", snapshotExists(t, c, id), childRows(t, c, id))
+	}
+	if rows := runPackageListGC(t, c); rows != 1 || len(unnamedLists(t, c)) != 0 {
+		t.Fatalf("sub-job D deleted %d package rows, %d unnamed lists left; want the quarantined snapshot's 1 row and none",
+			rows, len(unnamedLists(t, c)))
 	}
 }
 

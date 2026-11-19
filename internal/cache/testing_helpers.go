@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -46,19 +47,22 @@ func (c *Cache) DeleteSnapshotMembersForTest(ctx context.Context, snapshotID int
 	})
 }
 
-// DeletePackageHashForTest removes the package_hash row identified by
-// (scheme, host, debPath, snapshotID). This is a TEST-ONLY helper used by
-// reconcile tests to simulate a snapshot whose index member AND its derived
-// package_hash rows have been stripped — i.e. a truly clean degraded state
-// where reconcile must produce both. Refcount accuracy is NOT maintained.
+// DeletePackageHashForTest removes the package row (scheme, host, debPath)
+// from the list of the suite whose current snapshot is snapshotID. This is
+// a TEST-ONLY helper used by reconcile tests to simulate a snapshot whose
+// index member AND its derived package rows have been stripped — i.e. a
+// truly clean degraded state where reconcile must produce both. Refcount
+// accuracy is NOT maintained, and the list's generation is not bumped.
 //
 // AIDEV-NOTE: paired with DeleteSnapshotMembersForTest; both are needed when
-// a test must prove that reconcile builds package_hash rows from scratch, not
+// a test must prove that reconcile builds package rows from scratch, not
 // just that they survive from the initial adoption.
 func (c *Cache) DeletePackageHashForTest(ctx context.Context, scheme, host, debPath string, snapshotID int64) error {
 	return c.submitWrite(ctx, writeTest, func(ctx context.Context, conn *sql.Conn) error {
-		if _, err := conn.ExecContext(ctx,
-			`DELETE FROM package_hash WHERE canonical_scheme = ? AND canonical_host = ? AND path = ? AND snapshot_id = ?`,
+		if _, err := conn.ExecContext(ctx, `
+DELETE FROM package_list_entry
+ WHERE canonical_scheme = ? AND canonical_host = ? AND path = ?
+   AND package_list_id IN (SELECT package_list_id FROM suite_freshness WHERE current_snapshot_id = ?)`,
 			scheme, host, debPath, snapshotID); err != nil {
 			return fmt.Errorf("DeletePackageHashForTest: %w", err)
 		}
@@ -196,27 +200,33 @@ func (c *Cache) HoldWriterForTest(ctx context.Context) (release func(), err erro
 	}
 }
 
-// PackageRowsOfSnapshotForTest returns the package rows the snapshot holds,
-// in path order: what a test used to read from the table by snapshot id.
-// TEST-ONLY.
+// PackageRowsOfSnapshotForTest returns the package rows the snapshot
+// declares, in path order: the entries of the list of the suite whose
+// current snapshot it is. A snapshot that is no suite's current one — a
+// candidate, a displaced or retired one, or an unsigned current one — has
+// none (schema 11: package rows are a suite's, not a snapshot's). Each
+// row's SnapshotID is the snapshot asked for. TEST-ONLY.
 //
 // AIDEV-NOTE: tests read and seed package rows through this,
-// InsertPackageRowForTest, GetPackageHash and DeletePackageHashForTest, not
-// by SQL of their own, so that where the rows are kept is this file's
-// business and not every test's (the package-list plan, Task 1).
+// InsertPackageRowForTest, InsertUnnamedPackageListForTest, GetPackageHash
+// and DeletePackageHashForTest, not by SQL of their own, so that where the
+// rows are kept is this file's business and not every test's (the
+// package-list plan, Task 1).
 func (c *Cache) PackageRowsOfSnapshotForTest(ctx context.Context, snapshotID int64) ([]PackageHash, error) {
 	rows, err := c.db.QueryContext(ctx, `
-SELECT canonical_scheme, canonical_host, path, declared_sha256, snapshot_id,
-       package_name, architecture, version, flat_filename
-  FROM package_hash WHERE snapshot_id = ? ORDER BY path`, snapshotID)
+SELECT e.canonical_scheme, e.canonical_host, e.path, e.declared_sha256,
+       e.package_name, e.architecture, e.version, e.flat_filename
+  FROM suite_freshness sf
+  JOIN package_list_entry e ON e.package_list_id = sf.package_list_id
+ WHERE sf.current_snapshot_id = ? ORDER BY e.path`, snapshotID)
 	if err != nil {
 		return nil, fmt.Errorf("PackageRowsOfSnapshotForTest: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	var out []PackageHash
 	for rows.Next() {
-		var p PackageHash
-		if err := rows.Scan(&p.CanonicalScheme, &p.CanonicalHost, &p.Path, &p.DeclaredSHA256, &p.SnapshotID,
+		p := PackageHash{SnapshotID: snapshotID}
+		if err := rows.Scan(&p.CanonicalScheme, &p.CanonicalHost, &p.Path, &p.DeclaredSHA256,
 			&p.PackageName, &p.Architecture, &p.Version, &p.FlatFilename); err != nil {
 			return nil, fmt.Errorf("PackageRowsOfSnapshotForTest scan: %w", err)
 		}
@@ -228,20 +238,89 @@ SELECT canonical_scheme, canonical_host, path, declared_sha256, snapshot_id,
 	return out, nil
 }
 
-// InsertPackageRowForTest adds one package row to the snapshot's rows,
-// through the writer, with no validation beyond the schema's and none of a
-// commit's bookkeeping (row.SnapshotID is ignored). TEST-ONLY: for fixtures
-// that need a row no adoption would write.
+// InsertPackageRowForTest adds one package row to the list of the suite
+// whose current snapshot is snapshotID, through the writer, with no
+// validation beyond the schema's and none of a writer's bookkeeping (no
+// generation bump, no noteFlatRows, no hot-package record; row.SnapshotID
+// is ignored). A suite that names no list — a fixture that pointed
+// current_snapshot_id by SQL — is given one first. A snapshot that is no
+// suite's current one is an error: it has no rows to add to. TEST-ONLY:
+// for fixtures that need a row no adoption would write.
 func (c *Cache) InsertPackageRowForTest(ctx context.Context, snapshotID int64, row PackageHash) error {
 	return c.submitWrite(ctx, writeTest, func(ctx context.Context, conn *sql.Conn) error {
-		if _, err := conn.ExecContext(ctx, `
-INSERT INTO package_hash (canonical_scheme, canonical_host, path, declared_sha256, snapshot_id,
-                          package_name, architecture, version, flat_filename)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			row.CanonicalScheme, row.CanonicalHost, row.Path, row.DeclaredSHA256, snapshotID,
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("InsertPackageRowForTest: begin: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		var listID sql.NullInt64
+		switch err := tx.QueryRowContext(ctx,
+			`SELECT package_list_id FROM suite_freshness WHERE current_snapshot_id = ? ORDER BY package_list_id IS NULL LIMIT 1`,
+			snapshotID).Scan(&listID); {
+		case errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("InsertPackageRowForTest: snapshot %d is no suite's current snapshot", snapshotID)
+		case err != nil:
+			return fmt.Errorf("InsertPackageRowForTest: %w", err)
+		}
+		if !listID.Valid {
+			res, err := tx.ExecContext(ctx, `INSERT INTO package_list DEFAULT VALUES`)
+			if err != nil {
+				return fmt.Errorf("InsertPackageRowForTest: create list: %w", err)
+			}
+			id, err := res.LastInsertId()
+			if err != nil {
+				return fmt.Errorf("InsertPackageRowForTest: create list: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE suite_freshness SET package_list_id = ? WHERE current_snapshot_id = ?`, id, snapshotID); err != nil {
+				return fmt.Errorf("InsertPackageRowForTest: name list: %w", err)
+			}
+			listID = sql.NullInt64{Int64: id, Valid: true}
+		}
+		if _, err := tx.ExecContext(ctx, insertPackageListEntrySQL, listID.Int64,
+			row.CanonicalScheme, row.CanonicalHost, row.Path, row.DeclaredSHA256,
 			row.PackageName, row.Architecture, row.Version, row.FlatFilename); err != nil {
 			return fmt.Errorf("InsertPackageRowForTest: %w", err)
 		}
+		return tx.Commit()
+	})
+}
+
+// InsertUnnamedPackageListForTest creates a package list holding rows that
+// no suite names — what a rewritten list or a removed suite's list is
+// until GC deletes it — and returns its id. No validation beyond the
+// schema's. TEST-ONLY.
+func (c *Cache) InsertUnnamedPackageListForTest(ctx context.Context, rows []PackageHash) (int64, error) {
+	var got int64
+	err := c.submitWrite(ctx, writeTest, func(ctx context.Context, conn *sql.Conn) error {
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("InsertUnnamedPackageListForTest: begin: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		res, err := tx.ExecContext(ctx, `INSERT INTO package_list DEFAULT VALUES`)
+		if err != nil {
+			return fmt.Errorf("InsertUnnamedPackageListForTest: %w", err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return fmt.Errorf("InsertUnnamedPackageListForTest: %w", err)
+		}
+		for _, row := range rows {
+			if _, err := tx.ExecContext(ctx, insertPackageListEntrySQL, id,
+				row.CanonicalScheme, row.CanonicalHost, row.Path, row.DeclaredSHA256,
+				row.PackageName, row.Architecture, row.Version, row.FlatFilename); err != nil {
+				return fmt.Errorf("InsertUnnamedPackageListForTest: %w", err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("InsertUnnamedPackageListForTest: commit: %w", err)
+		}
+		got = id
 		return nil
 	})
+	if err != nil {
+		return 0, err
+	}
+	return got, nil
 }

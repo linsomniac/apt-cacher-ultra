@@ -46,20 +46,13 @@ func TestKeepNewestNVersionSet_EquivalenceClasses(t *testing.T) {
 func TestInsertPackageHashTx_HealsPreV6EmptyVersion(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
-	ir := seedBlob(t, c, "inrelease")
 	debHash := strings.Repeat("a", 64)
-	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
-		CanonicalScheme: "http", CanonicalHost: "ex.test",
-		SuitePath: "/dists/noble", InReleaseHash: &ir,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	const path = "/pool/p/pkg/pkg_1.2.3_amd64.deb"
-	// Pre-v6 style row: version defaulted to ''.
-	if _, err := c.db.Exec(`INSERT INTO package_hash
-	  (canonical_scheme, canonical_host, path, declared_sha256, snapshot_id, package_name, architecture, version)
-	  VALUES ('http','ex.test',?,?,?,'pkg','amd64','')`, path, debHash, id); err != nil {
+	// Pre-v6 style row: version defaulted to ''. The list needs no suite
+	// here: insertPackageHashTx works on the list it is given.
+	list, err := c.InsertUnnamedPackageListForTest(ctx, []PackageHash{{CanonicalScheme: "http", CanonicalHost: "ex.test",
+		Path: path, DeclaredSHA256: debHash, PackageName: "pkg", Architecture: "amd64"}})
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -67,20 +60,24 @@ func TestInsertPackageHashTx_HealsPreV6EmptyVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := insertPackageHashTx(ctx, tx, PackageHash{
+	wrote, err := insertPackageHashTx(ctx, tx, list, PackageHash{
 		CanonicalScheme: "http", CanonicalHost: "ex.test", Path: path,
-		DeclaredSHA256: debHash, SnapshotID: id,
-		PackageName: "pkg", Architecture: "amd64", Version: "1.2.3",
-	}); err != nil {
+		DeclaredSHA256: debHash,
+		PackageName:    "pkg", Architecture: "amd64", Version: "1.2.3",
+	})
+	if err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("insertPackageHashTx healed-version path: unexpected error: %v", err)
+	}
+	if !wrote {
+		t.Error("a heal reports that it wrote nothing")
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 
 	var got string
-	if err := c.db.QueryRow(`SELECT version FROM package_hash WHERE path=? AND snapshot_id=?`, path, id).Scan(&got); err != nil {
+	if err := c.db.QueryRow(`SELECT version FROM package_list_entry WHERE path=? AND package_list_id=?`, path, list).Scan(&got); err != nil {
 		t.Fatal(err)
 	}
 	if got != "1.2.3" {
@@ -94,19 +91,11 @@ func TestInsertPackageHashTx_HealsPreV6EmptyVersion(t *testing.T) {
 func TestInsertPackageHashTx_LoudOnRealVersionConflict(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
-	ir := seedBlob(t, c, "inrelease2")
 	debHash := strings.Repeat("b", 64)
-	id, _, err := c.InsertTrackedCandidateForTest(ctx, SnapshotCandidate{
-		CanonicalScheme: "http", CanonicalHost: "ex.test",
-		SuitePath: "/dists/noble", InReleaseHash: &ir,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	const path = "/pool/p/pkg/pkg_1.0_amd64.deb"
-	if _, err := c.db.Exec(`INSERT INTO package_hash
-	  (canonical_scheme, canonical_host, path, declared_sha256, snapshot_id, package_name, architecture, version)
-	  VALUES ('http','ex.test',?,?,?,'pkg','amd64','1.0')`, path, debHash, id); err != nil {
+	list, err := c.InsertUnnamedPackageListForTest(ctx, []PackageHash{{CanonicalScheme: "http", CanonicalHost: "ex.test",
+		Path: path, DeclaredSHA256: debHash, PackageName: "pkg", Architecture: "amd64", Version: "1.0"}})
+	if err != nil {
 		t.Fatal(err)
 	}
 	tx, err := c.db.BeginTx(ctx, nil)
@@ -114,10 +103,10 @@ func TestInsertPackageHashTx_LoudOnRealVersionConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := insertPackageHashTx(ctx, tx, PackageHash{
+	if _, err := insertPackageHashTx(ctx, tx, list, PackageHash{
 		CanonicalScheme: "http", CanonicalHost: "ex.test", Path: path,
-		DeclaredSHA256: debHash, SnapshotID: id,
-		PackageName: "pkg", Architecture: "amd64", Version: "2.0",
+		DeclaredSHA256: debHash,
+		PackageName:    "pkg", Architecture: "amd64", Version: "2.0",
 	}); err == nil {
 		t.Error("expected a loud error on conflicting non-empty versions, got nil")
 	}

@@ -77,7 +77,7 @@ func TestCommitAdoption_InsertFailureRollsBackAndRetries(t *testing.T) {
 				}
 				assertCounts := func(want int) {
 					t.Helper()
-					for _, table := range []string{"snapshot_member", "snapshot_skipped_member", "package_hash"} {
+					for _, table := range []string{"snapshot_member", "snapshot_skipped_member"} {
 						var got int
 						if err := c.db.QueryRowContext(ctx, "SELECT count(*) FROM "+table+" WHERE snapshot_id = ?", id).Scan(&got); err != nil {
 							t.Fatal(err)
@@ -85,6 +85,20 @@ func TestCommitAdoption_InsertFailureRollsBackAndRetries(t *testing.T) {
 						if got != want {
 							t.Errorf("%s rows = %d, want %d", table, got, want)
 						}
+					}
+					// The snapshot's package rows are its suite's list, once it
+					// is current; and a rolled-back commit leaves no package row
+					// anywhere (the prior snapshot declared none).
+					rows, err := c.PackageRowsOfSnapshotForTest(ctx, id)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var entries int
+					if err := c.db.QueryRowContext(ctx, "SELECT count(*) FROM package_list_entry").Scan(&entries); err != nil {
+						t.Fatal(err)
+					}
+					if len(rows) != want || entries != want {
+						t.Errorf("package rows = %d of the snapshot, %d in all; want %d", len(rows), entries, want)
 					}
 				}
 				assertCounts(0)

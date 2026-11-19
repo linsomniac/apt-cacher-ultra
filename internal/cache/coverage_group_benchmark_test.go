@@ -82,10 +82,10 @@ SELECT sf.current_snapshot_id, p.architecture,
   END AS kind,
   count(*) AS n
 FROM suite_freshness sf
-CROSS JOIN package_hash p
-  ON sf.canonical_scheme = p.canonical_scheme
- AND sf.canonical_host   = p.canonical_host
- AND sf.current_snapshot_id = p.snapshot_id
+CROSS JOIN package_list_entry p
+  ON p.package_list_id  = sf.package_list_id
+ AND p.canonical_scheme = sf.canonical_scheme
+ AND p.canonical_host   = sf.canonical_host
 GROUP BY sf.current_snapshot_id, p.architecture, kind`)
 	if err != nil {
 		return coverage, err
@@ -141,7 +141,9 @@ WHERE m.path GLOB '*/Packages.diff/Index'
 }
 
 // Keep both benchmark datasets at 100k current and 900k retained rows,
-// including their cached-blob layout, for comparable measurements.
+// including their cached-blob layout, for comparable measurements. Since
+// schema 11 the retained rows are nine unnamed package lists a suite (the
+// worst case: GC has deleted none), the current rows the list it names.
 func seedCoverageGroupingBenchmark(b *testing.B, groups int) *Cache {
 	b.Helper()
 	ctx := context.Background()
@@ -181,17 +183,18 @@ SELECT printf('%064x', 100000+i), 1000+3*i, 1 FROM n`)
 			exec(`INSERT INTO suite_snapshot(snapshot_id, canonical_scheme, canonical_host,
 suite_path, inrelease_hash, anchor_form, created_at, adopted_at)
 VALUES (?, 'https', ?, ?, ?, 'inline', 1, 1)`, snapshot, host, suite, hash)
+			exec(`INSERT INTO package_list(package_list_id) VALUES (?)`, snapshot)
 			if groups == 1 {
 				exec(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<100000)
-INSERT INTO package_hash(canonical_scheme, canonical_host, path, declared_sha256,
-snapshot_id, package_name, architecture, version)
+INSERT INTO package_list_entry(canonical_scheme, canonical_host, path, declared_sha256,
+package_list_id, package_name, architecture, version)
 SELECT 'https', 'mirror.example', '/pool/pkg-' || i || '.deb', ?, ?,
 'pkg-' || i, CASE WHEN i%10=0 THEN 'source' WHEN i%2=0 THEN 'arm64' ELSE 'amd64' END,
 '1.0' FROM n`, hash, snapshot)
 			} else {
 				exec(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?)
-INSERT INTO package_hash(canonical_scheme, canonical_host, path, declared_sha256,
-snapshot_id, package_name, architecture, version)
+INSERT INTO package_list_entry(canonical_scheme, canonical_host, path, declared_sha256,
+package_list_id, package_name, architecture, version)
 SELECT 'https', ?, ? ||
 CASE WHEN i%31=0 THEN '/Packages.diff/'
      WHEN i%37=0 THEN '/Sources.diff/'
@@ -204,7 +207,7 @@ CASE WHEN i%31=0 THEN '/Packages.diff/'
 		}
 		current := group*10 + 10
 		exec(`INSERT INTO suite_freshness(canonical_scheme, canonical_host, suite_path,
-current_snapshot_id) VALUES ('https', ?, ?, ?)`, host, suite, current)
+current_snapshot_id, package_list_id) VALUES ('https', ?, ?, ?, ?)`, host, suite, current, current)
 		if groups == 1 {
 			exec(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1000)
 INSERT INTO url_path(canonical_scheme, canonical_host, path, blob_hash, upstream_url, is_metadata)
@@ -214,7 +217,7 @@ SELECT 'https', 'mirror.example', '/pool/pkg-' || i || '.deb', ?,
 			exec(`INSERT INTO url_path(canonical_scheme, canonical_host, path, blob_hash, upstream_url, is_metadata)
 SELECT canonical_scheme, canonical_host, path,
 printf('%064x', 100000+rowid%50), 'https://' || canonical_host || path, 0
-FROM package_hash WHERE snapshot_id=? ORDER BY path LIMIT ?`, current, 1000/groups)
+FROM package_list_entry WHERE package_list_id=? ORDER BY path LIMIT ?`, current, 1000/groups)
 			exec(`INSERT INTO snapshot_member(snapshot_id, path, blob_hash, declared_sha256)
 VALUES (?, 'main/Packages.diff/Index', ?, ?)`, current, fmt.Sprintf("%064x", current), fmt.Sprintf("%064x", current))
 		}

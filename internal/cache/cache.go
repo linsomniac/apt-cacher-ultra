@@ -91,7 +91,7 @@ type Cache struct {
 	touches suiteTouches
 
 	// flatRows is the "flat rows may exist" flag (ruling PG-31): false
-	// while package_hash holds no row with a non-empty flat_filename, so
+	// while package_list_entry holds no row with a non-empty flat_filename, so
 	// DeclaredHashesForPath skips the suffix fallback, which only such a
 	// row can answer. Open primes it (flatRowsExistSQL); noteFlatRows sets
 	// it; nothing clears it at run time.
@@ -104,7 +104,7 @@ type Cache struct {
 	// fallback's query, until the next Open primes it again). A stale false
 	// would skip the fallback for a flat .deb: strict mode would refuse it
 	// (fail closed) and a non-strict serve would go unhashed — the
-	// vouching lost silently. A new package_hash writer must call
+	// vouching lost silently. A new writer of package rows must call
 	// noteFlatRows too.
 	flatRows atomic.Bool
 
@@ -176,7 +176,7 @@ func OpenWithDBDir(ctx context.Context, dir, dbDir string, logger *slog.Logger) 
 	var flat bool
 	if err := db.QueryRowContext(ctx, flatRowsExistSQL).Scan(&flat); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("read whether flat package_hash rows exist: %w", err)
+		return nil, fmt.Errorf("read whether flat package rows exist: %w", err)
 	}
 	c.flatRows.Store(flat)
 	c.wg.Add(1)

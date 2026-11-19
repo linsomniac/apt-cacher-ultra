@@ -10,7 +10,7 @@ import (
 )
 
 // Issue #14 follow-up, Tier 2: sub-job D strips the package_hash rows of
-// the displaced snapshots (cache.RunDisplacedPackageHashChunk), after A ∪ B
+// the displaced snapshots (cache.RunPackageListGCChunk), after A ∪ B
 // and C, in the snapshot pass and in the retired run; and a sub-job that
 // fails no longer stops the sub-jobs after it (ruling HD-15 within the
 // pass), so a C stuck on one snapshot never stops D.
@@ -292,11 +292,11 @@ func TestSubJobs_AShutdownStopsTheLaterSubJobs(t *testing.T) {
 	})
 }
 
-// On a real cache: a suite with three adopted snapshots, each holding
-// package_hash rows, and keep_displaced = 3 (so B retires none). One
-// periodic tick's D strips the two displaced snapshots' package_hash rows
-// and nothing else: their headers and members stay, and the current
-// snapshot's rows are intact; LastRunSummary reports the rows stripped.
+// On a real cache: a suite adopted three times, each adoption writing a
+// package list of its own, and keep_displaced = 3 (so B retires none). One
+// periodic tick's D deletes the two lists the suite no longer names and
+// nothing else: the displaced snapshots' headers and members stay, and the
+// suite's live list is intact; LastRunSummary reports the rows deleted.
 func TestPeriodicTick_StripsDisplacedPackageRowsOnARealCache(t *testing.T) {
 	logger, buf := captureLogger()
 	g, c := storeGC(t, nil, 2, logger)
@@ -317,18 +317,38 @@ func TestPeriodicTick_StripsDisplacedPackageRowsOnARealCache(t *testing.T) {
 		}
 		return n
 	}
-	for _, id := range ids {
-		if n := count("package_hash", id); n != pkgs {
-			t.Fatalf("snapshot %d holds %d package_hash rows before the tick, want %d", id, n, pkgs)
+	// unnamed counts the package lists no suite names and their rows.
+	unnamed := func() (lists, rows int) {
+		t.Helper()
+		if err := db.QueryRow(`SELECT count(*) FROM package_list pl
+ WHERE NOT EXISTS (SELECT 1 FROM suite_freshness sf WHERE sf.package_list_id = pl.package_list_id)`).Scan(&lists); err != nil {
+			t.Fatal(err)
 		}
+		if err := db.QueryRow(`SELECT count(*) FROM package_list_entry e
+ WHERE NOT EXISTS (SELECT 1 FROM suite_freshness sf WHERE sf.package_list_id = e.package_list_id)`).Scan(&rows); err != nil {
+			t.Fatal(err)
+		}
+		return lists, rows
+	}
+	liveRows := func() int {
+		t.Helper()
+		rows, err := c.PackageRowsOfSnapshotForTest(context.Background(), current)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(rows)
+	}
+	if lists, rows := unnamed(); lists != len(displaced) || rows != len(displaced)*pkgs || liveRows() != pkgs {
+		t.Fatalf("before the tick: %d unnamed lists with %d rows, %d live rows; want %d, %d and %d",
+			lists, rows, liveRows(), len(displaced), len(displaced)*pkgs, pkgs)
 	}
 
 	g.periodicTick(context.Background())
 
+	if lists, rows := unnamed(); lists != 0 || rows != 0 {
+		t.Errorf("after the tick: %d unnamed lists with %d rows, want none", lists, rows)
+	}
 	for _, id := range displaced {
-		if n := count("package_hash", id); n != 0 {
-			t.Errorf("displaced snapshot %d still holds %d package_hash rows, want 0", id, n)
-		}
 		if !snapshotRowExists(t, db, id) {
 			t.Errorf("displaced snapshot %d's header was deleted, want it kept (keep_displaced)", id)
 		}
@@ -336,8 +356,8 @@ func TestPeriodicTick_StripsDisplacedPackageRowsOnARealCache(t *testing.T) {
 			t.Errorf("displaced snapshot %d holds %d members, want its 1 kept", id, n)
 		}
 	}
-	if n := count("package_hash", current); n != pkgs {
-		t.Errorf("the current snapshot holds %d package_hash rows, want its %d intact", n, pkgs)
+	if n := liveRows(); n != pkgs {
+		t.Errorf("the suite's live list holds %d package rows, want its %d intact", n, pkgs)
 	}
 	if n := count("snapshot_member", current); n != 1 {
 		t.Errorf("the current snapshot holds %d members, want 1", n)

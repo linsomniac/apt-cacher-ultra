@@ -231,8 +231,9 @@ func (r SnapshotGCBatchResult) Total() int {
 //  2. SELECT (sub-job A ∪ sub-job B) candidate ids inside the tx — the
 //     SELECT-DELETE liveness race is closed by single-writer ordering.
 //  3. cascade DELETE of sub-job A's orphan candidates: snapshot_member,
-//     snapshot_skipped_member, package_hash, suite_snapshot (children
-//     before parent for FK ordering with PRAGMA foreign_keys = ON).
+//     snapshot_skipped_member, suite_snapshot (children before parent
+//     for FK ordering with PRAGMA foreign_keys = ON). A snapshot holds no
+//     package rows since schema 11: they are its suite's list's.
 //  4. sub-job B's displaced snapshots get retired_at = now in one UPDATE,
 //     their rows kept: sub-job C (RunRetiredSnapshotGCChunk) deletes them
 //     in chunks (DN-7 of the GC and upstream hardening plan; at a start
@@ -369,7 +370,6 @@ LIMIT ?`
 			for _, stmt := range []string{
 				`DELETE FROM snapshot_member         WHERE snapshot_id IN (` + idList + `)`,
 				`DELETE FROM snapshot_skipped_member WHERE snapshot_id IN (` + idList + `)`,
-				`DELETE FROM package_hash            WHERE snapshot_id IN (` + idList + `)`,
 				`DELETE FROM suite_snapshot          WHERE snapshot_id IN (` + idList + `)`,
 			} {
 				if _, err := tx.ExecContext(ctx, stmt, orphans...); err != nil {
@@ -382,6 +382,7 @@ LIMIT ?`
 			// HD-7 superseded in part 2026-11-09 (issue #14 follow-up Tier 1b).
 			// B used to delete a displaced snapshot's rows here, in this one
 			// writer transaction: six snapshots of 70,000 package_hash rows
+			// (schema 10 and earlier kept package rows per snapshot)
 			// held the writer 4.7 s in a probe, so a full batch held every
 			// write (a miss's store, a flip's commit) about 8 s. It now only
 			// retires them, and sub-job C deletes them in chunks
@@ -445,11 +446,15 @@ func placeholders(n int) string {
 // with its four indexes. Measured again 2026-10-28, Task 2's probe of the
 // GC and upstream hardening plan: 120-240 ms a chunk, median 149-191 ms,
 // over ~700,000 package_hash rows, no -race, a loaded 12-thread laptop.
+// Both were taken on package_hash, the per-snapshot table schema 11
+// replaced. On package_list_entry (2026-11-19, a production database
+// copy, 290,000 rows, no -race, load 3 to 7): 250-340 ms for the longest
+// 10,000-row chunk of a 67,000-row list (the package-list plan).
 // Re-measure before raising it.
 const retiredChunkRows = 10_000
 
-// effectiveChunkRows is the rows one sub-job C (or, since 2026-11-09,
-// sub-job D: issue #14 follow-up Tier 2) transaction deletes for a
+// effectiveChunkRows is the rows one sub-job C (or sub-job D:
+// RunPackageListGCChunk) transaction deletes for a
 // requested maxRows: retiredChunkRows for 0 or less — what the snapshot
 // pass asks for — and maxRows otherwise (deferred minor F-2: the default
 // is pinned here without a 10,001-row fixture, which takes some 5 s under
@@ -463,8 +468,9 @@ func effectiveChunkRows(maxRows int) int {
 
 // RunRetiredSnapshotGCChunk is one writer transaction of snapshot-GC
 // sub-job C (spec C9): it takes the oldest retired snapshot, deletes up to
-// maxRows of its rows — snapshot_member, then snapshot_skipped_member,
-// then package_hash — and, when none is left, its suite_snapshot header.
+// maxRows of its rows — snapshot_member, then snapshot_skipped_member
+// (a snapshot holds no package rows since schema 11: sub-job D deletes
+// the lists) — and, when none is left, its suite_snapshot header.
 // It reports how many headers it deleted (0 or 1) and more = false only
 // when no retired snapshot was left to work on; the snapshot pass calls it
 // until then (or its deadline). maxRows <= 0 means retiredChunkRows.
@@ -494,8 +500,8 @@ func effectiveChunkRows(maxRows int) int {
 // draining a backlog at up to one max_tick_duration an hour; before issue
 // #14's fix a retirement rate above one tick's capacity grew the backlog
 // without bound (the final review 2's G2-I2). Chunking bounds the
-// writer's hold on a large suite (tens of thousands of package_hash
-// rows).
+// writer's hold on a large suite's snapshot (its member rows; before
+// schema 11, tens of thousands of package rows too).
 func (c *Cache) RunRetiredSnapshotGCChunk(ctx context.Context, maxRows int) (reaped int, more bool, err error) {
 	maxRows = effectiveChunkRows(maxRows)
 	// The op writes gotReaped/gotMore, never the named results: on a
@@ -523,7 +529,7 @@ SELECT snapshot_id FROM suite_snapshot
 			return fmt.Errorf("RunRetiredSnapshotGCChunk: select: %w", err)
 		}
 		left := int64(maxRows)
-		for _, table := range []string{"snapshot_member", "snapshot_skipped_member", "package_hash"} {
+		for _, table := range []string{"snapshot_member", "snapshot_skipped_member"} {
 			res, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE rowid IN (SELECT rowid FROM `+table+
 				` WHERE snapshot_id = ? LIMIT ?)`, id, left)
 			if err != nil {
@@ -568,109 +574,101 @@ SELECT snapshot_id FROM suite_snapshot
 	return gotReaped, gotMore, nil
 }
 
-// displacedPackageHashSelectSQL is sub-job D's candidate SELECT: the
-// oldest adopted, non-retired, non-current snapshot that still has a
-// package_hash row.
-const displacedPackageHashSelectSQL = `
-SELECT ss.snapshot_id FROM suite_snapshot ss
- WHERE ss.adopted_at IS NOT NULL AND ss.retired_at IS NULL
-   AND ss.snapshot_id NOT IN (SELECT current_snapshot_id FROM suite_freshness WHERE current_snapshot_id IS NOT NULL)
-   AND EXISTS (SELECT 1 FROM package_hash p WHERE p.snapshot_id = ss.snapshot_id)
- ORDER BY ss.snapshot_id
+// unnamedPackageListSelectSQL is sub-job D's candidate SELECT: the
+// lowest-id package list no suite names.
+const unnamedPackageListSelectSQL = `
+SELECT pl.package_list_id FROM package_list pl
+ WHERE NOT EXISTS (SELECT 1 FROM suite_freshness sf WHERE sf.package_list_id = pl.package_list_id)
+ ORDER BY pl.package_list_id
  LIMIT 1`
 
-// RunDisplacedPackageHashChunk is one writer transaction of snapshot-GC
-// sub-job D (issue #14 follow-up, Tier 2): it takes the oldest displaced
-// snapshot — adopted, not retired, not any suite's current one — that
-// still has package_hash rows, and deletes up to maxRows of them. Nothing
-// else goes: the snapshot's header, snapshot_member and
-// snapshot_skipped_member rows stay (forensics, the rollback check and
-// retained by-hash serving read them), and so a displaced snapshot kept by
-// gc.keep_displaced keeps its headers and index files, not its package
-// list. It reports the rows it deleted and more = false only when no such
-// snapshot was left at the start of the call; the snapshot pass calls it
-// until then (or its deadline). maxRows <= 0 means retiredChunkRows. A
-// snapshot still queued in legacy_trust_audit is not excluded: the audit
-// never reads package_hash. Unadopted candidates and orphans hold no rows
-// (only CommitAdoption inserts them, in the transaction that adopts), and
-// the adopted_at term keeps D off them regardless.
+// RunPackageListGCChunk is one writer transaction of snapshot-GC sub-job D
+// (the package-list design, "What deletes rows"): it takes the lowest-id
+// package list no suite names and deletes up to maxRows of its entries;
+// when the delete comes up short — no entry is left — it deletes the
+// list's header too. It reports the entries it deleted and more = false
+// only when no unnamed list existed at the start of the call; the
+// snapshot pass calls it until then (or its deadline). maxRows <= 0 means
+// retiredChunkRows.
 //
-// AIDEV-NOTE: the audit argument (spec "Audit: who reads package_hash",
-// re-verified 2026-11-09). Deleting a displaced snapshot's package_hash
-// rows changes no reader's answer:
-//   - every reader is current-only — vouching (declaredExactSQL,
-//     declaredBySuffixSQL), ListIntegrityCandidates, the url_path mirror
-//     match and topNVersionSetTx, coverage and host/arch stats — or reads
-//     a snapshot that is current when it reads it: ComputeHotSet's stage 1
-//     reads the pre-flip prior (still current until the flip that follows
-//     displaces it), reconcile's insertPackageHashTx probe reads the
-//     snapshot InsertReconciledMembers checks is current in the same
-//     writer transaction. flatRowsExistSQL (Open) may open false when only
-//     displaced flat rows existed, which is correct: they are never read.
-//     GetPackageHash has no non-test caller.
-//   - a displaced snapshot never becomes current again: CommitAdoption, the
-//     only writer that points current_snapshot_id at a snapshot, commits
-//     only an unadopted candidate (the AIDEV-NOTE at
-//     RunRetiredSnapshotGCChunk).
-//   - the blob pass's reachability predicate does not read package_hash
-//     (url_path, snapshot_member and suite_snapshot only), and the legacy
-//     trust audit, the rollback check and by-hash serving from a displaced
-//     snapshot read suite_snapshot and snapshot_member.
+// What leaves a list unnamed: a commit that wrote a whole new list (a
+// first adoption has none before it; a publication that changed most of
+// the list; a commit without a difference), a suite's removal (reap,
+// forget, cap eviction), the legacy audit's quarantine of a suite's
+// current snapshot. An adoption that applied a difference leaves nothing:
+// it deleted the removed paths in its own transaction.
 //
-// TestPackageHashReaders_AnswerTheSameAfterTheStrip
-// (displaced_package_hash_test.go) pins this. A new reader of displaced
-// package_hash rows must change it — and D — first.
+// AIDEV-NOTE: why deleting an unnamed list changes no reader's answer
+// (this replaces the 2026-11-09 "who reads package_hash" audit, which was
+// about a displaced snapshot's rows). Every reader of package_list_entry
+// reaches an entry through the suite that names its list (package_list.go
+// has the rule and the one exception, flatRowsExistSQL), so an unnamed
+// list is already invisible; and a list no suite names is never named
+// again: only CommitAdoption points a suite at a list, and only at one it
+// created in the same transaction, on the single writer, so this
+// transaction never sees a list between its creation and its naming.
+// ComputeHotSet does not read the table (it reads hot_package and the
+// candidate's in-memory rows). TestPackageListReaders_AnUnnamedListIsInvisible
+// and TestPackageListReaders_AnswerTheSameBeforeAndAfterGC pin it; a new
+// reader of unnamed lists must change them, and this, first.
 //
-// AIDEV-NOTE: EXPLAIN QUERY PLAN of displacedPackageHashSelectSQL
-// (2026-11-09; TestRunDisplacedPackageHashChunk_TheExistsUsesTheSnapshotIndex
-// pins the EXISTS line):
-//
-//	SCAN ss
-//	LIST SUBQUERY 1
-//	SCAN suite_freshness
-//	CREATE BLOOM FILTER
-//	SEARCH p EXISTS USING COVERING INDEX idx_package_hash_snapshot (snapshot_id=?)
-//
-// suite_snapshot is walked in snapshot_id order (headers only: a few per
-// suite, plus the retired ones C has not deleted yet) and each adopted,
-// non-retired, non-current header costs one probe of
-// idx_package_hash_snapshot, so a displaced snapshot already stripped
-// (kept by keep_displaced) costs one index probe a call, never a
-// package_hash scan. No index was added (no schema change).
-//
-// The chunk's DELETE is sub-job C's shape (rowid IN (… LIMIT ?)), so one
-// transaction holds the writer for one chunk of one snapshot, as C's does.
-func (c *Cache) RunDisplacedPackageHashChunk(ctx context.Context, maxRows int) (rows int, more bool, err error) {
+// AIDEV-NOTE: the SELECT walks package_list in id order — one row per
+// suite with a list, plus the garbage — and probes
+// idx_suite_freshness_package_list once per row, so a call costs at most
+// one probe per live list before it finds garbage or reports none. The
+// chunk's DELETE is keyed by the entries' primary key (package_list_id,
+// path), so one transaction holds the writer for one chunk of one list,
+// as sub-job C's does (measurement at retiredChunkRows).
+func (c *Cache) RunPackageListGCChunk(ctx context.Context, maxRows int) (rows int, more bool, err error) {
 	maxRows = effectiveChunkRows(maxRows)
 	// The op writes gotRows/gotMore, never the named results: on a ctx/close
 	// path submitWrite returns before the op ends (see InsertCandidateSnapshot).
 	var gotRows int
 	var gotMore bool
-	werr := c.submitWrite(ctx, writeGCDisplacedPackages, func(ctx context.Context, conn *sql.Conn) error {
+	werr := c.submitWrite(ctx, writeGCPackageLists, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
-			return fmt.Errorf("RunDisplacedPackageHashChunk: begin: %w", err)
+			return fmt.Errorf("RunPackageListGCChunk: begin: %w", err)
 		}
 		defer func() { _ = tx.Rollback() }()
 		var id int64
-		err = tx.QueryRowContext(ctx, displacedPackageHashSelectSQL).Scan(&id)
+		err = tx.QueryRowContext(ctx, unnamedPackageListSelectSQL).Scan(&id)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
-			return tx.Commit() // nothing displaced holds rows: gotMore stays false
+			return tx.Commit() // every list is named: gotMore stays false
 		case err != nil:
-			return fmt.Errorf("RunDisplacedPackageHashChunk: select: %w", err)
+			return fmt.Errorf("RunPackageListGCChunk: select: %w", err)
 		}
-		res, err := tx.ExecContext(ctx, `DELETE FROM package_hash WHERE rowid IN (SELECT rowid FROM package_hash
- WHERE snapshot_id = ? LIMIT ?)`, id, maxRows)
+		res, err := tx.ExecContext(ctx, `
+DELETE FROM package_list_entry WHERE package_list_id = ?1 AND path IN
+ (SELECT path FROM package_list_entry WHERE package_list_id = ?1 LIMIT ?2)`, id, maxRows)
 		if err != nil {
-			return fmt.Errorf("RunDisplacedPackageHashChunk: delete snapshot %d: %w", id, err)
+			return fmt.Errorf("RunPackageListGCChunk: delete entries of list %d: %w", id, err)
 		}
 		n, err := res.RowsAffected()
 		if err != nil {
-			return fmt.Errorf("RunDisplacedPackageHashChunk: delete snapshot %d: %w", id, err)
+			return fmt.Errorf("RunPackageListGCChunk: delete entries of list %d: %w", id, err)
+		}
+		if n < int64(maxRows) { // the delete came up short: no entry of id is left
+			res, err := tx.ExecContext(ctx, `
+DELETE FROM package_list WHERE package_list_id = ?1
+   AND NOT EXISTS (SELECT 1 FROM suite_freshness sf WHERE sf.package_list_id = ?1)`, id)
+			if err != nil {
+				return fmt.Errorf("RunPackageListGCChunk: delete list %d: %w", id, err)
+			}
+			// A header delete that deletes nothing means the SELECT's and the
+			// DELETE's predicates disagree: fail loudly rather than re-select
+			// the same list until the deadline on every tick (as sub-job C).
+			h, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("RunPackageListGCChunk: delete list %d: %w", id, err)
+			}
+			if h != 1 {
+				return fmt.Errorf("RunPackageListGCChunk: delete list %d: deleted %d headers, want 1", id, h)
+			}
 		}
 		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("RunDisplacedPackageHashChunk: commit: %w", err)
+			return fmt.Errorf("RunPackageListGCChunk: commit: %w", err)
 		}
 		gotRows, gotMore = int(n), true
 		return nil

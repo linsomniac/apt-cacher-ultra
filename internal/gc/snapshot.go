@@ -347,7 +347,7 @@ func (g *GC) runSubJobC(ctx context.Context, dl snapshotPassDeadline, batchesRun
 
 // runSubJobD is snapshot GC sub-job D (issue #14 follow-up, Tier 2): it
 // strips the displaced snapshots' package_hash rows
-// (cache.RunDisplacedPackageHashChunk), oldest snapshot first, in bounded
+// (cache.RunPackageListGCChunk), oldest snapshot first, in bounded
 // chunks, until none is left, ctx ends, or dl's deadline comes (deadlineHit:
 // rows left): dl expired between chunks, or a chunk the writer never
 // started before it (notStarted). ctx is the caller's wctx (runSubJobC's
@@ -364,7 +364,7 @@ func (g *GC) runSubJobD(ctx context.Context, dl snapshotPassDeadline, batchesRun
 		}
 		// 0: the cache's own chunk (retiredChunkRows, 10,000 rows a
 		// transaction), as C's.
-		rows, more, err := g.store.RunDisplacedPackageHashChunk(ctx, 0)
+		rows, more, err := g.store.RunPackageListGCChunk(ctx, 0)
 		if notStarted(err) {
 			return stripped, dl.reached(), nil // the chunk never ran: rows may be left
 		}

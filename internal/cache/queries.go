@@ -394,11 +394,76 @@ func (c *Cache) GetCacheStats(ctx context.Context) (CacheStats, error) {
 	return s, nil
 }
 
+// The admin aggregates' queries over the package lists (GetRepoCoverage,
+// GetCacheSummaryByHostArch).
+//
+// AIDEV-NOTE: the unary plus on the scheme and host terms is load-bearing.
+// The terms keep what these queries always required — a row counts for
+// the suite whose origin it carries (TestAdminAggregatesCurrentSnapshots)
+// — but as plain equalities they made SQLite choose
+// idx_package_list_entry_path by its (scheme, host) prefix for the join,
+// which walks every list of the host, the unnamed ones GC has yet to
+// delete included: 10.9 s for the host summary over ten 100,000-row lists
+// in BenchmarkAdminCacheSummaries, where the list's primary key reads
+// only the list a suite names. `+column` keeps a term out of index
+// selection without changing what it means.
+// TestPackageListReaders_QueryPlans pins the three plans.
+const (
+	// repoCoverageRowsSQL: per current snapshot and architecture, its
+	// list's rows and how many of them are pdiff rows.
+	repoCoverageRowsSQL = `
+SELECT sf.current_snapshot_id, p.architecture, count(*) AS n,
+  sum(CASE
+    WHEN p.path GLOB '*/Packages.diff/*' OR p.path GLOB '*/Sources.diff/*' THEN 1
+    ELSE 0
+  END) AS pdiff
+FROM suite_freshness sf
+CROSS JOIN package_list_entry p
+  ON p.package_list_id   = sf.package_list_id
+ AND +p.canonical_scheme = sf.canonical_scheme
+ AND +p.canonical_host   = sf.canonical_host
+GROUP BY sf.current_snapshot_id, p.architecture`
+
+	// cacheSummaryCountsSQL: package rows per (host, architecture) over
+	// the lists suites name.
+	cacheSummaryCountsSQL = `
+SELECT p.canonical_host, p.architecture, count(*)
+FROM suite_freshness sf
+CROSS JOIN package_list_entry p
+  ON p.package_list_id   = sf.package_list_id
+ AND +p.canonical_scheme = sf.canonical_scheme
+ AND +p.canonical_host   = sf.canonical_host
+WHERE p.architecture != ''
+GROUP BY p.canonical_host, p.architecture`
+
+	// cacheSummaryBlobsSQL: distinct cached blobs per (host,
+	// architecture), driven from url_path (the note at its use says why).
+	cacheSummaryBlobsSQL = `
+SELECT canonical_host, architecture,
+       count(*) AS blob_count,
+       COALESCE(sum(size), 0) AS blob_bytes
+FROM (
+    SELECT DISTINCT p.canonical_host, p.architecture, b.hash, b.size
+    FROM url_path u
+    JOIN blob b ON b.hash = u.blob_hash
+    CROSS JOIN package_list_entry p
+      ON p.canonical_scheme = u.canonical_scheme
+     AND p.canonical_host   = u.canonical_host
+     AND p.path             = u.path
+    JOIN suite_freshness sf
+      ON sf.package_list_id   = p.package_list_id
+     AND +sf.canonical_scheme = p.canonical_scheme
+     AND +sf.canonical_host   = p.canonical_host
+    WHERE u.blob_hash IS NOT NULL AND p.architecture != ''
+)
+GROUP BY canonical_host, architecture`
+)
+
 // GetRepoCoverage returns the SPEC6_5 §2.4 repo_coverage payload
 // (architectures observed, source/pdiff snapshot counts, per-kind
 // package_hash row totals). All counts are scoped to current snapshots
-// — the join against suite_freshness.current_snapshot_id ensures
-// displaced snapshots' rows don't inflate the totals.
+// — the package rows are read through the lists suites name, so a list
+// no suite names any more does not inflate the totals.
 //
 // AIDEV-NOTE: the per-kind row classifier mirrors handler.classifyPath:
 // architecture="source" + non-pdiff path → kind=source; path under
@@ -438,27 +503,16 @@ func (c *Cache) GetRepoCoverage(ctx context.Context) (RepoCoverage, error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Walk each current catalog once for all package-derived fields. Pin the
-	// small suite table as the outer loop: retained/displaced catalogs can
-	// greatly outnumber current ones, especially with a daily GC interval.
-	// The existing (scheme, host, snapshot_id, ...) index serves this join.
-	// Grouping by snapshot preserves the distinct source-snapshot count;
-	// grouping by architecture also supplies the architecture list without
-	// a second package_hash scan. Count pdiff rows inside each group instead
+	// Walk each suite's package list once for all package-derived fields.
+	// Pin the small suite table as the outer loop: each list is then one
+	// range of the entries' primary key (package_list_id, path), and a list
+	// no suite names is never read (repoCoverageRowsSQL has the plan's
+	// pin). Grouping by snapshot preserves the
+	// distinct source-snapshot count; grouping by architecture also
+	// supplies the architecture list without a second scan. Count pdiff rows inside each group instead
 	// of sorting by their computed kind, then classify the remaining rows by
 	// architecture. Keep the path classifier case-sensitive.
-	rows, err := tx.QueryContext(ctx, `
-SELECT sf.current_snapshot_id, p.architecture, count(*) AS n,
-  sum(CASE
-    WHEN p.path GLOB '*/Packages.diff/*' OR p.path GLOB '*/Sources.diff/*' THEN 1
-    ELSE 0
-  END) AS pdiff
-FROM suite_freshness sf
-CROSS JOIN package_hash p
-  ON sf.canonical_scheme = p.canonical_scheme
- AND sf.canonical_host   = p.canonical_host
- AND sf.current_snapshot_id = p.snapshot_id
-GROUP BY sf.current_snapshot_id, p.architecture`)
+	rows, err := tx.QueryContext(ctx, repoCoverageRowsSQL)
 	if err != nil {
 		return RepoCoverage{}, fmt.Errorf("GetRepoCoverage package aggregates: %w", err)
 	}
@@ -571,15 +625,7 @@ func (c *Cache) GetCacheSummaryByHostArch(ctx context.Context) (map[string]map[s
 		m[arch] = e
 	}
 
-	rows, err := tx.QueryContext(ctx, `
-SELECT p.canonical_host, p.architecture, count(*)
-FROM package_hash p
-JOIN suite_freshness sf
-  ON sf.canonical_scheme = p.canonical_scheme
- AND sf.canonical_host   = p.canonical_host
- AND sf.current_snapshot_id = p.snapshot_id
-WHERE p.architecture != ''
-GROUP BY p.canonical_host, p.architecture`)
+	rows, err := tx.QueryContext(ctx, cacheSummaryCountsSQL)
 	if err != nil {
 		return nil, fmt.Errorf("GetCacheSummaryByHostArch counts: %w", err)
 	}
@@ -600,41 +646,26 @@ GROUP BY p.canonical_host, p.architecture`)
 	}
 	_ = rows.Close()
 
-	// AIDEV-NOTE: drive this join from url_path, NOT package_hash.
-	// package_hash holds one row per .deb per snapshot (≈1M rows on a
-	// full Ubuntu mirror), while url_path holds only the artifacts
+	// AIDEV-NOTE: drive this join from url_path, NOT the package rows.
+	// package_list_entry holds one row per .deb per suite (hundreds of
+	// thousands on a full Ubuntu mirror; package_hash, which this was
+	// measured on, held ≈1M), while url_path holds only the artifacts
 	// actually cached (low thousands), and the inner join to url_path is
 	// what gates the result. Left to its own row-count estimates SQLite
-	// drives from package_hash and SCANs all ~1M rows, probing url_path
-	// per row — ~1.5s in C sqlite and >10s under the pure-Go modernc
-	// driver, blowing the §9.7.6 gauge-refresh deadline (the
+	// drove from the package rows and SCANned all ~1M of them, probing
+	// url_path per row — ~1.5s in C sqlite and >10s under the pure-Go
+	// modernc driver, blowing the §9.7.6 gauge-refresh deadline (the
 	// cache_summary panel then stays perpetually empty). The CROSS JOIN
-	// pins url_path as the outer table so SQLite probes package_hash by
-	// its PK prefix (canonical_scheme, canonical_host, path) instead —
-	// ~40× faster with byte-identical results. The `blob_hash IS NOT
+	// pins url_path as the outer table so SQLite probes the entries by
+	// idx_package_list_entry_path (canonical_scheme, canonical_host, path)
+	// instead — ~40× faster with byte-identical results. Each entry then
+	// reaches its suite by its list (idx_suite_freshness_package_list),
+	// which also drops the entries of a list no suite names. The `blob_hash IS NOT
 	// NULL` predicate lets the partial index idx_url_path_blob drive the
 	// scan; it is also semantically a no-op (the JOIN to blob already
 	// drops NULL-blob rows). Do not reorder these joins without
 	// re-checking EXPLAIN QUERY PLAN against a large cache.
-	blobRows, err := tx.QueryContext(ctx, `
-SELECT canonical_host, architecture,
-       count(*) AS blob_count,
-       COALESCE(sum(size), 0) AS blob_bytes
-FROM (
-    SELECT DISTINCT p.canonical_host, p.architecture, b.hash, b.size
-    FROM url_path u
-    JOIN blob b ON b.hash = u.blob_hash
-    CROSS JOIN package_hash p
-      ON p.canonical_scheme = u.canonical_scheme
-     AND p.canonical_host   = u.canonical_host
-     AND p.path             = u.path
-    JOIN suite_freshness sf
-      ON sf.canonical_scheme = p.canonical_scheme
-     AND sf.canonical_host   = p.canonical_host
-     AND sf.current_snapshot_id = p.snapshot_id
-    WHERE u.blob_hash IS NOT NULL AND p.architecture != ''
-)
-GROUP BY canonical_host, architecture`)
+	blobRows, err := tx.QueryContext(ctx, cacheSummaryBlobsSQL)
 	if err != nil {
 		return nil, fmt.Errorf("GetCacheSummaryByHostArch blobs: %w", err)
 	}

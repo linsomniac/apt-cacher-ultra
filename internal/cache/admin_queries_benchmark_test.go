@@ -35,15 +35,19 @@ func BenchmarkAdminCacheSummaries(b *testing.B) {
 		exec(`INSERT INTO suite_snapshot(snapshot_id, canonical_scheme, canonical_host,
 suite_path, inrelease_hash, anchor_form, created_at, adopted_at)
 VALUES (?, 'https', 'mirror.example', '/dists/stable', ?, 'inline', 1, 1)`, snapshot, hash)
+		// Each generation's package rows are a list of its own: the last is
+		// the one the suite names, the nine before it are unnamed (what GC
+		// has not deleted yet).
+		exec(`INSERT INTO package_list(package_list_id) VALUES (?)`, snapshot)
 		exec(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<100000)
-INSERT INTO package_hash(canonical_scheme, canonical_host, path, declared_sha256,
-snapshot_id, package_name, architecture, version)
+INSERT INTO package_list_entry(canonical_scheme, canonical_host, path, declared_sha256,
+package_list_id, package_name, architecture, version)
 SELECT 'https', 'mirror.example', '/pool/pkg-' || i || '.deb', ?, ?,
 'pkg-' || i, CASE WHEN i%10=0 THEN 'source' WHEN i%2=0 THEN 'arm64' ELSE 'amd64' END,
 '1.0' FROM n`, hash, snapshot)
 	}
 	exec(`INSERT INTO suite_freshness(canonical_scheme, canonical_host, suite_path,
-current_snapshot_id) VALUES ('https', 'mirror.example', '/dists/stable', 10)`)
+current_snapshot_id, package_list_id) VALUES ('https', 'mirror.example', '/dists/stable', 10, 10)`)
 	exec(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1000)
 INSERT INTO url_path(canonical_scheme, canonical_host, path, blob_hash, upstream_url, is_metadata)
 SELECT 'https', 'mirror.example', '/pool/pkg-' || i || '.deb', ?,

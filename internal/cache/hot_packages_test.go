@@ -58,12 +58,13 @@ func TestHotPackageSurvivesVersionChangesGCAndRestart(t *testing.T) {
 		t.Fatalf("version 2 hot set: %v %v", hot, err)
 	}
 	commitHotSnapshot(t, c, id2, ph2, a2, true)
-	// Simulate reclamation of the old URL and displaced package list.
+	// Reclaim the old URL and the displaced package list (the list the
+	// first adoption wrote, unnamed since the second: sub-job D's).
 	if err := c.EvictURLPath(t.Context(), "http", "h", ph1[0].Path); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.db.Exec(`DELETE FROM package_hash WHERE snapshot_id = ?`, id1); err != nil {
-		t.Fatal(err)
+	if rows := runPackageListGC(t, c); rows != 1 {
+		t.Fatalf("GC deleted %d package rows, want the first adoption's 1", rows)
 	}
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
@@ -110,35 +111,55 @@ func TestHotPackageSurvivesVersionChangesGCAndRestart(t *testing.T) {
 	}
 }
 
+// The schema-10 migration backfills hot_package from the requests clients
+// already made, on a database that is really at schema 9 (package rows per
+// snapshot, no hot_package); the schema-11 migration that follows keeps
+// the row and puts the triggers on the package lists, so a later request
+// stamp still reaches it.
 func TestSchemaV10BackfillsRealClientInterest(t *testing.T) {
-	c := openCache(t)
-	id, ph, anchor := hotSnapshot(t, c, 1)
-	commitHotSnapshot(t, c, id, ph, anchor, false)
-	for _, q := range []string{`DROP TRIGGER hot_package_insert`, `DROP TRIGGER hot_package_touch`, `DROP TABLE hot_package`, `UPDATE schema_version SET version=9`} {
-		if _, err := c.db.Exec(q); err != nil {
-			t.Fatal(err)
-		}
-	}
+	db, dir := openCacheAtSchema(t, 9)
+	f := &v10{t: t, db: db}
+	key := SuiteKey{CanonicalScheme: "http", CanonicalHost: "h", SuitePath: "/dists/stable"}
+	f.suite(key)
+	id := f.snapshot(key, "inline", "current")
+	const path = "/pool/pkg_1_amd64.deb"
+	deb := hashOf('d')
+	f.row(id, PackageHash{CanonicalScheme: "http", CanonicalHost: "h", Path: path, DeclaredSHA256: deb,
+		PackageName: "pkg", Architecture: "amd64", Version: "1"})
 	stamp := int64(1700000000)
-	if err := c.PutURLPath(t.Context(), URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: ph[0].Path,
-		BlobHash: &ph[0].DeclaredSHA256, UpstreamURL: "http://h" + ph[0].Path, LastRequestedAt: &stamp, RequestCount: 1}); err != nil {
+	f.requested("h", path, deb, stamp)
+	if err := migrate(context.Background(), db, discardSlog()); err != nil {
 		t.Fatal(err)
 	}
-	if err := migrate(context.Background(), c.db, discardSlog()); err != nil {
+	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	c, err := Open(t.Context(), dir, discardSlog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
 	var got int64
 	if err := c.db.QueryRow(`SELECT last_requested_at FROM hot_package WHERE package_name='pkg'`).Scan(&got); err != nil || got != stamp {
 		t.Fatalf("backfill: %d %v", got, err)
 	}
 	// Backward wall-clock observations must not shorten the original window.
 	stamp--
-	if err := c.PutURLPath(t.Context(), URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: ph[0].Path,
-		BlobHash: &ph[0].DeclaredSHA256, UpstreamURL: "http://h" + ph[0].Path, LastRequestedAt: &stamp, RequestCount: 2}); err != nil {
+	if err := c.PutURLPath(t.Context(), URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: path,
+		BlobHash: &deb, UpstreamURL: "http://h" + path, LastRequestedAt: &stamp, RequestCount: 2}); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.db.QueryRow(`SELECT last_requested_at FROM hot_package`).Scan(&got); err != nil || got != stamp+1 {
 		t.Fatalf("backward timestamp: %d %v", got, err)
+	}
+	// A later one, through the schema-11 triggers, moves it forward.
+	stamp += 100
+	if err := c.PutURLPath(t.Context(), URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: path,
+		BlobHash: &deb, UpstreamURL: "http://h" + path, LastRequestedAt: &stamp, RequestCount: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.db.QueryRow(`SELECT last_requested_at FROM hot_package`).Scan(&got); err != nil || got != stamp {
+		t.Fatalf("forward timestamp: %d %v, want %d", got, err, stamp)
 	}
 }
 

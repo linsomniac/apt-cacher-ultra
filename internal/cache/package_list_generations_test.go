@@ -11,12 +11,14 @@ import (
 	"testing"
 )
 
-// AIDEV-NOTE: tests for snapshot-GC sub-job D (RunDisplacedPackageHashChunk,
-// issue #14 follow-up Tier 2). TestPackageHashReaders_AnswerTheSameAfterTheStrip
-// pins the spec's package_hash reader audit: every production reader gives
-// the same answer after D strips displaced snapshots' package_hash rows. A
-// new reader of displaced package_hash rows must join that test (and D's
-// AIDEV-NOTE), or D must change.
+// AIDEV-NOTE: TestPackageListReaders_AnswerTheSameBeforeAndAfterGC is the
+// reader audit for package lists (it was the audit of sub-job D's strip of
+// displaced snapshots' package_hash rows, before schema 11): every
+// production reader gives the same answer while the lists earlier
+// adoptions wrote are still on disk, unnamed, as after GC has deleted
+// them. A new reader of package_list_entry must join that test (and the
+// AIDEV-NOTE at RunPackageListGCChunk). Sub-job D's own tests are in
+// package_list_gc_test.go.
 
 // blobs seeds each content as a blob once and returns its hash (seedBlob
 // keyed by content, so a fixture can name one content twice).
@@ -111,196 +113,8 @@ func tableDump(t *testing.T, c *Cache, q string, args ...any) []string {
 	return out
 }
 
-// packageHashCount counts snapshot id's package_hash rows.
-func packageHashCount(t *testing.T, c *Cache, id int64) int {
-	t.Helper()
-	var n int
-	if err := c.db.QueryRow(`SELECT COUNT(*) FROM package_hash WHERE snapshot_id = ?`, id).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	return n
-}
-
-// drainDisplaced runs sub-job D with the cache's own chunk until it reports
-// nothing left, and returns the rows it deleted.
-func drainDisplaced(t *testing.T, c *Cache) int {
-	t.Helper()
-	deleted := 0
-	for i := 0; ; i++ {
-		if i == 100 { // a stuck more = true fails here, not at the test timeout
-			t.Fatal("sub-job D still reports more after 100 calls")
-		}
-		n, more, err := c.RunDisplacedPackageHashChunk(context.Background(), 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		deleted += n
-		if !more {
-			if n != 0 {
-				t.Fatalf("sub-job D deleted %d rows in a call that reported nothing left", n)
-			}
-			return deleted
-		}
-	}
-}
-
-// Untouched-table dumps: every snapshot_member, snapshot_skipped_member and
-// suite_snapshot row, in a fixed order.
-const (
-	dumpMembers  = `SELECT * FROM snapshot_member ORDER BY snapshot_id, path`
-	dumpSkipped  = `SELECT * FROM snapshot_skipped_member ORDER BY snapshot_id, path`
-	dumpHeaders  = `SELECT * FROM suite_snapshot ORDER BY snapshot_id`
-	dumpPkgsOfIn = `SELECT * FROM package_hash WHERE snapshot_id IN (?, ?) ORDER BY snapshot_id, path`
-)
-
-// Issue #14 follow-up Tier 2: sub-job D strips the package_hash rows of
-// adopted, non-current, non-retired snapshots — the two displaced ones and
-// the one the legacy trust audit still has queued (the audit never reads
-// package_hash) — and nothing else: the current snapshot's and the retired
-// one's rows (sub-job C's) stay, the unadopted candidate has none to take,
-// and every snapshot_member, snapshot_skipped_member and suite_snapshot row
-// is as it was (forensics, the rollback check and by-hash serving read
-// them).
-func TestRunDisplacedPackageHashChunk_StripsOnlyAdoptedNonCurrentUnretired(t *testing.T) {
-	c := openCache(t)
-	ctx := context.Background()
-	b := newBlobs(t, c)
-	key := sk("h", "/r/dists/x")
-	seedRow(t, c, key, 1)
-	gen := func(label string) int64 {
-		return adoptGeneration(t, c, b, key,
-			map[string]string{"InRelease": "InRelease " + label, "main/binary-amd64/Packages": "Packages " + label},
-			[]string{"main/Contents-amd64.gz"},
-			[]PackageHash{
-				pkgRow("/r/pool/main/a/a_1_amd64.deb", b.of("a 1 "+label), ""),
-				pkgRow("/r/pool/main/b/b_1_amd64.deb", b.of("b 1 "+label), ""),
-				pkgRow("/r/pool/main/c/c_1_amd64.deb", b.of("c 1 "+label), ""),
-			})
-	}
-	d1 := gen("d1")
-	retired := gen("retired")
-	d2 := gen("d2")
-	cur := gen("current")
-	retire(t, c, retired)
-	queued := seedDisplacedAt(t, c, key, 5, true)
-	for _, p := range []string{"a", "b", "c"} {
-		seedPackageHash(t, c, "http", "h", "/r/pool/main/"+p+"/"+p+"_1_amd64.deb", b.of(p+" 1 queued"), queued, p, "amd64", "1")
-	}
-	h := b.of("Packages queued")
-	if _, err := c.db.Exec(`INSERT INTO snapshot_member (snapshot_id, path, blob_hash, declared_sha256) VALUES (?, 'main/binary-amd64/Packages', ?, ?)`,
-		queued, h, h); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := c.db.Exec(`INSERT INTO snapshot_skipped_member (snapshot_id, path, declared_sha256, size, reason, skipped_at)
-VALUES (?, 'main/Contents-amd64.gz', ?, 1, '4xx', 1)`, queued, h); err != nil {
-		t.Fatal(err)
-	}
-	next := b.of("InRelease candidate")
-	cand, _, err := c.InsertCandidateSnapshot(ctx, SnapshotCandidate{CanonicalScheme: "http", CanonicalHost: "h",
-		SuitePath: key.SuitePath, InReleaseHash: &next})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, id := range []int64{d1, retired, d2, cur, queued} {
-		if n := packageHashCount(t, c, id); n != 3 {
-			t.Fatalf("premise: snapshot %d has %d package_hash rows, want 3", id, n)
-		}
-	}
-	if n := packageHashCount(t, c, cand); n != 0 || !snapshotExists(t, c, cand) {
-		t.Fatalf("premise: candidate %d: header %v, %d package_hash rows; want the header and none", cand, snapshotExists(t, c, cand), n)
-	}
-	members, skipped, headers := tableDump(t, c, dumpMembers), tableDump(t, c, dumpSkipped), tableDump(t, c, dumpHeaders)
-	kept := tableDump(t, c, dumpPkgsOfIn, cur, retired)
-
-	if n := drainDisplaced(t, c); n != 9 {
-		t.Fatalf("sub-job D deleted %d rows, want the 3 rows of each of the 3 displaced snapshots", n)
-	}
-	for _, id := range []int64{d1, d2, queued} {
-		if n := packageHashCount(t, c, id); n != 0 {
-			t.Errorf("displaced snapshot %d keeps %d package_hash rows, want 0", id, n)
-		}
-	}
-	if got := tableDump(t, c, dumpPkgsOfIn, cur, retired); !reflect.DeepEqual(got, kept) {
-		t.Errorf("the current and retired snapshots' package_hash rows changed:\nbefore %v\nafter  %v", kept, got)
-	}
-	for _, d := range []struct {
-		what, q string
-		before  []string
-	}{{"snapshot_member", dumpMembers, members}, {"snapshot_skipped_member", dumpSkipped, skipped}, {"suite_snapshot", dumpHeaders, headers}} {
-		if got := tableDump(t, c, d.q); !reflect.DeepEqual(got, d.before) {
-			t.Errorf("%s changed:\nbefore %v\nafter  %v", d.what, d.before, got)
-		}
-	}
-}
-
-// Sub-job D, defensively: an unadopted candidate or orphan holds no
-// package_hash row in production (only CommitAdoption inserts them, in the
-// transaction that adopts), so D's adopted_at term is pinned by rows seeded
-// by hand onto one: D never takes them.
-func TestRunDisplacedPackageHashChunk_NeverTouchesAnUnadoptedSnapshot(t *testing.T) {
-	c := openCache(t)
-	ctx := context.Background()
-	b := newBlobs(t, c)
-	orphan := orphanCandidate(t, c, "http", "h", "/r/dists/x", b.of("an orphan's anchor"), 1)
-	seedPackageHash(t, c, "http", "h", "/r/pool/main/o/o_1_amd64.deb", b.of("o 1"), orphan, "o", "amd64", "1")
-	if n, more, err := c.RunDisplacedPackageHashChunk(ctx, 0); err != nil || n != 0 || more {
-		t.Fatalf("RunDisplacedPackageHashChunk = %d, %v, %v; want nothing to work on (0, false)", n, more, err)
-	}
-	if n := packageHashCount(t, c, orphan); n != 1 {
-		t.Fatalf("the unadopted snapshot keeps %d package_hash rows, want 1", n)
-	}
-}
-
-// Sub-job D chunks a snapshot larger than one chunk: 25 rows at maxRows 10
-// take three calls, each reporting more, and a fourth finds nothing left.
-func TestRunDisplacedPackageHashChunk_ChunksALargeSnapshot(t *testing.T) {
-	c := openCache(t)
-	ctx := context.Background()
-	b := newBlobs(t, c)
-	key := sk("h", "/r/dists/x")
-	seedRow(t, c, key, 1)
-	var phs []PackageHash
-	for i := range 25 {
-		phs = append(phs, pkgRow(fmt.Sprintf("/r/pool/main/p/p%02d_1_amd64.deb", i), b.of(fmt.Sprintf("p%02d", i)), ""))
-	}
-	displaced := adoptGeneration(t, c, b, key, map[string]string{"InRelease": "old"}, nil, phs)
-	cur := adoptGeneration(t, c, b, key, map[string]string{"InRelease": "new"}, nil, phs)
-	for i, want := range []struct {
-		rows int
-		more bool
-		left int
-	}{{10, true, 15}, {10, true, 5}, {5, true, 0}, {0, false, 0}} {
-		rows, more, err := c.RunDisplacedPackageHashChunk(ctx, 10)
-		if err != nil || rows != want.rows || more != want.more || packageHashCount(t, c, displaced) != want.left {
-			t.Fatalf("call %d: (%d, %v, %v), %d rows left; want (%d, %v, nil), %d left",
-				i+1, rows, more, err, packageHashCount(t, c, displaced), want.rows, want.more, want.left)
-		}
-		if n := packageHashCount(t, c, cur); n != 25 {
-			t.Fatalf("call %d: the current snapshot has %d package_hash rows, want 25", i+1, n)
-		}
-	}
-}
-
-// Sub-job D with nothing to do: an empty cache.
-func TestRunDisplacedPackageHashChunk_NothingToDo(t *testing.T) {
-	c := openCache(t)
-	if n, more, err := c.RunDisplacedPackageHashChunk(context.Background(), 0); err != nil || n != 0 || more {
-		t.Fatalf("RunDisplacedPackageHashChunk on an empty cache = %d, %v, %v; want 0, false, nil", n, more, err)
-	}
-}
-
-// The AIDEV-NOTE pin: D's candidate SELECT answers its EXISTS from
-// idx_package_hash_snapshot, never by scanning package_hash.
-func TestRunDisplacedPackageHashChunk_TheExistsUsesTheSnapshotIndex(t *testing.T) {
-	c := openCache(t)
-	plan := queryPlan(t, c, displacedPackageHashSelectSQL)
-	if !strings.Contains(plan, "USING COVERING INDEX idx_package_hash_snapshot (snapshot_id=?)") || strings.Contains(plan, "SCAN p") {
-		t.Fatalf("query plan does not probe idx_package_hash_snapshot for the EXISTS:\n%s", plan)
-	}
-}
-
-// readerAnswers is every package_hash reader's answer in the spec's audit
-// table, for one state of the cache.
+// readerAnswers is the answer of every reader of the package lists (the
+// design's "Readers" table), for one state of the cache.
 type readerAnswers struct {
 	Declared   map[string][]DeclaredHash
 	Integrity  []IntegrityCandidate
@@ -310,44 +124,44 @@ type readerAnswers struct {
 	URLRetains map[string]bool
 }
 
-// Issue #14 follow-up Tier 2, the first anti-goal: no reader that serves,
-// vouches, reconciles, ranks, warms or reports gives a different answer
-// after sub-job D strips displaced snapshots' package_hash rows. Three signed
-// dists suites (one at the host root) and two signed flat suites (one nested
-// in the other) on one host, each with a current snapshot and two displaced
-// ones, all adopted through CommitAdoption. The displaced snapshots declare
-// other hashes for paths the current ones list (and in another
-// architecture, and source rows), plus paths only they list; one .deb path
-// is in both /r dists suites; one flat row is in a displaced snapshot only.
-// Fix round 1 of the Task 4 review added the shapes that make two readers
-// discriminate:
-//   - the newest-N ranking (topNVersionSetTx): suite a's displaced
-//     snapshots list a withdrawn alpha 5, so a cold current alpha 2, kept
-//     in the current newest 2 {3, 2}, would be reaped if displaced rows
-//     were ranked ({5, 3});
-//   - the flat fallback (Review Focus 4): the host-root dists suite's
-//     displaced snapshots declare /flat/tool_2_amd64.deb as an exact path
-//     (which, read, would suppress the fallback the flat suite's current
-//     row answers it by), and the nested flat suite's displaced snapshots
-//     carry tool_2_amd64.deb (a tie at base /flat) and tool_3_amd64.deb
-//     under the deeper base /flat/deeper (which, read, would win the
+// The package-list design's first anti-goal: no reader that serves,
+// vouches, reconciles, ranks, warms or reports reads a row its suite's
+// current snapshot does not declare. Three signed dists suites (one at the
+// host root) and two signed flat suites (one nested in the other) on one
+// host, each adopted three times through CommitAdoption, so each has a
+// live list (generation 2) and two unnamed ones (generations 0 and 1)
+// that GC has not deleted yet. The earlier generations declare other
+// hashes for paths the current ones list (and in another architecture,
+// and source rows), plus paths only they list; one .deb path is in both
+// /r dists suites; one flat row is in an earlier generation only. The
+// shapes that make two readers discriminate (from the issue #14 review):
+//   - the newest-N ranking (topNVersionSetTx): suite a's earlier
+//     generations list a withdrawn alpha 5, so a cold current alpha 2,
+//     kept in the current newest 2 {3, 2}, would be reaped if an unnamed
+//     list were ranked ({5, 3});
+//   - the flat fallback: the host-root dists suite's earlier generations
+//     declare /flat/tool_2_amd64.deb as an exact path (which, read, would
+//     suppress the fallback the flat suite's current row answers it by),
+//     and the nested flat suite's earlier generations carry
+//     tool_2_amd64.deb (a tie at base /flat) and tool_3_amd64.deb under
+//     the deeper base /flat/deeper (which, read, would win the
 //     longest-base choice for /flat/deeper/tool_3_amd64.deb over /flat's
 //     current deeper/tool_3_amd64.deb).
 //
 // url_path rows give a hot set and both retention answers. Every reader's
-// answer is recorded, D strips to completion, and the answers must be
-// deep-equal.
+// answer is recorded with the unnamed lists on disk, GC deletes them, and
+// the answers must be deep-equal. The premises check the answers
+// themselves: they are the current rows'.
 //
-// Readers (spec "Audit: who reads package_hash"): DeclaredHashesForPath
-// (declaredExactSQL and, for the flat paths, declaredBySuffixSQL),
-// ListIntegrityCandidates, GetRepoCoverage, GetCacheSummaryByHostArch,
-// ComputeHotSet with each suite's current snapshot as the pre-flip prior,
-// and urlPathRetainedTx (the mirror match and topNVersionSetTx). Not here:
-// GetPackageHash (test-only), flatRowsExistSQL (read at Open, and the
-// current flat snapshot keeps its row), and reconcile's insertPackageHashTx
-// probe (it reads only a snapshot the same writer transaction checks is
-// current).
-func TestPackageHashReaders_AnswerTheSameAfterTheStrip(t *testing.T) {
+// Readers: DeclaredHashesForPath (declaredExactSQL and, for the flat
+// paths, declaredBySuffixSQL), ListIntegrityCandidates, GetRepoCoverage,
+// GetCacheSummaryByHostArch, ComputeHotSet (it reads hot_package, which
+// the triggers and the commits fill from the lists), and urlPathRetainedTx
+// (the mirror match and topNVersionSetTx). Not here: GetPackageHash
+// (test-only), flatRowsExistSQL (it reads unnamed lists on purpose), and
+// reconcile's insertPackageHashTx probe (it reads only the list the same
+// writer transaction found the suite naming).
+func TestPackageListReaders_AnswerTheSameBeforeAndAfterGC(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()
 	b := newBlobs(t, c)
@@ -361,8 +175,8 @@ func TestPackageHashReaders_AnswerTheSameAfterTheStrip(t *testing.T) {
 			PackageName: name, Architecture: arch, Version: version, FlatFilename: flatName}
 	}
 	pool := "/r/pool/main/"
-	// rowsOf is each suite's package_hash rows for generation g: 0 and 1
-	// are displaced, 2 is current.
+	// rowsOf is each suite's package rows for generation g: 0 and 1 are
+	// the earlier adoptions' (unnamed lists by the end), 2 is current.
 	rowsOf := func(key SuiteKey, g int) []PackageHash {
 		cur := g == 2
 		tag := fmt.Sprintf(" %s gen %d", key.SuitePath, g) // a displaced snapshot's content (so another hash)
@@ -498,7 +312,7 @@ func TestPackageHashReaders_AnswerTheSameAfterTheStrip(t *testing.T) {
 	}
 
 	paths := []string{"/flat/tool_2_amd64.deb", "/flat/tool_1_amd64.deb", "/flat/deeper/tool_3_amd64.deb"} // the suffix fallback's
-	paths = append(paths, tableDump(t, c, `SELECT DISTINCT path FROM package_hash ORDER BY path`)...)
+	paths = append(paths, tableDump(t, c, `SELECT DISTINCT path FROM package_list_entry ORDER BY path`)...)
 
 	answers := func() readerAnswers {
 		t.Helper()
@@ -618,28 +432,27 @@ func TestPackageHashReaders_AnswerTheSameAfterTheStrip(t *testing.T) {
 	if kept == 0 || reaped == 0 {
 		t.Fatalf("premise: retention answers %v are not mixed", before.URLRetains)
 	}
-	var displacedRows int
-	for _, s := range ids {
-		for _, id := range s.displaced {
-			displacedRows += packageHashCount(t, c, id)
-		}
+	// Each suite's two earlier lists are still on disk, unnamed.
+	if got := unnamedLists(t, c); len(got) != 2*len(suites) {
+		t.Fatalf("premise: %d unnamed lists, want %d (two earlier generations a suite)", len(got), 2*len(suites))
 	}
-	if displacedRows == 0 {
-		t.Fatal("premise: the displaced snapshots hold no package_hash rows")
+	var unnamedRows int
+	if err := c.db.QueryRow(`SELECT count(*) FROM package_list_entry e
+ WHERE NOT EXISTS (SELECT 1 FROM suite_freshness sf WHERE sf.package_list_id = e.package_list_id)`).Scan(&unnamedRows); err != nil {
+		t.Fatal(err)
+	}
+	if unnamedRows == 0 {
+		t.Fatal("premise: the unnamed lists hold no rows")
 	}
 
-	if n := drainDisplaced(t, c); n != displacedRows {
-		t.Fatalf("sub-job D deleted %d rows, want the displaced snapshots' %d", n, displacedRows)
+	if n := runPackageListGC(t, c); n != unnamedRows {
+		t.Fatalf("sub-job D deleted %d rows, want the unnamed lists' %d", n, unnamedRows)
 	}
-	for _, s := range ids {
-		for _, id := range s.displaced {
-			if n := packageHashCount(t, c, id); n != 0 {
-				t.Fatalf("displaced snapshot %d keeps %d package_hash rows after the strip", id, n)
-			}
-		}
+	if got := unnamedLists(t, c); len(got) != 0 {
+		t.Fatalf("unnamed lists after GC: %v", got)
 	}
 
 	if after := answers(); !reflect.DeepEqual(after, before) {
-		t.Fatalf("a package_hash reader answers differently after the strip:\nbefore %+v\nafter  %+v", before, after)
+		t.Fatalf("a reader of the package lists answers differently once GC has deleted the unnamed ones:\nbefore %+v\nafter  %+v", before, after)
 	}
 }

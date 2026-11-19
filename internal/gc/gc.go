@@ -698,7 +698,7 @@ type gcStore interface {
 	RunURLPathGCBatch(ctx context.Context, batchSize int, ttlSeconds, holdSeconds int64, maxVersions int, afterScheme, afterHost, afterPath string) (cache.URLPathGCBatchResult, error)
 	RunSnapshotGCBatch(ctx context.Context, batchSize int, staleGraceSeconds int64, keepDisplaced int) (cache.SnapshotGCBatchResult, error)
 	RunRetiredSnapshotGCChunk(ctx context.Context, maxRows int) (reaped int, more bool, err error)
-	RunDisplacedPackageHashChunk(ctx context.Context, maxRows int) (rows int, more bool, err error)
+	RunPackageListGCChunk(ctx context.Context, maxRows int) (rows int, more bool, err error)
 	HashKnown(ctx context.Context, hash string) (bool, error)
 	PruneRepresentationMetadata(ctx context.Context, limit int) (int, error)
 }

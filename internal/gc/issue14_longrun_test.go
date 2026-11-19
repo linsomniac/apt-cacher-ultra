@@ -106,7 +106,7 @@ func poolStats(t *testing.T, c *cache.Cache) (rows int, bytes int64, snaps int, 
 	if err := db.QueryRow(`SELECT count(*) FROM suite_snapshot`).Scan(&snaps); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.QueryRow(`SELECT count(*) FROM package_hash`).Scan(&phRows); err != nil {
+	if err := db.QueryRow(`SELECT count(*) FROM package_list_entry`).Scan(&phRows); err != nil {
 		t.Fatal(err)
 	}
 	return

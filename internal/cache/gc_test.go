@@ -1160,13 +1160,14 @@ func TestRunSnapshotGCBatch_OrphanReap_ExcludesCurrentSnapshot(t *testing.T) {
 // (issue #14 follow-up Tier 1b) the startup pass's B retires them too.
 // ---------------------------------------------------------------------------
 
-// childRowsByTable counts snapshot id's snapshot_member,
-// snapshot_skipped_member and package_hash rows, in that order (childRows,
-// snapshot_gc_retired_test.go, gives their sum).
-func childRowsByTable(t *testing.T, c *Cache, id int64) [3]int {
+// childRowsByTable counts snapshot id's snapshot_member and
+// snapshot_skipped_member rows, in that order (childRows,
+// snapshot_gc_retired_test.go, gives their sum): every row a snapshot
+// owns since schema 11.
+func childRowsByTable(t *testing.T, c *Cache, id int64) [2]int {
 	t.Helper()
-	var n [3]int
-	for i, table := range []string{"snapshot_member", "snapshot_skipped_member", "package_hash"} {
+	var n [2]int
+	for i, table := range []string{"snapshot_member", "snapshot_skipped_member"} {
 		if err := c.db.QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE snapshot_id = ?`, id).Scan(&n[i]); err != nil {
 			t.Fatal(err)
 		}
@@ -1226,9 +1227,11 @@ func drainRetired(t *testing.T, c *Cache) int {
 
 // displacedSuite creates key's suite and gives it six adopted snapshots,
 // oldest first: five displaced and the current one (the last). Each holds
-// wholeChildRows: two snapshot_member rows (InRelease and main/Packages),
-// one snapshot_skipped_member row and two package_hash rows. It returns
-// their ids and InRelease hashes (the content of their natural keys).
+// wholeChildRows: two snapshot_member rows (InRelease and main/Packages)
+// and one snapshot_skipped_member row; and each left two package rows in
+// the suite's list of its time (five unnamed lists and the live one, by
+// the end). It returns their ids and InRelease hashes (the content of
+// their natural keys).
 func displacedSuite(t *testing.T, c *Cache, key SuiteKey) (ids []int64, anchors []string) {
 	t.Helper()
 	seedRow(t, c, key, 1)
@@ -1256,7 +1259,7 @@ VALUES (?, 'main/skipped', ?, 1, '4xx', 1)`, id, hashes["main/Packages"]); err !
 }
 
 // wholeChildRows is each displacedSuite snapshot's childRowsByTable.
-var wholeChildRows = [3]int{2, 1, 2}
+var wholeChildRows = [2]int{2, 1}
 
 // DN-7: sub-job B (a periodic tick's; a start's too since 2026-11-09) only retires the
 // displaced snapshots beyond keep_displaced, in one short UPDATE —
@@ -1299,7 +1302,7 @@ func TestRunSnapshotGCBatch_RetiresTheDisplacedBeyondKeep(t *testing.T) {
 	for i, id := range ids {
 		beyond, want := i < 2, wholeChildRows
 		if beyond {
-			want = [3]int{}
+			want = [2]int{}
 		}
 		if _, retired := snapshotRetiredAt(t, c, id); snapshotExists(t, c, id) == beyond || retired || childRowsByTable(t, c, id) != want {
 			t.Fatalf("after sub-job C, snapshot %d (beyond keep_displaced: %v): header %v, retired %v, child rows %v; "+

@@ -305,7 +305,8 @@ type PrefetchedURLPath struct {
 //
 //  1. Verify the snapshot is still a candidate (adopted_at IS NULL).
 //  2. Insert all snapshot_member rows for snapshotID.
-//  3. Insert all package_hash rows.
+//  3. Write the suite's package list: a new list holding every package
+//     row (an unsigned candidate: none). Step 6 points the suite at it.
 //     3a. (Phase 3, SPEC3 §7.5.1) Insert/upsert url_path rows for the
 //     hot debs warmed during prefetch. Hotness signal preservation:
 //     DO UPDATE intentionally omits last_requested_at and
@@ -350,7 +351,9 @@ type PrefetchedURLPath struct {
 // skips.
 //
 // PackageHashes is the per-.deb declared-hash assertion set. Pass an
-// empty slice for suites with no .debs (e.g. metadata-only suites).
+// empty slice for suites with no .debs (e.g. metadata-only suites): a
+// signed suite then names an empty list. Paths are unique within the
+// set; a duplicate fails the list's primary key and aborts the flip.
 //
 // PrefetchedURLPaths is the SPEC3 §7.5.1 hot-prefetch outcome list.
 // Pass nil (Phase 2 callers, or Phase 3 callers whose hot-prefetch
@@ -480,37 +483,44 @@ VALUES (?, ?, ?, ?, ?, ?, ?, 0)`)
 			}
 		}
 
-		// Step 3: insert package_hash rows. Phase 3 (SPEC3 §4.3.1)
-		// added package_name and architecture columns; rows whose
-		// stanza didn't declare both end up with empty strings, which
-		// the SPEC3 §7.5.3 hot-set query filters out.
-		packageStmt, err := tx.PrepareContext(ctx, `
-INSERT INTO package_hash (canonical_scheme, canonical_host, path,
-                          declared_sha256, snapshot_id,
-                          package_name, architecture, version, flat_filename)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-		if err != nil {
-			return fmt.Errorf("CommitAdoption: prepare package_hash insert: %w", err)
+		// Step 3: the suite's package list (the package-list design, "The
+		// switch"). A signed candidate's rows go into a new list, which
+		// Step 6 points the suite at; the list the suite named until then
+		// is left unnamed, for GC (RunPackageListGCChunk). An unsigned
+		// candidate writes no row and Step 6 leaves the suite naming no
+		// list (spec C5 safeguard 5: an unsigned snapshot never vouches;
+		// the adopter builds no rows for one). Rows whose stanza declared
+		// no package name or architecture carry empty strings, which the
+		// SPEC3 §7.5.3 hot-set query filters out.
+		//
+		// The suite's row is read here, before Step 5's, because the list
+		// belongs to it: no row is Step 6's ErrSuiteGone, before any row
+		// is written.
+		suiteKey := SuiteKey{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suite}
+		var one int
+		err = tx.QueryRowContext(ctx, `
+SELECT 1 FROM suite_freshness
+ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`, scheme, host, suite).Scan(&one)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("%w: %s://%s%s", ErrSuiteGone, scheme, host, suite)
+		case err != nil:
+			return fmt.Errorf("CommitAdoption: read the suite's row: %w", err)
 		}
-		defer func() { _ = packageStmt.Close() }()
-
-		for _, p := range packageHashes {
-			if !validBlobHash(p.DeclaredSHA256) {
-				return fmt.Errorf("CommitAdoption: package_hash %q declared_sha256 %w", p.Path, ErrInvalidHash)
+		var newList sql.NullInt64 // the list Step 6 points the suite at; NULL for an unsigned candidate
+		if AnchorForm(form) != FormUnsigned {
+			id, err := writePackageListTx(ctx, tx, packageHashes)
+			if err != nil {
+				return fmt.Errorf("CommitAdoption: %w", err)
 			}
-			if _, err := packageStmt.ExecContext(ctx,
-				p.CanonicalScheme, p.CanonicalHost, p.Path,
-				p.DeclaredSHA256, snapshotID,
-				p.PackageName, p.Architecture, p.Version, p.FlatFilename); err != nil {
-				return fmt.Errorf("CommitAdoption: insert package_hash %q: %w", p.Path, err)
+			newList = sql.NullInt64{Int64: id, Valid: true}
+			// Learn identities for requests made before this suite had an
+			// adopted index. This uses only real URL request timestamps;
+			// warming never creates or extends interest. It also handles
+			// newly attributed paths.
+			if err := recordListHotPackages(ctx, tx, id, suiteKey, nil); err != nil {
+				return err
 			}
-		}
-
-		// Learn identities for requests made before this suite had an adopted
-		// index. This uses only real URL request timestamps; warming never
-		// creates or extends interest. It also handles newly attributed paths.
-		if err := recordSnapshotHotPackages(ctx, tx, snapshotID); err != nil {
-			return err
 		}
 
 		now := nowUnix()
@@ -687,15 +697,23 @@ SELECT current_snapshot_id FROM suite_freshness
 		// rolls the whole flip back with ErrSuiteGone: an adoption never
 		// resurrects a suite that cap eviction (or phase F's reaper)
 		// deleted, and createSuiteTx stays the only INSERT.
+		//
+		// The same statement names the suite's package list (Step 3: the
+		// new list, or none for an unsigned candidate) and bumps
+		// package_list_generation, as every writer of a suite's list does
+		// in its own transaction: readers see the snapshot and its package
+		// rows change together.
 		res, err := tx.ExecContext(ctx, `
 UPDATE suite_freshness
    SET current_snapshot_id      = ?,
+       package_list_id          = ?,
+       package_list_generation  = package_list_generation + 1,
        inrelease_etag           = ?,
        inrelease_lastmod        = ?,
        inrelease_change_seen_at = NULL,
        `+clearAdoptionFailureSet+`
  WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,
-			snapshotID, candETag, candLastMod, scheme, host, suite)
+			snapshotID, newList, candETag, candLastMod, scheme, host, suite)
 		if err != nil {
 			return fmt.Errorf("CommitAdoption: flip pointer: %w", err)
 		}
@@ -839,15 +857,18 @@ WHERE snapshot_id = ?`
 	return out, nil
 }
 
-// GetPackageHash returns the package_hash row for (scheme, host, path,
-// snapshot_id), or ErrNotFound. Hot path: §6.5 .deb hash validation.
+// GetPackageHash returns the package row for (scheme, host, path) in the
+// list of the suite whose current snapshot is snapshotID, or ErrNotFound:
+// the row that snapshot declares. A snapshot that is no suite's current
+// one has no rows (schema 11). It has no caller but tests.
 func (c *Cache) GetPackageHash(ctx context.Context, scheme, host, path string, snapshotID int64) (*PackageHash, error) {
 	const q = `
-SELECT canonical_scheme, canonical_host, path, declared_sha256, snapshot_id
-FROM package_hash
-WHERE canonical_scheme = ? AND canonical_host = ? AND path = ? AND snapshot_id = ?`
+SELECT e.canonical_scheme, e.canonical_host, e.path, e.declared_sha256, sf.current_snapshot_id
+FROM suite_freshness sf
+JOIN package_list_entry e ON e.package_list_id = sf.package_list_id
+WHERE sf.current_snapshot_id = ? AND e.canonical_scheme = ? AND e.canonical_host = ? AND e.path = ?`
 	var p PackageHash
-	err := c.db.QueryRowContext(ctx, q, scheme, host, path, snapshotID).Scan(
+	err := c.db.QueryRowContext(ctx, q, snapshotID, scheme, host, path).Scan(
 		&p.CanonicalScheme, &p.CanonicalHost, &p.Path, &p.DeclaredSHA256, &p.SnapshotID,
 	)
 	switch {
@@ -882,9 +903,10 @@ type DeclaredHash struct {
 
 // DeclaredHashesForPath returns every package_hash row covering this .deb
 // path under any signed (inline or detached) current snapshot — an
-// unsigned one never vouches (deferred minor E-2). Joins package_hash →
-// suite_freshness on current_snapshot_id so a row whose snapshot was
-// displaced (orphaned rows from a prior adoption) does not count. SPEC2
+// unsigned one never vouches (deferred minor E-2). Reads the entries of
+// the lists suites name (package_list_entry → suite_freshness on
+// package_list_id), so a row of a list no suite names any more (a
+// rewritten list, a removed suite's, until GC) does not count. SPEC2
 // §6.1 step 2 / §6.2.
 //
 // Returns rows in no defined order. Empty slice + nil error means "no
@@ -920,7 +942,7 @@ type DeclaredHash struct {
 func (c *Cache) DeclaredHashesForPath(ctx context.Context, scheme, host, path string) ([]DeclaredHash, error) {
 	out, err := c.declaredHashesExact(ctx, scheme, host, path)
 	if err != nil || len(out) > 0 || !c.flatRows.Load() {
-		// Ruling PG-31: with no flat row in package_hash (every cache
+		// Ruling PG-31: with no flat row in package_list_entry (every cache
 		// with adoption off, or without flat suites) the fallback could
 		// find nothing — see Cache.flatRows for why false is never stale.
 		return out, err
@@ -929,8 +951,8 @@ func (c *Cache) DeclaredHashesForPath(ctx context.Context, scheme, host, path st
 }
 
 // noteFlatRows sets Cache.flatRows when rows hold a flat row (a non-empty
-// FlatFilename). Every package_hash writer calls it before it submits the
-// transaction that inserts rows (ruling PG-31).
+// FlatFilename). Every writer of package rows calls it before it submits
+// the transaction that inserts rows (ruling PG-31).
 func (c *Cache) noteFlatRows(rows []PackageHash) {
 	for _, r := range rows {
 		if r.FlatFilename != "" {
@@ -941,34 +963,33 @@ func (c *Cache) noteFlatRows(rows []PackageHash) {
 }
 
 // declaredExactSQL is the exact lookup's query (spec C6 step 1): the
-// current signed snapshots' rows of (scheme, host) whose path is the
-// request path, with the row's suite path.
+// entries of (scheme, host) whose path is the request path, in the lists
+// that suites with a signed current snapshot name, with the suite's path
+// and current snapshot.
 //
 // AIDEV-NOTE: spec C5 safeguard 5 — an unsigned snapshot never vouches
-// a .deb. Adoption builds no package_hash rows for one; the form
-// filter keeps any that exist out (defence in depth).
+// a .deb. Adoption builds no package rows for one and its commit leaves
+// the suite naming no list; the form filter keeps out any that exist
+// regardless (defence in depth).
 //
-// AIDEV-NOTE: design review M-2 (phase G). Both lookups (this query and
-// declaredBySuffixSQL) join suite_freshness on its primary key — the
-// snapshot's own suite, read from suite_snapshot — and current_snapshot_id,
-// never on current_snapshot_id alone: that column has no index, so the
-// bare join scanned suite_freshness once per matched row (up to
-// max_suites rows for each current, displaced or retired snapshot that
-// declares the name). A snapshot belongs to its suite_snapshot row's
-// suite, so the key terms change no answer.
-// TestDeclaredHashesForPath_TheExactLookupProbesSuiteFreshnessByItsKey and
-// TestDeclaredHashesForPath_TheFallbackUsesThePartialIndex pin both plans.
+// AIDEV-NOTE: design review M-2 (phase G), restated for schema 11. Both
+// lookups (this query and declaredBySuffixSQL) reach the suite from an
+// entry by its list: `sf.package_list_id = e.package_list_id`, a probe of
+// the unique partial index idx_suite_freshness_package_list. They never
+// join suite_freshness on current_snapshot_id, which has no index (the
+// bare join scanned up to max_suites rows per matched row). The inner
+// joins are also what hides a list no suite names (package_list.go).
+// TestPackageListReaders_QueryPlans,
+// TestDeclaredHashesForPath_TheExactLookupProbesSuiteFreshnessByItsList and
+// TestDeclaredHashesForPath_TheFallbackUsesThePartialIndex pin the plans.
 const declaredExactSQL = `
-SELECT DISTINCT p.declared_sha256, p.snapshot_id, p.package_name, sf.suite_path
-  FROM package_hash p
-  JOIN suite_snapshot ss  ON ss.snapshot_id = p.snapshot_id
-  JOIN suite_freshness sf ON sf.canonical_scheme    = ss.canonical_scheme
-                         AND sf.canonical_host      = ss.canonical_host
-                         AND sf.suite_path          = ss.suite_path
-                         AND sf.current_snapshot_id = p.snapshot_id
- WHERE p.canonical_scheme = ?
-   AND p.canonical_host   = ?
-   AND p.path             = ?
+SELECT DISTINCT e.declared_sha256, sf.current_snapshot_id, e.package_name, sf.suite_path
+  FROM package_list_entry e
+  JOIN suite_freshness sf ON sf.package_list_id = e.package_list_id
+  JOIN suite_snapshot ss  ON ss.snapshot_id     = sf.current_snapshot_id
+ WHERE e.canonical_scheme = ?
+   AND e.canonical_host   = ?
+   AND e.path             = ?
    AND ss.anchor_form    <> 'unsigned'`
 
 // declaredHashesExact is DeclaredHashesForPath's exact lookup (spec C6
@@ -994,9 +1015,12 @@ func (c *Cache) declaredHashesExact(ctx context.Context, scheme, host, path stri
 }
 
 // flatRowsExistSQL primes Cache.flatRows at Open (ruling PG-31): whether
-// package_hash holds a flat row, one probe of the partial index
-// idx_package_hash_flat_filename (whose WHERE is the same term).
-const flatRowsExistSQL = `SELECT EXISTS(SELECT 1 FROM package_hash WHERE flat_filename <> '')`
+// package_list_entry holds a flat row, one probe of the partial index
+// idx_package_list_entry_flat (whose WHERE is the same term). It reads
+// every list, named by a suite or not: true is never wrong, and a true
+// for a list only GC has yet to delete costs the fallback's query until
+// the next Open.
+const flatRowsExistSQL = `SELECT EXISTS(SELECT 1 FROM package_list_entry WHERE flat_filename <> '')`
 
 // maxFallbackSegments bounds spec C6's suffix fallback: a dot-cleaned
 // request path of more segments is never looked up by suffix (a constant;
@@ -1071,29 +1095,27 @@ func flatSplits(path string) (bases, names []string) {
 	return bases, names
 }
 
-// declaredBySuffixSQL is the suffix fallback's query for n names: the
-// current signed snapshots' flat rows of (scheme, host) whose
-// flat_filename is one of them, with the row's suite path.
+// declaredBySuffixSQL is the suffix fallback's query for n names: the flat
+// entries of (scheme, host) whose flat_filename is one of them, in the
+// lists that suites with a signed current snapshot name, with the suite's
+// path and current snapshot.
 //
 // AIDEV-NOTE: the term requiring a non-empty flat_filename is what lets
-// SQLite use the partial index idx_package_hash_flat_filename (whose WHERE
+// SQLite use the partial index idx_package_list_entry_flat (whose WHERE
 // is the same term); without it every lookup scans the host's rows. The
-// suite_freshness join is declaredExactSQL's: by its primary key (design
+// suite_freshness join is declaredExactSQL's: by the list (design
 // review M-2).
 // TestDeclaredHashesForPath_TheFallbackUsesThePartialIndex pins the plan.
 func declaredBySuffixSQL(n int) string {
 	return `
-SELECT DISTINCT p.declared_sha256, p.snapshot_id, p.package_name, sf.suite_path, p.flat_filename
-  FROM package_hash p
-  JOIN suite_snapshot ss  ON ss.snapshot_id = p.snapshot_id
-  JOIN suite_freshness sf ON sf.canonical_scheme    = ss.canonical_scheme
-                         AND sf.canonical_host      = ss.canonical_host
-                         AND sf.suite_path          = ss.suite_path
-                         AND sf.current_snapshot_id = p.snapshot_id
- WHERE p.canonical_scheme = ?
-   AND p.canonical_host   = ?
-   AND p.flat_filename   <> ''
-   AND p.flat_filename IN (` + strings.TrimSuffix(strings.Repeat("?, ", n), ", ") + `)
+SELECT DISTINCT e.declared_sha256, sf.current_snapshot_id, e.package_name, sf.suite_path, e.flat_filename
+  FROM package_list_entry e
+  JOIN suite_freshness sf ON sf.package_list_id = e.package_list_id
+  JOIN suite_snapshot ss  ON ss.snapshot_id     = sf.current_snapshot_id
+ WHERE e.canonical_scheme = ?
+   AND e.canonical_host   = ?
+   AND e.flat_filename   <> ''
+   AND e.flat_filename IN (` + strings.TrimSuffix(strings.Repeat("?, ", n), ", ") + `)
    AND ss.anchor_form    <> 'unsigned'`
 }
 
@@ -1166,9 +1188,11 @@ type IntegrityCandidate struct {
 }
 
 // ListIntegrityCandidates returns one row per distinct blob hash pinned
-// by any current snapshot, drawn from snapshot_member and package_hash.
-// Rows whose snapshot is no longer current (displaced by a later
-// adoption) are excluded — the §6.5 scanner only verifies blobs the
+// by any current snapshot, drawn from snapshot_member and the package
+// lists suites name (source "package_hash": the name the log line has
+// always used for a package's declared hash). Rows whose snapshot is no
+// longer current (displaced by a later adoption), and entries of a list no
+// suite names, are excluded — the §6.5 scanner only verifies blobs the
 // current contract still relies on. SPEC §10.2's "first-found is
 // reported" semantic governs duplicates: when the same blob is pinned
 // by both a snapshot_member and a package_hash, snapshot_member wins
@@ -1192,12 +1216,12 @@ SELECT blob_hash, declared_sha256, snapshot_id, source FROM (
     FROM snapshot_member sm
     JOIN suite_freshness sf ON sf.current_snapshot_id = sm.snapshot_id
   UNION ALL
-  SELECT p.declared_sha256 AS blob_hash,
-         p.declared_sha256 AS declared_sha256,
-         p.snapshot_id     AS snapshot_id,
-         'package_hash'    AS source
-    FROM package_hash p
-    JOIN suite_freshness sf ON sf.current_snapshot_id = p.snapshot_id
+  SELECT e.declared_sha256      AS blob_hash,
+         e.declared_sha256      AS declared_sha256,
+         sf.current_snapshot_id AS snapshot_id,
+         'package_hash'         AS source
+    FROM package_list_entry e
+    JOIN suite_freshness sf ON sf.package_list_id = e.package_list_id
 )`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {

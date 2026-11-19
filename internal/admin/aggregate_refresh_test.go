@@ -173,10 +173,16 @@ func TestAggregateRefreshExternalCommitInvalidates(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
-	if _, err := db.ExecContext(ctx, `INSERT INTO package_hash
-(canonical_scheme, canonical_host, path, declared_sha256, snapshot_id, architecture)
-VALUES ('https', 'example.test', '/pool/externally-added.deb', ?, ?, 'amd64')`, strings.Repeat("b", 64), id); err != nil {
+	// A row added to the suite's package list from another connection.
+	res, err := db.ExecContext(ctx, `INSERT INTO package_list_entry
+(package_list_id, canonical_scheme, canonical_host, path, declared_sha256, architecture)
+SELECT package_list_id, 'https', 'example.test', '/pool/externally-added.deb', ?, 'amd64'
+  FROM suite_freshness WHERE current_snapshot_id = ?`, strings.Repeat("b", 64), id)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		t.Fatalf("the external insert wrote %d rows (%v), want 1: the suite names a list", n, err)
 	}
 	s.refreshDatabaseAggregates(ctx)
 	if got := s.repoCoverage.Load(); got == before || got.PackageHashRowsBinary != 1 {

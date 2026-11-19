@@ -60,7 +60,7 @@ const (
 	writeGCBlobs
 	writeGCSnapshots
 	writeGCRetiredSnapshots
-	writeGCDisplacedPackages
+	writeGCPackageLists
 	writeGCURLPaths
 	writeLegacyAuditEnqueue
 	writeLegacyAuditApply
@@ -105,7 +105,7 @@ var writeKindNames = [numWriteKinds]string{
 	writeGCBlobs:                  "gc_blobs",
 	writeGCSnapshots:              "gc_snapshots",
 	writeGCRetiredSnapshots:       "gc_retired_snapshots",
-	writeGCDisplacedPackages:      "gc_displaced_packages",
+	writeGCPackageLists:           "gc_package_lists",
 	writeGCURLPaths:               "gc_url_paths",
 	writeLegacyAuditEnqueue:       "legacy_audit_enqueue",
 	writeLegacyAuditApply:         "legacy_audit_apply",

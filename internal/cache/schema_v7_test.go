@@ -272,13 +272,15 @@ func TestSchemaV7_TriggerRejectsEmptyFormAndUniqueIndexIsPartial(t *testing.T) {
 	                      VALUES('http','h','/u/dists/s1',?,'bogus',1)`, hB); err == nil {
 		t.Fatal("bogus anchor_form accepted")
 	}
-	// The flat_filename partial index exists, and is partial (deferred minor A-21).
+	// The flat_filename partial index exists, and is partial (deferred minor
+	// A-21). The migration here runs to the current schema, where the index
+	// v7 created on package_hash is schema 11's on package_list_entry.
 	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_package_hash_flat_filename'`).Scan(&n); err != nil || n != 1 {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_package_list_entry_flat'`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("flat_filename index missing (%v)", err)
 	}
 	var partial int
-	if err := db.QueryRow(`SELECT partial FROM pragma_index_list('package_hash') WHERE name = 'idx_package_hash_flat_filename'`).Scan(&partial); err != nil || partial != 1 {
+	if err := db.QueryRow(`SELECT partial FROM pragma_index_list('package_list_entry') WHERE name = 'idx_package_list_entry_flat'`).Scan(&partial); err != nil || partial != 1 {
 		t.Fatalf("flat_filename index partial = %d (%v), want 1", partial, err)
 	}
 }

@@ -156,9 +156,12 @@ type SkippedMember struct {
 	RetryCount     int64
 }
 
-// PackageHash mirrors the package_hash table — one (host, .deb path,
-// snapshot_id) row asserting that the .deb at the URL must hash to
-// DeclaredSHA256 under this snapshot. SPEC2 §4.3.1, §7.5 step 8.
+// PackageHash is one package row — (host, .deb path) asserting that the
+// .deb at the URL must hash to DeclaredSHA256 under the suite's current
+// snapshot. SPEC2 §4.3.1, §7.5 step 8. Since schema 11 the rows are kept
+// in package_list_entry, one list per suite (package_list.go), not per
+// snapshot in package_hash: SnapshotID is not stored. Writers ignore it;
+// GetPackageHash and the test helpers fill it with the snapshot asked for.
 //
 // Phase 3 (SPEC3 §4.3.1) adds PackageName and Architecture: the binary
 // `Package:` and `Architecture:` from the Packages stanza. The hot-set
@@ -179,11 +182,11 @@ type PackageHash struct {
 	// (PackageName, Architecture). Empty for source/pdiff/Contents rows and
 	// for pre-v6 rows; the mirror rule only applies to non-empty versions.
 	Version string
-	// FlatFilename is package_hash.flat_filename (spec C6): for a flat
+	// FlatFilename is the row's flat_filename (spec C6): for a flat
 	// suite's row, its stanza's Filename with every "." segment removed
 	// (aptpath.DotClean), the key DeclaredHashesForPath's suffix fallback
 	// looks a request up by; "" for a dists row, which the fallback never
-	// reads (the partial index idx_package_hash_flat_filename leaves it
+	// reads (the partial index idx_package_list_entry_flat leaves it
 	// out).
 	FlatFilename string
 }

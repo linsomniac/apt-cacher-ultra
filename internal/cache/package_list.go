@@ -1,10 +1,86 @@
 package cache
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
 )
+
+// A package list is the set of package rows a suite's current snapshot
+// declares (schema 11; docs/superpowers/specs/2026-11-18-package-list-per-suite-design.md).
+// package_list holds its id, package_list_entry its rows, and
+// suite_freshness.package_list_id names the list a suite serves from.
+//
+// AIDEV-NOTE: who may see an entry. A list a suite names is live: every
+// reader reaches entries through `JOIN suite_freshness sf ON
+// sf.package_list_id = e.package_list_id` (the unique partial index
+// idx_suite_freshness_package_list), so an entry of a list no suite names
+// — a rewritten list, a removed or quarantined suite's, until GC deletes
+// it (RunPackageListGCChunk) — is invisible to vouching, the at-rest
+// scan, the admin counts, the url-path GC's retention and the hot_package
+// triggers. The one reader without that join is flatRowsExistSQL, whose
+// answer may be true for no reason and never false for one (ruling
+// PG-31). A new reader of package_list_entry must join the same way;
+// TestPackageListReaders_AnUnnamedListIsInvisible is where it is pinned.
+//
+// AIDEV-NOTE: who writes a suite's list, each bumping
+// suite_freshness.package_list_generation in the same transaction:
+// CommitAdoption (a new list, or none for an unsigned candidate),
+// InsertReconciledMembers (rows added to the live list), the legacy
+// audit's quarantine (the suite names none). A suite's delete leaves its
+// list unnamed with nothing to bump. A new writer must bump it too: the
+// generation is what a commit checks a difference against.
+
+// insertPackageListEntrySQL inserts one row into a list.
+const insertPackageListEntrySQL = `
+INSERT INTO package_list_entry (package_list_id, canonical_scheme, canonical_host, path,
+                                declared_sha256, package_name, architecture, version, flat_filename)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+// writePackageListTx creates a new package list holding rows and returns
+// its id. Nothing names the list yet: the caller points a suite at it in
+// the same transaction, or it is garbage. Each row's declared hash is
+// shape-checked first; two rows with one path fail the list's primary
+// key. rows is not reordered.
+//
+// AIDEV-NOTE: the rows go in by ascending path, so a new list (the highest
+// id) appends to the right edge of the primary key instead of landing at
+// 67,000 scattered places; the path index still takes them scattered.
+// Measured on a production database copy: 67,000 rows, about 2 s and
+// 67 MiB of WAL (the plan, "Measured before planning").
+func writePackageListTx(ctx context.Context, tx *sql.Tx, rows []PackageHash) (int64, error) {
+	res, err := tx.ExecContext(ctx, `INSERT INTO package_list DEFAULT VALUES`)
+	if err != nil {
+		return 0, fmt.Errorf("create package list: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("create package list: %w", err)
+	}
+	stmt, err := tx.PrepareContext(ctx, insertPackageListEntrySQL)
+	if err != nil {
+		return 0, fmt.Errorf("prepare package_hash insert: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
+	order := make([]int, len(rows))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(i, j int) bool { return rows[order[i]].Path < rows[order[j]].Path })
+	for _, i := range order {
+		p := rows[i]
+		if !validBlobHash(p.DeclaredSHA256) {
+			return 0, fmt.Errorf("package_hash %q declared_sha256 %w", p.Path, ErrInvalidHash)
+		}
+		if _, err := stmt.ExecContext(ctx, id, p.CanonicalScheme, p.CanonicalHost, p.Path,
+			p.DeclaredSHA256, p.PackageName, p.Architecture, p.Version, p.FlatFilename); err != nil {
+			return 0, fmt.Errorf("insert package_hash %q: %w", p.Path, err)
+		}
+	}
+	return id, nil
+}
 
 // PackageListDiff is what turns a suite's live package list into an
 // adoption's new rows (the package-list design, "The switch"): the paths

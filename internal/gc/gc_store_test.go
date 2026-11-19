@@ -54,11 +54,11 @@ type fakeStore struct {
 	chunkHook   func() // called on every RunRetiredSnapshotGCChunk call that does not panic, before it fails or answers; runs under f.mu: it must not call the fake
 	hashPanic   string
 
-	dChunks          int           // RunDisplacedPackageHashChunk calls
-	dChunkRows       []int         // maxRows of each RunDisplacedPackageHashChunk call
+	dChunks          int           // RunPackageListGCChunk calls
+	dChunkRows       []int         // maxRows of each RunPackageListGCChunk call
 	dChunksMore      int           // the first dChunksMore D calls strip fakeDChunkRows rows each and report more
-	dChunkErrs       bool          // RunDisplacedPackageHashChunk fails
-	dChunkNotStarted bool          // RunDisplacedPackageHashChunk returns cache.ErrWriteNotStarted (its start deadline)
+	dChunkErrs       bool          // RunPackageListGCChunk fails
+	dChunkNotStarted bool          // RunPackageListGCChunk returns cache.ErrWriteNotStarted (its start deadline)
 	dChunkSleep      time.Duration // each D chunk takes this long (virtual time in a bubble)
 
 	calls []string // "batch", "C", "D": the snapshot pass's store calls, in order
@@ -142,7 +142,7 @@ func (f *fakeStore) RunRetiredSnapshotGCChunk(_ context.Context, maxRows int) (i
 	return 0, false, nil
 }
 
-func (f *fakeStore) RunDisplacedPackageHashChunk(_ context.Context, maxRows int) (int, bool, error) {
+func (f *fakeStore) RunPackageListGCChunk(_ context.Context, maxRows int) (int, bool, error) {
 	time.Sleep(f.dChunkSleep)
 	f.mu.Lock()
 	defer f.mu.Unlock()

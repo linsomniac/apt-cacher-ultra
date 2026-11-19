@@ -236,7 +236,8 @@ func TestDeclaredHashesForPath_TheFallbackReadsCurrentSignedSnapshotsOnly(t *tes
 // Spec C6 "non-retired": a snapshot retired through either retirement
 // path — the legacy audit's quarantine and the reaper's delete — vouches
 // nothing, by its exact rows or through the fallback, although its
-// package_hash rows are still there. Neither path leaves a current
+// package rows are still there (its suite's list, unnamed until GC
+// deletes it). Neither path leaves a current
 // pointer at a retired snapshot: the quarantine clears the pointer before
 // it stamps retired_at, and the reaper stamps retired_at and then deletes
 // the suite's row, in one transaction (suite_reap.go deleteSuiteTx). This
@@ -267,10 +268,10 @@ func TestDeclaredHashesForPath_ARetiredSnapshotVouchesNothing(t *testing.T) {
 		if err := c.db.QueryRowContext(ctx, `SELECT retired_at FROM suite_snapshot WHERE snapshot_id = ?`, id).Scan(&retired); err != nil || !retired.Valid {
 			t.Fatalf("snapshot %d: retired_at %v, %v; want it retired", id, retired, err)
 		}
-		var rows int
-		if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM package_hash WHERE snapshot_id = ?`, id).Scan(&rows); err != nil || rows != 1 {
-			t.Fatalf("snapshot %d: %d package_hash rows, %v; want its row still there", id, rows, err)
-		}
+	}
+	lists := unnamedLists(t, c)
+	if len(lists) != 2 || entryCount(t, c, lists[0]) != 1 || entryCount(t, c, lists[1]) != 1 {
+		t.Fatalf("unnamed lists = %v; want the two retired snapshots' lists, each still holding its row", lists)
 	}
 	for _, p := range paths {
 		if got := declared(t, c, p); got != nil {
@@ -302,14 +303,16 @@ func queryPlan(t *testing.T, c *Cache, q string, args ...any) string {
 	return strings.Join(plan, "\n")
 }
 
-// suiteFreshnessByKey is the plan line of a suite_freshness probe by its
-// primary key (design review M-2: current_snapshot_id has no index, so a
-// join on it alone scans the table once per matched row).
-const suiteFreshnessByKey = "SEARCH sf USING INDEX sqlite_autoindex_suite_freshness_1 (canonical_scheme=? AND canonical_host=? AND suite_path=?)"
+// suiteFreshnessByList is the plan line of a suite_freshness probe by the
+// list an entry belongs to (design review M-2, restated for schema 11:
+// current_snapshot_id has no index, so a join on it alone scans the table
+// once per matched row; the unique partial index on package_list_id is
+// what every reader reaches the suite by).
+const suiteFreshnessByList = "SEARCH sf USING INDEX idx_suite_freshness_package_list (package_list_id=?)"
 
 // AIDEV-NOTE pin: the fallback's query uses the partial index over
 // flat_filename (spec C6: "an EXPLAIN QUERY PLAN assertion pins it"), and
-// probes suite_freshness by its primary key, never scanning it (design
+// probes suite_freshness by the entry's list, never scanning it (design
 // review M-2).
 //
 // It is pinned at every IN size production builds, up to the worst case
@@ -322,27 +325,27 @@ func TestDeclaredHashesForPath_TheFallbackUsesThePartialIndex(t *testing.T) {
 			args = append(args, strings.Repeat("d/", i)+"b.deb")
 		}
 		plan := queryPlan(t, c, declaredBySuffixSQL(n), args...)
-		if !strings.Contains(plan, "USING INDEX idx_package_hash_flat_filename") {
-			t.Fatalf("n=%d: query plan does not use idx_package_hash_flat_filename:\n%s", n, plan)
+		if !strings.Contains(plan, "USING INDEX idx_package_list_entry_flat") {
+			t.Fatalf("n=%d: query plan does not use idx_package_list_entry_flat:\n%s", n, plan)
 		}
-		if !strings.Contains(plan, suiteFreshnessByKey) || strings.Contains(plan, "SCAN ") {
-			t.Fatalf("n=%d: query plan scans a table or does not probe suite_freshness by its key:\n%s", n, plan)
+		if !strings.Contains(plan, suiteFreshnessByList) || strings.Contains(plan, "SCAN ") {
+			t.Fatalf("n=%d: query plan scans a table or does not probe suite_freshness by the list:\n%s", n, plan)
 		}
 	}
 }
 
 // Design review M-2 on the exact lookup (spec C6 step 1, every .deb
-// request): suite_freshness is probed by its primary key, never scanned.
-func TestDeclaredHashesForPath_TheExactLookupProbesSuiteFreshnessByItsKey(t *testing.T) {
+// request): suite_freshness is probed by the entry's list, never scanned.
+func TestDeclaredHashesForPath_TheExactLookupProbesSuiteFreshnessByItsList(t *testing.T) {
 	c := openCache(t)
 	plan := queryPlan(t, c, declaredExactSQL, "http", "h", "/a/b.deb")
-	if !strings.Contains(plan, suiteFreshnessByKey) || strings.Contains(plan, "SCAN ") {
-		t.Fatalf("query plan scans a table or does not probe suite_freshness by its key:\n%s", plan)
+	if !strings.Contains(plan, suiteFreshnessByList) || strings.Contains(plan, "SCAN ") {
+		t.Fatalf("query plan scans a table or does not probe suite_freshness by the list:\n%s", plan)
 	}
 }
 
 // Ruling PG-31 (the final review's concurrency lens m-1): the cache's
-// "flat rows may exist" flag. Open primes it from package_hash — false on
+// "flat rows may exist" flag. Open primes it from package_list_entry — false on
 // a cache with no flat row, true on one with — by one probe of the partial
 // index; CommitAdoption and reconcile's insert set it before the
 // transaction that inserts a flat row commits, so a fallback lookup right
@@ -400,8 +403,8 @@ func TestDeclaredHashesForPath_TheFlatRowsFlag(t *testing.T) {
 		if got := declared(t, c, twin); !slices.Equal(got, []string{"a@/repo"}) {
 			t.Fatalf("fallback after a reopen = %v, want [a@/repo]", got)
 		}
-		if plan := queryPlan(t, c, flatRowsExistSQL); !strings.Contains(plan, "INDEX idx_package_hash_flat_filename") {
-			t.Fatalf("the prime does not probe idx_package_hash_flat_filename:\n%s", plan)
+		if plan := queryPlan(t, c, flatRowsExistSQL); !strings.Contains(plan, "INDEX idx_package_list_entry_flat") {
+			t.Fatalf("the prime does not probe idx_package_list_entry_flat:\n%s", plan)
 		}
 	})
 	t.Run("false skips the fallback", func(t *testing.T) {
