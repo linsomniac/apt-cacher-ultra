@@ -200,3 +200,274 @@ func diffPackageRows(next func() (row PackageHash, ok bool, err error), rows []P
 	}
 	return d, nil
 }
+
+// How a commit wrote its suite's package list (PackageListWrite.Mode).
+const (
+	PackageListDifference = "difference" // the live list was changed in place
+	PackageListRewrite    = "rewrite"    // a new list was written whole
+	PackageListNone       = "none"       // an unsigned commit: the suite names no list
+)
+
+// PackageListWrite says how a commit wrote its suite's package list.
+type PackageListWrite struct {
+	Mode string
+	// Reason says why a rewrite was not a difference: "first" (the suite
+	// named no list), "no_difference" (the commit was given none), "large"
+	// (more than half the new list differs), "list_changed" (the list was
+	// written after the difference was read), "mismatch" (the difference
+	// did not produce the new rows: a defect, reported by the adopter).
+	Reason string
+	// Rows inserted, updated and deleted. A rewrite counts every row as
+	// Added.
+	Added, Changed, Removed int
+	// A mismatch: the rows the list must hold, the rows it held with the
+	// difference applied, and what was wrong.
+	Expected, Found int
+	Detail          string
+}
+
+// DiffPackageList reads key's live package list, on a reader connection in
+// one read transaction, and returns what turns it into rows: the argument
+// CommitAdoptionDiff takes. It returns nil, nil when the suite names no
+// list (or has no row): there is nothing to differ from, and the commit
+// writes a whole list. A difference of more than half of rows is returned
+// TooLarge, without its rows: the commit would not apply it. rows is not
+// reordered; two of its rows with one path are ErrDuplicatePackagePath.
+//
+// The list is streamed in path order (its primary key's) and never held:
+// only the rows that differ are kept, at most len(rows)/2 of them.
+func (c *Cache) DiffPackageList(ctx context.Context, key SuiteKey, rows []PackageHash) (*PackageListDiff, error) {
+	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("DiffPackageList: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var (
+		listID     sql.NullInt64
+		generation int64
+	)
+	err = tx.QueryRowContext(ctx, `
+SELECT package_list_id, package_list_generation FROM suite_freshness
+ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`,
+		key.CanonicalScheme, key.CanonicalHost, key.SuitePath).Scan(&listID, &generation)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, nil
+	case err != nil:
+		return nil, fmt.Errorf("DiffPackageList: read the suite's list: %w", err)
+	}
+	if !listID.Valid {
+		return nil, nil
+	}
+	live, err := tx.QueryContext(ctx, `
+SELECT canonical_scheme, canonical_host, path, declared_sha256,
+       package_name, architecture, version, flat_filename
+  FROM package_list_entry WHERE package_list_id = ? ORDER BY path`, listID.Int64)
+	if err != nil {
+		return nil, fmt.Errorf("DiffPackageList: read list %d: %w", listID.Int64, err)
+	}
+	defer func() { _ = live.Close() }()
+	next := func() (PackageHash, bool, error) {
+		if !live.Next() {
+			return PackageHash{}, false, live.Err()
+		}
+		var p PackageHash
+		if err := live.Scan(&p.CanonicalScheme, &p.CanonicalHost, &p.Path, &p.DeclaredSHA256,
+			&p.PackageName, &p.Architecture, &p.Version, &p.FlatFilename); err != nil {
+			return PackageHash{}, false, err
+		}
+		return p, true, nil
+	}
+	d, err := diffPackageRows(next, rows, len(rows)/2)
+	if err != nil {
+		return nil, fmt.Errorf("DiffPackageList: %w", err)
+	}
+	d.ListID, d.Generation = listID.Int64, generation
+	return &d, nil
+}
+
+// commitPackageListTx brings key's package list to rows inside the flip
+// transaction and returns the list the suite is to name (the caller's
+// Step 6 points it there and bumps the generation) and how it got there.
+// live and generation are the suite's package_list_id and
+// package_list_generation, read in this transaction.
+//
+// The difference path: diff is applied to the live list in place, when it
+// was computed against this list at this generation and is at most half
+// of rows. The rewrite path, otherwise and whenever the difference turns
+// out wrong: a new list holding rows; the live one is left unnamed, for
+// GC.
+//
+// AIDEV-NOTE: this is the guard the package-list design rests on ("The
+// switch", step 1). A difference says how to turn one particular state of
+// the list into rows; applied to any other state it produces a list that
+// is neither. package_list_generation, bumped by every writer of a
+// suite's list in its own transaction (package_list.go has the list of
+// them), is what makes "computed against this list" checkable here, in
+// the transaction that applies it. The suite's mutex is why the check
+// normally passes — it keeps another adoption and a reconcile of the
+// suite out between the read and the commit — but it is not the proof:
+// the proof is this comparison. A new writer of a list that does not bump
+// the generation breaks it silently; TestPackageLists_AModelOfTheSwitch
+// is where that would show.
+func commitPackageListTx(ctx context.Context, tx *sql.Tx, key SuiteKey, live sql.NullInt64, generation int64,
+	rows []PackageHash, diff *PackageListDiff) (listID int64, w PackageListWrite, err error) {
+	switch {
+	case !live.Valid:
+		w.Reason = "first"
+	case diff == nil:
+		w.Reason = "no_difference"
+	case diff.TooLarge || diff.Size() > len(rows)/2:
+		w.Reason = "large"
+	case diff.ListID != live.Int64 || diff.Generation != generation:
+		w.Reason = "list_changed"
+	}
+	if w.Reason == "" {
+		found, detail, err := applyPackageListDiffTx(ctx, tx, key, live.Int64, len(rows), diff)
+		if err != nil {
+			return 0, PackageListWrite{}, err
+		}
+		if detail == "" {
+			return live.Int64, PackageListWrite{Mode: PackageListDifference,
+				Added: len(diff.Added), Changed: len(diff.Changed), Removed: len(diff.Removed)}, nil
+		}
+		w.Reason, w.Expected, w.Found, w.Detail = "mismatch", len(rows), found, detail
+	}
+	id, err := writePackageListTx(ctx, tx, rows)
+	if err != nil {
+		return 0, PackageListWrite{}, err
+	}
+	// Learn identities for requests made before this suite had the row.
+	// Only real request stamps count; warming never creates or extends
+	// interest.
+	if err := recordListHotPackages(ctx, tx, id, key, nil); err != nil {
+		return 0, PackageListWrite{}, err
+	}
+	w.Mode, w.Added = PackageListRewrite, len(rows)
+	return id, w, nil
+}
+
+// applyPackageListDiffTx applies diff to list listID inside a savepoint:
+// each removed path deleted, each changed row updated, each added row
+// inserted, one statement a row, by the list's primary key; then it
+// records hot-package interest for the changed and added rows. detail ==
+// "" means the list now holds exactly want rows and every statement did
+// what the difference said it would. Otherwise the difference was wrong:
+// the savepoint is rolled back, so the list is as it was, and detail says
+// what did not hold (found is the row count when that was it).
+//
+// AIDEV-NOTE: the tripwires, none of them a proof (a wrong hash on a
+// changed row passes all three; the model test is the proof). Each DELETE
+// and UPDATE must hit exactly one row; an INSERT must not fail; the final
+// count must be the number of new rows. A failed tripwire is not an error:
+// the caller writes the whole list instead, which is exact by
+// construction, and the adopter reports it (ERROR package_list_mismatch).
+// Failing the adoption would repeat at every retry against the same list.
+// A malformed hash is an error, as on the rewrite path: the rows are bad,
+// not the difference. One statement per row, never an IN list: a
+// difference can exceed SQLite's 32,766 bound parameters.
+func applyPackageListDiffTx(ctx context.Context, tx *sql.Tx, key SuiteKey, listID int64, want int, diff *PackageListDiff) (found int, detail string, err error) {
+	for _, set := range [][]PackageHash{diff.Changed, diff.Added} {
+		for _, p := range set {
+			if !validBlobHash(p.DeclaredSHA256) {
+				return 0, "", fmt.Errorf("package_hash %q declared_sha256 %w", p.Path, ErrInvalidHash)
+			}
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT package_list`); err != nil {
+		return 0, "", fmt.Errorf("package list savepoint: %w", err)
+	}
+	found, detail, err = runPackageListDiffTx(ctx, tx, key, listID, want, diff)
+	if err != nil {
+		return 0, "", err
+	}
+	if detail != "" {
+		if _, err := tx.ExecContext(ctx, `ROLLBACK TO package_list`); err != nil {
+			return 0, "", fmt.Errorf("undo a wrong package list difference (%s): %w", detail, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `RELEASE package_list`); err != nil {
+		return 0, "", fmt.Errorf("package list savepoint release: %w", err)
+	}
+	return found, detail, nil
+}
+
+// runPackageListDiffTx is applyPackageListDiffTx's body between the
+// savepoint and its end. A statement that fails while ctx is done is an
+// error (nothing more can be done in this transaction); any other failed
+// statement is a tripwire.
+func runPackageListDiffTx(ctx context.Context, tx *sql.Tx, key SuiteKey, listID int64, want int, diff *PackageListDiff) (found int, detail string, err error) {
+	failed := func(what, path string, err error) (int, string, error) {
+		if ctx.Err() != nil {
+			return 0, "", fmt.Errorf("package list difference: %s %q: %w", what, path, err)
+		}
+		return 0, fmt.Sprintf("%s %q failed: %v", what, path, err), nil
+	}
+	one := func(res sql.Result, what, path string) (string, error) {
+		n, err := res.RowsAffected()
+		if err != nil {
+			return "", fmt.Errorf("package list difference: %s %q: %w", what, path, err)
+		}
+		if n != 1 {
+			return fmt.Sprintf("%s %q touched %d rows, want 1", what, path, n), nil
+		}
+		return "", nil
+	}
+	del, err := tx.PrepareContext(ctx, `DELETE FROM package_list_entry WHERE package_list_id = ? AND path = ?`)
+	if err != nil {
+		return 0, "", fmt.Errorf("package list difference: prepare delete: %w", err)
+	}
+	defer func() { _ = del.Close() }()
+	for _, path := range diff.Removed {
+		res, err := del.ExecContext(ctx, listID, path)
+		if err != nil {
+			return failed("delete", path, err)
+		}
+		if detail, err := one(res, "delete", path); detail != "" || err != nil {
+			return 0, detail, err
+		}
+	}
+	upd, err := tx.PrepareContext(ctx, `
+UPDATE package_list_entry
+   SET canonical_scheme = ?, canonical_host = ?, declared_sha256 = ?,
+       package_name = ?, architecture = ?, version = ?, flat_filename = ?
+ WHERE package_list_id = ? AND path = ?`)
+	if err != nil {
+		return 0, "", fmt.Errorf("package list difference: prepare update: %w", err)
+	}
+	defer func() { _ = upd.Close() }()
+	written := make([]string, 0, len(diff.Changed)+len(diff.Added))
+	for _, p := range diff.Changed {
+		res, err := upd.ExecContext(ctx, p.CanonicalScheme, p.CanonicalHost, p.DeclaredSHA256,
+			p.PackageName, p.Architecture, p.Version, p.FlatFilename, listID, p.Path)
+		if err != nil {
+			return failed("update", p.Path, err)
+		}
+		if detail, err := one(res, "update", p.Path); detail != "" || err != nil {
+			return 0, detail, err
+		}
+		written = append(written, p.Path)
+	}
+	ins, err := tx.PrepareContext(ctx, insertPackageListEntrySQL)
+	if err != nil {
+		return 0, "", fmt.Errorf("package list difference: prepare insert: %w", err)
+	}
+	defer func() { _ = ins.Close() }()
+	for _, p := range diff.Added {
+		if _, err := ins.ExecContext(ctx, listID, p.CanonicalScheme, p.CanonicalHost, p.Path,
+			p.DeclaredSHA256, p.PackageName, p.Architecture, p.Version, p.FlatFilename); err != nil {
+			return failed("insert", p.Path, err)
+		}
+		written = append(written, p.Path)
+	}
+	if err := recordListHotPackages(ctx, tx, listID, key, written); err != nil {
+		return 0, "", err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM package_list_entry WHERE package_list_id = ?`, listID).Scan(&found); err != nil {
+		return 0, "", fmt.Errorf("package list difference: count: %w", err)
+	}
+	if found != want {
+		return found, fmt.Sprintf("the list holds %d rows, want %d", found, want), nil
+	}
+	return found, "", nil
+}

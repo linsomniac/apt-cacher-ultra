@@ -305,8 +305,10 @@ type PrefetchedURLPath struct {
 //
 //  1. Verify the snapshot is still a candidate (adopted_at IS NULL).
 //  2. Insert all snapshot_member rows for snapshotID.
-//  3. Write the suite's package list: a new list holding every package
-//     row (an unsigned candidate: none). Step 6 points the suite at it.
+//  3. Write the suite's package list: the difference to the list the
+//     suite names, in place (CommitAdoptionDiff, given one that fits), or
+//     a new list holding every package row; an unsigned candidate: none.
+//     Step 6 points the suite at it.
 //     3a. (Phase 3, SPEC3 §7.5.1) Insert/upsert url_path rows for the
 //     hot debs warmed during prefetch. Hotness signal preservation:
 //     DO UPDATE intentionally omits last_requested_at and
@@ -372,8 +374,26 @@ type PrefetchedURLPath struct {
 func (c *Cache) CommitAdoption(ctx context.Context, snapshotID int64,
 	members []SnapshotMember, skipped []SkippedMember, packageHashes []PackageHash,
 	prefetchedURLPaths []PrefetchedURLPath, coverageComplete bool) error {
+	_, err := c.CommitAdoptionDiff(ctx, snapshotID, members, skipped, packageHashes, prefetchedURLPaths, coverageComplete, nil)
+	return err
+}
+
+// CommitAdoptionDiff is CommitAdoption given what turns the suite's live
+// package list into packageHashes (DiffPackageList's result, read before
+// the commit), and it reports how the list was written. With a difference
+// that still fits the list, Step 3 writes only the rows that changed, in
+// place; with none (nil), or one that no longer fits, it writes the whole
+// list as CommitAdoption does. Either way the list the suite names after
+// the commit holds exactly packageHashes (commitPackageListTx).
+func (c *Cache) CommitAdoptionDiff(ctx context.Context, snapshotID int64,
+	members []SnapshotMember, skipped []SkippedMember, packageHashes []PackageHash,
+	prefetchedURLPaths []PrefetchedURLPath, coverageComplete bool,
+	diff *PackageListDiff) (PackageListWrite, error) {
 	c.noteFlatRows(packageHashes) // ruling PG-31: before the transaction can commit
-	return c.submitWrite(ctx, writeAdoptionCommit, func(ctx context.Context, conn *sql.Conn) error {
+	// The op writes got, never a named result: on a ctx/close path
+	// submitWrite returns before the op ends (see InsertCandidateSnapshot).
+	var got PackageListWrite
+	err := c.submitWrite(ctx, writeAdoptionCommit, func(ctx context.Context, conn *sql.Conn) error {
 		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("CommitAdoption: begin: %w", err)
@@ -484,23 +504,28 @@ VALUES (?, ?, ?, ?, ?, ?, ?, 0)`)
 		}
 
 		// Step 3: the suite's package list (the package-list design, "The
-		// switch"). A signed candidate's rows go into a new list, which
-		// Step 6 points the suite at; the list the suite named until then
-		// is left unnamed, for GC (RunPackageListGCChunk). An unsigned
-		// candidate writes no row and Step 6 leaves the suite naming no
-		// list (spec C5 safeguard 5: an unsigned snapshot never vouches;
-		// the adopter builds no rows for one). Rows whose stanza declared
-		// no package name or architecture carry empty strings, which the
-		// SPEC3 §7.5.3 hot-set query filters out.
+		// switch"; commitPackageListTx). A signed candidate's rows are
+		// written either as the difference to the list the suite names,
+		// in place, or as a new list, which Step 6 points the suite at;
+		// the list the suite named until then is left unnamed, for GC
+		// (RunPackageListGCChunk). An unsigned candidate writes no row and
+		// Step 6 leaves the suite naming no list (spec C5 safeguard 5: an
+		// unsigned snapshot never vouches; the adopter builds no rows for
+		// one). Rows whose stanza declared no package name or architecture
+		// carry empty strings, which the SPEC3 §7.5.3 hot-set query
+		// filters out.
 		//
 		// The suite's row is read here, before Step 5's, because the list
 		// belongs to it: no row is Step 6's ErrSuiteGone, before any row
 		// is written.
 		suiteKey := SuiteKey{CanonicalScheme: scheme, CanonicalHost: host, SuitePath: suite}
-		var one int
+		var (
+			liveList   sql.NullInt64
+			generation int64
+		)
 		err = tx.QueryRowContext(ctx, `
-SELECT 1 FROM suite_freshness
- WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`, scheme, host, suite).Scan(&one)
+SELECT package_list_id, package_list_generation FROM suite_freshness
+ WHERE canonical_scheme = ? AND canonical_host = ? AND suite_path = ?`, scheme, host, suite).Scan(&liveList, &generation)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			return fmt.Errorf("%w: %s://%s%s", ErrSuiteGone, scheme, host, suite)
@@ -508,19 +533,13 @@ SELECT 1 FROM suite_freshness
 			return fmt.Errorf("CommitAdoption: read the suite's row: %w", err)
 		}
 		var newList sql.NullInt64 // the list Step 6 points the suite at; NULL for an unsigned candidate
+		written := PackageListWrite{Mode: PackageListNone}
 		if AnchorForm(form) != FormUnsigned {
-			id, err := writePackageListTx(ctx, tx, packageHashes)
+			id, w, err := commitPackageListTx(ctx, tx, suiteKey, liveList, generation, packageHashes, diff)
 			if err != nil {
 				return fmt.Errorf("CommitAdoption: %w", err)
 			}
-			newList = sql.NullInt64{Int64: id, Valid: true}
-			// Learn identities for requests made before this suite had an
-			// adopted index. This uses only real URL request timestamps;
-			// warming never creates or extends interest. It also handles
-			// newly attributed paths.
-			if err := recordListHotPackages(ctx, tx, id, suiteKey, nil); err != nil {
-				return err
-			}
+			newList, written = sql.NullInt64{Int64: id, Valid: true}, w
 		}
 
 		now := nowUnix()
@@ -756,8 +775,13 @@ UPDATE suite_snapshot SET adopted_at = ? WHERE snapshot_id = ?`,
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("CommitAdoption: commit: %w", err)
 		}
+		got = written
 		return nil
 	})
+	if err != nil {
+		return PackageListWrite{}, err
+	}
+	return got, nil
 }
 
 // decrementSnapshotRefcountsTx releases one pin per distinct blob the
