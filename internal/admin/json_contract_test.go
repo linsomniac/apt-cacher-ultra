@@ -80,7 +80,7 @@ func TestJSONContractPreserved(t *testing.T) {
 
 	// Issue #14 follow-up Tier 1c (additive): the full gc block carries
 	// last_run_failed_passes (a list, [] when none failed, never null),
-	// last_run_displaced_package_rows_deleted and
+	// last_run_package_list_rows_deleted and
 	// last_run_representation_rows_pruned; the abbreviated pre-first-run
 	// form still carries last_run_unixtime alone (SPEC5 §10.5 / §11).
 	t.Run("gc_failed_passes_and_prune_fields", func(t *testing.T) {
@@ -100,9 +100,9 @@ func TestJSONContractPreserved(t *testing.T) {
 		}
 		full := gcBlock(t, populatedJSONContractFixture())
 		for key, want := range map[string]any{
-			"last_run_failed_passes":                  []any{"snapshot"},
-			"last_run_displaced_package_rows_deleted": float64(70_000),
-			"last_run_representation_rows_pruned":     float64(5),
+			"last_run_failed_passes":              []any{"snapshot"},
+			"last_run_package_list_rows_deleted":  float64(70_000),
+			"last_run_representation_rows_pruned": float64(5),
 		} {
 			if got, ok := full[key]; !ok || !reflect.DeepEqual(got, want) {
 				t.Errorf("gc.%s = %#v (present %v), want %#v", key, got, ok, want)
@@ -330,9 +330,9 @@ func populatedJSONContractFixture() statusModel {
 			PoolOrphanBytesRepaired: 0,
 			PoolUnlinkErrors:        0,
 			// Issue #14 follow-up Tier 1c (additive).
-			LastRunFailedPasses:                []string{"snapshot"},
-			LastRunDisplacedPackageRowsDeleted: 70_000,
-			LastRunRepresentationRowsPruned:    5,
+			LastRunFailedPasses:             []string{"snapshot"},
+			LastRunPackageListRowsDeleted:   70_000,
+			LastRunRepresentationRowsPruned: 5,
 		},
 		HotURLPaths: []hotURLEntry{
 			{

@@ -663,8 +663,8 @@ table.usage-table tbody th{display:block;padding:3px 0 6px;border-bottom:0}
           <div class="v"><code>{{.GC.DisplacedReaped}}</code></div>
           <div class="k">Retired reaped</div>
           <div class="v"><code>{{.GC.RetiredReaped}}</code></div>
-          <div class="k">Package rows stripped</div>
-          <div class="v"><code>{{.GC.LastRunDisplacedPackageRowsDeleted}}</code></div>
+          <div class="k">Package-list rows deleted</div>
+          <div class="v"><code>{{.GC.LastRunPackageListRowsDeleted}}</code></div>
           <div class="k">Representation rows pruned</div>
           <div class="v"><code>{{.GC.LastRunRepresentationRowsPruned}}</code></div>
           <div class="k">Pool orphans repaired</div>

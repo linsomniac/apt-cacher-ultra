@@ -17,13 +17,13 @@ import (
 
 // The snapshot pass runs A ∪ B's batches, then C's chunks, then D's, each
 // asking for the cache's own chunk (0), and the tick reports D's rows:
-// displaced_package_rows_deleted in gc_run_complete, the last-run summary
-// and acu_gc_displaced_package_rows_deleted_total.
+// package_list_rows_deleted in gc_run_complete, the last-run summary
+// and acu_gc_package_list_rows_deleted_total.
 func TestRunSnapshotPass_RunsDAfterC(t *testing.T) {
 	logger, buf := captureLogger()
 	f := &fakeStore{chunksMore: 2, dChunksMore: 2}
 	g, _ := storeGC(t, f, 2, logger)
-	before := gcMetricValue(t, "acu_gc_displaced_package_rows_deleted_total")
+	before := gcMetricValue(t, "acu_gc_package_list_rows_deleted_total")
 	g.periodicTick(context.Background())
 
 	if want := []string{"batch", "C", "C", "C", "D", "D", "D"}; !reflect.DeepEqual(f.calls, want) {
@@ -34,14 +34,14 @@ func TestRunSnapshotPass_RunsDAfterC(t *testing.T) {
 	}
 	const want = 2 * fakeDChunkRows
 	runs := gcEvents(t, buf, "gc_run_complete")
-	if len(runs) != 1 || runs[0]["displaced_package_rows_deleted"] != float64(want) {
-		t.Fatalf("gc_run_complete lines %v, want one with displaced_package_rows_deleted %d", runs, want)
+	if len(runs) != 1 || runs[0]["package_list_rows_deleted"] != float64(want) {
+		t.Fatalf("gc_run_complete lines %v, want one with package_list_rows_deleted %d", runs, want)
 	}
-	if s, ok := g.LastRunSummary(); !ok || s.DisplacedPackageRowsDeleted != want {
-		t.Fatalf("LastRunSummary = %+v, %v; want DisplacedPackageRowsDeleted %d", s, ok, want)
+	if s, ok := g.LastRunSummary(); !ok || s.PackageListRowsDeleted != want {
+		t.Fatalf("LastRunSummary = %+v, %v; want PackageListRowsDeleted %d", s, ok, want)
 	}
-	if got := gcMetricValue(t, "acu_gc_displaced_package_rows_deleted_total") - before; got != want {
-		t.Fatalf("acu_gc_displaced_package_rows_deleted_total rose by %v, want %d", got, want)
+	if got := gcMetricValue(t, "acu_gc_package_list_rows_deleted_total") - before; got != want {
+		t.Fatalf("acu_gc_package_list_rows_deleted_total rose by %v, want %d", got, want)
 	}
 	if ev := gcEvents(t, buf, "gc_tick_failed"); len(ev) != 0 {
 		t.Fatalf("gc_tick_failed lines %v, want none", ev)
@@ -113,7 +113,7 @@ func TestRunSnapshotPass_AFailingCStillRunsD(t *testing.T) {
 			name:   "D fails too",
 			store:  &fakeStore{chunkErrs: true, dChunksMore: 2, dChunkErrs: true},
 			calls:  []string{"batch", "C", "D"},
-			failed: []string{"retired snapshot gc chunk", "displaced package_hash gc chunk"},
+			failed: []string{"retired snapshot gc chunk", "package list gc chunk"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) { runSubJobFailureCase(t, tc) })
@@ -134,7 +134,7 @@ func TestRunSnapshotPass_AFailingBatchStillRunsCAndD(t *testing.T) {
 			name:   "every sub-job fails",
 			store:  &fakeStore{batchErrs: 1, chunkErrs: true, dChunkErrs: true},
 			calls:  []string{"batch", "C", "D"},
-			failed: []string{"snapshot gc batch", "retired snapshot gc chunk", "displaced package_hash gc chunk"},
+			failed: []string{"snapshot gc batch", "retired snapshot gc chunk", "package list gc chunk"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) { runSubJobFailureCase(t, tc) })
@@ -150,18 +150,18 @@ func TestRetiredRun_RunsDUntilItsDeadline(t *testing.T) {
 		f := &fakeStore{dChunksMore: 1000, dChunkSleep: 30 * time.Second}
 		g, _ := storeGC(t, f, 2, logger)
 		g.cfg.MaxTickDuration = time.Minute
-		before := gcMetricValue(t, "acu_gc_displaced_package_rows_deleted_total")
+		before := gcMetricValue(t, "acu_gc_package_list_rows_deleted_total")
 		g.retiredRun(context.Background())
 		if want := []string{"C", "D", "D"}; !reflect.DeepEqual(f.calls, want) {
 			t.Fatalf("store calls %v, want %v: C, then D until its deadline", f.calls, want)
 		}
 		const want = 2 * fakeDChunkRows
 		runs := gcEvents(t, buf, "gc_retired_run_complete")
-		if len(runs) != 1 || runs[0]["displaced_package_rows_deleted"] != float64(want) || runs[0]["deadline_reached"] != true {
-			t.Fatalf("gc_retired_run_complete lines %v, want one with displaced_package_rows_deleted %d and deadline_reached true", runs, want)
+		if len(runs) != 1 || runs[0]["package_list_rows_deleted"] != float64(want) || runs[0]["deadline_reached"] != true {
+			t.Fatalf("gc_retired_run_complete lines %v, want one with package_list_rows_deleted %d and deadline_reached true", runs, want)
 		}
-		if got := gcMetricValue(t, "acu_gc_displaced_package_rows_deleted_total") - before; got != want {
-			t.Fatalf("acu_gc_displaced_package_rows_deleted_total rose by %v, want %d", got, want)
+		if got := gcMetricValue(t, "acu_gc_package_list_rows_deleted_total") - before; got != want {
+			t.Fatalf("acu_gc_package_list_rows_deleted_total rose by %v, want %d", got, want)
 		}
 		if line := deadlineLine(t, buf, "snapshot"); line["phase"] != phaseRetired {
 			t.Fatalf("deadline line %v, want the retired run's", line)
@@ -297,7 +297,7 @@ func TestSubJobs_AShutdownStopsTheLaterSubJobs(t *testing.T) {
 // periodic tick's D deletes the two lists the suite no longer names and
 // nothing else: the displaced snapshots' headers and members stay, and the
 // suite's live list is intact; LastRunSummary reports the rows deleted.
-func TestPeriodicTick_StripsDisplacedPackageRowsOnARealCache(t *testing.T) {
+func TestPeriodicTick_DeletesUnnamedPackageListsOnARealCache(t *testing.T) {
 	logger, buf := captureLogger()
 	g, c := storeGC(t, nil, 2, logger)
 	g.store = c // the real cache behind the seam too, as New sets it
@@ -363,8 +363,8 @@ func TestPeriodicTick_StripsDisplacedPackageRowsOnARealCache(t *testing.T) {
 		t.Errorf("the current snapshot holds %d members, want 1", n)
 	}
 	want := len(displaced) * pkgs
-	if s, ok := g.LastRunSummary(); !ok || s.DisplacedPackageRowsDeleted != want {
-		t.Fatalf("LastRunSummary = %+v, %v; want DisplacedPackageRowsDeleted %d", s, ok, want)
+	if s, ok := g.LastRunSummary(); !ok || s.PackageListRowsDeleted != want {
+		t.Fatalf("LastRunSummary = %+v, %v; want PackageListRowsDeleted %d", s, ok, want)
 	}
 	if ev := gcEvents(t, buf, "gc_tick_failed"); len(ev) != 0 {
 		t.Fatalf("gc_tick_failed lines %v, want none", ev)

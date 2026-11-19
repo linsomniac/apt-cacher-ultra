@@ -348,11 +348,12 @@ type gcInfo struct {
 	// Issue #14 follow-up Tier 1c (additive): the last run's passes whose
 	// failure was logged (gc_tick_failed), in tick order — url_path,
 	// snapshot, blob; [] when none failed (MarshalJSON), and the GC vital
-	// is crit when any did (vitalState); sub-job D's package rows; the
+	// is crit when any did (vitalState); the package rows sub-job D deleted
+	// (lists no suite names any more); the
 	// representation prune's rows.
-	LastRunFailedPasses                []string `json:"last_run_failed_passes"`
-	LastRunDisplacedPackageRowsDeleted int      `json:"last_run_displaced_package_rows_deleted"`
-	LastRunRepresentationRowsPruned    int      `json:"last_run_representation_rows_pruned"`
+	LastRunFailedPasses             []string `json:"last_run_failed_passes"`
+	LastRunPackageListRowsDeleted   int      `json:"last_run_package_list_rows_deleted"`
+	LastRunRepresentationRowsPruned int      `json:"last_run_representation_rows_pruned"`
 }
 
 // MarshalJSON renders the abbreviated form when no GC run has
@@ -542,9 +543,9 @@ func gcInfoFromSummary(summary gc.LastRunSummary) *gcInfo {
 		PoolOrphanBytesRepaired: summary.PoolOrphanBytesRepaired,
 		PoolUnlinkErrors:        summary.PoolUnlinkErrors,
 		// Issue #14 follow-up Tier 1c; a copy, never nil (JSON []).
-		LastRunFailedPasses:                append([]string{}, summary.FailedPasses...),
-		LastRunDisplacedPackageRowsDeleted: summary.DisplacedPackageRowsDeleted,
-		LastRunRepresentationRowsPruned:    summary.RepresentationRowsPruned,
+		LastRunFailedPasses:             append([]string{}, summary.FailedPasses...),
+		LastRunPackageListRowsDeleted:   summary.PackageListRowsDeleted,
+		LastRunRepresentationRowsPruned: summary.RepresentationRowsPruned,
 	}
 }
 

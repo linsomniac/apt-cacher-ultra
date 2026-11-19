@@ -80,9 +80,9 @@ var (
 		"Total retired suite_snapshot rows reaped by snapshot-GC sub-job C: snapshots of reaped, evicted or forgotten suites, snapshots the legacy trust audit quarantined (spec C9), and displaced snapshots beyond keep_displaced a startup or periodic run retired (counted in acu_gc_displaced_reaped_total when retired).",
 		0,
 	)
-	gcDisplacedPackageRowsDeletedTotal = metrics.NewCounterWithCap(
-		"acu_gc_displaced_package_rows_deleted_total",
-		"Total package_hash rows of displaced snapshots deleted by snapshot-GC sub-job D, in the startup pass, the periodic ticks and the retired runs; the snapshots' headers and index files stay (gc.keep_displaced).",
+	gcPackageListRowsDeletedTotal = metrics.NewCounterWithCap(
+		"acu_gc_package_list_rows_deleted_total",
+		"Total package rows of lists no suite names any more (a list an adoption rewrote, a removed or quarantined suite's) deleted by snapshot-GC sub-job D, in the startup pass, the periodic ticks and the retired runs.",
 		0,
 	)
 	gcURLPathRowsReapedTotal = metrics.NewCounterWithCap(
@@ -226,7 +226,7 @@ func emitGCMetrics(
 	orphanCandidatesReaped int,
 	displacedReaped int,
 	retiredReaped int,
-	displacedPackageRowsDeleted int,
+	packageListRowsDeleted int,
 	urlPathRowsReaped int,
 	poolOrphansRepaired int,
 	poolOrphanBytesRepaired int64,
@@ -251,8 +251,8 @@ func emitGCMetrics(
 	if retiredReaped > 0 {
 		gcRetiredReapedTotal.Add(float64(retiredReaped))
 	}
-	if displacedPackageRowsDeleted > 0 {
-		gcDisplacedPackageRowsDeletedTotal.Add(float64(displacedPackageRowsDeleted))
+	if packageListRowsDeleted > 0 {
+		gcPackageListRowsDeletedTotal.Add(float64(packageListRowsDeleted))
 	}
 	if urlPathRowsReaped > 0 {
 		gcURLPathRowsReapedTotal.Add(float64(urlPathRowsReaped))

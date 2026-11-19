@@ -436,8 +436,9 @@ type GCConfig struct {
 
 	// SnapshotBatchSize bounds the per-batch cascade DELETE in the
 	// snapshot GC pass. Smaller than BatchSize because each
-	// snapshot's cascade can touch tens of thousands of
-	// snapshot_member + package_hash rows. Default 10. Must be >= 1.
+	// snapshot's cascade can touch thousands of snapshot_member rows
+	// (and, before schema 11, tens of thousands of package rows).
+	// Default 10. Must be >= 1.
 	SnapshotBatchSize int `toml:"snapshot_batch_size"`
 
 	// MaxTickDuration is the budget checked between batches of a GC tick
@@ -456,7 +457,9 @@ type GCConfig struct {
 	// their headers and index files (suite_snapshot, snapshot_member,
 	// snapshot_skipped_member), not their package lists: since 2026-11-09
 	// (issue #14 follow-up Tier 2, approved by the maintainer) GC sub-job D
-	// deletes every displaced snapshot's package_hash rows, kept or not.
+	// deleted every displaced snapshot's package rows, kept or not, and
+	// since schema 11 a displaced snapshot has none to keep (package rows
+	// are its suite's list; D deletes a list once no suite names it).
 	KeepDisplaced int `toml:"keep_displaced"`
 
 	// PoolScanWorkers is the worker pool size for the startup

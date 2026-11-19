@@ -198,21 +198,21 @@ type LastRunSummary struct {
 	OrphanCandidatesReaped int
 	DisplacedReaped        int
 	RetiredReaped          int // snapshot-GC sub-job C (spec C9)
-	// DisplacedPackageRowsDeleted is snapshot-GC sub-job D's count: the
-	// package_hash rows of displaced snapshots it stripped (issue #14
-	// follow-up, Tier 2).
-	DisplacedPackageRowsDeleted int
-	URLPathRowsReaped           int
-	URLPathRowsScanned          int
-	URLPathRowsStamped          int
-	URLPathRowsCleared          int
-	URLPathDurationSeconds      float64
-	SnapshotDurationSeconds     float64
-	BlobDurationSeconds         float64
-	PoolOrphansRepaired         int
-	PoolOrphanBytesRepaired     int64
-	PoolUnlinkErrors            int
-	DeadlineReached             bool
+	// PackageListRowsDeleted is snapshot-GC sub-job D's count: the
+	// package rows it deleted, of lists no suite names any more (a list an
+	// adoption rewrote, a removed or quarantined suite's).
+	PackageListRowsDeleted  int
+	URLPathRowsReaped       int
+	URLPathRowsScanned      int
+	URLPathRowsStamped      int
+	URLPathRowsCleared      int
+	URLPathDurationSeconds  float64
+	SnapshotDurationSeconds float64
+	BlobDurationSeconds     float64
+	PoolOrphansRepaired     int
+	PoolOrphanBytesRepaired int64
+	PoolUnlinkErrors        int
+	DeadlineReached         bool
 	// FailedPasses names the run's passes whose failure was logged (WARN
 	// gc_tick_failed), in tick order, each once: "url_path", "snapshot",
 	// "blob"; nil when none failed (issue #14 follow-up, Tier 1c). A
@@ -431,7 +431,7 @@ func (g *GC) runStartupPass(ctx context.Context) (err error) {
 		"orphan_candidates_reaped", tick.orphanCandidatesReaped,
 		"displaced_reaped", tick.displacedReaped,
 		"retired_reaped", tick.retiredReaped,
-		"displaced_package_rows_deleted", tick.displacedPackageRowsDeleted,
+		"package_list_rows_deleted", tick.packageListRowsDeleted,
 		"url_path_rows_reaped", tick.urlPathRowsReaped,
 		"url_path_rows_scanned", tick.urlPath.scanned,
 		"url_path_rows_stamped", tick.urlPath.stamped,
@@ -456,7 +456,7 @@ func (g *GC) runStartupPass(ctx context.Context) (err error) {
 		tick.orphanCandidatesReaped,
 		tick.displacedReaped,
 		tick.retiredReaped,
-		tick.displacedPackageRowsDeleted,
+		tick.packageListRowsDeleted,
 		tick.urlPathRowsReaped,
 		scan.orphansRepaired,
 		scan.orphanBytesRepaired,
@@ -465,29 +465,29 @@ func (g *GC) runStartupPass(ctx context.Context) (err error) {
 	)
 	emitGCPassMetrics("startup", tick)
 	g.recordLastRun(LastRunSummary{
-		Phase:                       "startup",
-		AtUnixTime:                  endUnix,
-		DurationSeconds:             duration.Seconds(),
-		BlobsReaped:                 tick.blobsReaped,
-		BytesReclaimed:              tick.bytesReclaimed,
-		OrphanCandidatesReaped:      tick.orphanCandidatesReaped,
-		DisplacedReaped:             tick.displacedReaped,
-		RetiredReaped:               tick.retiredReaped,
-		DisplacedPackageRowsDeleted: tick.displacedPackageRowsDeleted,
-		URLPathRowsReaped:           tick.urlPathRowsReaped,
-		URLPathRowsScanned:          tick.urlPath.scanned,
-		URLPathRowsStamped:          tick.urlPath.stamped,
-		URLPathRowsCleared:          tick.urlPath.cleared,
-		URLPathDurationSeconds:      tick.urlPathDuration.Seconds(),
-		SnapshotDurationSeconds:     tick.snapshotDuration.Seconds(),
-		BlobDurationSeconds:         tick.blobDuration.Seconds(),
-		PoolOrphansRepaired:         scan.orphansRepaired,
-		PoolOrphanBytesRepaired:     scan.orphanBytesRepaired,
-		PoolUnlinkErrors:            tick.poolUnlinkErrors + scan.unlinkErrors,
-		DeadlineReached:             tick.deadlineReached,
-		FailedPasses:                tick.failedPasses,
-		RepresentationRowsPruned:    tick.representationRowsPruned,
-		RepresentationPruneSeconds:  tick.representationPruneDuration.Seconds(),
+		Phase:                      "startup",
+		AtUnixTime:                 endUnix,
+		DurationSeconds:            duration.Seconds(),
+		BlobsReaped:                tick.blobsReaped,
+		BytesReclaimed:             tick.bytesReclaimed,
+		OrphanCandidatesReaped:     tick.orphanCandidatesReaped,
+		DisplacedReaped:            tick.displacedReaped,
+		RetiredReaped:              tick.retiredReaped,
+		PackageListRowsDeleted:     tick.packageListRowsDeleted,
+		URLPathRowsReaped:          tick.urlPathRowsReaped,
+		URLPathRowsScanned:         tick.urlPath.scanned,
+		URLPathRowsStamped:         tick.urlPath.stamped,
+		URLPathRowsCleared:         tick.urlPath.cleared,
+		URLPathDurationSeconds:     tick.urlPathDuration.Seconds(),
+		SnapshotDurationSeconds:    tick.snapshotDuration.Seconds(),
+		BlobDurationSeconds:        tick.blobDuration.Seconds(),
+		PoolOrphansRepaired:        scan.orphansRepaired,
+		PoolOrphanBytesRepaired:    scan.orphanBytesRepaired,
+		PoolUnlinkErrors:           tick.poolUnlinkErrors + scan.unlinkErrors,
+		DeadlineReached:            tick.deadlineReached,
+		FailedPasses:               tick.failedPasses,
+		RepresentationRowsPruned:   tick.representationRowsPruned,
+		RepresentationPruneSeconds: tick.representationPruneDuration.Seconds(),
 	})
 	if tickErr != nil {
 		return fmt.Errorf("gc startup: tick: %w", tickErr)
@@ -505,8 +505,8 @@ func (g *GC) runStartupPass(ctx context.Context) (err error) {
 // When `gc.interval` is longer than an hour, Run also deletes the retired
 // snapshots an hour after the start — after the startup pass ended, since
 // 2026-11-11 — (retiredRun; the final review's R3 #2),
-// and strips the displaced snapshots' package rows (sub-job D, issue #14
-// follow-up Tier 2), and again every hour after that, an hour after the
+// and the package lists no suite names any more (sub-job D; issue #14
+// follow-up Tier 2, on package lists since schema 11), and again every hour after that, an hour after the
 // previous run ended (issue #14; unconditional since 2026-11-10).
 //
 // AIDEV-NOTE: issue #14 (the hardening plan's final review 2, G2-I2; the
@@ -626,7 +626,7 @@ func (g *GC) periodicTick(ctx context.Context) {
 		"orphan_candidates_reaped", tick.orphanCandidatesReaped,
 		"displaced_reaped", tick.displacedReaped,
 		"retired_reaped", tick.retiredReaped,
-		"displaced_package_rows_deleted", tick.displacedPackageRowsDeleted,
+		"package_list_rows_deleted", tick.packageListRowsDeleted,
 		"url_path_rows_reaped", tick.urlPathRowsReaped,
 		"url_path_rows_scanned", tick.urlPath.scanned,
 		"url_path_rows_stamped", tick.urlPath.stamped,
@@ -651,7 +651,7 @@ func (g *GC) periodicTick(ctx context.Context) {
 		tick.orphanCandidatesReaped,
 		tick.displacedReaped,
 		tick.retiredReaped,
-		tick.displacedPackageRowsDeleted,
+		tick.packageListRowsDeleted,
 		tick.urlPathRowsReaped,
 		0,
 		0,
@@ -660,29 +660,29 @@ func (g *GC) periodicTick(ctx context.Context) {
 	)
 	emitGCPassMetrics("periodic", tick)
 	g.recordLastRun(LastRunSummary{
-		Phase:                       "periodic",
-		AtUnixTime:                  endUnix,
-		DurationSeconds:             duration.Seconds(),
-		BlobsReaped:                 tick.blobsReaped,
-		BytesReclaimed:              tick.bytesReclaimed,
-		OrphanCandidatesReaped:      tick.orphanCandidatesReaped,
-		DisplacedReaped:             tick.displacedReaped,
-		RetiredReaped:               tick.retiredReaped,
-		DisplacedPackageRowsDeleted: tick.displacedPackageRowsDeleted,
-		URLPathRowsReaped:           tick.urlPathRowsReaped,
-		URLPathRowsScanned:          tick.urlPath.scanned,
-		URLPathRowsStamped:          tick.urlPath.stamped,
-		URLPathRowsCleared:          tick.urlPath.cleared,
-		URLPathDurationSeconds:      tick.urlPathDuration.Seconds(),
-		SnapshotDurationSeconds:     tick.snapshotDuration.Seconds(),
-		BlobDurationSeconds:         tick.blobDuration.Seconds(),
-		PoolOrphansRepaired:         0,
-		PoolOrphanBytesRepaired:     0,
-		PoolUnlinkErrors:            tick.poolUnlinkErrors,
-		DeadlineReached:             tick.deadlineReached,
-		FailedPasses:                tick.failedPasses,
-		RepresentationRowsPruned:    tick.representationRowsPruned,
-		RepresentationPruneSeconds:  tick.representationPruneDuration.Seconds(),
+		Phase:                      "periodic",
+		AtUnixTime:                 endUnix,
+		DurationSeconds:            duration.Seconds(),
+		BlobsReaped:                tick.blobsReaped,
+		BytesReclaimed:             tick.bytesReclaimed,
+		OrphanCandidatesReaped:     tick.orphanCandidatesReaped,
+		DisplacedReaped:            tick.displacedReaped,
+		RetiredReaped:              tick.retiredReaped,
+		PackageListRowsDeleted:     tick.packageListRowsDeleted,
+		URLPathRowsReaped:          tick.urlPathRowsReaped,
+		URLPathRowsScanned:         tick.urlPath.scanned,
+		URLPathRowsStamped:         tick.urlPath.stamped,
+		URLPathRowsCleared:         tick.urlPath.cleared,
+		URLPathDurationSeconds:     tick.urlPathDuration.Seconds(),
+		SnapshotDurationSeconds:    tick.snapshotDuration.Seconds(),
+		BlobDurationSeconds:        tick.blobDuration.Seconds(),
+		PoolOrphansRepaired:        0,
+		PoolOrphanBytesRepaired:    0,
+		PoolUnlinkErrors:           tick.poolUnlinkErrors,
+		DeadlineReached:            tick.deadlineReached,
+		FailedPasses:               tick.failedPasses,
+		RepresentationRowsPruned:   tick.representationRowsPruned,
+		RepresentationPruneSeconds: tick.representationPruneDuration.Seconds(),
 	})
 }
 
@@ -834,16 +834,16 @@ type tickResult struct {
 	orphanCandidatesReaped int
 	displacedReaped        int
 	retiredReaped          int
-	// displacedPackageRowsDeleted: sub-job D's package_hash rows (issue #14
-	// follow-up, Tier 2).
-	displacedPackageRowsDeleted int
-	urlPathRowsReaped           int
-	poolUnlinkErrors            int
-	deadlineReached             bool
-	urlPath                     urlPathResult
-	urlPathDuration             time.Duration
-	snapshotDuration            time.Duration
-	blobDuration                time.Duration
+	// packageListRowsDeleted: the package rows sub-job D deleted (lists
+	// no suite names any more).
+	packageListRowsDeleted int
+	urlPathRowsReaped      int
+	poolUnlinkErrors       int
+	deadlineReached        bool
+	urlPath                urlPathResult
+	urlPathDuration        time.Duration
+	snapshotDuration       time.Duration
+	blobDuration           time.Duration
 	// representationRowsPruned and representationPruneDuration are the
 	// blob pass's representation prune's (blobResult; issue #14 follow-up,
 	// Tier 1c).
@@ -1053,7 +1053,7 @@ func (g *GC) runTick(ctx context.Context, phase string) (tickResult, error) {
 		res.orphanCandidatesReaped += snap.batch.OrphanReaped
 		res.displacedReaped += snap.batch.DisplacedReaped
 		res.retiredReaped += snap.retired
-		res.displacedPackageRowsDeleted += snap.packageRowsStripped
+		res.packageListRowsDeleted += snap.packageListRowsDeleted
 		if snapDeadline {
 			res.deadlineReached = true
 		}

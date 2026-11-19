@@ -171,7 +171,7 @@ func TestGoldenGCShowsFailedPassesAndPrune(t *testing.T) {
 	m := newHealthyModel()
 	gc := *m.GC
 	gc.LastRunFailedPasses = []string{"url_path", "blob"}
-	gc.LastRunDisplacedPackageRowsDeleted = 70123
+	gc.LastRunPackageListRowsDeleted = 70123
 	gc.LastRunRepresentationRowsPruned = 456
 	m.GC = &gc
 	html := renderHTMLForGolden(t, m)
@@ -181,7 +181,7 @@ func TestGoldenGCShowsFailedPassesAndPrune(t *testing.T) {
 		`<span class="b b--crit" title="This pass failed on the last run: see WARN gc_tick_failed in the log.`,
 		`>url_path</span>`,
 		`>blob</span>`,
-		`<div class="k">Package rows stripped</div>`,
+		`<div class="k">Package-list rows deleted</div>`,
 		`<code>70123</code>`,
 		`<div class="k">Representation rows pruned</div>`,
 		`<code>456</code>`,

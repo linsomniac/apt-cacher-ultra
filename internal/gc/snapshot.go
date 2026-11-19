@@ -17,9 +17,9 @@ type snapshotPassResult struct {
 	batch cache.SnapshotGCBatchResult
 	// retired counts the retired snapshots sub-job C deleted (spec C9).
 	retired int
-	// packageRowsStripped counts the package_hash rows of displaced
-	// snapshots sub-job D deleted (issue #14 follow-up, Tier 2).
-	packageRowsStripped int
+	// packageListRowsDeleted counts the package rows sub-job D deleted:
+	// those of package lists no suite names any more.
+	packageListRowsDeleted int
 	// failureLogged: a sub-job's failure was logged (WARN gc_tick_failed)
 	// and counted (subJobRun.next), so runTick names the pass in
 	// FailedPasses, even when a shutdown followed (issue #14 follow-up,
@@ -43,10 +43,21 @@ type snapshotPassResult struct {
 // snapshots B retired — in chunks of at most 10,000
 // rows per writer transaction, in the startup pass and the periodic ticks
 // alike (ruling PF-15, re-ruled for issue #14), as does retiredRun, an
-// hour after the start and then hourly. Then sub-job D
-// (issue #14 follow-up Tier 2) strips the displaced snapshots'
-// package_hash rows, 10,000 rows a writer transaction, keeping their
-// headers, members and skipped members, as does retiredRun after its C.
+// hour after the start and then hourly. Then sub-job D deletes the
+// package lists no suite names any more, 10,000 rows a writer transaction,
+// as does retiredRun after its C.
+//
+// AIDEV-NOTE: what sub-job D deletes, since schema 11 (2026-11-19, the
+// package-list design). Package rows are a suite's list, not a snapshot's:
+// an adoption that changed little updates the list in place and leaves D
+// nothing; a list is left unnamed — D's — by an adoption that wrote a whole
+// new one (a first adoption has none before it, a publication that changed
+// most of the list), by a suite's removal (reap, forget, cap eviction) and
+// by the legacy audit's quarantine. From issue #14's follow-up (Tier 2,
+// 2026-11-09) until then, D stripped the package_hash rows every displaced
+// snapshot kept: one whole list per adoption. The notes below that say
+// "strip" and "displaced snapshots' package_hash rows" are from that time;
+// their rulings (D last, HD-15 within the pass, the hourly run) stand.
 //
 // AIDEV-NOTE: sub-job D and ruling HD-15 within the pass (issue #14
 // follow-up Tier 2, 2026-11-09; the maintainer approved keep_displaced's
@@ -173,7 +184,7 @@ func (g *GC) runSnapshotPass(ctx context.Context, deadline time.Time, phase stri
 	}
 	// Sub-job D, last: C frees disk (its snapshots' blobs), D only rows.
 	stripped, hit, err := g.runSubJobD(wctx, dl, &batchesRun)
-	acc.packageRowsStripped += stripped
+	acc.packageListRowsDeleted += stripped
 	sj.next(hit, err)
 	acc.failureLogged = sj.failureLogged
 	return acc, hit, sj.firstErr
@@ -345,15 +356,15 @@ func (g *GC) runSubJobC(ctx context.Context, dl snapshotPassDeadline, batchesRun
 	}
 }
 
-// runSubJobD is snapshot GC sub-job D (issue #14 follow-up, Tier 2): it
-// strips the displaced snapshots' package_hash rows
-// (cache.RunPackageListGCChunk), oldest snapshot first, in bounded
-// chunks, until none is left, ctx ends, or dl's deadline comes (deadlineHit:
-// rows left): dl expired between chunks, or a chunk the writer never
-// started before it (notStarted). ctx is the caller's wctx (runSubJobC's
-// note). The snapshot pass runs it after C, and so does retiredRun. Their
-// headers, members and skipped members stay: gc.keep_displaced now keeps a
-// displaced snapshot's headers and index files, not its package list.
+// runSubJobD is snapshot GC sub-job D: it deletes the package lists no
+// suite names any more (cache.RunPackageListGCChunk), lowest list id
+// first, in bounded chunks, until none is left, ctx ends, or dl's deadline
+// comes (deadlineHit: rows left): dl expired between chunks, or a chunk
+// the writer never started before it (notStarted). ctx is the caller's
+// wctx (runSubJobC's note). The snapshot pass runs it after C, and so does
+// retiredRun. No snapshot's header, member or skipped member is touched:
+// gc.keep_displaced keeps a displaced snapshot's headers and index files,
+// and a snapshot has no package rows of its own (schema 11).
 func (g *GC) runSubJobD(ctx context.Context, dl snapshotPassDeadline, batchesRun *int) (stripped int, deadlineHit bool, err error) {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -369,7 +380,7 @@ func (g *GC) runSubJobD(ctx context.Context, dl snapshotPassDeadline, batchesRun
 			return stripped, dl.reached(), nil // the chunk never ran: rows may be left
 		}
 		if err != nil {
-			return stripped, false, fmt.Errorf("displaced package_hash gc chunk: %w", err)
+			return stripped, false, fmt.Errorf("package list gc chunk: %w", err)
 		}
 		*batchesRun++
 		stripped += rows
@@ -465,11 +476,11 @@ func (g *GC) retiredRun(ctx context.Context) {
 		gcRetiredReapedTotal.Add(float64(retired))
 	}
 	if stripped > 0 {
-		gcDisplacedPackageRowsDeletedTotal.Add(float64(stripped))
+		gcPackageListRowsDeletedTotal.Add(float64(stripped))
 	}
 	g.cfg.Logger.Info("gc_retired_run_complete",
 		"retired_reaped", retired,
-		"displaced_package_rows_deleted", stripped,
+		"package_list_rows_deleted", stripped,
 		"deadline_reached", deadlineHit,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)

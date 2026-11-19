@@ -143,11 +143,11 @@ func TestGCInfoFromSummary_CopiesEveryShownField(t *testing.T) {
 	g := gcInfoFromSummary(gc.LastRunSummary{Phase: "periodic", AtUnixTime: 1_800_000_000, DurationSeconds: 1.5,
 		BlobsReaped: 2, BytesReclaimed: 3, OrphanCandidatesReaped: 4, DisplacedReaped: 5, RetiredReaped: 6,
 		URLPathRowsReaped: 7, PoolOrphansRepaired: 8, PoolOrphanBytesRepaired: 9, PoolUnlinkErrors: 10, DeadlineReached: true,
-		FailedPasses: []string{"snapshot", "blob"}, DisplacedPackageRowsDeleted: 11, RepresentationRowsPruned: 12})
+		FailedPasses: []string{"snapshot", "blob"}, PackageListRowsDeleted: 11, RepresentationRowsPruned: 12})
 	want := gcInfo{LastRunPhase: "periodic", LastRunDurationSeconds: 1.5, LastRunBlobsReaped: 2, LastRunBytesReclaimed: 3,
 		OrphanCandidatesReaped: 4, DisplacedReaped: 5, RetiredReaped: 6, URLPathRowsReaped: 7, PoolOrphansRepaired: 8,
 		PoolOrphanBytesRepaired: 9, PoolUnlinkErrors: 10, LastRunDeadlineReached: true,
-		LastRunFailedPasses: []string{"snapshot", "blob"}, LastRunDisplacedPackageRowsDeleted: 11,
+		LastRunFailedPasses: []string{"snapshot", "blob"}, LastRunPackageListRowsDeleted: 11,
 		LastRunRepresentationRowsPruned: 12}
 	if g.LastRunUnixTime == nil || *g.LastRunUnixTime != 1_800_000_000 {
 		t.Fatalf("last run %v, want 1800000000", g.LastRunUnixTime)
