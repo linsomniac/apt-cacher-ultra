@@ -2,10 +2,8 @@ package freshness
 
 import (
 	"context"
-	"database/sql"
 	"log/slog"
 	"maps"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -16,26 +14,13 @@ import (
 // flat_filename.
 func packageHashRows(t *testing.T, c *cache.Cache, id int64) map[string]string {
 	t.Helper()
-	db, err := sql.Open("sqlite", filepath.Join(c.Dir(), "cache.db"))
+	rows, err := c.PackageRowsOfSnapshotForTest(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = db.Close() }()
-	rows, err := db.Query(`SELECT path, flat_filename FROM package_hash WHERE snapshot_id = ?`, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = rows.Close() }()
 	out := map[string]string{}
-	for rows.Next() {
-		var p, f string
-		if err := rows.Scan(&p, &f); err != nil {
-			t.Fatal(err)
-		}
-		out[p] = f
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
+	for _, r := range rows {
+		out[r.Path] = r.FlatFilename
 	}
 	return out
 }

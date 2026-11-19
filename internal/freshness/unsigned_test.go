@@ -453,16 +453,11 @@ func TestReconcile_UnsignedSnapshotGetsNoPackageHash(t *testing.T) {
 // count shows that none were written.
 func packageHashCount(t *testing.T, c *cache.Cache, id int64) int {
 	t.Helper()
-	db, err := sql.Open("sqlite", filepath.Join(c.Dir(), "cache.db"))
+	rows, err := c.PackageRowsOfSnapshotForTest(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = db.Close() }()
-	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM package_hash WHERE snapshot_id = ?`, id).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	return n
+	return len(rows)
 }
 
 // Spec C8 for the unsigned form: a first adoption whose Release is the

@@ -413,8 +413,14 @@ func TestDeclaredHashesForPath_TheFlatRowsFlag(t *testing.T) {
 		seedRow(t, c, flat, 1)
 		r := row()
 		r.FlatFilename = ""
-		adoptPackages(t, c, flat, []PackageHash{r}, true)
-		if _, err := c.db.Exec(`UPDATE package_hash SET flat_filename = 'x_1_amd64.deb'`); err != nil {
+		id := adoptPackages(t, c, flat, []PackageHash{r}, true)
+		// Give the row its flat name behind the writers' backs (no
+		// noteFlatRows): the flag stays false over a flat row.
+		if err := c.DeletePackageHashForTest(ctx, r.CanonicalScheme, r.CanonicalHost, r.Path, id); err != nil {
+			t.Fatal(err)
+		}
+		r.FlatFilename = "x_1_amd64.deb"
+		if err := c.InsertPackageRowForTest(ctx, id, r); err != nil {
 			t.Fatal(err)
 		}
 		if got := declared(t, c, twin); got != nil {

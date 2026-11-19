@@ -195,3 +195,53 @@ func (c *Cache) HoldWriterForTest(ctx context.Context) (release func(), err erro
 		return nil, fmt.Errorf("HoldWriterForTest: no hold: %w", err)
 	}
 }
+
+// PackageRowsOfSnapshotForTest returns the package rows the snapshot holds,
+// in path order: what a test used to read from the table by snapshot id.
+// TEST-ONLY.
+//
+// AIDEV-NOTE: tests read and seed package rows through this,
+// InsertPackageRowForTest, GetPackageHash and DeletePackageHashForTest, not
+// by SQL of their own, so that where the rows are kept is this file's
+// business and not every test's (the package-list plan, Task 1).
+func (c *Cache) PackageRowsOfSnapshotForTest(ctx context.Context, snapshotID int64) ([]PackageHash, error) {
+	rows, err := c.db.QueryContext(ctx, `
+SELECT canonical_scheme, canonical_host, path, declared_sha256, snapshot_id,
+       package_name, architecture, version, flat_filename
+  FROM package_hash WHERE snapshot_id = ? ORDER BY path`, snapshotID)
+	if err != nil {
+		return nil, fmt.Errorf("PackageRowsOfSnapshotForTest: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []PackageHash
+	for rows.Next() {
+		var p PackageHash
+		if err := rows.Scan(&p.CanonicalScheme, &p.CanonicalHost, &p.Path, &p.DeclaredSHA256, &p.SnapshotID,
+			&p.PackageName, &p.Architecture, &p.Version, &p.FlatFilename); err != nil {
+			return nil, fmt.Errorf("PackageRowsOfSnapshotForTest scan: %w", err)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("PackageRowsOfSnapshotForTest iter: %w", err)
+	}
+	return out, nil
+}
+
+// InsertPackageRowForTest adds one package row to the snapshot's rows,
+// through the writer, with no validation beyond the schema's and none of a
+// commit's bookkeeping (row.SnapshotID is ignored). TEST-ONLY: for fixtures
+// that need a row no adoption would write.
+func (c *Cache) InsertPackageRowForTest(ctx context.Context, snapshotID int64, row PackageHash) error {
+	return c.submitWrite(ctx, writeTest, func(ctx context.Context, conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx, `
+INSERT INTO package_hash (canonical_scheme, canonical_host, path, declared_sha256, snapshot_id,
+                          package_name, architecture, version, flat_filename)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			row.CanonicalScheme, row.CanonicalHost, row.Path, row.DeclaredSHA256, snapshotID,
+			row.PackageName, row.Architecture, row.Version, row.FlatFilename); err != nil {
+			return fmt.Errorf("InsertPackageRowForTest: %w", err)
+		}
+		return nil
+	})
+}

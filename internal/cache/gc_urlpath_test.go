@@ -120,9 +120,9 @@ func seedCurrentSnapshot(t *testing.T, c *Cache, scheme, host, suite, inrelease 
 
 func seedPackageHash(t *testing.T, c *Cache, scheme, host, path, declared string, snapID int64, name, arch, version string) {
 	t.Helper()
-	if _, err := c.db.Exec(`INSERT INTO package_hash
-	  (canonical_scheme, canonical_host, path, declared_sha256, snapshot_id, package_name, architecture, version)
-	  VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, scheme, host, path, declared, snapID, name, arch, version); err != nil {
+	if err := c.InsertPackageRowForTest(context.Background(), snapID, PackageHash{
+		CanonicalScheme: scheme, CanonicalHost: host, Path: path, DeclaredSHA256: declared,
+		PackageName: name, Architecture: arch, Version: version}); err != nil {
 		t.Fatalf("seed package_hash(%s): %v", path, err)
 	}
 }

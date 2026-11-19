@@ -2,8 +2,6 @@ package cache
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"strings"
 	"testing"
 )
@@ -40,15 +38,17 @@ func adoptPackages(t *testing.T, c *Cache, key SuiteKey, phs []PackageHash, comp
 // snapshot id.
 func flatFilenameOf(t *testing.T, c *Cache, path string, id int64) string {
 	t.Helper()
-	var f string
-	err := c.db.QueryRow(`SELECT flat_filename FROM package_hash WHERE path = ? AND snapshot_id = ?`, path, id).Scan(&f)
-	if errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("no package_hash row for %s in snapshot %d", path, id)
-	}
+	rows, err := c.PackageRowsOfSnapshotForTest(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return f
+	for _, r := range rows {
+		if r.Path == path {
+			return r.FlatFilename
+		}
+	}
+	t.Fatalf("no package_hash row for %s in snapshot %d", path, id)
+	return ""
 }
 
 // pkgRow is a package_hash row of host h: path, declared hash, flat name.

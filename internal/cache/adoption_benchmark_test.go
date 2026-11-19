@@ -46,12 +46,12 @@ func BenchmarkCommitAdoptionLargeCatalog(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		var rows int
-		if err := c.db.QueryRowContext(ctx, `SELECT count(*) FROM package_hash WHERE snapshot_id = ?`, id).Scan(&rows); err != nil {
+		rows, err := c.PackageRowsOfSnapshotForTest(ctx, id)
+		if err != nil {
 			b.Fatal(err)
 		}
-		if rows != len(packages) {
-			b.Fatalf("package rows = %d, want %d", rows, len(packages))
+		if len(rows) != len(packages) {
+			b.Fatalf("package rows = %d, want %d", len(rows), len(packages))
 		}
 		if err := c.Close(); err != nil {
 			b.Fatal(err)
