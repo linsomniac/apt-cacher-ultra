@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 )
@@ -52,6 +53,10 @@ type adoptionLog struct {
 	membersSkipped                 int
 	hot                            hotPrefetchStats
 	pipelineDone                   bool
+	// committed: the flip transaction committed, and packageList is how it
+	// wrote the suite's package list.
+	committed   bool
+	packageList cache.PackageListWrite
 	// releaseDate is the Release's Date field (unix seconds; 0: none, or
 	// not parsed yet).
 	releaseDate int64
@@ -151,6 +156,17 @@ func (l *adoptionLog) finish(logger *slog.Logger, ctx context.Context, suite Sui
 	// behind upstream, whatever the cache's own logs cover. Each only when
 	// known (a direct adopter call has no first sighting; a Release may
 	// carry no Date).
+	// How the commit wrote the suite's package list: the rows that changed
+	// (difference), the whole list (rewrite, with why), or none (an
+	// unsigned snapshot). Only an attempt that committed has one.
+	if l.committed {
+		attrs = append(attrs, "package_list_write", l.packageList.Mode)
+		if l.packageList.Mode == cache.PackageListRewrite {
+			attrs = append(attrs, "package_list_rewrite_reason", l.packageList.Reason)
+		}
+		attrs = append(attrs, "package_rows_added", l.packageList.Added,
+			"package_rows_changed", l.packageList.Changed, "package_rows_removed", l.packageList.Removed)
+	}
 	// What the attempt's database writes waited behind: every write in the
 	// daemon runs on one goroutine, and phase_seconds alone cannot tell a
 	// slow transaction of the attempt's own from a queue.

@@ -706,6 +706,11 @@ type Adopter struct {
 	// in-transaction never-downgrade recheck closes.
 	beforeCommit func()
 
+	// packageListDiff, when set (tests only), stands in for
+	// cache.DiffPackageList: the read of the suite's live package list
+	// before the flip barrier.
+	packageListDiff func(ctx context.Context, key cache.SuiteKey, rows []cache.PackageHash) (*cache.PackageListDiff, error)
+
 	// heartbeatHook, when set (tests only), runs at each heartbeat tick.
 	heartbeatHook func()
 
@@ -2064,6 +2069,43 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		}
 	}
 
+	// The package-list design, "The switch": read what turns the suite's
+	// live package list into this publication's rows, so that the commit
+	// writes the rows that changed and not the list (a typical publication
+	// changes well under 1% of it). It runs here, before the barrier and
+	// outside the client hold, on a reader connection: the commit applies
+	// it only if the list is still the one read (the cache's generation
+	// guard) and writes the whole list otherwise. An unsigned form has no
+	// package rows.
+	//
+	// AIDEV-NOTE: the difference is an optimisation, never a condition of
+	// the adoption. A failed read is a WARN and no difference: the commit
+	// then writes the whole list, as every commit did before schema 11. It
+	// runs under the shutdown signal and the commit's bound, like the
+	// re-mark above, not under adoption.max_duration (which would discard
+	// finished member work for a read that is not needed).
+	var listDiff *cache.PackageListDiff
+	if p.form != adoptionFormUnsigned {
+		read := a.cache.DiffPackageList
+		if a.packageListDiff != nil {
+			read = a.packageListDiff // test seam
+		}
+		dctx, cancel := context.WithTimeout(p.barrierCtx(ctx), commitTimeout)
+		diff, derr := read(dctx, cache.SuiteKey{CanonicalScheme: suite.CanonicalScheme,
+			CanonicalHost: suite.CanonicalHost, SuitePath: suite.SuitePath}, packageHashes)
+		cancel()
+		if derr != nil {
+			if stop := p.stopErr(ctx); stop != nil {
+				return fmt.Errorf("adoption: shutdown before the commit: %w", stop)
+			}
+			a.adoptionLogger(ctx).Warn("package_list_diff_failed",
+				"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath,
+				"snapshot_id", snapshotID, "err", derr.Error())
+		} else {
+			listDiff = diff
+		}
+	}
+
 	// Step 11: the atomic flip transaction, behind the spec C8 flip
 	// barrier. The barrier's waits do not honour adoption.max_duration
 	// (they are bounded by 140 s, and giving up would throw away finished
@@ -2088,10 +2130,11 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		}
 		commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
 		defer cancelCommit()
-		err := a.cache.CommitAdoption(commitCtx, snapshotID, memberRows, integritySkipped, packageHashes,
-			prefetchedURLPaths, pkgHashRes.coverageComplete)
+		written, err := a.cache.CommitAdoptionDiff(commitCtx, snapshotID, memberRows, integritySkipped, packageHashes,
+			prefetchedURLPaths, pkgHashRes.coverageComplete, listDiff)
 		if err == nil {
 			attempt.resulting = snapshotID
+			attempt.packageList, attempt.committed = written, true
 		}
 		return err
 	}
@@ -2118,6 +2161,25 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	}
 
 	hotPrefetchTotal.Inc("complete", suite.CanonicalHost)
+
+	// How the commit wrote the suite's package list. A mismatch is a
+	// defect in the difference (cache.PackageListWrite): the commit undid
+	// it and wrote the whole list, so the adoption is whole and the list
+	// exact, and the defect is worth an ERROR someone reads.
+	if w := attempt.packageList; attempt.committed {
+		packageListWritesTotal.Inc(w.Mode, w.Reason, suite.CanonicalHost)
+		if w.Reason == "mismatch" {
+			var added, changed, removed int
+			if listDiff != nil {
+				added, changed, removed = len(listDiff.Added), len(listDiff.Changed), len(listDiff.Removed)
+			}
+			a.adoptionLogger(ctx).Error("package_list_mismatch",
+				"canonical_host", suite.CanonicalHost, "suite_path", suite.SuitePath,
+				"snapshot_id", snapshotID,
+				"expected_rows", w.Expected, "found_rows", w.Found, "detail", w.Detail,
+				"added", added, "changed", changed, "removed", removed)
+		}
+	}
 
 	// Step 10: success log + form-drift signal.
 	//
