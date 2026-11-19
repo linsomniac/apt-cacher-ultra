@@ -1,8 +1,9 @@
 # One package list per suite, written by difference
 
 Date: 2026-11-18. Branch: `perf/package-rows-per-suite` (off `main`
-421f5ea, which has the writer-wait logging). Status: design, awaiting the
-maintainer's approval; nothing is built.
+421f5ea, which has the writer-wait logging). Status: approved by the
+maintainer 2026-11-19 as written. Plan:
+`docs/superpowers/plans/2026-11-19-package-list-per-suite.md`.
 
 ## Why
 
@@ -343,7 +344,10 @@ Robustness over speed: each behaviour is pinned before it is built.
 - **The guard:** a difference computed against a list that then changed (a
   reconcile's row, a swapped list) takes the rewrite path and still ends
   exact. The count check turns a deliberately wrong difference into a
-  failed adoption with the previous snapshot still serving.
+  rewrite of the list and an ERROR, with the adoption succeeding and the
+  list exact (corrected 2026-11-19: this bullet still described the
+  earlier "fail the adoption" variant, which "The switch" and call 2
+  replaced before approval).
 - **Every reader, before and after:** the existing reader tests, moved to
   the new table, plus the query-plan pins (`suite_freshness` by key, the
   partial flat index, the list index for the newest-N probe).
