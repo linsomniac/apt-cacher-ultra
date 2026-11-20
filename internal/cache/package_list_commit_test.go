@@ -670,3 +670,130 @@ func TestCommitDiff_TheSameRowsInAnotherOrderAreTheSameRows(t *testing.T) {
 	}
 	requireLive(t, c, key, next)
 }
+
+// A statement of the difference that fails, as it runs, for a reason that
+// is not the difference's — here a trigger that raises an arithmetic
+// error; in the field a full disk or an I/O error — fails the commit, as
+// it would on the rewrite
+// path, and leaves everything as it was. Only a constraint failure (an
+// added path the list already has) says the difference itself is wrong
+// and is answered by writing the list whole (the final review's M-1): the
+// adopter reports that as a defect, which a full disk is not.
+func TestCommitDiff_AStatementErrorThatIsNotAConstraintFailsTheCommit(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	key := sk("h", "/ubuntu/dists/jammy")
+	seedRow(t, c, key, 1)
+	rows := numbered(100, 'a')
+	prior, _ := publish(t, c, key, rows)
+	list, gen := listIDOf(t, c, key), generationOf(t, c, key)
+	// The fault must come when the statement runs, not when it is prepared
+	// (a prepare error already failed the commit): abs() of the smallest
+	// integer is SQLite's documented run-time "integer overflow", an error
+	// that is not a constraint failure.
+	if _, err := c.db.Exec(`CREATE TRIGGER break_delete BEFORE DELETE ON package_list_entry
+ BEGIN SELECT abs(-9223372036854775807 - 1 + OLD.rowid * 0); END`); err != nil {
+		t.Fatal(err)
+	}
+	next := slices.Clone(rows[1:]) // one removed: the difference deletes a row
+	id, members := signedCandidate(t, c, key)
+	diff, err := c.DiffPackageList(ctx, key, next)
+	if err != nil || len(diff.Removed) != 1 {
+		t.Fatalf("DiffPackageList = %+v, %v", diff, err)
+	}
+	w, err := c.CommitAdoptionDiff(ctx, id, members, nil, next, nil, true, diff)
+	if err == nil {
+		t.Fatalf("a difference whose delete failed committed: %+v; want the commit to fail", w)
+	}
+	if !strings.Contains(err.Error(), "integer overflow") {
+		t.Fatalf("the commit's error = %v, want the statement's own (integer overflow)", err)
+	}
+	requireLive(t, c, key, rows)
+	if listIDOf(t, c, key) != list || generationOf(t, c, key) != gen || len(unnamedLists(t, c)) != 0 {
+		t.Fatal("a failed commit changed the suite's list or its generation, or left a list behind")
+	}
+	suite, err := c.GetSuiteFreshness(ctx, "http", "h", key.SuitePath)
+	if err != nil || suite.CurrentSnapshotID == nil || *suite.CurrentSnapshotID != prior {
+		t.Fatalf("the prior snapshot is no longer current: %+v, %v", suite, err)
+	}
+	// With the fault gone the same difference applies.
+	if _, err := c.db.Exec(`DROP TRIGGER break_delete`); err != nil {
+		t.Fatal(err)
+	}
+	if w, err := c.CommitAdoptionDiff(ctx, id, members, nil, next, nil, true, diff); err != nil || w.Mode != PackageListDifference {
+		t.Fatalf("the retry = %+v, %v; want the difference applied", w, err)
+	}
+	requireLive(t, c, key, next)
+}
+
+// A file a client asked for whose cached bytes were not the declared ones
+// at the time (so the request recorded no interest), and that the adoption
+// then warms to the declared bytes: the commit records the interest for
+// the warmed path, on both commit paths, although its list entry did not
+// change. Warming writes the url_path row without a request stamp, so no
+// trigger fires for it, and no later commit visits an unchanged entry
+// (the final review's M-2). The stamp recorded is the client's own:
+// warming never invents interest.
+func TestCommitDiff_RecordsInterestForAWarmedFileOfAnUnchangedEntry(t *testing.T) {
+	for _, mode := range []string{PackageListDifference, PackageListRewrite} {
+		t.Run(mode, func(t *testing.T) {
+			c := openCache(t)
+			ctx := context.Background()
+			key := sk("h", "/ubuntu/dists/jammy")
+			seedRow(t, c, key, 1)
+			warm := PackageHash{CanonicalScheme: "http", CanonicalHost: "h", Path: "/ubuntu/pool/warm.deb",
+				DeclaredSHA256: hashOf('1'), PackageName: "warm", Architecture: "amd64", Version: "1"}
+			never := PackageHash{CanonicalScheme: "http", CanonicalHost: "h", Path: "/ubuntu/pool/never.deb",
+				DeclaredSHA256: hashOf('2'), PackageName: "never", Architecture: "amd64", Version: "1"}
+			rows := append(numbered(20, '0'), warm, never)
+			publish(t, c, key, rows)
+
+			// A client asked for warm.deb while the cache held other bytes for it.
+			for _, h := range []string{hashOf('1'), hashOf('2'), hashOf('9')} {
+				if _, err := c.db.Exec(`INSERT OR IGNORE INTO blob (hash, size, created_at) VALUES (?, 1, 0)`, h); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stale, at := hashOf('9'), int64(5000)
+			if err := c.PutURLPath(ctx, URLPath{CanonicalScheme: "http", CanonicalHost: "h", Path: warm.Path, BlobHash: &stale,
+				UpstreamURL: "http://up/warm", LastRequestedAt: &at, RequestCount: 1, LastFetchedAt: &at}); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := hotStamp(t, c, key, "warm"); ok {
+				t.Fatal("premise: a request for bytes the list does not declare recorded interest")
+			}
+
+			// The next publication leaves both entries as they are and warms
+			// both files; never.deb was never asked for.
+			next := slices.Clone(rows)
+			next[0].Version = "2"
+			id, members := signedCandidate(t, c, key)
+			var diff *PackageListDiff
+			if mode == PackageListDifference {
+				var err error
+				if diff, err = c.DiffPackageList(ctx, key, next); err != nil {
+					t.Fatal(err)
+				}
+			}
+			warmed := []PrefetchedURLPath{
+				{CanonicalScheme: "http", CanonicalHost: "h", Path: warm.Path, BlobHash: warm.DeclaredSHA256, UpstreamURL: "http://up/warm"},
+				{CanonicalScheme: "http", CanonicalHost: "h", Path: never.Path, BlobHash: never.DeclaredSHA256, UpstreamURL: "http://up/never"},
+			}
+			w, err := c.CommitAdoptionDiff(ctx, id, members, nil, next, warmed, true, diff)
+			if err != nil || w.Mode != mode {
+				t.Fatalf("the write = %+v, %v; want mode %s", w, err, mode)
+			}
+			if got, ok := hotStamp(t, c, key, "warm"); !ok || got != at {
+				t.Fatalf("interest in the warmed, once-requested file = %d, %v; want the client's stamp %d", got, ok, at)
+			}
+			if _, ok := hotStamp(t, c, key, "never"); ok {
+				t.Fatal("warming a file nobody asked for recorded interest")
+			}
+			// The warm kept the client's stamp on the row and added none.
+			up, err := c.LookupURL(ctx, "http", "h", never.Path)
+			if err != nil || up.LastRequestedAt != nil || up.RequestCount != 0 {
+				t.Fatalf("the warmed, never-requested row = %+v, %v; want no request recorded", up, err)
+			}
+		})
+	}
+}

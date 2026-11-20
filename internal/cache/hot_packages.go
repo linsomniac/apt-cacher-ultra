@@ -34,7 +34,10 @@ const recordListHotPackagesSQL = `INSERT INTO hot_package
 // AIDEV-NOTE: a writer of entries calls this for the rows it wrote, and
 // only those. The hot_package triggers cover every later request stamp,
 // so an entry that did not change was recorded when it arrived (by the
-// commit or the reconcile that wrote it) or by a trigger since. The
+// commit or the reconcile that wrote it) or by a trigger since. The one
+// other caller is the commit's warm step, for the files it warmed: a
+// warm changes a url_path row's bytes without a request stamp, so no
+// trigger fires for it (CommitAdoption, after Step 3a). The
 // suite's key is a parameter, not a join on suite_freshness, because a new
 // list is not named by its suite until the commit's Step 6.
 func recordListHotPackages(ctx context.Context, tx *sql.Tx, listID int64, key SuiteKey, paths []string) error {

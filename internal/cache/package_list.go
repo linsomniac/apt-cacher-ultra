@@ -273,6 +273,17 @@ type PackageListWrite struct {
 	Detail          string
 }
 
+// liveListRowsSQL reads one list in path order: the difference's read.
+//
+// AIDEV-NOTE: the order comes from the list's primary key (package_list_id,
+// path), so the rows stream without a sort: a sort would hold the whole
+// list (420,000 rows for the largest suite) in a temporary B-tree before
+// the first row. TestPackageListReaders_QueryPlans pins it.
+const liveListRowsSQL = `
+SELECT canonical_scheme, canonical_host, path, declared_sha256,
+       package_name, architecture, version, flat_filename
+  FROM package_list_entry WHERE package_list_id = ? ORDER BY path`
+
 // DiffPackageList reads key's live package list, on a reader connection in
 // one read transaction, and returns what turns it into rows: the argument
 // CommitAdoptionDiff takes. It returns nil, nil when the suite names no
@@ -306,10 +317,7 @@ SELECT package_list_id, package_list_generation FROM suite_freshness
 	if !listID.Valid {
 		return nil, nil
 	}
-	live, err := tx.QueryContext(ctx, `
-SELECT canonical_scheme, canonical_host, path, declared_sha256,
-       package_name, architecture, version, flat_filename
-  FROM package_list_entry WHERE package_list_id = ? ORDER BY path`, listID.Int64)
+	live, err := tx.QueryContext(ctx, liveListRowsSQL, listID.Int64)
 	if err != nil {
 		return nil, fmt.Errorf("DiffPackageList: read list %d: %w", listID.Int64, err)
 	}
@@ -412,8 +420,10 @@ func commitPackageListTx(ctx context.Context, tx *sql.Tx, key SuiteKey, live sql
 //
 // AIDEV-NOTE: the tripwires, none of them a proof (a wrong hash on a
 // changed row passes all three; the model test is the proof). Each DELETE
-// and UPDATE must hit exactly one row; an INSERT must not fail; the final
-// count must be the number of new rows. A failed tripwire is not an error:
+// and UPDATE must hit exactly one row; an INSERT must not be refused by a
+// constraint (isConstraintViolation: any other statement error fails the
+// commit); the final count must be the number of new rows. A failed
+// tripwire is not an error:
 // the caller writes the whole list instead, which is exact by
 // construction, and the adopter reports it (ERROR package_list_mismatch).
 // Failing the adoption would repeat at every retry against the same list.
@@ -447,12 +457,15 @@ func applyPackageListDiffTx(ctx context.Context, tx *sql.Tx, key SuiteKey, listI
 }
 
 // runPackageListDiffTx is applyPackageListDiffTx's body between the
-// savepoint and its end. A statement that fails while ctx is done is an
-// error (nothing more can be done in this transaction); any other failed
-// statement is a tripwire.
+// savepoint and its end. A statement refused by a constraint is a tripwire
+// (an added path the list already has: the difference is wrong). A
+// statement that fails any other way — ctx is done, the disk is full, an
+// I/O error — is an error, and the commit fails as it would on the rewrite
+// path: that is a fault of the database, not a defect in the difference,
+// and must not be reported as one (the final review's M-1).
 func runPackageListDiffTx(ctx context.Context, tx *sql.Tx, key SuiteKey, listID int64, want int, diff *PackageListDiff) (found int, detail string, err error) {
 	failed := func(what, path string, err error) (int, string, error) {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || !isConstraintViolation(err) {
 			return 0, "", fmt.Errorf("package list difference: %s %q: %w", what, path, err)
 		}
 		return 0, fmt.Sprintf("%s %q failed: %v", what, path, err), nil

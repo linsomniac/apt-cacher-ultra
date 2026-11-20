@@ -67,6 +67,23 @@ func isUniqueViolation(err error) bool {
 	return sqliteErr.Code() == sqliteConstraintUnique
 }
 
+// sqliteConstraint is the primary result code SQLITE_CONSTRAINT: the low
+// byte of every extended constraint code (PRIMARY KEY, UNIQUE, CHECK,
+// NOT NULL, FOREIGN KEY, a trigger's RAISE). Fixed by SQLite's public ABI,
+// like sqliteConstraintUnique.
+const sqliteConstraint = 19
+
+// isConstraintViolation reports whether err is a SQLite constraint
+// failure of any kind: the statement was refused for what it would have
+// written, not for a fault of the database (I/O, disk full, corruption).
+func isConstraintViolation(err error) bool {
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	return sqliteErr.Code()&0xff == sqliteConstraint
+}
+
 // HeartbeatSnapshot updates suite_snapshot.heartbeat_at to "now" for the
 // given candidate snapshot id. SPEC4 §7.5.2 sites 2–5: the adoption
 // goroutine calls this after each member fetch, after Packages parsing,
@@ -594,6 +611,28 @@ ON CONFLICT(canonical_scheme, canonical_host, path) DO UPDATE SET
 				up.CanonicalScheme, up.CanonicalHost, up.Path,
 				up.BlobHash, up.UpstreamURL, now, up.CanonicalScheme, up.CanonicalHost, up.Path, up.BlobHash); err != nil {
 				return fmt.Errorf("CommitAdoption: prefetched url_path %q: %w", up.Path, err)
+			}
+		}
+
+		// The warmed rows now hold their entries' declared bytes. A row a
+		// client asked for while it held other bytes recorded no interest
+		// then (the hot_package triggers match on the hash), and the upsert
+		// above fires no trigger (it leaves last_requested_at alone, on
+		// purpose), so record the interest here, for the warmed paths. Only
+		// real request stamps count: a warmed row nobody asked for has none.
+		//
+		// AIDEV-NOTE: the final review's M-2. Before schema 11 every commit
+		// joined the snapshot's whole package list with url_path, so the
+		// next adoption caught these; the difference path visits only the
+		// rows it wrote, and Step 3's whole-list record on the rewrite path
+		// runs before this upsert. Cost: one indexed probe per warmed file.
+		if newList.Valid && len(prefetchedURLPaths) > 0 {
+			warmed := make([]string, len(prefetchedURLPaths))
+			for i, up := range prefetchedURLPaths {
+				warmed[i] = up.Path
+			}
+			if err := recordListHotPackages(ctx, tx, newList.Int64, suiteKey, warmed); err != nil {
+				return fmt.Errorf("CommitAdoption: %w", err)
 			}
 		}
 
