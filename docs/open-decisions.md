@@ -924,15 +924,32 @@ the cache trusts or serves.
   - The package-list model test runs 12 seeds of 150 steps in the suite
     and 40 of 300 before a release that changes a writer of the lists
     ([docs/releasing.md](releasing.md), step 5).
+  - The admin aggregates keep their scheme and host terms (the
+    maintainer, 2026-11-20): a row counts for the suite whose scheme and
+    host it carries (`TestAdminAggregatesCurrentSnapshots`). The price is
+    that the host summary's row count reads the table instead of an index
+    alone. On a production database copy (292,712 rows in 24 lists; nine
+    repetitions in one sitting, with a throwaway test that is not in the
+    tree) the count takes 0.59 s where `main` takes 0.45 to 0.50 s, and
+    repo coverage, the other query of the same refresh, 0.65 to 0.80 s
+    where `main` takes 1.1 to 1.2 s. Both run on a reader connection, at
+    most once per `admin.gauge_refresh` and only after the database
+    changed, each under a 10 s limit. Weighed and not taken: dropping the
+    terms from the count (0.43 s; a row with another origin would be
+    counted under its suite's host, and the three admin queries would no
+    longer agree on it); an index carrying scheme, host and architecture
+    (0.39 s; 12 MiB more on that database and a fifth index on every
+    package-row write, which this change exists to make cheap); having
+    the commit and reconcile refuse a row whose scheme or host is not its
+    suite's, which would make the terms redundant (not measured; it
+    touches the writers that carry trust).
   Evidence: `docs/superpowers/specs/2026-11-18-package-list-per-suite-design.md`
   (the design, its result and the calls made while building), the plan
   beside it, `e2e/freshness-lab/README.md` ("One package list per suite:
   the result"), `TestPackageLists_AModelOfTheSwitch`,
   `TestMigrationV11_EveryReaderAnswersAsSchema10DidOnRandomDatabases`,
   `TestMeasure_CommitOnARealDatabase`. Not decided: the release it lands
-  in; whether the admin host summary keeps its scheme and host terms (it
-  is no longer answered from a covering index: 336 ms against 155 ms in
-  the benchmark); phase 2, writing a whole list in chunks before the flip.
+  in; phase 2, writing a whole list in chunks before the flip.
 - **1.1.0-rc1 release preparation** (2026-11-11 local / 2026-11-12 UTC).
   The candidate is opt-in testing; 1.0.4 remains the recommended stable
   release. Its release notes are `docs/release-notes/1.1.0-rc1.md`, with

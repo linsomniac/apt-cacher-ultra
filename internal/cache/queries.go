@@ -408,6 +408,17 @@ func (c *Cache) GetCacheStats(ctx context.Context) (CacheStats, error) {
 // only the list a suite names. `+column` keeps a term out of index
 // selection without changing what it means.
 // TestPackageListReaders_QueryPlans pins the three plans.
+//
+// AIDEV-NOTE: the terms stay (the maintainer, 2026-11-20), and are not to
+// be dropped for speed. Their price is that the host summary's count
+// reads the table: without them idx_package_list_entry_pkg would answer
+// it alone. On a production database copy (292,712 rows in 24 lists) that
+// is 0.59 s against 0.43 s, on a reader connection, at most once per
+// admin.gauge_refresh and only after the database changed. The writers
+// store a row's scheme and host as given and do not compare them with the
+// suite's, so the terms are the only place the rule is checked.
+// docs/open-decisions.md, "One package list per suite", has the options
+// that were weighed.
 const (
 	// repoCoverageRowsSQL: per current snapshot and architecture, its
 	// list's rows and how many of them are pdiff rows.

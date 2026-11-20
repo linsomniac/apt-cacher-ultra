@@ -452,7 +452,12 @@ asked:
   three times as long a chunk as `main`'s; it is keyed by rowid since,
   and is back at `main`'s level (0.30 s for the longest chunk).
 - The host summary's row count (admin) is no longer answered from a
-  covering index: 336 ms against 155 ms in `BenchmarkAdminCacheSummaries`.
+  covering index: 336 ms against 155 ms in `BenchmarkAdminCacheSummaries`
+  (one suite of 100,000 rows). On the production database copy it is
+  0.59 s against 0.45 to 0.50 s, and repo coverage, which the same
+  refresh runs, is 0.65 to 0.80 s against 1.1 to 1.2 s. Kept as built
+  (the maintainer, 2026-11-20); `docs/open-decisions.md` has the options
+  weighed.
 - The largest database measured is 1.16M package rows. The migration's
   time and temporary space on a much larger one are not measured.
 
