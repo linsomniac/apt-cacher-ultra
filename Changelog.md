@@ -178,9 +178,12 @@ not included in the published 1.1.0-rc1.
   collection has no package rows to delete afterwards. A suite's first
   adoption, and a publication that changes more than half of its
   packages, still write the whole list (about 2 s). In the freshness lab
-  six such suites updating at once were all visible in 136.5 s against
-  160.5 s (one run each); a single suite's update is unchanged, since its
-  minute is detection and the publication barrier. The migration runs at
+  the commits of six such suites updating at once took 0.2 to 0.4 s
+  together where they took 15 s. How much sooner all six are visible is
+  not established: 136 to 160 s over four runs against 160 to 180 s over
+  three, a difference no larger than the variation between runs. A single
+  suite's update is unchanged, since its minute is detection and the
+  publication barrier. The migration runs at
   the first start, before the ports open: it copies the current package
   rows into the new tables and drops the old one, with the package lists
   earlier versions kept for displaced snapshots; 5 to 10 s for a database

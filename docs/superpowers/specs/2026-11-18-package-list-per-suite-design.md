@@ -403,18 +403,19 @@ budget, the barrier.
 
 ### Result (2026-11-19)
 
-Branch 602de26 against `main` 421f5ea. The detail, the conditions and
-the evidence files are in `e2e/freshness-lab/README.md`, "One package
-list per suite: the result".
+Branch 602de26 against `main` 421f5ea; the 0.3% burst was repeated on
+2026-11-20 at cb73f3f, after the review's minor findings were done. The
+detail, the conditions and the evidence files are in
+`e2e/freshness-lab/README.md`, "One package list per suite: the result".
 
 1 and 2, the lab, branch and main alternating on a quiet machine (the
 baseline table above was taken under load; `main` is re-measured here):
 
 | | `main` | Branch |
 |---|---|---|
-| One suite, "PHP update": publication to client-visible | 59.6 s, 61.1 s | 59.8 s, 59.7 s |
-| Six suites of 66,016 rows, 0.3% changed: to all visible | 160.5 s | 136.5 s |
-| commit phase per suite (in all) | 2.33 to 2.74 s (14.9 s) | 0.05 to 0.09 s (0.41 s) |
+| One suite, "PHP update": publication to client-visible | 59.6 s, 61.1 s | 59.8 s, 59.7 s, 59.6 s |
+| Six suites of 66,016 rows, 0.3% changed: commit phase, all six together (three runs of `main`, four of the branch) | 14.9 to 15.6 s | 0.18 to 0.41 s |
+| to all visible, the same runs | 160.5 to 180.1 s | 135.5 to 160.1 s |
 | Six suites, all changed: to all visible | 163.0 s | 153.6 s |
 | commit phase per suite (in all) | 2.29 to 2.58 s (14.4 s) | 1.75 to 1.89 s (10.8 s) |
 
@@ -438,8 +439,11 @@ row stayed about where it was.
 What the measurements do not show, and what they showed that was not
 asked:
 
-- The bursts are one run a side (the single suite two). The 24 s on the
-  middle row's publication time rests on that.
+- How much sooner the six suites are all visible. The branch was ahead
+  in both sittings, but runs of one binary differ by about 20 s, as much
+  as the two sides do; the first sitting's single pair (136.5 s against
+  160.5 s) overstated it. The commit seconds are the firm result. The
+  all-changed burst is still one run a side.
 - Under heavy load from other work on the machine, one branch run still
   had commits of 12 to 16 s that wrote 428 rows each. A quiet rerun did
   not, and evicting the database file from the page cache does not

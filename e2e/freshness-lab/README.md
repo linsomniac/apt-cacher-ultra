@@ -671,20 +671,25 @@ The change the baseline above was taken for: a suite's package rows are
 one list, and an adoption writes the rows a publication changed instead
 of the whole list
 (`docs/superpowers/specs/2026-11-18-package-list-per-suite-design.md`).
-Branch `perf/package-rows-per-suite` at 602de26 against `main` 421f5ea,
-the same three scenarios, branch and main alternating in one sitting on a
-machine doing nothing else of the measurer's (load average 0.4 to 2.5 at
-each run's start); one run each of the bursts, two each of the single
-suite.
+Branch `perf/package-rows-per-suite` against `main` 421f5ea, the same
+three scenarios, branch and main alternating on a machine doing nothing
+else of the measurer's (load average 0.4 to 2.5 at each run's start). The
+first sitting (2026-11-19, branch at 602de26) ran each burst once a side
+and the single suite twice; a second (2026-11-20, branch at cb73f3f) ran
+the 0.3% burst twice more a side, after a third branch run showed how far
+its publication time moves between runs. The fourth branch run of that
+burst is the first sitting's earlier one, at 4aa542c.
 [package-list-result-measurements.json](package-list-result-measurements.json)
 has every attempt's phases, how each commit wrote its list, and every
-`database_write_waited` line.
+`database_write_waited` line, for all of them.
 
 | | `main` | Branch |
 | --- | ---: | ---: |
-| **One suite, the "PHP update" scenario:** publication to client-visible | 59.6 s, 61.1 s | 59.8 s, 59.7 s |
-| **Six suites of 66,016 rows, 0.3% changed:** publication to all candidates visible | 160.5 s | 136.5 s |
-| commit phase per suite (in all) | 2.33 to 2.74 s (14.9 s) | 0.05 to 0.09 s (0.41 s) |
+| **One suite, the "PHP update" scenario:** publication to client-visible | 59.6 s, 61.1 s | 59.8 s, 59.7 s, 59.6 s |
+| **Six suites of 66,016 rows, 0.3% changed:** commit phase per suite | 2.26 to 3.12 s | 0.02 to 0.09 s |
+| commit phase, the six suites together, per run | 14.9 s, 15.0 s, 15.6 s | 0.18 s, 0.35 s, 0.40 s, 0.41 s |
+| publication to all candidates visible, per run | 160.5 s, 164.1 s, 180.1 s | 135.5 s, 136.5 s, 153.9 s, 160.1 s |
+| writes that waited 2 s or more | none | none |
 | package rows written per commit | 66,016 | 428 (214 in, 214 out) |
 | database file after the run | 322 MiB | 176 MiB |
 | **Six suites of 66,016 rows, all changed:** publication to all candidates visible | 163.0 s | 153.6 s |
@@ -695,13 +700,20 @@ What it says:
 
 - **A typical publication's commit is no longer seconds.** With 0.3% of
   the rows changed (the June data's shape) each commit wrote 428 rows
-  where it wrote 66,016, and took 0.05 to 0.09 s where it took 2.3 to
-  2.7 s. Publication to all six suites visible was 136.5 s against
-  160.5 s, one run each (a second branch run, at 4aa542c, gave 135.5 s;
-  `main` has the one quiet run). That is more than the 14.5 s of commit
-  time saved; the likely reason is that the two adoption slots are held
-  through the commit, so a commit's seconds are also seconds the queued
-  suites wait, but one run a side does not establish the size.
+  where it wrote 66,016, and took 0.02 to 0.09 s where it took 2.3 to
+  3.1 s: 15 s of commit per publication of the six suites became 0.2 to
+  0.4 s, in every run.
+- **How much sooner the six suites are all visible is not established.**
+  The branch's four runs took 135.5 to 160.1 s and `main`'s three 160.5 to
+  180.1 s. In each sitting the branch was ahead (136.5 s against 160.5 s
+  the first day; 153.9 and 160.1 s against 164.1 and 180.1 s the second),
+  but runs of one binary differ by 20 s, as much as the two sides do: the
+  time is set by the publication barrier and the two adoption slots, and
+  the barrier's waits alone summed to between 86 and 126 s a run. From
+  the mechanism the gain should be the commit seconds along the slower
+  slot's chain of suites, roughly 7 to 15 s here; the runs are consistent
+  with that and do not pin it down. The first sitting's single pair
+  (136.5 s against 160.5 s) overstated it.
 - **The single-suite scenario did not move,** as expected: its minute is
   detection (39 s) and the publication barrier (20 s), and its commit was
   2 to 4 ms before and after. (Its one-package list is written whole on
