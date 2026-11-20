@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
@@ -237,5 +238,48 @@ func TestAdoption_AnUnsignedAdoptionReadsNoDifference(t *testing.T) {
 	rec := lastFinished(t, logs)
 	if rec["outcome"] != "success" || rec["package_list_write"] != "none" {
 		t.Fatalf("adoption_finished = %v; want a success whose package_list_write is none", rec)
+	}
+}
+
+// A shutdown while the live list is being read abandons the adoption
+// before its commit, as a shutdown anywhere before the commit does: the
+// previous snapshot stays current, and the interrupted read is not
+// reported as a read failure (which would send the adoption on to write
+// the whole list during a stop).
+func TestAdoption_AShutdownDuringTheListReadAbandonsTheAdoption(t *testing.T) {
+	r := newRetryRig(t, 0)
+	pkgs := rigPackages(10)
+	if err := r.publishPackages("first", pkgs); err != nil {
+		t.Fatalf("first adoption: %v", err)
+	}
+	before := r.currentSnapshot()
+	logs := adoptionLogs(r)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	read := 0
+	r.adopter.packageListDiff = func(context.Context, cache.SuiteKey, []cache.PackageHash) (*cache.PackageListDiff, error) {
+		read++
+		cancel() // the stop arrives while the list is being read
+		return nil, context.Canceled
+	}
+	pkgs["pool/main/p/new/new_1.deb"] = fmt.Sprintf("%064x", 4242)
+	r.pkgs = fakePackagesStanzas(pkgs)
+	r.members.put(rigPkgsURL, r.pkgs)
+	err := r.adopter.Run(ctx, SuiteRef{"http", rigHost, rigSuite}, r.release("second", 0), "", "")
+	if err == nil || !strings.Contains(err.Error(), "shutdown before the commit") {
+		t.Fatalf("Run = %v, want the adoption abandoned at the shutdown before the commit", err)
+	}
+	if read != 1 {
+		t.Fatalf("the live list was read %d times, want once", read)
+	}
+	if after := r.currentSnapshot(); after == nil || before == nil || after.SnapshotID != before.SnapshotID {
+		t.Fatalf("the current snapshot changed from %+v to %+v: an adoption abandoned at a shutdown committed", before, after)
+	}
+	if warns := logRecords(t, logs, "package_list_diff_failed"); len(warns) != 0 {
+		t.Fatalf("a read interrupted by a shutdown was logged as a failed read: %v", warns)
+	}
+	rec := lastFinished(t, logs)
+	if rec["outcome"] == "success" || rec["package_list_write"] != nil {
+		t.Fatalf("adoption_finished = %v; want an attempt that did not commit", rec)
 	}
 }

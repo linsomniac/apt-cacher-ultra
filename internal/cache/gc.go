@@ -582,6 +582,13 @@ SELECT pl.package_list_id FROM package_list pl
  ORDER BY pl.package_list_id
  LIMIT 1`
 
+// packageListChunkDeleteSQL is sub-job D's chunk: up to a number of
+// entries of one list, by rowid (the note at RunPackageListGCChunk has the
+// measurement that chose this shape).
+const packageListChunkDeleteSQL = `
+DELETE FROM package_list_entry WHERE rowid IN
+ (SELECT rowid FROM package_list_entry WHERE package_list_id = ? LIMIT ?)`
+
 // RunPackageListGCChunk is one writer transaction of snapshot-GC sub-job D
 // (the package-list design, "What deletes rows"): it takes the lowest-id
 // package list no suite names and deletes up to maxRows of its entries;
@@ -644,9 +651,7 @@ func (c *Cache) RunPackageListGCChunk(ctx context.Context, maxRows int) (rows in
 		case err != nil:
 			return fmt.Errorf("RunPackageListGCChunk: select: %w", err)
 		}
-		res, err := tx.ExecContext(ctx, `
-DELETE FROM package_list_entry WHERE rowid IN
- (SELECT rowid FROM package_list_entry WHERE package_list_id = ? LIMIT ?)`, id, maxRows)
+		res, err := tx.ExecContext(ctx, packageListChunkDeleteSQL, id, maxRows)
 		if err != nil {
 			return fmt.Errorf("RunPackageListGCChunk: delete entries of list %d: %w", id, err)
 		}

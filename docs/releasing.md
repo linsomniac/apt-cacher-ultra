@@ -31,7 +31,7 @@ until its README's procedure says what to do.
    adoption commit, reconcile, the quarantine, suite removal, GC's sub-job
    D, a migration of those tables):
    `ACU_MODEL_SEEDS=40 ACU_MODEL_STEPS=300 go test ./internal/cache/ -run TestPackageLists_AModelOfTheSwitch -count=1`
-   (about 75 seconds). The suite runs it at 12 seeds of 150 steps; this is
+   (about 85 seconds). The suite runs it at 12 seeds of 150 steps; this is
    the plan's full run, kept out of every `go test` for its time under
    `-race`. A failure names its seed: `ACU_MODEL_SEED=<n>` repeats it.
 6. **The vendor anchors.** `go test ./internal/gpg` (step 1) verifies the

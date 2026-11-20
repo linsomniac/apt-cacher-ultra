@@ -484,10 +484,12 @@ rulings; the final review weighed them):
 6. `CommitAdoption` keeps its signature and always writes the whole
    list; `CommitAdoptionDiff` takes the difference.
 7. A difference is applied behind more than the row count: every delete
-   and update must hit exactly one row, no insert may fail, and the
-   difference must have been computed for the very rows the commit is
-   given (a digest). Any of them failing writes the whole list and
-   reports `package_list_mismatch`.
+   and update must hit exactly one row, no insert may be refused by a
+   constraint, and the difference must have been computed for the very
+   rows the commit is given (a digest). Any of them failing writes the
+   whole list and reports `package_list_mismatch`. A statement that fails
+   any other way (a full disk, an I/O error) fails the commit, as on the
+   whole-list path: it is not a defect in the difference.
 8. Reconcile records hot-package interest for the rows it adds: no later
    commit visits an unchanged row.
 9. The migration copies a current snapshot's rows whose scheme and host
@@ -498,3 +500,16 @@ rulings; the final review weighed them):
     test pins them), written so SQLite does not choose an index by them.
 11. `package_list_entry` is a rowid table; the rewrite path is taken past
     half the new list (both by measurement, in the plan).
+12. The commit records hot-package interest for the files the adoption
+    warmed, after it writes their `url_path` rows: a warm changes a row's
+    bytes without a request stamp, so no trigger fires, and no later
+    commit visits an unchanged entry.
+
+The final review's four minor findings (2026-11-19) were done on
+2026-11-20: items 7 (its last sentence) and 12 above; query-plan pins for
+GC's unnamed-list select, its chunk delete and the difference's read; a
+test of a shutdown during that read; and the model test now puts a
+quarantine and a forget-and-recreate between a difference's read and its
+commit, hands commits a difference made for other rows and for the
+scheme twin, heals rows through reconcile, and has https twins and flat
+suites.

@@ -214,6 +214,31 @@ func TestPackageListReaders_QueryPlans(t *testing.T) {
 		}
 	}
 
+	// GC's sub-job D runs inside a writer transaction (the final review's
+	// M-4). Its select walks the lists in id order, without a sort, and asks
+	// the suite index once per list; its chunk takes rowids from the primary
+	// key's index and deletes by rowid.
+	gcSelect := queryPlan(t, c, unnamedPackageListSelectSQL)
+	if !strings.Contains(gcSelect, "SCAN pl") ||
+		!strings.Contains(gcSelect, "SEARCH sf USING COVERING INDEX idx_suite_freshness_package_list (package_list_id=?)") ||
+		strings.Contains(gcSelect, "SCAN sf") || strings.Contains(gcSelect, "TEMP B-TREE") {
+		t.Errorf("GC's unnamed-list select:\n%s", gcSelect)
+	}
+	chunk := queryPlan(t, c, packageListChunkDeleteSQL, 1, 10)
+	if !strings.Contains(chunk, "SEARCH package_list_entry USING INTEGER PRIMARY KEY (rowid=?)") ||
+		!strings.Contains(chunk, "USING COVERING INDEX sqlite_autoindex_package_list_entry_1 (package_list_id=?)") ||
+		strings.Contains(chunk, "SCAN ") {
+		t.Errorf("GC's chunk delete:\n%s", chunk)
+	}
+
+	// The difference's read streams one list in path order off its primary
+	// key: no sort, which would hold the whole list before its first row.
+	live := queryPlan(t, c, liveListRowsSQL, 1)
+	if !strings.Contains(live, "SEARCH package_list_entry USING INDEX sqlite_autoindex_package_list_entry_1 (package_list_id=?)") ||
+		strings.Contains(live, "TEMP B-TREE") || strings.Contains(live, "SCAN ") {
+		t.Errorf("the difference's read of the live list:\n%s", live)
+	}
+
 	// The hot_package triggers' SELECT, as stored, with NEW.x as parameters.
 	var body string
 	if err := c.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'hot_package_touch'`).Scan(&body); err != nil {
