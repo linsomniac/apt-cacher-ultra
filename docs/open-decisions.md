@@ -176,6 +176,29 @@ the cache trusts or serves.
   CI now allow 10 minutes. Class none: test time only.
   Recommendation: keep the 10-minute bound; split
   the package's simulations into their own test binary if it nears it.
+- **e2e/flat's `apt_sent` can miss a request line apt sent** (raised
+  2026-11-21, the 1.1.0-rc3 release gate). CI run 44936685430's
+  `e2e-flat (debian:12)` job failed at its first attempt in
+  `first-contact`: "apt did not send GET
+  http://signed.test/libnvidia-container/stable/deb/amd64/./acu-nvidia_1.0_amd64.deb".
+  The same job's log shows apt did send it: the daemon's `request` line
+  with that `url` (outcome `miss`, `validated_hash=true`) and nginx's line
+  for the same path. The other five images passed, the job passed when
+  re-run once (e2e/flat/README.md, *Flake, environment or daemon bug?*:
+  the log was kept and the failure classified first), and the image
+  passes on the same commit locally. Cause: the check wants the request
+  line at the start of a line (`^GET …`), and that install has two apt
+  method processes, one per host, writing debug output to one file. apt's
+  `Answer for: ` and the URL after it are two `write` calls (strace of
+  apt 2.6.2's http method: 12 bytes, then the URL, then a newline, then
+  the headers), and a request block is one, so the other host's request
+  can land between them: `Answer for: GET http://… HTTP/1.1`. apt's log
+  of that run was not kept, so that this is what it held is inferred, not
+  seen. Class none: the harness; the daemon's and nginx's records were
+  right. Recommendation: let `apt_sent_line` accept the line start or
+  `Answer for: ` before `GET` (the request block is one write, so the
+  rest of the line is whole), and print the apt log when the check fails;
+  the entry *CI keeps e2e/flat's full logs* would have settled it.
 - **`internal/cache` under `-race` is at the 10-minute bound on a
   developer machine** (raised 2026-11-21, the 1.1.0-rc3 release gate).
   The package took 299 s under `-race` on `main` and takes 565 to 613 s
@@ -185,9 +208,10 @@ the cache trusts or serves.
   difference: `TestPackageLists_AModelOfTheSwitch` (126 s),
   `TestCommitDiff_FortyThousandRemovedPathsCommit` (113 s) and
   `TestMigrationV11_EveryReaderAnswersAsSchema10DidOnRandomDatabases`
-  (44 s). On CI `main`'s package took 178 s; by the same ratio the
-  package would take about 6 minutes there, which is not measured as this
-  is written. Class none: test time only. Recommendation: let those
+  (44 s). On CI the package took 178 s on `main` and 374 s at the
+  1.1.0-rc3 commit (run 44936685430), inside the bound there; it is the
+  developer machine that is at it. Class none: test time only.
+  Recommendation: let those
   three run beside each other (each has its own cache; check first that
   none reads a process-wide counter), or split them into their own test
   binary as the entry above recommends for `internal/freshness`; do not
@@ -1022,6 +1046,17 @@ the cache trusts or serves.
   the xz fix and the compressed-sibling skip have not run in production.
   CI must also pass on the preparation commit before tagging, as
   [releasing.md](releasing.md) requires.
+  What followed, on `c2ccf3f`: CI run 44936685430 passed at its second
+  attempt. At the first, `e2e-flat (debian:12)` failed on a request line
+  the harness did not find in apt's debug output though apt sent it (the
+  *Open* entry "e2e/flat's `apt_sent` can miss a request line apt sent");
+  every other job passed, `internal/cache` under `-race` in 374 s. The
+  tag `1.1.0-rc3` was pushed at 20:06 UTC and the release workflow passed
+  (run 44944522781, *Verify no e2e test seam* included). Published:
+  prerelease, 1.0.5 still latest, the apt repository's publish job
+  skipped; the four assets match `SHA256SUMS`; the binary and the
+  packaged binary report `1.1.0-rc3`; the package is `1.1.0~rc3`, which
+  dpkg orders after `1.1.0~rc2` and before `1.1.0`.
 
 - **1.1.0-rc1 release preparation** (2026-11-11 local / 2026-11-12 UTC).
   The candidate is opt-in testing; 1.0.4 remains the recommended stable
