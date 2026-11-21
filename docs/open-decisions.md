@@ -924,6 +924,10 @@ the cache trusts or serves.
   - The package-list model test runs 12 seeds of 150 steps in the suite
     and 40 of 300 before a release that changes a writer of the lists
     ([docs/releasing.md](releasing.md), step 5).
+  - `adoption.write_package_list_differences = false` switches the
+    difference off (the maintainer, 2026-11-20, on the merge review's
+    advice): every adoption then writes the whole list. A remedy for an
+    operator who sees `package_list_mismatch`, short of a new release.
   - The admin aggregates keep their scheme and host terms (the
     maintainer, 2026-11-20): a row counts for the suite whose scheme and
     host it carries (`TestAdminAggregatesCurrentSnapshots`). The price is
@@ -948,8 +952,12 @@ the cache trusts or serves.
   beside it, `e2e/freshness-lab/README.md` ("One package list per suite:
   the result"), `TestPackageLists_AModelOfTheSwitch`,
   `TestMigrationV11_EveryReaderAnswersAsSchema10DidOnRandomDatabases`,
-  `TestMeasure_CommitOnARealDatabase`. Not decided: the release it lands
-  in; phase 2, writing a whole list in chunks before the flip.
+  `TestMeasure_CommitOnARealDatabase`. It lands in 1.1.0, in the release
+  candidates after RC2 (the maintainer, 2026-11-20, after a second,
+  independent review of the whole branch: no defect in the lists; its
+  findings and what was done for them are items 13 to 16 of the design's
+  "Added while building"). Not decided: phase 2, writing a whole list in
+  chunks before the flip.
 - **1.1.0-rc1 release preparation** (2026-11-11 local / 2026-11-12 UTC).
   The candidate is opt-in testing; 1.0.4 remains the recommended stable
   release. Its release notes are `docs/release-notes/1.1.0-rc1.md`, with

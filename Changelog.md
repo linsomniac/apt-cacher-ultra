@@ -173,9 +173,9 @@ not included in the published 1.1.0-rc1.
   list per suite, updated in place, instead of a copy per snapshot.
   Committing a typical update of a 67,000-package suite took 0.05 s and
   2 MiB of write-ahead log where it took 2.0 to 2.5 s and 64 MiB (a copy
-  of a production database, 241 rows changed), so client requests and
-  other suites' adoptions no longer queue behind it, and garbage
-  collection has no package rows to delete afterwards. A suite's first
+  of a production database, 241 rows changed), so the one database writer,
+  which every other write waits behind, is held for a fraction of the
+  time, and garbage collection has no package rows to delete afterwards. A suite's first
   adoption, and a publication that changes more than half of its
   packages, still write the whole list (about 2 s). In the freshness lab
   the commits of six such suites updating at once took 0.2 to 0.4 s
@@ -194,7 +194,11 @@ not included in the published 1.1.0-rc1.
   beforehand (WARN `package_list_diff_failed`: the whole list is written
   instead) and a difference that did not produce the publication's rows
   (ERROR `package_list_mismatch`: a defect to report; the list is written
-  whole and is exact). See
+  whole and is exact). `adoption.write_package_list_differences = false`
+  (new; default `true`) makes every adoption write the whole list, as
+  before: a fallback should that ERROR ever appear. The migration needs
+  free disk, about 1.3 KiB per current package row (400 MiB for the
+  measured database); see the release notes. See
   [the result](e2e/freshness-lab/README.md#one-package-list-per-suite-the-result-2026-11-19).
 - After 1.1.0-rc1: a suite that clients keep asking for no longer waits a
   minute before it switches to a new snapshot. The flip barrier waited up to

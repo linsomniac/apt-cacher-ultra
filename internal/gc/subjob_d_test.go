@@ -9,8 +9,9 @@ import (
 	"time"
 )
 
-// Issue #14 follow-up, Tier 2: sub-job D strips the package_hash rows of
-// the displaced snapshots (cache.RunPackageListGCChunk), after A ∪ B
+// Issue #14 follow-up, Tier 2: sub-job D deletes the package lists no
+// suite names any more (cache.RunPackageListGCChunk; before schema 11 it
+// stripped the package_hash rows of the displaced snapshots), after A ∪ B
 // and C, in the snapshot pass and in the retired run; and a sub-job that
 // fails no longer stops the sub-jobs after it (ruling HD-15 within the
 // pass), so a C stuck on one snapshot never stops D.

@@ -191,7 +191,9 @@ transaction, where the pointer moves today:
    today's code shape.
 3. **Check:** after the difference path, the live list's row count must
    equal the number of new rows (one index count, a few milliseconds at
-   67k rows). A mismatch means the difference was wrong. The transaction
+   67k rows; it grows with the list, not with the difference: 48 ms at
+   420,000 rows in the merge review's measurement). A mismatch means the
+   difference was wrong. The transaction
    then rolls back to a savepoint taken before step 1 and takes the
    rewrite path instead, which is exact by construction; ERROR
    `package_list_mismatch` (the suite, both counts, the size of the
@@ -449,8 +451,12 @@ asked:
   not, and evicting the database file from the page cache does not
   reproduce it. Unexplained.
 - GC's chunk delete was first keyed by path and held the writer about
-  three times as long a chunk as `main`'s; it is keyed by rowid since,
-  and is back at `main`'s level (0.30 s for the longest chunk).
+  three times as long a chunk as `main`'s; it is keyed by rowid since.
+  That is close to `main`'s level, not at it: the longest chunk holds the
+  writer 0.30 to 0.31 s against 0.16 to 0.29 s, and a 67,000-row list
+  takes 1.7 to 1.85 s to delete against 1.0 to 1.5 s. It runs only after
+  a commit that replaced a whole list; `main` deletes that many rows
+  after every adoption.
 - The host summary's row count (admin) is no longer answered from a
   covering index: 336 ms against 155 ms in `BenchmarkAdminCacheSummaries`
   (one suite of 100,000 rows). On the production database copy it is
@@ -522,3 +528,40 @@ quarantine and a forget-and-recreate between a difference's read and its
 commit, hands commits a difference made for other rows and for the
 scheme twin, heals rows through reconcile, and has https twins and flat
 suites.
+
+A second, independent review before the merge (2026-11-20) found no
+defect in the lists and one hole in their proof. Done for it:
+
+13. The model puts another adoption's difference, applied in place,
+    between a difference's read and its commit, and
+    `TestCommitDiff_ADifferenceReadBeforeAnotherWasAppliedInPlaceIsNotApplied`
+    shows that case alone. Before, every publication in between wrote a
+    new list, so the list's id caught it and the generation was never
+    what decided: a commit that did not bump the generation passed the
+    model, and only three assertions on the counter's value failed. With
+    the bump removed a stale difference changes its rows, leaves the count
+    right, and the cache vouches one publication's hash for a package of
+    another.
+14. `TestDigestPackageRows_EveryStoredColumnCounts` pins the digest that
+    binds a difference to its rows to every stored column, by walking
+    `PackageHash`'s fields and counting the table's columns.
+15. `adoption.write_package_list_differences` (default `true`): `false`
+    makes the adopter read no list and hand the commit no difference, so
+    every adoption writes the whole list (reason `disabled`). The rows
+    that decide what the proxy serves are edited in place by code new in
+    this release, behind a one-way migration; without the setting an
+    operator who saw `package_list_mismatch` had no remedy short of a new
+    release. It changes a commit's cost, not its result.
+16. The upgrade notes say what the migration needs on disk: measured on
+    the production database copy from a schema-10 file, the write-ahead
+    log grew to 169 MiB, SQLite's temporary files to 44 MiB, and the
+    database file by 79 MiB with the displaced snapshots' rows still in it
+    (by nothing once RC2's GC had stripped them and left free pages); two
+    runs each. No free-space check was added.
+
+Not taken from that review: computing the difference inside the writer
+transaction, which needs no generation, digest or read beforehand and
+holds the writer for the read (about 0.3 s instead of 0.05 s at 67,000
+rows; about 2 s instead of 0.3 s at 420,000 in the review's measurement).
+It is the simpler design. The read is disk-bound (0.9 s on a cold page
+cache here), which is the argument for keeping it off the writer.

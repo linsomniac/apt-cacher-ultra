@@ -26,6 +26,14 @@ import (
 // section quotes. Run it alone, on a quiet machine, more than once:
 //
 //	ACU_MEASURE_DB=/path/to/cache.db go test ./internal/cache/ -run TestMeasure_CommitOnARealDatabase -count=1 -v
+//
+// AIDEV-NOTE: the measurement this one follows. The issue #14 benchmark of
+// the package_hash table (TestPackageHashBench in
+// package_hash_bench_test.go, ACU_BENCH=1) went with that table in schema
+// 11, and its note with it; the note is restored here. Its before/after
+// measurements live in
+// docs/superpowers/plans/2026-11-09-issue-14-gc-followup-evidence.md, and
+// its code in git history (last in the tree at 421f5ea).
 
 // stepTimes records when each schema migration step started and ended.
 type stepTimes struct {

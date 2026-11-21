@@ -27,7 +27,7 @@ restart 8 startup            dur=2.5s    deadline=true  retired=1   displaced_re
 
 ### package_hash benchmark (variant base)
 
-Command: `ACU_BENCH=1 ACU_BENCH_K=1,4 ACU_BENCH_VARIANTS=base go test ./internal/cache -run TestPackageHashBench -v -timeout 60m` (PASS, 102.6s)
+Command (`TestPackageHashBench` went with the `package_hash` table in schema 11; it was last in the tree at 421f5ea): `ACU_BENCH=1 ACU_BENCH_K=1,4 ACU_BENCH_VARIANTS=base go test ./internal/cache -run TestPackageHashBench -v -timeout 60m` (PASS, 102.6s)
 
 ```
 RESULT k=1  rows=840000   variant=base      seed=17s      insert70k=1.355s   delete70k_chunked=904ms    per10k=129ms   delete70k_whole=577ms    db=320MiB
@@ -103,7 +103,7 @@ Reading it: every run ends at its 30 s budget (24.0 to 26.6 s, none over); blobs
 
 ### package_hash benchmark (variant base)
 
-Command: `ACU_BENCH=1 ACU_BENCH_K=1,4 ACU_BENCH_VARIANTS=base go test ./internal/cache -run TestPackageHashBench -v -timeout 60m` (PASS, 99.0s)
+Command (`TestPackageHashBench` went with the `package_hash` table in schema 11; it was last in the tree at 421f5ea): `ACU_BENCH=1 ACU_BENCH_K=1,4 ACU_BENCH_VARIANTS=base go test ./internal/cache -run TestPackageHashBench -v -timeout 60m` (PASS, 99.0s)
 
 ```
 RESULT k=1  rows=840000   variant=base      seed=15s      insert70k=1.289s   delete70k_chunked=839ms    per10k=120ms   delete70k_whole=570ms    db=320MiB
