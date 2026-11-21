@@ -570,13 +570,60 @@ seen_candidates() {
 # prints the header lines as sent, CRLF included. grep reads the file
 # itself: no pipe, so grep -q's early exit cannot fail anything under
 # pipefail.
+#
+# AIDEV-NOTE: the request line is at the start of a line, or follows
+# another method's "Answer for: " on one line. An install from two hosts
+# runs two apt method processes, each writing its debug output to the one
+# log. A method writes a request (the request line and its headers) in one
+# write call, but an answer in four: "Answer for: ", the URL, a newline,
+# the headers (strace of apt 2.6.2's http method). So the other host's
+# request can land after "Answer for: ", or after the URL that follows it,
+# and its request line is then whole but not at the start of a line:
+#   Answer for: GET http://signed.test/x.deb HTTP/1.1
+# The check wanted the line's start, and CI's debian:12 job failed once on
+# a request apt had sent (2026-11-21, run 44936685430: the daemon's and
+# nginx's lines for it were in the job's log; apt's own log was not kept,
+# so that it held this shape is inferred). Nothing else may precede GET:
+# apt_sent_selfcheck holds both halves, at every run's setup.
 apt_sent_line() {
-    grep -Eq -- "^GET $1 HTTP/1\\.1"$'\r'"?\$" "$APT_LOG"
+    grep -Eq -- "^(Answer for: .*)?GET $1 HTTP/1\\.1"$'\r'"?\$" "$APT_LOG"
 }
 
-# apt_sent REGEX: apt_sent_line, or fail.
+# apt_sent REGEX: apt_sent_line, or fail, with apt's output: the daemon's
+# and nginx's logs alone cannot show why a request line was not found.
 apt_sent() {
-    apt_sent_line "$1" || fail "apt did not send GET $1 (Debug::Acquire::http output in $APT_LOG)"
+    if ! apt_sent_line "$1"; then
+        sed 's/^/    | /' "$APT_LOG"
+        fail "apt did not send GET $1 (Debug::Acquire::http output above, from $APT_LOG)"
+    fi
+}
+
+# apt_sent_selfcheck: apt_sent_line against a log written here, in the
+# shapes two apt methods writing to one file leave (apt_sent_line's note).
+# A request line is read at the start of a line and after another method's
+# "Answer for: ", with or without that answer's URL before it; an answer's
+# URL is no request, a request line after anything else is not read, and a
+# URL is matched to its end.
+apt_sent_selfcheck() {
+    local saved=${APT_LOG:-} cr=$'\r' name
+    APT_LOG=$(mktemp)
+    {
+        printf 'GET http://a.test/at-start HTTP/1.1%s\n' "$cr"
+        printf 'Answer for: GET http://a.test/after-answer HTTP/1.1%s\n' "$cr"
+        printf 'Answer for: http://b.test/x.debGET http://a.test/after-url HTTP/1.1%s\n' "$cr"
+        printf 'Answer for: http://a.test/answered\n'
+        printf 'Get:1 GET http://a.test/after-other HTTP/1.1%s\n' "$cr"
+    } > "$APT_LOG"
+    for name in at-start after-answer after-url; do
+        apt_sent_line "http://a\\.test/$name" ||
+            fail "apt_sent_line misses a request line apt sent ($name; lib.sh, apt_sent_selfcheck)"
+    done
+    for name in answered after-other at-star; do
+        ! apt_sent_line "http://a\\.test/$name" ||
+            fail "apt_sent_line reads a request line apt never sent ($name; lib.sh, apt_sent_selfcheck)"
+    done
+    rm -f "$APT_LOG"
+    APT_LOG=$saved
 }
 
 # upstream_got HOST PATH-REGEX: nginx logged that request line from the

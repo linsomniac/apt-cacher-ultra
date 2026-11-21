@@ -113,6 +113,9 @@ setup() {
     : > "$DAEMON_LOG"
     # The waits are not vacuous: a condition that never holds times out.
     ! poll_quietly 0 false || fail "poll_quietly returned success for a condition that never held"
+    # Nor is apt_sent: it reads a request line where two apt methods
+    # writing to one log leave it, and nothing else.
+    apt_sent_selfcheck
     write_config
     start_nginx
     start_daemon

@@ -173,7 +173,11 @@ Assertions read:
   - The captive portal's aftermath prints the same signature words and
     `E:` lines for `plain.test`, so they do not count there.
 - **apt's `Debug::Acquire::http` request lines**, and nginx's access log:
-  the request lines the cache sent upstream.
+  the request lines the cache sent upstream. An install from two hosts
+  runs two apt method processes that write their debug output to the one
+  log, so a request line is read at the start of a line or after the
+  other method's `Answer for: ` (`apt_sent_line` in `lib.sh` says why;
+  `apt_sent_selfcheck` checks the reading at every run's setup).
 - **The daemon's own record:** its snake_case log events, the admin
   status JSON (`/?format=json`) and `/metrics`. One status-page text is
   read too: a failing suite's "backoff ends in".
@@ -343,6 +347,15 @@ failure.
   the H2 plan's runs, in its Task 9 run and in every review run since. A
   test failure is a harness, image or daemon change until shown
   otherwise.
+- **One harness failure since, fixed** (2026-11-21, CI run 44936685430,
+  `debian:12`, `first-contact`): "apt did not send GET …acu-nvidia…",
+  while the daemon's `request` line and nginx's line for that path were in
+  the same job's log. The check wanted the request line at the start of a
+  line; apt writes an answer's `Answer for: ` and its URL in separate
+  calls, and the other host's method wrote its request between them. The
+  job passed when re-run, and `apt_sent_line` now reads that shape. A
+  failed `apt_sent` prints apt's output since, which that run's log
+  lacked: read it before anything else.
 - **Compare the apt version** that `setup` prints first
   (`apt 2.6.1; fixtures key …`) with the table above. The image tags
   float; a new apt is a harness maintenance item, neither a flake nor a
