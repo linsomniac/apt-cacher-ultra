@@ -176,6 +176,22 @@ the cache trusts or serves.
   CI now allow 10 minutes. Class none: test time only.
   Recommendation: keep the 10-minute bound; split
   the package's simulations into their own test binary if it nears it.
+- **`internal/cache` under `-race` is at the 10-minute bound on a
+  developer machine** (raised 2026-11-21, the 1.1.0-rc3 release gate).
+  The package took 299 s under `-race` on `main` and takes 565 to 613 s
+  with the package-list work, on a 12-core machine with other test
+  binaries running, as `go test -race ./...` runs them; `make test-race`
+  and CI stop a package at 10 minutes. Three tests are 282 s of the
+  difference: `TestPackageLists_AModelOfTheSwitch` (126 s),
+  `TestCommitDiff_FortyThousandRemovedPathsCommit` (113 s) and
+  `TestMigrationV11_EveryReaderAnswersAsSchema10DidOnRandomDatabases`
+  (44 s). On CI `main`'s package took 178 s; by the same ratio the
+  package would take about 6 minutes there, which is not measured as this
+  is written. Class none: test time only. Recommendation: let those
+  three run beside each other (each has its own cache; check first that
+  none reads a process-wide counter), or split them into their own test
+  binary as the entry above recommends for `internal/freshness`; do not
+  shrink the model, whose 12 seeds are what CI runs of it.
 - **Packaging and test loose ends** (raised 2026-10-27, the H3 execution
   and its reviews; each harmless today):
   `packaging/scripts/preremove.sh` stops and disables with `systemctl`
@@ -986,6 +1002,27 @@ the cache trusts or serves.
   findings and what was done for them are items 13 to 16 of the design's
   "Added while building"). Not decided: phase 2, writing a whole list in
   chunks before the flip.
+- **1.1.0-rc3 release preparation** (the maintainer, 2026-11-21: "Let's
+  merge to master and cut a new release candidate"). The candidate is
+  opt-in testing; 1.0.5 remains the recommended stable release. Its notes
+  are `docs/release-notes/1.1.0-rc3.md`, with the full cycle's notes linked
+  from there; the full notes' links name the tag, the six that were
+  relative to the file included. It carries the package lists per suite
+  (schema 11), the writer-wait logs, the xz read fix, the
+  compressed-sibling skip and the Cloudsmith fix: everything on `main`
+  since RC2. Validation of application code `8f0e4f1` (the preparation
+  changes only documentation): all eleven apt client images freshly
+  pulled, both 904-shape oracles passed (105 s current, 101 s older); the
+  live vendor smoke passed (31 s: all eight suites, six installs, five
+  expected strict refusals); the package-list model's long form passed
+  (40 seeds of 300 steps, 88 s); `go test ./...` passed, and under
+  `-race` the six packages the work touched. The harness READMEs record
+  the runs. One production cache ran the package-list code for ten hours
+  before the candidate (the design document's *On a production cache*);
+  the xz fix and the compressed-sibling skip have not run in production.
+  CI must also pass on the preparation commit before tagging, as
+  [releasing.md](releasing.md) requires.
+
 - **1.1.0-rc1 release preparation** (2026-11-11 local / 2026-11-12 UTC).
   The candidate is opt-in testing; 1.0.4 remains the recommended stable
   release. Its release notes are `docs/release-notes/1.1.0-rc1.md`, with

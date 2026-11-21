@@ -4,6 +4,30 @@ A brief list of the changes in each release. Add an entry here with each
 change; the release notes for a release (in `docs/release-notes/`) give
 the detail an operator needs before upgrading.
 
+## 1.1.0-rc3
+
+Third opt-in candidate for 1.1.0; stable users remain on 1.0.5. See the
+[RC3 release and upgrade notes](docs/release-notes/1.1.0-rc3.md).
+
+- An adoption's commit writes the package rows a publication changed, not
+  the suite's whole package list, so the one database writer is no longer
+  held for seconds at every update: on a production cache the largest
+  suite's commit took 12 to 24 s before and 0.6 s after.
+  **The database migrates to schema 11; rollback to RC2, RC1 or 1.0.x
+  requires a pre-upgrade backup.** The migration ran 68 s on that cache,
+  before the ports opened. `adoption.write_package_list_differences = false`
+  restores whole-list writes.
+- Reading a `Packages.xz` or `Sources.xz` no longer makes a system call per
+  byte: on that cache, most of the 38 to 40 s a large suite's index parsing
+  took.
+- A plain file a repository answers with its compressed sibling
+  (packages.icinga.com's `Contents-*`) is treated as not published instead
+  of being fetched again at every check without end, and a zero-byte
+  `Packages.gz` beside a verified empty `Packages` is accepted (Caddy on
+  Cloudsmith).
+- Logs say what a database write waited behind (`database_write_waited`,
+  `writer_wait_seconds`, `writer_ahead`).
+
 ## 1.1.0-rc2
 
 Second opt-in candidate for 1.1.0; stable users remain on 1.0.5. See the
@@ -34,7 +58,8 @@ The detail, and what to do before upgrading
 from 1.0.x, is in [docs/release-notes/1.1.0.md](docs/release-notes/1.1.0.md).
 The freshness and publication changes marked "After 1.1.0-rc1" below are
 included in 1.1.0-rc2 and planned for the final 1.1.0 release; they are
-not included in the published 1.1.0-rc1.
+not included in the published 1.1.0-rc1. Those marked "After 1.1.0-rc2"
+are included in 1.1.0-rc3.
 
 ### Added
 

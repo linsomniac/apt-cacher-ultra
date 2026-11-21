@@ -19,10 +19,10 @@ servers fail; cold packages and packages left unwarmed require upstream access.
 Stable 1.0 release.  I run it in my 4 environments with 200 machines, serving thousands
 of "apt update/upgrade" and "apt installs".
 
-The [1.1.0-rc2 release candidate](https://github.com/linsomniac/apt-cacher-ultra/releases/tag/1.1.0-rc2)
+The [1.1.0-rc3 release candidate](https://github.com/linsomniac/apt-cacher-ultra/releases/tag/1.1.0-rc3)
 is for users who want to test the upcoming 1.1 release and report problems.
 Stable users should stay on 1.0.5 for now; the apt repository continues to
-serve stable releases only. Read the [candidate's upgrade notes](docs/release-notes/1.1.0-rc2.md)
+serve stable releases only. Read the [candidate's upgrade notes](docs/release-notes/1.1.0-rc3.md)
 before installing its downloaded `.deb` or standalone binary.
 
 ## Features
