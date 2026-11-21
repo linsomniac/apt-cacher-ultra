@@ -26,8 +26,11 @@ import (
 // it must kill: the eight of the package-list plan's Task 6, and those of
 // the final review's M-3 (a heal that does not bump the generation, a
 // suffix lookup that reads other suites' lists, a difference not bound to
-// its rows, a guard without the list id). A new writer of a suite's list
-// belongs in the model's operations.
+// its rows, a guard without the list id), and the commit that does not
+// bump the generation (the merge review: before the model had a
+// difference applied in place between another's read and its commit, that
+// one passed it). A new writer of a suite's list belongs in the model's
+// operations, and among what it puts between a read and its commit.
 //
 // What it models: http and https twins of one suite, two hosts that share
 // package paths, a flat suite per host (rows with a flat filename, vouched
@@ -332,8 +335,8 @@ func (m *listModel) do() {
 			m.failf("%s: DiffPackageList: %v", name, err)
 		}
 		// What happens to the suite's list between the read and the commit.
-		event := []string{"a reconcile", "another publication", "a quarantine",
-			"a forget and a new suite", "a forget, a new suite and its first adoption"}[m.rng.Intn(5)]
+		event := []string{"a reconcile", "another publication", "another publication by difference", "a quarantine",
+			"a forget and a new suite", "a forget, a new suite and its first adoption"}[m.rng.Intn(6)]
 		wrote := true // whether the event wrote, replaced or un-named the list
 		if event == "a reconcile" {
 			if ran, w := m.reconcile(s); ran {
@@ -348,6 +351,29 @@ func (m *listModel) do() {
 		switch event {
 		case "another publication":
 			m.publishPlain(s, m.nextRows(s, "small"))
+		case "another publication by difference":
+			// The adopter's way. A small difference is applied in place: the
+			// list keeps its id, and the generation alone says it was written.
+			other := m.nextRows(s, "small")
+			orows := m.shuffled(other)
+			oid, omembers := m.candidate(s, FormInline)
+			odiff, err := m.c.DiffPackageList(ctx, s.key, orows)
+			if err != nil {
+				m.failf("%s: DiffPackageList: %v", name, err)
+			}
+			ow, err := m.c.CommitAdoptionDiff(ctx, oid, omembers, nil, orows, nil, true, odiff)
+			if err != nil {
+				m.failf("%s: CommitAdoptionDiff of the publication in between: %v", name, err)
+			}
+			s.rows, s.current = other, oid
+			if ow.Mode == PackageListDifference {
+				// Rows it did not change are as the stale difference expects
+				// them; when it changed none, that difference is still exact.
+				wrote = ow.Added+ow.Changed+ow.Removed > 0
+				if wrote {
+					m.seen["stale after a difference applied in place"]++
+				}
+			}
 		case "a quarantine":
 			m.quarantine(s)
 		case "a forget and a new suite":
@@ -642,6 +668,7 @@ func TestPackageLists_AModelOfTheSwitch(t *testing.T) {
 		for _, kind := range []string{
 			PackageListDifference + " ", PackageListRewrite + " first", PackageListRewrite + " large",
 			"stale after a reconcile", "stale after another publication", "stale after a quarantine",
+			"stale after another publication by difference", "stale after a difference applied in place",
 			"stale after a forget and a new suite", "stale after a forget, a new suite and its first adoption",
 			"a difference for other rows refused", "the twin's difference refused",
 			"reconcile", "healing reconcile", "unsigned published", "unsigned refused", "failed commit",

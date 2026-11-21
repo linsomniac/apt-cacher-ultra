@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -239,6 +240,51 @@ func TestCommitDiff_AListThatChangedSinceTheReadIsRewritten(t *testing.T) {
 			requireLive(t, c, key, next) // exactly the new rows: no healed row, no row of the other adoption
 		})
 	}
+}
+
+// The generation's own case: another adoption's difference was applied in
+// place between this difference's read and its commit. The list keeps its
+// id, so the generation alone says it was written. Applied all the same,
+// this difference would leave a list that is neither publication's, with
+// the right number of rows and every statement hitting its one row: no
+// tripwire notices, and the cache would vouch the first publication's hash
+// for a package of the second.
+func TestCommitDiff_ADifferenceReadBeforeAnotherWasAppliedInPlaceIsNotApplied(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+	key := sk("h", "/ubuntu/dists/jammy")
+	seedRow(t, c, key, 1)
+	rows := numbered(100, 'a')
+	publish(t, c, key, rows)
+	list := listIDOf(t, c, key)
+
+	// Two publications of that list: one changes row 0, the other row 1 and
+	// has row 0 as it was. Both differences are read before either commits.
+	first, second := slices.Clone(rows), slices.Clone(rows)
+	first[0].DeclaredSHA256 = hashOf('b')
+	second[1].DeclaredSHA256 = hashOf('c')
+	firstID, firstMembers := signedCandidate(t, c, key)
+	secondID, secondMembers := signedCandidate(t, c, key)
+	firstDiff, err := c.DiffPackageList(ctx, key, first)
+	if err != nil || firstDiff == nil || firstDiff.Size() != 1 {
+		t.Fatalf("DiffPackageList for the first = %+v, %v; want one changed row", firstDiff, err)
+	}
+	secondDiff, err := c.DiffPackageList(ctx, key, second)
+	if err != nil || secondDiff == nil || secondDiff.Size() != 1 {
+		t.Fatalf("DiffPackageList for the second = %+v, %v; want one changed row", secondDiff, err)
+	}
+	w, err := c.CommitAdoptionDiff(ctx, firstID, firstMembers, nil, first, nil, true, firstDiff)
+	if err != nil || w.Mode != PackageListDifference || listIDOf(t, c, key) != list {
+		t.Fatalf("the first commit = %+v, %v, list %v (was %v); want its difference applied in place", w, err, listIDOf(t, c, key), list)
+	}
+	w, err = c.CommitAdoptionDiff(ctx, secondID, secondMembers, nil, second, nil, true, secondDiff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Mode != PackageListRewrite || w.Reason != "list_changed" {
+		t.Errorf("the second commit = %+v; want a rewrite (list_changed): its difference was read before the first was applied", w)
+	}
+	requireLive(t, c, key, second) // row 0 as the second publication has it, not as the first left it
 }
 
 // The count check: a difference that leaves the list with the wrong number
@@ -643,6 +689,57 @@ func TestCommitDiff_ADifferenceForOtherRowsIsNotApplied(t *testing.T) {
 			}
 			requireLive(t, c, key, committed)
 		})
+	}
+}
+
+// The digest that binds a difference to its rows covers every column a
+// list stores: rows that differ in any one of them are other rows. Walked
+// over PackageHash's fields, so a field added to the type fails here until
+// it is digested or named below as not stored; and counted against the
+// table, so a column added there without a field does too.
+func TestDigestPackageRows_EveryStoredColumnCounts(t *testing.T) {
+	notStored := map[string]string{
+		"SnapshotID": "a list belongs to a suite, not to a snapshot: package_list_entry has no such column",
+	}
+	base := PackageHash{CanonicalScheme: "http", CanonicalHost: "h", Path: "/pool/p.deb", DeclaredSHA256: hashOf('a'),
+		SnapshotID: 7, PackageName: "p", Architecture: "amd64", Version: "1", FlatFilename: "p.deb"}
+	of := func(r PackageHash) packageRowsDigest { return digestPackageRows([]PackageHash{r}) }
+	stored := 0
+	typ := reflect.TypeOf(base)
+	for i := 0; i < typ.NumField(); i++ {
+		name := typ.Field(i).Name
+		changed := base
+		switch v := reflect.ValueOf(&changed).Elem().Field(i); v.Kind() {
+		case reflect.String:
+			v.SetString(v.String() + "x")
+		case reflect.Int64:
+			v.SetInt(v.Int() + 1)
+		default:
+			t.Fatalf("PackageHash.%s is a %s: this test does not know how to change it", name, v.Kind())
+		}
+		if _, skip := notStored[name]; skip {
+			continue
+		}
+		stored++
+		if of(changed) == of(base) {
+			t.Errorf("rows that differ only in %s have the same digest: a difference computed for one would be applied to a commit of the other", name)
+		}
+	}
+	// Every column of the table but the list's id is one of those fields.
+	c := openCache(t)
+	var columns int
+	if err := c.db.QueryRow(`SELECT count(*) FROM pragma_table_info('package_list_entry') WHERE name <> 'package_list_id'`).Scan(&columns); err != nil {
+		t.Fatal(err)
+	}
+	if columns != stored {
+		t.Errorf("package_list_entry stores %d columns beside its list's id, PackageHash has %d stored fields: the digest must cover each column", columns, stored)
+	}
+	// A field's end counts: the same letters split differently are other rows.
+	a, b := base, base
+	a.PackageName, a.Architecture = "ab", "c"
+	b.PackageName, b.Architecture = "a", "bc"
+	if of(a) == of(b) {
+		t.Error(`("ab","c") and ("a","bc") have the same digest`)
 	}
 }
 

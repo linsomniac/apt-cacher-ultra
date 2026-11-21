@@ -119,7 +119,8 @@ type packageRowsDigest struct {
 // rows — not a security boundary: FNV-1a per row, summed, so no sort and
 // no allocation (about 15 ms for 67,000 rows, on the adopter's goroutine,
 // before the commit is queued). A column added to PackageHash that is
-// stored must be added here.
+// stored must be added here
+// (TestDigestPackageRows_EveryStoredColumnCounts fails until it is).
 func digestPackageRows(rows []PackageHash) packageRowsDigest {
 	const (
 		offset = 14695981039346656037
@@ -263,6 +264,8 @@ type PackageListWrite struct {
 	// (more than half the new list differs), "list_changed" (the list was
 	// written after the difference was read), "mismatch" (the difference
 	// did not produce the new rows: a defect, reported by the adopter).
+	// The adopter reports "disabled" in place of "no_difference" when it
+	// gave none because adoption.write_package_list_differences is false.
 	Reason string
 	// Rows inserted, updated and deleted. A rewrite counts every row as
 	// Added.
@@ -363,9 +366,14 @@ SELECT package_list_id, package_list_generation FROM suite_freshness
 // the transaction that applies it. The suite's mutex is why the check
 // normally passes — it keeps another adoption and a reconcile of the
 // suite out between the read and the commit — but it is not the proof:
-// the proof is this comparison. A new writer of a list that does not bump
-// the generation breaks it silently; TestPackageLists_AModelOfTheSwitch
-// is where that would show.
+// the proof is this comparison. A writer of a list that does not bump the
+// generation breaks it silently: no tripwire has to notice (a stale
+// difference can change rows and leave their number right).
+// TestCommitDiff_ADifferenceReadBeforeAnotherWasAppliedInPlaceIsNotApplied
+// shows that for the commit's own bump, and
+// TestPackageLists_AModelOfTheSwitch puts each writer it models between a
+// read and its commit. A new writer is covered only once it is added
+// there.
 func commitPackageListTx(ctx context.Context, tx *sql.Tx, key SuiteKey, live sql.NullInt64, generation int64,
 	rows []PackageHash, rowsDigest packageRowsDigest, diff *PackageListDiff) (listID int64, w PackageListWrite, err error) {
 	switch {
