@@ -1147,6 +1147,19 @@ codec, bad checksum, or failed reconstruction retains the original failure.
 `index_reconstructed` logs successful recovery at INFO;
 `index_reconstruction_failed` records failed fallback attempts at DEBUG.
 
+After 1.1.0-rc2, any other plain file answered that way is not rebuilt but
+treated as not published. A repository behind Apache content negotiation
+may list `Contents-amd64` and `Contents-amd64.gz`, publish the `.gz` only,
+and answer a request for the plain name with the `.gz` and status 200
+instead of 404. When the answer is exactly the compressed sibling (`.gz`,
+`.xz`, `.bz2`, `.lzma`, `.zst` or `.lz4`) declared by the same Release, by
+its declared size and every SHA256/SHA512 digest, the plain file is skipped
+like one answered 404: WARN `adoption_member_skipped` with
+`reason=compressed_sibling_served`, no retry round, and nothing for
+`repair_skipped_members` to fetch again. A record an earlier version left
+for such a file is dropped at the next repair pass. Any other bytes remain
+a failure, retried and repaired as before.
+
 ### Upgrading an existing cache
 
 Upgrading the Debian package to 1.1.0 or later restarts a running daemon

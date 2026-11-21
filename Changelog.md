@@ -301,6 +301,21 @@ not included in the published 1.1.0-rc1.
 
 ### Fixed
 
+- After 1.1.0-rc2: a plain file other than `Packages` or `Sources` whose
+  URL upstream answers with its compressed sibling is treated as not
+  published. Apache content negotiation (packages.icinga.com) answers
+  `Contents-amd64` with the bytes of `Contents-amd64.gz` and status 200
+  where Ubuntu answers 404; ACU took that for a failure that might heal,
+  waited two retry rounds at every publication and fetched the file again
+  at every unchanged check without end (WARN
+  `adoption_member_repair_failed`), and did not adopt the suite at all with
+  `tolerate_optional_member_failures = false`. When the answer is exactly
+  the sibling the same `Release` declares (its length and every declared
+  hash), the member is skipped like one answered 404
+  (`adoption_member_skipped` with `reason=compressed_sibling_served` and
+  `served_as`), and the repair pass retires the record an earlier version
+  left (`adoption_repair_pass` gains `retired`;
+  `acu_adoption_member_repairs_total` gains `outcome="not_published"`).
 - After 1.1.0-rc2: an adoption no longer reads a `Packages.xz` or
   `Sources.xz` with one system call per byte. The xz decoder was handed
   the cached file without a buffer: 1.47 million reads for a 1.47 MB

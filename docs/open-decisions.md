@@ -892,6 +892,34 @@ the cache trusts or serves.
 
 ## Decided
 
+- **A plain file answered with its compressed sibling is not published**
+  (the maintainer, 2026-11-21: "adapt so that we can adopt the icinga
+  repo, option 1 sounds good"). packages.icinga.com lists `Contents-amd64`
+  and `Contents-amd64.gz`, publishes the `.gz` only, and (Apache content
+  negotiation) answers the plain name 200 with the `.gz`'s bytes where
+  Ubuntu answers 404. apt never asks for the plain name while a compressed
+  one is listed, so the repository is not broken for apt. The cache took
+  the answer for a failure that may heal: two retry rounds at every
+  publication, and a fetch at every unchanged check by the repair pass
+  without end (5,483 `adoption_member_repair_failed` in one cache's
+  journal, 2026-10-22 to 2026-11-21, attempts past 1,200). Three options
+  were weighed: treat it as not published, like a 404 (taken); rebuild the
+  plain file from the sibling, as issue #32 does for `Packages` and
+  `Sources` (it stores a file apt never asks for, and leaves the loop for
+  files over the 256 MiB rebuild limit); back off repairs that keep
+  failing (it only slows the loop, and may still be worth having for other
+  permanent failures: not built). What was built: a plain member other
+  than `Packages` or `Sources` whose answer is exactly a compressed
+  sibling's bytes, by the length and every hash the same Release declares,
+  is skipped with `reason=compressed_sibling_served`
+  (`servedAsSibling`, `internal/freshness/index_recovery.go`), and the
+  repair pass drops the record an earlier version left for it. The builder's
+  calls: `Packages` and `Sources` keep issue #32's rebuild and are never
+  skipped this way; a 404 at the repair pass still counts as a failed
+  attempt and retires nothing (a mirror mid-sync answers 404 for a file a
+  backend has not got yet); the answer that failed is the evidence when
+  it was read to its end, and the URL is asked once more only when the
+  sibling is longer than the plain file.
 - **One package list per suite, written by difference** (the maintainer,
   2026-11-18: chosen among four approaches; 2026-11-19: the design
   approved as written). A suite's package rows are one list
