@@ -16,13 +16,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ulikunitz/xz"
-
 	"github.com/linsomniac/apt-cacher-ultra/internal/aptpath"
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 	"github.com/linsomniac/apt-cacher-ultra/internal/fetch"
 	"github.com/linsomniac/apt-cacher-ultra/internal/flipgate"
 	"github.com/linsomniac/apt-cacher-ultra/internal/hostsem"
+	"github.com/linsomniac/apt-cacher-ultra/internal/indexrecovery"
 	"github.com/linsomniac/apt-cacher-ultra/internal/integrity"
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 	"github.com/linsomniac/apt-cacher-ultra/internal/wallclock"
@@ -3582,10 +3581,10 @@ func (a *Adopter) readPackagesBlob(memberPath, blobHash string) ([]byte, error) 
 		return readGzipPackagesBlob(f, maxDecompressedPackagesBytes)
 	}
 	if strings.HasSuffix(memberPath, ".xz") {
-		// Phase 3: ulikunitz/xz pure-Go reader. Same size-cap posture
+		// Phase 3: the pure-Go xz reader. Same size-cap posture
 		// as the gzip path — a hostile signed-but-huge upstream cannot
 		// inflate past maxDecompressedPackagesBytes.
-		xr, err := xz.NewReader(f)
+		xr, err := indexrecovery.NewXZReader(f)
 		if err != nil {
 			return nil, fmt.Errorf("xz: %w", err)
 		}

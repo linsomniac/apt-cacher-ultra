@@ -12,8 +12,6 @@ import (
 	"os"
 	"path"
 
-	"github.com/ulikunitz/xz"
-
 	"github.com/linsomniac/apt-cacher-ultra/internal/cache"
 )
 
@@ -99,8 +97,8 @@ func Reconstruct(ctx context.Context, c *cache.Cache, plain, compressed Member, 
 	if path.Ext(compressed.Path) == ".gz" {
 		err = CopyGzip(dst, encoded, plain.Size)
 	} else {
-		var r *xz.Reader
-		r, err = xz.NewReader(encoded)
+		var r io.Reader
+		r, err = NewXZReader(encoded)
 		if err == nil {
 			_, err = io.Copy(dst, io.LimitReader(r, plain.Size+1))
 		}
