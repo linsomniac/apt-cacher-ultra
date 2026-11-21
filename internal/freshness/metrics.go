@@ -252,7 +252,7 @@ var (
 
 	// SPEC6_5 §10.3 / §7.4: adoption-member-skip / Sources-parse /
 	// pdiff-Index-parse counters. Cardinality is a closed enum per
-	// label (≤ 4 values for reason, ≤ 2 for outcome) so the totals
+	// label (≤ 5 values for reason, ≤ 2 for outcome) so the totals
 	// stay well under metric_series_cap.
 	adoptionMembersSkippedTotal = metrics.NewCounterWithCap(
 		"acu_adoption_members_skipped_total",
@@ -276,8 +276,9 @@ var (
 	// adoptionMemberRepairsTotal counts SPEC6_7 §3 freshness-tick
 	// repair attempts on integrity-skipped members, by outcome
 	// ("success" = member promoted into the snapshot, "failure" =
-	// fetch/validation/DB failure; retried next tick). Closed 2-value
-	// enum.
+	// fetch/validation/DB failure; retried next tick, "not_published" =
+	// upstream answers with the member's compressed sibling; its record
+	// is retired). Closed 3-value enum.
 	adoptionMemberRepairsTotal = metrics.NewCounterWithCap(
 		"acu_adoption_member_repairs_total",
 		"Freshness-tick repairs of integrity-skipped members, by outcome (SPEC6_7 §10).",

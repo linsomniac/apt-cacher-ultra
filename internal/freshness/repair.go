@@ -41,7 +41,10 @@ import (
 // whose upstream never republishes — at a cost of 1-2 upstream
 // requests per degraded member per fresh tick, with the tick cadence
 // already cooldown-limited. A persistent non-zero retry_count is the
-// operator signal that a member needs investigation.
+// operator signal that a member needs investigation. One cause of such
+// a member is recognised and ends its attempts: an upstream that
+// answers the member's URL with its compressed sibling does not
+// publish it, and the record is retired (errAdoptionMemberSiblingServed).
 //
 // No-ops (cheaply) when the repair switch is off or the snapshot has
 // no repairable rows — the steady state for every healthy suite.
@@ -63,7 +66,7 @@ func (a *Adopter) RepairSkippedMembers(ctx context.Context, suite SuiteRef, snap
 		return
 	}
 
-	repaired := 0
+	repaired, retired := 0, 0
 	decl := a.repairDeclarations(ctx, suite, snapshotID)
 	for _, row := range rows {
 		if ctx.Err() != nil {
@@ -87,6 +90,25 @@ func (a *Adopter) RepairSkippedMembers(ctx context.Context, suite SuiteRef, snap
 		// reason this repair can succeed while the canonical path is
 		// still serving the previous generation.
 		blobHash, _, ferr := a.adoptMemberFromRelease(ctx, suite, m, probeByHashFirst, decl)
+		if errors.Is(ferr, errAdoptionMemberSiblingServed) {
+			// Upstream answers the member's URL with its compressed
+			// sibling: the plain file is not published, and no later pass
+			// would find otherwise (servedAsSibling, which logged the
+			// skip). Retire the record instead of counting a failure
+			// against it at every unchanged check.
+			//
+			// AIDEV-NOTE: only this skip retires a record. A 404 here is
+			// still a failed attempt, tried again: while a mirror syncs, a
+			// backend that has not got a new file yet answers 404 for it,
+			// which is the very race this pass exists to outlast.
+			derr := a.cache.DropSkippedMember(ctx, snapshotID, row.Path)
+			if derr == nil {
+				adoptionMemberRepairsTotal.Inc("not_published")
+				retired++
+				continue
+			}
+			ferr = derr
+		}
 		if ferr != nil {
 			if yielded(ctx) {
 				// The repair gave way (repair_yield.go). Being stopped says
@@ -159,7 +181,8 @@ func (a *Adopter) RepairSkippedMembers(ctx context.Context, suite SuiteRef, snap
 		"snapshot_id", snapshotID,
 		"attempted", len(rows),
 		"repaired", repaired,
-		"remaining", len(rows)-repaired,
+		"retired", retired,
+		"remaining", len(rows)-repaired-retired,
 	)
 }
 

@@ -175,6 +175,11 @@ type AdoptionMemberError struct {
 	Detail                 string // short reason, e.g. "served 114572 vs declared 1664594"
 	err                    error  // wraps the category sentinel via %w
 	representationMismatch bool   // eligible for verified compressed-sibling recovery
+	// served identifies the body upstream answered with, when the fetch
+	// read it to its end (nil when it stopped at the member's download
+	// limit): what adoptMemberFromRelease compares with the member's
+	// compressed siblings (servedAsSibling).
+	served *servedBytes
 	// upstreamSilent: the fetch ended because upstream sent nothing for
 	// upstream.idle_read_timeout (fetch.ErrIdleTimeout) — twice for a
 	// member the snapshot needs, since the fetch retries a silence once
@@ -524,6 +529,14 @@ func missingRequestableIndexGroups(suitePath string, declared, fetched []Release
 // canonical case is Ubuntu's Release file declaring an uncompressed
 // Contents-amd64 the archive only ships as Contents-amd64.gz.
 var errAdoptionMemberSkipped = errors.New("adoption_member_skipped")
+
+// errAdoptionMemberSiblingServed is errAdoptionMemberSkipped for a member
+// whose URL upstream answers with the bytes of the compressed sibling its
+// Release declares (adoptMemberFromRelease): the plain file is not
+// published. An adoption treats it as any skip (errors.Is sees
+// errAdoptionMemberSkipped through it); the repair pass tells it apart, to
+// retire the record it was working on.
+var errAdoptionMemberSiblingServed = fmt.Errorf("%w: upstream answers with a compressed sibling", errAdoptionMemberSkipped)
 
 // AdoptionConfig bundles Adopter dependencies. Required: Cache, Fetcher,
 // Verifier, HostLimiter. Optional: MaxConcurrent (0 = unlimited),
@@ -1722,8 +1735,10 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 			// tolerance is enabled. These are files apt does not fetch
 			// for `apt update`/`apt install`; failing the suite on them
 			// is what causes the bulk of observed adoption_run_failed
-			// events (e.g. an index republished mid-fetch, or a mirror
-			// that serves the .gz at the uncompressed URL). The member
+			// events (e.g. an index republished mid-fetch; a mirror that
+			// serves the .gz at the uncompressed URL was another, and is
+			// now skipped as not published before it gets here:
+			// servedAsSibling). The member
 			// is skipped: no snapshot_member / by-hash / package_hash row
 			// is created for it, so a tampered optional file can never be
 			// served — apt 404s it, exactly as on the 404-skip path.
@@ -2650,9 +2665,12 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 	// sent, already failed the fetch with fetch.ErrBodyTooLarge
 	// (memberMaxBytes). A shorter body sent without a Content-Length
 	// (chunked) fails verifyMember's size check below instead.
+	served := w.served()
 	if m.Size > 0 && res.ContentLength > 0 && res.ContentLength != m.Size {
-		return "", newRepresentationErr(ErrAdoptionMemberFetchFailed, m.Path,
+		me := newRepresentationErr(ErrAdoptionMemberFetchFailed, m.Path,
 			fmt.Sprintf("served %d vs declared %d", res.ContentLength, m.Size))
+		me.served = &served
+		return "", me
 	}
 
 	// AIDEV-NOTE: the declared Size, as tryByHashFetch passes, never the
@@ -2685,11 +2703,16 @@ func (a *Adopter) fetchMemberURL(ctx context.Context, suite SuiteRef, m ReleaseM
 			"declared_"+suffix, mm.declared,
 			"actual_"+suffix, mm.actual,
 		)
-		return "", newRepresentationErr(ErrAdoptionMemberMismatch, m.Path,
+		me := newRepresentationErr(ErrAdoptionMemberMismatch, m.Path,
 			fmt.Sprintf("%sdeclared %s, got %s", prefix, shortHash(mm.declared), shortHash(mm.actual)))
+		me.served = &served
+		return "", me
 	case err != nil:
 		me := newMemberErr(ErrAdoptionMemberFetchFailed, m.Path, fmt.Sprintf("finalize: %v", err))
-		me.representationMismatch = errors.Is(err, cache.ErrSizeMismatch)
+		if errors.Is(err, cache.ErrSizeMismatch) {
+			me.representationMismatch = true
+			me.served = &served
+		}
 		return "", me
 	}
 	if err := a.cache.PutBlob(ctx, hashHex, w.Written()); err != nil {

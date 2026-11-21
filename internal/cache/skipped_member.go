@@ -232,3 +232,20 @@ UPDATE snapshot_skipped_member SET retry_count = retry_count + 1
 		return nil
 	})
 }
+
+// DropSkippedMember deletes a skipped-member row the repair pass has
+// nothing left to fetch for: upstream turned out not to publish the member
+// (it answers its URL with a compressed sibling's bytes). The snapshot is
+// then as an adoption that saw this at once leaves it, with no record for
+// the member. Zero rows affected (already repaired, dropped or reaped) is
+// benign, and the snapshot need not be current: the row only ever asked
+// for a fetch.
+func (c *Cache) DropSkippedMember(ctx context.Context, snapshotID int64, path string) error {
+	return c.submitWrite(ctx, writeRepairRetire, func(ctx context.Context, conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx, `
+DELETE FROM snapshot_skipped_member WHERE snapshot_id = ? AND path = ?`, snapshotID, path); err != nil {
+			return fmt.Errorf("DropSkippedMember: %w", err)
+		}
+		return nil
+	})
+}

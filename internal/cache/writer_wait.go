@@ -39,6 +39,7 @@ const (
 	writeReconcileMembers
 	writeRepairMember
 	writeRepairRetryBump
+	writeRepairRetire
 	writeCheckUnchanged
 	writeSuiteCreate
 	writeSuiteFreshnessUpdate
@@ -84,6 +85,7 @@ var writeKindNames = [numWriteKinds]string{
 	writeReconcileMembers:         "reconcile_members",
 	writeRepairMember:             "repair_member",
 	writeRepairRetryBump:          "repair_retry_bump",
+	writeRepairRetire:             "repair_retire",
 	writeCheckUnchanged:           "check_unchanged",
 	writeSuiteCreate:              "suite_create",
 	writeSuiteFreshnessUpdate:     "suite_freshness_update",

@@ -32,7 +32,6 @@ var mainEventsWithoutARow = []string{
 	"adoption_reconcile_member_failed",
 	"adoption_reconcile_snapshot_displaced",
 	"adoption_repair_bump_failed",
-	"adoption_repair_pass",
 	"adoption_repair_snapshot_displaced",
 	"adoption_required_index_target_missing",
 	"adoption_short_keyid_fallback",

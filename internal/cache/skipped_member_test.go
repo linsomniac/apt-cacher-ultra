@@ -371,6 +371,39 @@ func TestBumpSkippedMemberRetry(t *testing.T) {
 	}
 }
 
+// DropSkippedMember retires one record: the repair pass has nothing left to
+// fetch for it. The snapshot's other records stay, and a record that is
+// already gone is no error.
+func TestDropSkippedMember(t *testing.T) {
+	c := openCache(t)
+	ctx := context.Background()
+
+	id := commitSnapshotWithSkips(t, c, []SkippedMember{
+		{Path: "Contents-amd64", DeclaredSHA256: strings.Repeat("a", 64), Size: 7, Reason: SkipReasonOptionalMemberIntegrity},
+		{Path: "main/Contents-amd64", DeclaredSHA256: strings.Repeat("b", 64), Size: 9, Reason: SkipReasonOptionalMemberIntegrity},
+	})
+
+	if err := c.DropSkippedMember(ctx, id, "Contents-amd64"); err != nil {
+		t.Fatalf("DropSkippedMember: %v", err)
+	}
+	rows, err := c.ListRepairableSkippedMembers(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Path != "main/Contents-amd64" {
+		t.Fatalf("records left = %+v, want main/Contents-amd64 alone", rows)
+	}
+	if err := c.DropSkippedMember(ctx, id, "Contents-amd64"); err != nil {
+		t.Errorf("dropping a record that is gone: %v, want no error", err)
+	}
+	if err := c.DropSkippedMember(ctx, id+1, "main/Contents-amd64"); err != nil {
+		t.Errorf("dropping another snapshot's record: %v, want no error", err)
+	}
+	if rows, err := c.ListRepairableSkippedMembers(ctx, id); err != nil || len(rows) != 1 {
+		t.Errorf("records left = %+v (err=%v), want the one", rows, err)
+	}
+}
+
 func TestSnapshotGC_ReapsSkippedMemberRows(t *testing.T) {
 	c := openCache(t)
 	ctx := context.Background()

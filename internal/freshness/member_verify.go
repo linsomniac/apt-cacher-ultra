@@ -65,6 +65,32 @@ func (w *memberWriter) Truncate() error {
 	return nil
 }
 
+// servedBytes identifies bytes a fetch wrote: their length and both
+// digests.
+type servedBytes struct {
+	size           int64
+	sha256, sha512 string
+}
+
+// are reports whether the bytes are exactly m's: its declared length and
+// every hash it declares, of which there must be one.
+func (s servedBytes) are(m ReleaseMember) bool {
+	if (m.SHA256 == "" && m.SHA512 == "") || s.size != m.Size {
+		return false
+	}
+	return (m.SHA256 == "" || s.sha256 == m.SHA256) && (m.SHA512 == "" || s.sha512 == m.SHA512)
+}
+
+// served identifies the bytes written so far. It moves nothing into pool/
+// and leaves the writer as it was.
+func (w *memberWriter) served() servedBytes {
+	return servedBytes{size: w.Written(), sha256: w.blob.HashSum(), sha512: hex.EncodeToString(w.sha512.Sum(nil))}
+}
+
+// holds reports whether the bytes written so far are exactly m's
+// (servedBytes.are).
+func (w *memberWriter) holds(m ReleaseMember) bool { return w.served().are(m) }
+
 // memberHashMismatch is verifyMember's error for bytes whose hash is not
 // the declared one: algo is "SHA256" or "SHA512".
 type memberHashMismatch struct {
