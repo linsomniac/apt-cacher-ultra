@@ -1165,7 +1165,8 @@ serves anything. The migration moves each suite's current package rows into
 one list per suite and drops the table that held a copy per snapshot, and
 with it the package lists earlier versions kept for every displaced
 snapshot: 5 to 10 seconds for a database of 1.16 million package rows in
-our measurement, longer on a larger database or a slower disk. It needs
+our measurement, and 68 seconds on a production host with suites of the
+same size; longer on a larger database or a slower disk. It needs
 free disk while it runs: in our measurement, for 290,000 current package
 rows, the write-ahead log beside the database grew to 170 MiB, the database
 file itself by 79 MiB (by nothing when it already has free pages; by up to

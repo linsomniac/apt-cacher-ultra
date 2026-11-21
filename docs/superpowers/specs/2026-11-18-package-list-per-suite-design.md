@@ -467,6 +467,41 @@ asked:
 - The largest database measured is 1.16M package rows. The migration's
   time and temporary space on a much larger one are not measured.
 
+### On a production cache (2026-11-21)
+
+From the journal of one production cache: six days of `adoption_finished`
+before the change (256 successful adoptions, on 1.1.0-rc1 and rc2 builds)
+and the first ten hours after it (14 adoptions, all by difference; 13 of
+them changed no package row, one added a row and removed one).
+
+| Suite | Package rows | Commit phase before: median (range), adoptions | After, adoptions |
+| --- | --- | --- | --- |
+| jammy-updates | 66,526 | 16.4 s (11.7 to 23.8), 31 | 0.64 s, 1 |
+| jammy-security | 62,877 | 15.7 s (11.1 to 19.8), 19 | 0.49 s, 1 |
+| noble-updates | 26,678 | 7.1 s (4.3 to 9.6), 34 | 0.52 to 0.67 s, 3 |
+| noble-security | 22,386 | 4.7 s (3.4 to 6.0), 22 | 0.15 s, 1 |
+| resolute-updates | 11,938 | 3.5 s (2.7 to 4.4), 35 | 0.69 to 0.74 s, 3 |
+| resolute-security | 9,456 | 2.0 s (1.1 to 2.5), 19 | 0.18 s, 1 |
+
+- That host commits far more slowly than the machine the copy was measured
+  on (2.0 to 2.5 s there for the largest suite), so the change is worth
+  more on it. 86 commits held the writer 5 s or longer in the six days
+  before; none has since.
+- What is left of a commit there is not package rows. It grows with the
+  suite's warmed files (331 to 775 for the large suites): one `url_path`
+  upsert and one interest probe for each.
+- `usage_checkpoint_failed` ("save usage: context deadline exceeded"): all
+  eight of the six days before fell while a commit of 8 to 23 s held the
+  writer. None in the ten hours after.
+- The migration took 68 s there (start to "schema migrated"), against 5 to
+  10 s for the copy on a development machine.
+- The admin refresher's package aggregates timed out (10 s) 4 to 53 times
+  a day on that host before the change, 18 on a median day, every day
+  since 2026-10-29. After it: twice in the first two minutes after the
+  migration and once in the next nine hours.
+- Not seen yet there: a difference of many rows, a whole-list rewrite, and
+  the daily GC.
+
 ## Left to the builder
 
 - Whether `package_list_entry` is a rowid table or `WITHOUT ROWID` (the

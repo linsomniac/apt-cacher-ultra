@@ -187,7 +187,10 @@ not included in the published 1.1.0-rc1.
   the first start, before the ports open: it copies the current package
   rows into the new tables and drops the old one, with the package lists
   earlier versions kept for displaced snapshots; 5 to 10 s for a database
-  of 1.16 million package rows in our measurement. `adoption_finished`
+  of 1.16 million package rows in our measurement, 68 s on a production
+  host with suites of the same size. On that host the commit of its
+  largest suite took 12 to 24 s before the change (31 adoptions in six
+  days) and 0.6 s in the first adoption after it. `adoption_finished`
   says how each commit wrote the list (`package_list_write`, and the rows
   added, changed and removed), `acu_adoption_package_list_writes_total`
   counts them, and two new events report a list that could not be read
@@ -298,6 +301,15 @@ not included in the published 1.1.0-rc1.
 
 ### Fixed
 
+- After 1.1.0-rc2: an adoption no longer reads a `Packages.xz` or
+  `Sources.xz` with one system call per byte. The xz decoder was handed
+  the cached file without a buffer: 1.47 million reads for a 1.47 MB
+  `Packages.xz`. On a production host this was most of the
+  `parse_indexes` phase, 38 to 40 s of a 55 to 78 s adoption for a suite
+  of 66,000 packages. The file is read through a buffer now (0.20 s where
+  it took 0.72 s for that file on a development machine; not yet measured
+  on that host). Rebuilding a plain `Packages` or `Sources` from its `.xz`
+  sibling had the same fault and is fixed with it.
 - After 1.1.0-rc2, ACU can adopt the Caddy repository on Cloudsmith.
   Empty components previously caused adoption to report `parse_failed`. ACU
   accepts a zero-byte `Packages.gz` only when it also verifies a zero-byte
