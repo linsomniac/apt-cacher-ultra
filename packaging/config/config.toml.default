@@ -119,6 +119,11 @@ member_retry_delay    = "30s"
 # Repair integrity-skipped members and missing required indices when a
 # freshness check finds unchanged metadata at upstream.
 repair_skipped_members = true
+# Write only the package rows a publication changed when a suite's new
+# snapshot is switched in. false writes the suite's whole package list at
+# every adoption, as earlier releases did (seconds of database writes for a
+# large suite): a fallback if package_list_mismatch is ever logged.
+write_package_list_differences = true
 # Hot-package prefetch budget before publishing a snapshot; 0s removes it.
 # Set a larger budget (e.g. "5m") to favor warming before publication.
 # Unfinished packages are fetched on demand; warming is best effort.

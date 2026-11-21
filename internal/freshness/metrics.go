@@ -231,7 +231,7 @@ var (
 
 	packageListWritesTotal = metrics.NewCounterWithCap(
 		"acu_adoption_package_list_writes_total",
-		"Adoption commits by how they wrote the suite's package list: mode difference (only the rows that changed), rewrite (the whole list; reason first, no_difference, large, list_changed or mismatch) or none (an unsigned snapshot).",
+		"Adoption commits by how they wrote the suite's package list: mode difference (only the rows that changed), rewrite (the whole list; reason first, no_difference, large, list_changed, mismatch or disabled) or none (an unsigned snapshot).",
 		metrics.DefaultMaxSeries,
 		"mode", "reason", "host",
 	)

@@ -11,6 +11,13 @@ import (
 	"github.com/linsomniac/apt-cacher-ultra/internal/observability"
 )
 
+// packageListReasonDisabled is the package_list_rewrite_reason of a commit
+// that wrote the whole list because adoption.write_package_list_differences
+// is false. The cache's own reasons (cache.PackageListWrite.Reason) say why
+// a difference it was given, or could have been given, was not applied;
+// this one is the adopter's, which is what decides not to ask for one.
+const packageListReasonDisabled = "disabled"
+
 type adoptionTrigger struct {
 	source, reason, detail string
 	retry                  bool

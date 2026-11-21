@@ -376,6 +376,7 @@ func serveListeners(
 		"adoption_accept_any_signer", cfg.Adoption.AcceptAnySigner,
 		"adoption_adopt_unsigned", cfg.Adoption.AdoptUnsigned,
 		"adoption_tolerate_optional_member_failures", cfg.Adoption.TolerateOptionalMemberFailures,
+		"adoption_write_package_list_differences", cfg.Adoption.WritePackageListDifferences,
 		"adoption_hot_prefetch_budget", cfg.Adoption.HotPrefetchBudget.Duration,
 		"adoption_flip_quiet_period", cfg.Adoption.FlipQuietPeriod.Duration,
 		"hot_packages_window", cfg.HotPackages.Window.Duration,
@@ -1155,6 +1156,7 @@ func buildAdopter(
 		RepairSkippedMembers:           cfg.Adoption.RepairSkippedMembers,
 		RequiredArchitectures:          cfg.Adoption.RequiredArchitectures,
 		AdoptUnsigned:                  cfg.Adoption.AdoptUnsigned,
+		WholePackageLists:              !cfg.Adoption.WritePackageListDifferences,
 		Logger:                         logger,
 	})
 	if err != nil {
@@ -1175,6 +1177,7 @@ func buildAdopter(
 		"member_retry_count", cfg.Adoption.MemberRetryCount,
 		"member_retry_delay", cfg.Adoption.MemberRetryDelay.Duration,
 		"repair_skipped_members", cfg.Adoption.RepairSkippedMembers,
+		"write_package_list_differences", adopter.WritesPackageListDifferences(),
 		"required_architectures", cfg.Adoption.RequiredArchitectures,
 		"max_concurrent_adoptions", cfg.Freshness.MaxConcurrentAdoptions,
 		"max_duration", cfg.Adoption.MaxDuration.Duration,

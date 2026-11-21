@@ -35,6 +35,32 @@ func TestBuildAdopter_WiresAdoptUnsigned(t *testing.T) {
 	}
 }
 
+// adoption.write_package_list_differences reaches the adopter, and the
+// startup line says what it was built with.
+func TestBuildAdopter_WiresWritePackageListDifferences(t *testing.T) {
+	for _, on := range []bool{true, false} {
+		withKeyringDirs(t, []string{t.TempDir()})
+		cfg := newAdoptionEnabledCfg(t, false)
+		cfg.Adoption.WritePackageListDifferences = on
+		c, fetcher, hosts := newAdoptionWiringDeps(t)
+		var logs bytes.Buffer
+		a, _, err := buildAdopter(cfg, c, fetcher, hosts, slog.New(slog.NewJSONHandler(&logs, nil)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.WritesPackageListDifferences() != on {
+			t.Fatalf("write_package_list_differences = %v, adopter built with %v", on, a.WritesPackageListDifferences())
+		}
+		want := `"write_package_list_differences":false`
+		if on {
+			want = `"write_package_list_differences":true`
+		}
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("startup line lacks %s:\n%s", want, logs.String())
+		}
+	}
+}
+
 // Deferred minors D-45 and D-47: warnSuiteCaps says nothing for an
 // unvalidated max_suites of 0 (no cap, not "exceeded"), and a failed read
 // of the cap usage is a WARN.

@@ -241,6 +241,61 @@ func TestAdoption_AnUnsignedAdoptionReadsNoDifference(t *testing.T) {
 	}
 }
 
+// adoption.write_package_list_differences = false is the way to switch the
+// difference off without a new release: the adopter neither reads the live
+// list nor hands the commit a difference, so every adoption writes the
+// suite's whole list as a new one, as releases before schema 11 did. The
+// finish record says the difference was switched off, not that a read
+// failed; a suite's first list is "first" as ever.
+func TestAdoption_WithDifferencesSwitchedOffEveryAdoptionWritesTheWholeList(t *testing.T) {
+	r := newRetryRig(t, 0)
+	r.adopter.wholePackageLists = true
+	r.adopter.packageListDiff = func(context.Context, cache.SuiteKey, []cache.PackageHash) (*cache.PackageListDiff, error) {
+		t.Error("the live package list was read with differences switched off")
+		return nil, nil
+	}
+	logs := adoptionLogs(r)
+	pkgs := rigPackages(40)
+	if err := r.publishPackages("first", pkgs); err != nil {
+		t.Fatalf("first adoption: %v", err)
+	}
+	if rec := lastFinished(t, logs); rec["package_list_write"] != "rewrite" || rec["package_list_rewrite_reason"] != "first" {
+		t.Fatalf("the first adoption's adoption_finished = %v; want a rewrite for first", rec)
+	}
+	list := rigPackageList(t, r)
+
+	// The publication TestAdoption_AChangedPublicationWritesOnlyTheDifference
+	// writes as two rows.
+	delete(pkgs, "pool/main/p/p07/p07_1.deb")
+	pkgs["pool/main/p/p07/p07_2.deb"] = fmt.Sprintf("%064x", 7777)
+	if err := r.publishPackages("second", pkgs); err != nil {
+		t.Fatalf("second adoption: %v", err)
+	}
+	rec := lastFinished(t, logs)
+	for field, want := range map[string]any{
+		"outcome": "success", "package_list_write": "rewrite", "package_list_rewrite_reason": "disabled",
+		"package_rows_added": float64(40), "package_rows_changed": float64(0), "package_rows_removed": float64(0),
+	} {
+		if rec[field] != want {
+			t.Errorf("adoption_finished %s = %v, want %v", field, rec[field], want)
+		}
+	}
+	if got := rigPackageList(t, r); got == list {
+		t.Errorf("the suite still names list %d: a whole list is written as a new one", got)
+	}
+	for _, event := range []string{"package_list_diff_failed", "package_list_mismatch"} {
+		if recs := logRecords(t, logs, event); len(recs) != 0 {
+			t.Errorf("%s was logged for a difference that was switched off: %v", event, recs)
+		}
+	}
+	for path, want := range map[string]int{"/r/pool/main/p/p07/p07_2.deb": 1, "/r/pool/main/p/p07/p07_1.deb": 0, "/r/pool/main/p/p08/p08_1.deb": 1} {
+		rows, err := r.cache.DeclaredHashesForPath(context.Background(), "http", rigHost, path)
+		if err != nil || len(rows) != want {
+			t.Errorf("DeclaredHashesForPath(%s) = %v, %v; want %d rows", path, rows, err, want)
+		}
+	}
+}
+
 // A shutdown while the live list is being read abandons the adoption
 // before its commit, as a shutdown anywhere before the commit does: the
 // previous snapshot stays current, and the interrupted read is not

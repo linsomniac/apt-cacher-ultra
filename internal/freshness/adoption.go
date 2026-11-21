@@ -558,6 +558,13 @@ type AdoptionConfig struct {
 	// value is off; config defaults it on.
 	AdoptUnsigned bool
 
+	// WholePackageLists is adoption.write_package_list_differences
+	// turned round, so that the zero value is the default: false, the
+	// adopter reads the suite's live package list and the commit writes
+	// the rows the publication changed; true, no list is read and every
+	// commit writes the whole list (reason "disabled").
+	WholePackageLists bool
+
 	// HotPackagesWindow is the SPEC3 §5.2 hot_packages.window. 0
 	// disables hot-package proactive refresh entirely.
 	HotPackagesWindow time.Duration
@@ -705,6 +712,10 @@ type Adopter struct {
 	// the flip barrier, before CommitAdoption: the window spec C5's
 	// in-transaction never-downgrade recheck closes.
 	beforeCommit func()
+
+	// wholePackageLists is AdoptionConfig.WholePackageLists: no
+	// difference is read or handed to the commit.
+	wholePackageLists bool
 
 	// packageListDiff, when set (tests only), stands in for
 	// cache.DiffPackageList: the read of the suite's live package list
@@ -897,6 +908,7 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		maxDuration:             maxDur,
 		flipGate:                cfg.FlipGate,
 		adoptUnsigned:           cfg.AdoptUnsigned,
+		wholePackageLists:       cfg.WholePackageLists,
 		hotPackagesWindow:       cfg.HotPackagesWindow,
 		hotPrefetchBudget:       cfg.HotPrefetchBudget,
 		maxVersionsPerPackage:   maxVersions,
@@ -913,6 +925,10 @@ func NewAdopter(cfg AdoptionConfig) (*Adopter, error) {
 		now:                     now,
 	}, nil
 }
+
+// WritesPackageListDifferences reports adoption.write_package_list_differences
+// as the adopter was built with it, for the startup line.
+func (a *Adopter) WritesPackageListDifferences() bool { return !a.wholePackageLists }
 
 // SetCommitDelayForTest makes every adoption commit wait d before it runs,
 // inside the flip barrier, as a slow transaction does: the snapshot
@@ -2084,8 +2100,10 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 	// runs under the shutdown signal and the commit's bound, like the
 	// re-mark above, not under adoption.max_duration (which would discard
 	// finished member work for a read that is not needed).
+	// adoption.write_package_list_differences = false is the same thing
+	// on purpose: no read, no difference, the whole list at every commit.
 	var listDiff *cache.PackageListDiff
-	if p.form != adoptionFormUnsigned {
+	if p.form != adoptionFormUnsigned && !a.wholePackageLists {
 		read := a.cache.DiffPackageList
 		if a.packageListDiff != nil {
 			read = a.packageListDiff // test seam
@@ -2133,6 +2151,12 @@ func (a *Adopter) runShared(ctx context.Context, suite SuiteRef, p *adoptionPayl
 		written, err := a.cache.CommitAdoptionDiff(commitCtx, snapshotID, memberRows, integritySkipped, packageHashes,
 			prefetchedURLPaths, pkgHashRes.coverageComplete, listDiff)
 		if err == nil {
+			if a.wholePackageLists && written.Reason == "no_difference" {
+				// The commit was given no difference because none was
+				// wanted, not because the list could not be read: say so,
+				// where the finish record and the counter take it from.
+				written.Reason = packageListReasonDisabled
+			}
 			attempt.resulting = snapshotID
 			attempt.packageList, attempt.committed = written, true
 		}

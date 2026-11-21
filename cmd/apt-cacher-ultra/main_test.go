@@ -105,7 +105,11 @@ func minimalCfg(cacheDir string, mirrors []config.MirrorRule) *config.Config {
 			// what an operator deploying with no config sees.
 			AllowHTTPSToHTTPRedirect: true,
 		},
-		Mirror: mirrors,
+		// The production default, for the same reason: without it every
+		// adoption a cmd test runs would write whole package lists, the
+		// fallback, and none would take the path operators run.
+		Adoption: config.AdoptionConfig{WritePackageListDifferences: true},
+		Mirror:   mirrors,
 	}
 	cfg.Defaults()
 	return cfg

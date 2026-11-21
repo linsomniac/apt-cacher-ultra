@@ -339,6 +339,24 @@ type AdoptionConfig struct {
 	// "explicit false").
 	RepairSkippedMembers bool `toml:"repair_skipped_members"`
 
+	// WritePackageListDifferences is the switch on how an adoption's
+	// commit writes its suite's package rows (the package-list design,
+	// schema 11). true (default): the adopter reads the suite's live list
+	// before the commit and the commit writes the rows the publication
+	// changed. false: no list is read and every commit writes the whole
+	// list as a new one, as releases before schema 11 did; the old list
+	// is left for GC. It exists so that an operator who sees ERROR
+	// package_list_mismatch, or suspects the difference, has a remedy
+	// short of a new release; it changes the cost of a commit, never what
+	// the list holds, and it does not bring schema 10 back. Pre-populated
+	// true in defaultConfig (bool zero-value cannot distinguish "absent"
+	// from "explicit false").
+	//
+	// AIDEV-NOTE: added on the merge review's advice (2026-11-20): rows
+	// that decide what the proxy serves are edited in place by code new in
+	// this release, behind a one-way migration.
+	WritePackageListDifferences bool `toml:"write_package_list_differences"`
+
 	// RequiredArchitectures is the SPEC6_7 §6 served-index guard:
 	// arches (or the pseudo-arch "source") whose per-arch index groups
 	// (Packages*/Sources*, any codec) MUST have at least one variant
@@ -942,6 +960,10 @@ func defaultConfig() *Config {
 			// self-heals instead of persisting for the snapshot's
 			// lifetime). Opt out with `repair_skipped_members = false`.
 			RepairSkippedMembers: true,
+			// An adoption's commit writes the package rows a publication
+			// changed. Opt out with `write_package_list_differences =
+			// false` (every commit writes the whole list).
+			WritePackageListDifferences: true,
 			// Spec C5 safeguard 1, C11: unsigned adoption on by default,
 			// safeguarded (deferred minor E-72).
 			AdoptUnsigned: true,
